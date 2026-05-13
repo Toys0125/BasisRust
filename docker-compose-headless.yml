@@ -1,0 +1,109 @@
+services:
+  basis-headless:
+    image: ghcr.io/basisvr/basis-headless:nightly-linux
+    pull_policy: always
+    environment:
+      Port: 4296
+      Password: default_password
+      Ip: "192.168.51.75"
+      HealthCheckEnabled: "true"
+      HealthCheckHost: "127.0.0.1"
+      HealthCheckPort: "10666"
+      HealthPath: "/health"
+      AvatarFileLocation: ""
+      AvatarPassword: ""
+    volumes:
+      #- "${APPDATA}/../LocalLow/Basis Unity/Basis Unity:/root/.config/unity3d/Basis Unity/Basis Unity"
+      - "Basis:/root/.config/unity3d/Basis Unity/Basis Unity"
+      - "./Basis/AudioClips:/app/HeadlessLinuxServer_Data/AudioClips"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:10666/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 4096M
+        reservations:
+          memory: 1024M
+    labels:
+      autoheal-app: true
+  basis-headless-B:
+    profiles: ["AB"]
+    image: ghcr.io/basisvr/basis-headless:nightly-linux
+    pull_policy: always
+    environment:
+      Port: 4296
+      Password: default_password
+      Ip: "192.168.50.14"
+      HealthCheckEnabled: "true"
+      HealthCheckHost: "127.0.0.1"
+      HealthCheckPort: "10666"
+      HealthPath: "/health"
+      AvatarFileLocation: ""
+      AvatarPassword: ""
+    volumes:
+      #- "${APPDATA}/../LocalLow/Basis Unity/Basis Unity:/root/.config/unity3d/Basis Unity/Basis Unity"
+      - "Basis:/root/.config/unity3d/Basis Unity/Basis Unity"
+      
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:10666/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    labels:
+      autoheal-app: true
+    deploy:
+      resources:
+        limits:
+          memory: 4096M
+        reservations:
+          memory: 1024M
+    depends_on:
+      basis-headless:
+        condition: service_healthy
+  basis-headless-D:
+    profiles: ["AB"]
+    image: ghcr.io/toys0125/basis-headless:headless-mic-toggle-linux
+    pull_policy: always
+    environment:
+      Port: 4296
+      Password: default_password
+      Ip: "192.168.50.14"
+      HealthCheckEnabled: "true"
+      HealthCheckHost: "127.0.0.1"
+      HealthCheckPort: "10666"
+      HealthPath: "/health"
+      AvatarFileLocation: ""
+      AvatarPassword: ""
+    volumes:
+      #- "${APPDATA}/../LocalLow/Basis Unity/Basis Unity:/root/.config/unity3d/Basis Unity/Basis Unity"
+      - "Basis:/root/.config/unity3d/Basis Unity/Basis Unity"
+      - "./Basis/AudioClips:/app/HeadlessLinuxServer_Data/AudioClips"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:10666/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    labels:
+      autoheal-app: true
+    deploy:
+      resources:
+        limits:
+          memory: 4096M
+        reservations:
+          memory: 1024M
+  autoheal:
+    image: willfarrell/autoheal:latest
+    network_mode: none
+    restart: always
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal-app
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+volumes:
+  Basis:

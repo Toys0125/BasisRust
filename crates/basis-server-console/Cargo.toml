@@ -1,0 +1,19 @@
+[package]
+name = "basis-server-console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "basis-server-console"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+basis-protocol = { path = "../basis-protocol" }
+basis-server-core = { path = "../basis-server-core" }
+basis-server-health = { path = "../basis-server-health" }
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

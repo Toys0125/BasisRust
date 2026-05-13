@@ -1,0 +1,13 @@
+services:
+  basis-rust-server:
+    build: .
+    environment:
+      SetPort: 4296
+      EnableConsole: "false"
+      Password: default_password
+    ports:
+      - "4296:4296/udp"
+      - "10666:10666/tcp"
+    volumes:
+      - ./config:/app/config
+      - ./logs:/app/logs
