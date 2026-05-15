@@ -732,22 +732,6 @@ impl BasisClient {
         Ok(client)
     }
 
-    async fn wait_for_connected(&self, timeout: Duration, shutdown: &AtomicBool) -> bool {
-        let deadline = time::Instant::now() + timeout;
-        loop {
-            if self.connected.load(Ordering::Relaxed) {
-                return true;
-            }
-            if shutdown.load(Ordering::Relaxed)
-                || !self.in_use.load(Ordering::Relaxed)
-                || time::Instant::now() >= deadline
-            {
-                return false;
-            }
-            time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
     async fn start_client(self: &Arc<Self>, config: &Config, ready: &ReadyMessage) -> Result<()> {
         if self.in_use.swap(true, Ordering::SeqCst) {
             error!("Call Shutdown First!");
@@ -1293,6 +1277,27 @@ async fn sleep_or_shutdown(duration: Duration, shutdown: &AtomicBool) {
     }
 }
 
+async fn wait_for_batch_connected(
+    clients: &[Arc<BasisClient>],
+    timeout: Duration,
+    shutdown: &AtomicBool,
+) -> usize {
+    let deadline = time::Instant::now() + timeout;
+    loop {
+        let connected = clients
+            .iter()
+            .filter(|client| client.connected.load(Ordering::Relaxed))
+            .count();
+        if connected == clients.len()
+            || shutdown.load(Ordering::Relaxed)
+            || time::Instant::now() >= deadline
+        {
+            return connected;
+        }
+        time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -1363,18 +1368,21 @@ async fn main() -> Result<()> {
             }
         }
 
-        let mut connected_in_batch = 0usize;
-        for client in &batch_clients {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
-            }
-            if client.wait_for_connected(connect_timeout, &shutdown).await {
-                connected_in_batch += 1;
-            } else {
-                warn!(
-                    "client {} did not connect within {}ms",
-                    client.index, args.connect_timeout_ms
-                );
+        let connected_in_batch =
+            wait_for_batch_connected(&batch_clients, connect_timeout, &shutdown).await;
+        if connected_in_batch < batch_clients.len() {
+            for client in &batch_clients {
+                if !client.connected.load(Ordering::Relaxed) {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    client.in_use.store(false, Ordering::SeqCst);
+                    client.connected.store(false, Ordering::SeqCst);
+                    warn!(
+                        "client {} did not connect within {}ms",
+                        client.index, args.connect_timeout_ms
+                    );
+                }
             }
         }
 
