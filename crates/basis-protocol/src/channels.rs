@@ -54,10 +54,20 @@ pub const AUDIO_RECIPIENTS_INVERTED_LARGE: u8 = 50;
 pub const AUDIO_RECIPIENTS_BITFIELD: u8 = 51;
 pub const COMPRESSED_AVATAR_BUNDLE: u8 = 52;
 pub const SERVER_LIBRARY: u8 = 53;
+pub const P2P: u8 = 54;
 
 pub const EVENT_TYPE_CAMERA_SHUTTER_SOUND: u8 = 0;
 pub const EVENT_TYPE_CAMERA_COUNTDOWN: u8 = 1;
 pub const EVENT_TYPE_PLAYER_TEMP_BLOCK: u8 = 2;
+pub const EVENT_TYPE_AVATAR_RATE_CHANGE: u8 = 3;
+
+pub const P2P_SUB_REQUEST: u8 = 0;
+pub const P2P_SUB_ACCEPT: u8 = 1;
+pub const P2P_SUB_DECLINE: u8 = 2;
+pub const P2P_SUB_CANCEL: u8 = 3;
+pub const P2P_SUB_LINK_LOST: u8 = 4;
+pub const P2P_SUB_SERVER_ARMED: u8 = 5;
+pub const P2P_SUB_LINK_UP: u8 = 6;
 
 pub const PLAYER_AVATAR_QUALITY_CHANNELS: [u8; 16] = [
     PLAYER_AVATAR_VERY_LOW,

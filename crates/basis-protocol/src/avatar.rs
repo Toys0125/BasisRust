@@ -64,6 +64,11 @@ pub const BPC_VERY_LOW: [u8; SYNC_BONE_COUNT] = [
     3, 2, 2, 2, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
 ];
 
+const OFFSETS_HIGH: [usize; SYNC_BONE_COUNT] = bit_offsets(&BPC_HIGH);
+const OFFSETS_MEDIUM: [usize; SYNC_BONE_COUNT] = bit_offsets(&BPC_MEDIUM);
+const OFFSETS_LOW: [usize; SYNC_BONE_COUNT] = bit_offsets(&BPC_LOW);
+const OFFSETS_VERY_LOW: [usize; SYNC_BONE_COUNT] = bit_offsets(&BPC_VERY_LOW);
+
 pub fn encode_avatar_network_load(url: &str, unlock_password: &str) -> Result<Vec<u8>> {
     let mut raw = NetWriter::with_capacity(url.len() + unlock_password.len() + 4);
     raw.put_raw_len_string(url);
@@ -115,11 +120,11 @@ pub fn repack_high_to_lower_into(
     out.fill(0);
     out[..WRITE_POSITION].copy_from_slice(&high_payload[..WRITE_POSITION]);
 
-    let high_offsets = bit_offsets(&BPC_HIGH);
-    let (target_bpc, target_offsets): (&[u8], Vec<usize>) = match target {
-        BitQuality::Medium => (&BPC_MEDIUM, bit_offsets(&BPC_MEDIUM)),
-        BitQuality::Low => (&BPC_LOW, bit_offsets(&BPC_LOW)),
-        BitQuality::VeryLow => (&BPC_VERY_LOW, bit_offsets(&BPC_VERY_LOW)),
+    let high_offsets = &OFFSETS_HIGH;
+    let (target_bpc, target_offsets): (&[u8], &[usize; SYNC_BONE_COUNT]) = match target {
+        BitQuality::Medium => (&BPC_MEDIUM, &OFFSETS_MEDIUM),
+        BitQuality::Low => (&BPC_LOW, &OFFSETS_LOW),
+        BitQuality::VeryLow => (&BPC_VERY_LOW, &OFFSETS_VERY_LOW),
         BitQuality::High => unreachable!(),
     };
 
@@ -148,12 +153,14 @@ pub fn repack_high_to_lower_into(
     Ok(())
 }
 
-fn bit_offsets<const N: usize>(bpc: &[u8; N]) -> Vec<usize> {
-    let mut offsets = Vec::with_capacity(N);
+const fn bit_offsets<const N: usize>(bpc: &[u8; N]) -> [usize; N] {
+    let mut offsets = [0usize; N];
     let mut bit = 0usize;
-    for value in bpc {
-        offsets.push(bit);
-        bit += 2 + 3 * (*value as usize);
+    let mut index = 0usize;
+    while index < N {
+        offsets[index] = bit;
+        bit += 2 + 3 * (bpc[index] as usize);
+        index += 1;
     }
     offsets
 }

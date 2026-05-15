@@ -321,7 +321,9 @@ fn run_live_status(server: &ServerState, running: &Arc<AtomicBool>) {
                 {
                     match key.code {
                         KeyCode::Char('c')
-                            if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                            if key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
                         {
                             running.store(false, Ordering::SeqCst);
                             break;

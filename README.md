@@ -31,10 +31,24 @@ cargo test
 
 ## Drift Check
 
+Checks C# source from the Basis git repo against local Rust source:
+
 ```powershell
-cargo run -p basis-source-sync -- `
-  --csharp-source "C:\Users\mgsta\Documents\Unity Projects\Basis\Basis Server" `
-  --rust-source "C:\Users\mgsta\Documents\BasisRustServer"
+cargo run -p basis-source-sync
+```
+
+Options:
+- `--repo <url>` - Git repo URL (default: `https://github.com/BasisVR/Basis/`)
+- `--branch <branch>` - Branch to check (auto-detected as 'developer')
+- `--rust-repo <url>` - Alternative Rust repo URL
+- `--rust-source <path>` - Path to local Rust source
+
+```powershell
+# Check a specific branch
+cargo run -p basis-source-sync -- --branch main
+
+# Use a different C# repo
+cargo run -p basis-source-sync -- --repo https://github.com/example/CsharpSource
 ```
 
 ## Current Scope

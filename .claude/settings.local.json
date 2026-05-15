@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git ls-remote *)",
+      "Read(//d/crates/**)",
+      "Bash(cargo check *)",
+      "Bash(cargo run *)"
+    ]
+  }
+}

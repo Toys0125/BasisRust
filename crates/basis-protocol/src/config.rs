@@ -14,6 +14,7 @@ pub enum BasisUserRestrictionMode {
 #[serde(rename = "Configuration", rename_all = "PascalCase")]
 pub struct ServerConfig {
     pub peer_limit: i32,
+    pub network_stack_id: String,
     pub set_port: u16,
     pub server_name: String,
     pub server_motd: String,
@@ -69,12 +70,14 @@ pub struct ServerConfig {
     pub worlds_locked: bool,
     pub servers_locked: bool,
     pub third_person_disabled: bool,
+    pub additional_avatar_data_lock: bool,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             peer_limit: u16::MAX as i32,
+            network_stack_id: String::new(),
             set_port: 4296,
             server_name: "Basis Server".to_string(),
             server_motd: String::new(),
@@ -130,6 +133,7 @@ impl Default for ServerConfig {
             worlds_locked: true,
             servers_locked: false,
             third_person_disabled: false,
+            additional_avatar_data_lock: false,
         }
     }
 }
@@ -184,6 +188,7 @@ impl ServerConfig {
         }
 
         override_field!("PeerLimit", peer_limit, i32);
+        override_string!("NetworkStackId", network_stack_id);
         override_field!("SetPort", set_port, u16);
         override_string!("ServerName", server_name);
         override_string!("ServerMotd", server_motd);
@@ -270,6 +275,11 @@ impl ServerConfig {
         override_field!("WorldsLocked", worlds_locked, bool);
         override_field!("ServersLocked", servers_locked, bool);
         override_field!("ThirdPersonDisabled", third_person_disabled, bool);
+        override_field!(
+            "AdditionalAvatarDataLock",
+            additional_avatar_data_lock,
+            bool
+        );
 
         if let Ok(value) = env::var("BasisUserRestrictionMode") {
             self.basis_user_restriction_mode = match value.as_str() {
@@ -284,6 +294,7 @@ impl ServerConfig {
         let key = name.to_ascii_lowercase();
         Some(match key.as_str() {
             "peerlimit" => self.peer_limit.to_string(),
+            "networkstackid" => self.network_stack_id.clone(),
             "setport" => self.set_port.to_string(),
             "servername" => self.server_name.clone(),
             "servermotd" => self.server_motd.clone(),
@@ -299,6 +310,7 @@ impl ServerConfig {
             "worldslocked" => self.worlds_locked.to_string(),
             "serverslocked" => self.servers_locked.to_string(),
             "thirdpersondisabled" => self.third_person_disabled.to_string(),
+            "additionalavatardatalock" => self.additional_avatar_data_lock.to_string(),
             _ => return None,
         })
     }
@@ -307,6 +319,7 @@ impl ServerConfig {
         let key = name.to_ascii_lowercase();
         match key.as_str() {
             "peerlimit" => self.peer_limit = value.parse()?,
+            "networkstackid" => self.network_stack_id = value.to_string(),
             "setport" => self.set_port = value.parse()?,
             "servername" => self.server_name = value.to_string(),
             "servermotd" => self.server_motd = value.to_string(),
@@ -322,6 +335,7 @@ impl ServerConfig {
             "worldslocked" => self.worlds_locked = value.parse()?,
             "serverslocked" => self.servers_locked = value.parse()?,
             "thirdpersondisabled" => self.third_person_disabled = value.parse()?,
+            "additionalavatardatalock" => self.additional_avatar_data_lock = value.parse()?,
             _ => anyhow::bail!("unknown config field {name}"),
         }
         Ok(())

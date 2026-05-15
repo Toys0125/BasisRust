@@ -1,2 +1,2 @@
-pub const SERVER_VERSION: u16 = 32;
+pub const SERVER_VERSION: u16 = 33;
 pub const LITENETLIB_PROTOCOL_ID: i32 = 13;

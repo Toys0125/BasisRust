@@ -1,4 +1,5 @@
 mod avatar_sync;
+mod p2p;
 
 use anyhow::{Context, Result};
 use basis_protocol::{
@@ -73,6 +74,7 @@ pub struct ServerState {
     pub pip: PipState,
     pub voice_recipients: Arc<DashMap<PeerId, Vec<PeerId>>>,
     pub avatar_sync: AvatarSyncSystem,
+    pub p2p_broker: p2p::P2pBroker,
     pub moderation: ModerationLists,
     pub global_state: Arc<RwLock<GlobalState>>,
     pub statistics: Statistics,
@@ -115,27 +117,30 @@ impl ServerState {
         );
         let _ = database.load();
 
-        let avatar_sync = AvatarSyncSystem::new(AvatarSyncConfig {
-            default_interval_ms: config.bsrsmillisecond_default_interval.max(1) as u64,
-            base_multiplier: config.bsrbase_multiplier as f32,
-            increase_rate: config.bsrsincrease_rate,
-            high_distance_sq: config.high_quality_distance * config.high_quality_distance,
-            medium_distance_sq: config.medium_quality_distance * config.medium_quality_distance,
-            low_distance_sq: config.low_quality_distance * config.low_quality_distance,
-            enable_bundle_compression: config.enable_avatar_bundle_compression,
-            bundle_min_messages: config.avatar_bundle_min_messages.max(1) as usize,
-            bundle_min_bytes: config.avatar_bundle_min_bytes.max(0) as usize,
-            min_receiver_slices: 1,
-            max_receiver_slices: 32,
-            tick_budget_ms: avatar_sync::DEFAULT_AVATAR_TICK_BUDGET_MS,
-            receiver_cycle_budget_ms: avatar_sync::DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
-            spatial_cull_enabled: false,
-        }
-        .apply_env_tuning());
+        let p2p_broker = p2p::P2pBroker::default();
+        let mut avatar_sync = AvatarSyncSystem::new(
+            AvatarSyncConfig {
+                default_interval_ms: config.bsrsmillisecond_default_interval.max(1) as u64,
+                base_multiplier: config.bsrbase_multiplier as f32,
+                increase_rate: config.bsrsincrease_rate,
+                high_distance_sq: config.high_quality_distance * config.high_quality_distance,
+                medium_distance_sq: config.medium_quality_distance * config.medium_quality_distance,
+                low_distance_sq: config.low_quality_distance * config.low_quality_distance,
+                enable_bundle_compression: config.enable_avatar_bundle_compression,
+                bundle_min_messages: config.avatar_bundle_min_messages.max(1) as usize,
+                bundle_min_bytes: config.avatar_bundle_min_bytes.max(0) as usize,
+                min_receiver_slices: 1,
+                max_receiver_slices: 32,
+                tick_budget_ms: avatar_sync::DEFAULT_AVATAR_TICK_BUDGET_MS,
+                receiver_cycle_budget_ms: avatar_sync::DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
+                spatial_cull_enabled: false,
+            }
+            .apply_env_tuning(),
+        );
+        avatar_sync.set_offloaded_pairs(p2p_broker.offloaded_pairs());
 
-        let moderation = ModerationLists::file_backed(
-            base_dir.join(ServerConfig::CONFIG_FOLDER_NAME),
-        )?;
+        let moderation =
+            ModerationLists::file_backed(base_dir.join(ServerConfig::CONFIG_FOLDER_NAME))?;
 
         let state = Self {
             config: Arc::new(RwLock::new(config.clone())),
@@ -151,6 +156,7 @@ impl ServerState {
             pip: PipState::default(),
             voice_recipients: Arc::new(DashMap::new()),
             avatar_sync,
+            p2p_broker,
             moderation,
             global_state: Arc::new(RwLock::new(GlobalState::from(&config))),
             statistics: Statistics::default(),
@@ -173,23 +179,25 @@ impl ServerState {
 
     pub fn refresh_runtime_config(&self) {
         let config = self.config.read().clone();
-        self.avatar_sync.update_config(AvatarSyncConfig {
-            default_interval_ms: config.bsrsmillisecond_default_interval.max(1) as u64,
-            base_multiplier: config.bsrbase_multiplier as f32,
-            increase_rate: config.bsrsincrease_rate,
-            high_distance_sq: config.high_quality_distance * config.high_quality_distance,
-            medium_distance_sq: config.medium_quality_distance * config.medium_quality_distance,
-            low_distance_sq: config.low_quality_distance * config.low_quality_distance,
-            enable_bundle_compression: config.enable_avatar_bundle_compression,
-            bundle_min_messages: config.avatar_bundle_min_messages.max(1) as usize,
-            bundle_min_bytes: config.avatar_bundle_min_bytes.max(0) as usize,
-            min_receiver_slices: 1,
-            max_receiver_slices: 32,
-            tick_budget_ms: avatar_sync::DEFAULT_AVATAR_TICK_BUDGET_MS,
-            receiver_cycle_budget_ms: avatar_sync::DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
-            spatial_cull_enabled: false,
-        }
-        .apply_env_tuning());
+        self.avatar_sync.update_config(
+            AvatarSyncConfig {
+                default_interval_ms: config.bsrsmillisecond_default_interval.max(1) as u64,
+                base_multiplier: config.bsrbase_multiplier as f32,
+                increase_rate: config.bsrsincrease_rate,
+                high_distance_sq: config.high_quality_distance * config.high_quality_distance,
+                medium_distance_sq: config.medium_quality_distance * config.medium_quality_distance,
+                low_distance_sq: config.low_quality_distance * config.low_quality_distance,
+                enable_bundle_compression: config.enable_avatar_bundle_compression,
+                bundle_min_messages: config.avatar_bundle_min_messages.max(1) as usize,
+                bundle_min_bytes: config.avatar_bundle_min_bytes.max(0) as usize,
+                min_receiver_slices: 1,
+                max_receiver_slices: 32,
+                tick_budget_ms: avatar_sync::DEFAULT_AVATAR_TICK_BUDGET_MS,
+                receiver_cycle_budget_ms: avatar_sync::DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
+                spatial_cull_enabled: false,
+            }
+            .apply_env_tuning(),
+        );
     }
 
     pub fn players_text(&self) -> String {
@@ -279,12 +287,18 @@ impl ServerState {
         except: Option<PeerId>,
     ) {
         for peer in self.authenticated_peers.iter() {
-            if Some(*peer.key()) == except {
+            let target = *peer.key();
+            if Some(target) == except {
                 continue;
+            }
+            if let Some(sender) = except {
+                if is_p2p_offload_channel(channel) && self.p2p_broker.is_offloaded(sender, target) {
+                    continue;
+                }
             }
             if self
                 .transport
-                .send(*peer.key(), channel, delivery, payload)
+                .send(target, channel, delivery, payload)
                 .await
                 .is_ok()
             {
@@ -294,6 +308,13 @@ impl ServerState {
             }
         }
     }
+}
+
+fn is_p2p_offload_channel(channel: u8) -> bool {
+    matches!(
+        channel,
+        channels::VOICE | channels::VOICE_LARGE | channels::SHOUT_VOICE | channels::AVATAR
+    )
 }
 
 async fn event_loop(
@@ -390,6 +411,24 @@ async fn handle_event(state: &ServerState, event: ServerEvent) -> Result<()> {
                 .transport
                 .send_server_info(remote_addr, &response)
                 .await?;
+            Ok(())
+        }
+        ServerEvent::NatIntroductionRequest {
+            remote_addr,
+            local_addr,
+            token,
+        } => {
+            if state.config.read().nat_punch_enabled {
+                state
+                    .p2p_broker
+                    .handle_nat_introduction_request(
+                        &state.transport,
+                        local_addr,
+                        remote_addr,
+                        token,
+                    )
+                    .await;
+            }
             Ok(())
         }
         ServerEvent::NetworkError(err) => {
@@ -741,6 +780,7 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
 }
 
 async fn handle_disconnect(state: &ServerState, peer: PeerId, reason: DisconnectReason) {
+    state.p2p_broker.remove_peer(&state.transport, peer).await;
     state.pending_identity.remove(&peer);
     state.voice_recipients.remove(&peer);
     state.avatar_sync.remove_player(peer);
@@ -1207,6 +1247,15 @@ async fn handle_message(
         channels::ADMIN => {
             handle_admin_message(state, peer, &payload).await?;
         }
+        channels::P2P => {
+            let peers = state.authenticated_peers.clone();
+            state
+                .p2p_broker
+                .handle_signal(&state.transport, peer, &payload, move |id| {
+                    peers.contains_key(&id)
+                })
+                .await;
+        }
         channels::SERVER_STATISTICS => {
             handle_statistics_request(state, peer, &payload).await?;
         }
@@ -1329,7 +1378,10 @@ async fn send_to_recipients_or_broadcast(
         return Ok(());
     }
     for recipient in recipients {
-        if *recipient == peer || !state.authenticated_peers.contains_key(recipient) {
+        if *recipient == peer
+            || !state.authenticated_peers.contains_key(recipient)
+            || (is_p2p_offload_channel(channel) && state.p2p_broker.is_offloaded(peer, *recipient))
+        {
             continue;
         }
         let _ = state
@@ -1510,6 +1562,9 @@ async fn relay_voice_message(state: &ServerState, peer: PeerId, payload: &[u8]) 
     let mut writer = NetWriter::new();
     message.serialize_with_id_size(&mut writer, large_id);
     for recipient in recipients {
+        if state.p2p_broker.is_offloaded(peer, recipient) {
+            continue;
+        }
         let _ = state
             .transport
             .send(
@@ -1653,6 +1708,10 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
         }
         AdminRequestMode::GlobalToggleThirdPerson => {
             state.global_state.write().third_person_disabled ^= true;
+            broadcast_lock_state(state).await;
+        }
+        AdminRequestMode::GlobalToggleAdditionalAvatarDataLock => {
+            state.global_state.write().additional_avatar_data_lock ^= true;
             broadcast_lock_state(state).await;
         }
         AdminRequestMode::GlobalGetLockState => {
@@ -1968,6 +2027,7 @@ async fn send_lock_state_to_peer(state: &ServerState, peer_id: PeerId) -> Result
     writer.put_bool(locks.worlds_locked);
     writer.put_bool(locks.servers_locked);
     writer.put_bool(locks.third_person_disabled);
+    writer.put_bool(locks.additional_avatar_data_lock);
     state
         .transport
         .send(
@@ -2048,6 +2108,7 @@ fn encode_lock_state_payload(locks: &GlobalState) -> Vec<u8> {
     writer.put_bool(locks.worlds_locked);
     writer.put_bool(locks.servers_locked);
     writer.put_bool(locks.third_person_disabled);
+    writer.put_bool(locks.additional_avatar_data_lock);
     writer.into_vec()
 }
 
@@ -2253,6 +2314,7 @@ async fn broadcast_lock_state(state: &ServerState) {
     writer.put_bool(locks.worlds_locked);
     writer.put_bool(locks.servers_locked);
     writer.put_bool(locks.third_person_disabled);
+    writer.put_bool(locks.additional_avatar_data_lock);
     state
         .broadcast(
             channels::ADMIN,

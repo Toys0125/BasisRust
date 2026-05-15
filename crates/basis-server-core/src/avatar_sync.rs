@@ -23,6 +23,8 @@ use std::{
 use tokio::{runtime::Handle, task::JoinSet};
 use tracing::warn;
 
+use crate::p2p::pack_pair;
+
 const DISTANCE_UPDATE_INTERVAL_TICKS: usize = 125;
 const MAX_SLICE_COUNT: usize = 32;
 const AVATAR_BUNDLE_RAW_TARGET_BYTES: usize = 900;
@@ -89,6 +91,62 @@ struct ReceiverTracking {
     cached_quality_index: u8,
     cached_interval_byte: u8,
     cached_interval_ms: u64,
+}
+
+struct SpatialGrid {
+    cell_size: f32,
+    cells: HashMap<(i32, i32, i32), Vec<usize>>,
+}
+
+impl SpatialGrid {
+    fn build(peer_states: &[(PeerId, PlayerAvatarState)], low_distance_sq: f32) -> Option<Self> {
+        let cell_size = low_distance_sq.sqrt();
+        if !cell_size.is_finite() || cell_size <= f32::EPSILON {
+            return None;
+        }
+        let mut cells = HashMap::with_capacity(peer_states.len());
+        for (index, (_, state)) in peer_states.iter().enumerate() {
+            cells
+                .entry(Self::cell_for_position(state.position, cell_size))
+                .or_insert_with(Vec::new)
+                .push(index);
+        }
+        Some(Self { cell_size, cells })
+    }
+
+    fn ordered_indices(&self, position: [f32; 3], peer_count: usize) -> Vec<usize> {
+        let (cx, cy, cz) = Self::cell_for_position(position, self.cell_size);
+        let mut included = vec![false; peer_count];
+        let mut indices = Vec::new();
+        for x in (cx - 1)..=(cx + 1) {
+            for y in (cy - 1)..=(cy + 1) {
+                for z in (cz - 1)..=(cz + 1) {
+                    if let Some(cell) = self.cells.get(&(x, y, z)) {
+                        for index in cell {
+                            if *index < peer_count && !included[*index] {
+                                included[*index] = true;
+                                indices.push(*index);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (index, seen) in included.into_iter().enumerate() {
+            if !seen {
+                indices.push(index);
+            }
+        }
+        indices
+    }
+
+    fn cell_for_position(position: [f32; 3], cell_size: f32) -> (i32, i32, i32) {
+        (
+            (position[0] / cell_size).floor() as i32,
+            (position[1] / cell_size).floor() as i32,
+            (position[2] / cell_size).floor() as i32,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -213,6 +271,7 @@ pub struct AvatarSyncSystem {
     slice_state: Arc<parking_lot::Mutex<SliceState>>,
     payload_pool: Arc<BytePool>,
     counters: Arc<AvatarSyncCounters>,
+    offloaded_pairs: Arc<DashMap<u64, ()>>,
 }
 
 impl AvatarSyncSystem {
@@ -232,7 +291,12 @@ impl AvatarSyncSystem {
             })),
             payload_pool: Arc::new(BytePool::new()),
             counters: Arc::new(AvatarSyncCounters::default()),
+            offloaded_pairs: Arc::new(DashMap::new()),
         }
+    }
+
+    pub fn set_offloaded_pairs(&mut self, offloaded_pairs: Arc<DashMap<u64, ()>>) {
+        self.offloaded_pairs = offloaded_pairs;
     }
 
     pub fn update_config(&self, config: AvatarSyncConfig) {
@@ -396,6 +460,11 @@ impl AvatarSyncSystem {
             .collect::<Vec<_>>();
 
         let build_start = Instant::now();
+        let spatial_grid = if config.spatial_cull_enabled {
+            SpatialGrid::build(&peer_states, config.low_distance_sq)
+        } else {
+            None
+        };
         let receiver_groups = receiver_states
             .par_iter()
             .filter_map(|(receiver_id, receiver_state)| {
@@ -403,6 +472,7 @@ impl AvatarSyncSystem {
                     *receiver_id,
                     receiver_state,
                     &peer_states,
+                    spatial_grid.as_ref(),
                     &config,
                     now,
                     update_distances,
@@ -433,10 +503,7 @@ impl AvatarSyncSystem {
             .tick_micros
             .fetch_add(tick_micros, Ordering::Relaxed);
         self.counters.tick_count.fetch_add(1, Ordering::Relaxed);
-        update_max_atomic(
-            &self.counters.max_tick_micros,
-            tick_micros,
-        );
+        update_max_atomic(&self.counters.max_tick_micros, tick_micros);
         let tick_count = self.counters.tick_count.load(Ordering::Relaxed);
         if tick_count % 100 == 0 {
             self.adapt_slice_count(tick_micros, &config);
@@ -527,6 +594,7 @@ impl AvatarSyncSystem {
         receiver_id: PeerId,
         receiver_state: &PlayerAvatarState,
         peer_states: &[(PeerId, PlayerAvatarState)],
+        spatial_grid: Option<&SpatialGrid>,
         config: &AvatarSyncConfig,
         now: Instant,
         update_distances: bool,
@@ -537,20 +605,30 @@ impl AvatarSyncSystem {
         let mut bundle_raw_bytes = 0usize;
         let mut receiver_tracking = self.tracking.entry(receiver_id).or_default();
 
-        let peer_count = peer_states.len();
+        let spatial_candidates = spatial_grid
+            .map(|grid| grid.ordered_indices(receiver_state.position, peer_states.len()));
+        let peer_count = spatial_candidates
+            .as_ref()
+            .map_or(peer_states.len(), |indices| indices.len());
         let start_index = if peer_count == 0 {
             0
         } else {
             (fanout_round.wrapping_add(receiver_id as usize)) % peer_count
         };
         for offset in 0..peer_count {
-            let (sender_id, sender_state) = &peer_states[(start_index + offset) % peer_count];
+            let peer_index = if let Some(indices) = spatial_candidates.as_ref() {
+                indices[(start_index + offset) % peer_count]
+            } else {
+                (start_index + offset) % peer_count
+            };
+            let (sender_id, sender_state) = &peer_states[peer_index];
             let sender_id = *sender_id;
             if sender_id == receiver_id {
                 continue;
             }
-            if config.spatial_cull_enabled
-                && outside_spatial_cull(receiver_state, sender_state, config.low_distance_sq)
+            if self
+                .offloaded_pairs
+                .contains_key(&pack_pair(receiver_id, sender_id))
             {
                 continue;
             }
@@ -634,11 +712,7 @@ impl AvatarSyncSystem {
             } else {
                 direct.push(OutboundAvatarSend {
                     channel,
-                    payload: patch_interval_bytes(
-                        packet_bytes,
-                        interval_offset,
-                        interval_byte,
-                    ),
+                    payload: patch_interval_bytes(packet_bytes, interval_offset, interval_byte),
                 });
             }
         }
@@ -686,13 +760,16 @@ impl AvatarSyncSystem {
         };
 
         let min_slices = config.min_receiver_slices.max(1);
-        let max_slices = config.max_receiver_slices.max(min_slices).min(MAX_SLICE_COUNT);
+        let max_slices = config
+            .max_receiver_slices
+            .max(min_slices)
+            .min(MAX_SLICE_COUNT);
         state.slice_count = state.slice_count.clamp(min_slices, max_slices);
         let tick_budget_micros = (config.tick_budget_ms.max(1.0) * 1000.0) as u64;
-        let cycle_budget_micros =
-            (config.receiver_cycle_budget_ms.max(1.0) * 1000.0) as u64;
-        let estimated_cycle_micros =
-            state.smoothed_tick_micros.saturating_mul(state.slice_count as u64);
+        let cycle_budget_micros = (config.receiver_cycle_budget_ms.max(1.0) * 1000.0) as u64;
+        let estimated_cycle_micros = state
+            .smoothed_tick_micros
+            .saturating_mul(state.slice_count as u64);
 
         let mut next_slice_count = state.slice_count;
         if state.smoothed_tick_micros > tick_budget_micros {
@@ -726,8 +803,7 @@ impl AvatarSyncConfig {
             .unwrap_or(self.max_receiver_slices)
             .max(self.min_receiver_slices)
             .min(MAX_SLICE_COUNT);
-        self.tick_budget_ms =
-            env_f64("BASIS_AVATAR_TICK_BUDGET_MS").unwrap_or(self.tick_budget_ms);
+        self.tick_budget_ms = env_f64("BASIS_AVATAR_TICK_BUDGET_MS").unwrap_or(self.tick_budget_ms);
         self.receiver_cycle_budget_ms = env_f64("BASIS_AVATAR_RECEIVER_CYCLE_BUDGET_MS")
             .unwrap_or(self.receiver_cycle_budget_ms);
         self.spatial_cull_enabled =
@@ -985,23 +1061,12 @@ fn set_avatar_thread_priority() {
 
 #[cfg(not(windows))]
 fn set_avatar_thread_priority() {}
-
+#[inline(always)]
 fn distance_sq(receiver: &PlayerAvatarState, sender: &PlayerAvatarState) -> f32 {
     let dx = receiver.position[0] - sender.position[0];
     let dy = receiver.position[1] - sender.position[1];
     let dz = receiver.position[2] - sender.position[2];
     dx * dx + dy * dy + dz * dz
-}
-
-fn outside_spatial_cull(
-    receiver: &PlayerAvatarState,
-    sender: &PlayerAvatarState,
-    max_distance_sq: f32,
-) -> bool {
-    let dx = receiver.position[0] - sender.position[0];
-    let dy = receiver.position[1] - sender.position[1];
-    let dz = receiver.position[2] - sender.position[2];
-    dx * dx + dy * dy + dz * dz > max_distance_sq
 }
 
 fn quality_from_distance_sq(distance_sq: f32, config: &AvatarSyncConfig) -> u8 {

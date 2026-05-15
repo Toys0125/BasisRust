@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
         Arc,
@@ -165,6 +165,11 @@ pub enum ServerEvent {
         remote_addr: SocketAddr,
         nonce: u16,
         payload: Bytes,
+    },
+    NatIntroductionRequest {
+        remote_addr: SocketAddr,
+        local_addr: SocketAddr,
+        token: String,
     },
 }
 
@@ -614,6 +619,25 @@ impl TransportHandle {
         self.send_raw_to(&packet, remote_addr).await?;
         Ok(())
     }
+
+    pub async fn send_nat_introduce(
+        &self,
+        host_internal: SocketAddr,
+        host_external: SocketAddr,
+        client_internal: SocketAddr,
+        client_external: SocketAddr,
+        token: &str,
+    ) -> Result<()> {
+        let to_client = build_nat_introduce_response(host_internal, host_external, token);
+        self.send_raw_to(&to_client, client_external).await?;
+        let to_host = build_nat_introduce_response(client_internal, client_external, token);
+        self.send_raw_to(&to_host, host_external).await?;
+        Ok(())
+    }
+
+    pub fn peer_addr(&self, peer: PeerId) -> Option<SocketAddr> {
+        self.peers.get(&peer).map(|state| state.addr)
+    }
 }
 
 fn record_pending_reliable(state: &PeerState, built: &BuiltPacket) {
@@ -954,6 +978,20 @@ async fn process_packet(
                 }
             }
         }
+        PacketProperty::NatMessage => {
+            if let Some((local_addr, token)) = parse_nat_introduce_request(&bytes[1..]) {
+                enqueue_event(
+                    tx,
+                    ServerEvent::NatIntroductionRequest {
+                        remote_addr,
+                        local_addr,
+                        token,
+                    },
+                )
+                .await
+                .map_err(|_| TransportError::EventChannelClosed)?;
+            }
+        }
         PacketProperty::Ack => {
             if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
                 if let Some(peer) = handle.peers.get(&peer_id) {
@@ -1004,8 +1042,7 @@ fn server_info_payload(bytes: &[u8]) -> Option<&[u8]> {
     if looks_like_server_info_payload(bytes) {
         return Some(bytes);
     }
-    if bytes.first().map(|header| header & 0x1f) == Some(PacketProperty::UnconnectedMessage as u8)
-    {
+    if bytes.first().map(|header| header & 0x1f) == Some(PacketProperty::UnconnectedMessage as u8) {
         let payload = &bytes[1..];
         if looks_like_server_info_payload(payload) {
             return Some(payload);
@@ -1271,6 +1308,110 @@ fn build_ack_packet(connection_number: u8, channel_id: u8, ack: &AckState) -> Ve
     packet.push(channel_id);
     packet.extend_from_slice(&ack.bits);
     packet
+}
+
+const NAT_INTRODUCE_REQUEST_HASH: u64 =
+    fnv1_64("LiteNetLib.NatPunchModule+NatIntroduceRequestPacket");
+const NAT_INTRODUCE_RESPONSE_HASH: u64 =
+    fnv1_64("LiteNetLib.NatPunchModule+NatIntroduceResponsePacket");
+
+const fn fnv1_64(text: &str) -> u64 {
+    let bytes = text.as_bytes();
+    let mut hash = 14_695_981_039_346_656_037u64;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        hash ^= bytes[index] as u64;
+        hash = hash.wrapping_mul(1_099_511_628_211u64);
+        index += 1;
+    }
+    hash
+}
+
+fn parse_nat_introduce_request(bytes: &[u8]) -> Option<(SocketAddr, String)> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let hash = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+    if hash != NAT_INTRODUCE_REQUEST_HASH {
+        return None;
+    }
+    let mut position = 8usize;
+    let local_addr = read_litenet_endpoint(bytes, &mut position)?;
+    let token = read_litenet_string(bytes, &mut position)?;
+    Some((local_addr, token))
+}
+
+fn build_nat_introduce_response(
+    internal: SocketAddr,
+    external: SocketAddr,
+    token: &str,
+) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(1 + 8 + 2 * 19 + token.len() + 2);
+    packet.push(PacketProperty::NatMessage as u8);
+    packet.extend_from_slice(&NAT_INTRODUCE_RESPONSE_HASH.to_le_bytes());
+    write_litenet_endpoint(&mut packet, internal);
+    write_litenet_endpoint(&mut packet, external);
+    write_litenet_string(&mut packet, token);
+    packet
+}
+
+fn read_litenet_endpoint(bytes: &[u8], position: &mut usize) -> Option<SocketAddr> {
+    let family = *bytes.get(*position)?;
+    *position += 1;
+    match family {
+        0 => {
+            let octets: [u8; 4] = bytes.get(*position..*position + 4)?.try_into().ok()?;
+            *position += 4;
+            let port = u16::from_le_bytes(bytes.get(*position..*position + 2)?.try_into().ok()?);
+            *position += 2;
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(octets)), port))
+        }
+        1 => {
+            let octets: [u8; 16] = bytes.get(*position..*position + 16)?.try_into().ok()?;
+            *position += 16;
+            let port = u16::from_le_bytes(bytes.get(*position..*position + 2)?.try_into().ok()?);
+            *position += 2;
+            Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port))
+        }
+        _ => None,
+    }
+}
+
+fn write_litenet_endpoint(packet: &mut Vec<u8>, endpoint: SocketAddr) {
+    match endpoint.ip() {
+        IpAddr::V4(addr) => {
+            packet.push(0);
+            packet.extend_from_slice(&addr.octets());
+        }
+        IpAddr::V6(addr) => {
+            packet.push(1);
+            packet.extend_from_slice(&addr.octets());
+        }
+    }
+    packet.extend_from_slice(&endpoint.port().to_le_bytes());
+}
+
+fn read_litenet_string(bytes: &[u8], position: &mut usize) -> Option<String> {
+    let size = u16::from_le_bytes(bytes.get(*position..*position + 2)?.try_into().ok()?) as usize;
+    *position += 2;
+    if size == 0 {
+        return Some(String::new());
+    }
+    let len = size.checked_sub(1)?;
+    let raw = bytes.get(*position..*position + len)?;
+    *position += len;
+    std::str::from_utf8(raw).ok().map(str::to_owned)
+}
+
+fn write_litenet_string(packet: &mut Vec<u8>, value: &str) {
+    if value.is_empty() {
+        packet.extend_from_slice(&0u16.to_le_bytes());
+        return;
+    }
+    let bytes = value.as_bytes();
+    let len_plus = (bytes.len() + 1).min(u16::MAX as usize) as u16;
+    packet.extend_from_slice(&len_plus.to_le_bytes());
+    packet.extend_from_slice(&bytes[..len_plus as usize - 1]);
 }
 
 async fn send_pong(

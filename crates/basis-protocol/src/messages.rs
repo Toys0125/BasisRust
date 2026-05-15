@@ -1539,6 +1539,7 @@ pub enum AdminRequestMode {
     GlobalToggleThirdPerson = 38,
     AddDefaultLibraryItem = 39,
     RemoveDefaultLibraryItem = 40,
+    GlobalToggleAdditionalAvatarDataLock = 41,
 }
 
 impl From<u8> for AdminRequestMode {
@@ -1584,6 +1585,7 @@ impl From<u8> for AdminRequestMode {
             38 => Self::GlobalToggleThirdPerson,
             39 => Self::AddDefaultLibraryItem,
             40 => Self::RemoveDefaultLibraryItem,
+            41 => Self::GlobalToggleAdditionalAvatarDataLock,
             _ => Self::Ban,
         }
     }
@@ -1604,6 +1606,28 @@ impl BasisDeserialize for AdminRequest {
     fn deserialize(reader: &mut NetReader<'_>) -> ReadResult<Self> {
         Ok(Self {
             mode: AdminRequestMode::from(reader.get_u8()?),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BasisP2PSignalMessage {
+    pub other_player_id: u16,
+    pub session_token: String,
+}
+
+impl BasisSerialize for BasisP2PSignalMessage {
+    fn serialize(&self, writer: &mut NetWriter) {
+        writer.put_u16(self.other_player_id);
+        writer.put_string(&self.session_token);
+    }
+}
+
+impl BasisDeserialize for BasisP2PSignalMessage {
+    fn deserialize(reader: &mut NetReader<'_>) -> ReadResult<Self> {
+        Ok(Self {
+            other_player_id: reader.get_u16()?,
+            session_token: reader.get_string()?,
         })
     }
 }
