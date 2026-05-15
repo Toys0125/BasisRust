@@ -607,7 +607,11 @@ impl TransportHandle {
         remote_addr: SocketAddr,
         response: &ServerInfoResponse,
     ) -> Result<()> {
-        self.send_raw_to(&response.serialize(), remote_addr).await?;
+        let payload = response.serialize();
+        let mut packet = Vec::with_capacity(payload.len() + 1);
+        packet.push(PacketProperty::UnconnectedMessage as u8);
+        packet.extend_from_slice(&payload);
+        self.send_raw_to(&packet, remote_addr).await?;
         Ok(())
     }
 }
@@ -801,19 +805,14 @@ async fn process_packet(
     remote_addr: SocketAddr,
     bytes: &[u8],
 ) -> Result<()> {
-    if bytes.len() >= 6 {
-        let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let protocol = u16::from_le_bytes([bytes[4], bytes[5]]);
-        if magic == SERVER_INFO_QUERY_MAGIC
-            && protocol == SERVER_INFO_PROTOCOL_VERSION
-            && bytes.len() >= SERVER_INFO_MIN_REQUEST_BYTES
-        {
+    if let Some(server_info_payload) = server_info_payload(bytes) {
+        if server_info_payload.len() >= SERVER_INFO_MIN_REQUEST_BYTES {
             enqueue_event(
                 tx,
                 ServerEvent::UnconnectedRequest {
                     remote_addr,
-                    nonce: parse_server_info_query_nonce(bytes).unwrap_or_default(),
-                    payload: Bytes::copy_from_slice(bytes),
+                    nonce: parse_server_info_query_nonce(server_info_payload).unwrap_or_default(),
+                    payload: Bytes::copy_from_slice(server_info_payload),
                 },
             )
             .await
@@ -999,6 +998,29 @@ async fn process_packet(
         _ => debug!("ignored packet property {property:?} from {remote_addr}"),
     }
     Ok(())
+}
+
+fn server_info_payload(bytes: &[u8]) -> Option<&[u8]> {
+    if looks_like_server_info_payload(bytes) {
+        return Some(bytes);
+    }
+    if bytes.first().map(|header| header & 0x1f) == Some(PacketProperty::UnconnectedMessage as u8)
+    {
+        let payload = &bytes[1..];
+        if looks_like_server_info_payload(payload) {
+            return Some(payload);
+        }
+    }
+    None
+}
+
+fn looks_like_server_info_payload(bytes: &[u8]) -> bool {
+    if bytes.len() < 6 {
+        return false;
+    }
+    let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let protocol = u16::from_le_bytes([bytes[4], bytes[5]]);
+    magic == SERVER_INFO_QUERY_MAGIC && protocol == SERVER_INFO_PROTOCOL_VERSION
 }
 
 async fn enqueue_event(tx: &mpsc::Sender<ServerEvent>, event: ServerEvent) -> Result<()> {
@@ -1564,6 +1586,21 @@ mod tests {
         let packet = vec![PacketProperty::Channeled as u8, 0, 0, 0x8a, 1];
         let datagrams = build_merged_datagrams(0, vec![packet.clone()]);
         assert_eq!(datagrams, vec![packet]);
+    }
+
+    #[test]
+    fn server_info_payload_accepts_raw_and_litenetlib_unconnected() {
+        let mut payload = vec![0u8; SERVER_INFO_MIN_REQUEST_BYTES];
+        payload[0..4].copy_from_slice(&SERVER_INFO_QUERY_MAGIC.to_le_bytes());
+        payload[4..6].copy_from_slice(&SERVER_INFO_PROTOCOL_VERSION.to_le_bytes());
+        payload[6..8].copy_from_slice(&0xCAFEu16.to_le_bytes());
+
+        assert_eq!(server_info_payload(&payload).unwrap()[6..8], [0xFE, 0xCA]);
+
+        let mut wrapped = Vec::with_capacity(payload.len() + 1);
+        wrapped.push(PacketProperty::UnconnectedMessage as u8);
+        wrapped.extend_from_slice(&payload);
+        assert_eq!(server_info_payload(&wrapped).unwrap()[6..8], [0xFE, 0xCA]);
     }
 
     #[tokio::test]

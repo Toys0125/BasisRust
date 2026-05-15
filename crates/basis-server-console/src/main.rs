@@ -154,13 +154,14 @@ fn start_console_listener(server: ServerState, config_path: PathBuf, running: Ar
         }
         {
             let server = server.clone();
+            let status_running = running.clone();
             commands.insert(
                 "/status".to_string(),
                 Box::new(move |args| {
                     if args.first().is_some_and(|arg| {
                         arg.eq_ignore_ascii_case("live") || arg.eq_ignore_ascii_case("watch")
                     }) {
-                        run_live_status(&server);
+                        run_live_status(&server, &status_running);
                     } else if args.first().is_some_and(|arg| {
                         arg.eq_ignore_ascii_case("verbose") || arg.eq_ignore_ascii_case("-v")
                     }) {
@@ -274,7 +275,7 @@ fn start_console_listener(server: ServerState, config_path: PathBuf, running: Ar
     });
 }
 
-fn run_live_status(server: &ServerState) {
+fn run_live_status(server: &ServerState, running: &Arc<AtomicBool>) {
     let mut stdout = io::stdout();
     let mut verbose = false;
     let mut rendered_rows = 0u16;
@@ -311,11 +312,25 @@ fn run_live_status(server: &ServerState) {
 
         match event::poll(std::time::Duration::from_millis(500)) {
             Ok(true) => match event::read() {
-                Ok(Event::Key(key)) => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('v') => verbose = !verbose,
-                    _ => {}
-                },
+                Ok(Event::Key(key))
+                    if matches!(
+                        key.kind,
+                        crossterm::event::KeyEventKind::Press
+                            | crossterm::event::KeyEventKind::Repeat
+                    ) =>
+                {
+                    match key.code {
+                        KeyCode::Char('c')
+                            if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            running.store(false, Ordering::SeqCst);
+                            break;
+                        }
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('v') => verbose = !verbose,
+                        _ => {}
+                    }
+                }
                 Ok(_) => {}
                 Err(_) => break,
             },
