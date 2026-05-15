@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use flate2::{write::DeflateEncoder, Compression};
-use lz4_flex::{compress_prepend_size, decompress_size_prepended};
+use lz4_flex::{compress, decompress};
 use std::io::Write;
 
 use crate::io::{NetReader, NetWriter};
@@ -239,7 +239,7 @@ pub fn encode_avatar_bundle(items: &[AvatarBundleItem]) -> Result<Vec<u8>> {
         raw.len() <= u16::MAX as usize,
         "bundle raw payload too large"
     );
-    let compressed = compress_prepend_size(&raw);
+    let compressed = compress(&raw);
     let mut out = NetWriter::with_capacity(compressed.len() + 3);
     out.put_u8(items.len() as u8);
     out.put_u16(raw.len() as u16);
@@ -251,8 +251,7 @@ pub fn decode_avatar_bundle(bytes: &[u8]) -> Result<Vec<AvatarBundleItem>> {
     let mut reader = NetReader::new(bytes);
     let count = reader.get_u8()? as usize;
     let raw_len = reader.get_u16()? as usize;
-    let raw =
-        decompress_size_prepended(reader.remaining_slice()).context("decompressing LZ4 bundle")?;
+    let raw = decompress(reader.remaining_slice(), raw_len).context("decompressing LZ4 bundle")?;
     anyhow::ensure!(raw.len() == raw_len, "bundle raw length mismatch");
     let mut raw_reader = NetReader::new(&raw);
     let mut items = Vec::with_capacity(count);

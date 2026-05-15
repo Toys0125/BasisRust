@@ -3,9 +3,15 @@ use basis_protocol::config::ServerConfig;
 use basis_server_core::{migrate_legacy_resource_dirs, ServerState};
 use basis_server_health::{start_health_server, HealthState};
 use clap::Parser;
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode},
+    execute,
+    terminal::{self, ClearType},
+};
 use std::{
     collections::HashMap,
-    io::{self, BufRead},
+    io::{self, BufRead, Write},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -91,22 +97,43 @@ async fn main() -> Result<()> {
     if config.enable_console {
         start_console_listener(server.clone(), config_path.clone(), console_running);
     }
-
-    let signal_running = running.clone();
-    tokio::spawn(async move {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            warn!("failed to listen for Ctrl+C: {err}");
-            return;
+    if let Ok(interval) = std::env::var("BASIS_STATUS_INTERVAL_SECS") {
+        if let Ok(seconds) = interval.parse::<u64>() {
+            if seconds > 0 {
+                let server = server.clone();
+                let running = running.clone();
+                thread::spawn(move || {
+                    while running.load(Ordering::Relaxed) {
+                        thread::sleep(std::time::Duration::from_secs(seconds));
+                        println!("{}", server.status_text_with_detail(true));
+                    }
+                });
+            }
         }
-        signal_running.store(false, Ordering::SeqCst);
-    });
+    }
 
-    while running.load(Ordering::Relaxed) {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    loop {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(err) = result {
+                    warn!("failed to listen for Ctrl+C: {err}");
+                }
+                running.store(false, Ordering::SeqCst);
+                break;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+        }
     }
     info!("Shutting down server...");
     request_shutdown(shutdown_tx);
-    server.shutdown().await?;
+    match tokio::time::timeout(std::time::Duration::from_secs(5), server.shutdown()).await {
+        Ok(result) => result?,
+        Err(_) => warn!("server shutdown timed out; exiting process"),
+    }
     info!("Server shut down successfully.");
     Ok(())
 }
@@ -129,11 +156,18 @@ fn start_console_listener(server: ServerState, config_path: PathBuf, running: Ar
             let server = server.clone();
             commands.insert(
                 "/status".to_string(),
-                Box::new(move |_| {
-                    println!(
-                        "Server is running and healthy. Players: {}",
-                        server.player_count()
-                    )
+                Box::new(move |args| {
+                    if args.first().is_some_and(|arg| {
+                        arg.eq_ignore_ascii_case("live") || arg.eq_ignore_ascii_case("watch")
+                    }) {
+                        run_live_status(&server);
+                    } else if args.first().is_some_and(|arg| {
+                        arg.eq_ignore_ascii_case("verbose") || arg.eq_ignore_ascii_case("-v")
+                    }) {
+                        println!("{}", server.status_text_with_detail(true));
+                    } else {
+                        println!("{}", server.status_text());
+                    }
                 }),
             );
         }
@@ -201,6 +235,8 @@ fn start_console_listener(server: ServerState, config_path: PathBuf, running: Ar
                 println!("Available commands:");
                 println!("/players - Lists all connected players.");
                 println!("/status - Shows the current server status.");
+                println!("/status verbose - Shows detailed counters.");
+                println!("/status live - Live status view. Press v for verbose, q to quit.");
                 println!("/shutdown - Shuts down the server.");
                 println!("/help - Displays all available commands.");
                 println!("/clear - Clears the console.");
@@ -236,6 +272,95 @@ fn start_console_listener(server: ServerState, config_path: PathBuf, running: Ar
             }
         }
     });
+}
+
+fn run_live_status(server: &ServerState) {
+    let mut stdout = io::stdout();
+    let mut verbose = false;
+    let mut rendered_rows = 0u16;
+    let raw_mode_enabled = terminal::enable_raw_mode().is_ok();
+    println!();
+
+    loop {
+        if rendered_rows > 0 {
+            move_to_render_start(&mut stdout, rendered_rows);
+            clear_rendered_rows(&mut stdout, rendered_rows);
+            move_to_render_start(&mut stdout, rendered_rows);
+        }
+
+        let text = format!(
+            "{}\n\n[q] quit  [v] {} verbose",
+            server.status_text_with_detail(verbose),
+            if verbose { "hide" } else { "show" }
+        );
+        let next_rows = physical_row_count(&text);
+        let line_count = text.lines().count();
+        for (index, line) in text.lines().enumerate() {
+            let _ = execute!(
+                stdout,
+                cursor::MoveToColumn(0),
+                terminal::Clear(ClearType::CurrentLine)
+            );
+            print!("{line}");
+            if index + 1 < line_count {
+                println!();
+            }
+        }
+        rendered_rows = next_rows;
+        let _ = stdout.flush();
+
+        match event::poll(std::time::Duration::from_millis(500)) {
+            Ok(true) => match event::read() {
+                Ok(Event::Key(key)) => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('v') => verbose = !verbose,
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(_) => break,
+            },
+            Ok(false) => {}
+            Err(_) => break,
+        }
+    }
+
+    if raw_mode_enabled {
+        let _ = terminal::disable_raw_mode();
+    }
+    println!();
+}
+
+fn move_to_render_start(stdout: &mut io::Stdout, rendered_rows: u16) {
+    let _ = execute!(stdout, cursor::MoveToColumn(0));
+    if rendered_rows > 1 {
+        let _ = execute!(stdout, cursor::MoveUp(rendered_rows - 1));
+    }
+}
+
+fn clear_rendered_rows(stdout: &mut io::Stdout, rendered_rows: u16) {
+    for row in 0..rendered_rows {
+        let _ = execute!(
+            stdout,
+            cursor::MoveToColumn(0),
+            terminal::Clear(ClearType::CurrentLine)
+        );
+        if row + 1 < rendered_rows {
+            let _ = execute!(stdout, cursor::MoveDown(1));
+        }
+    }
+}
+
+fn physical_row_count(text: &str) -> u16 {
+    let width = terminal::size()
+        .map(|(width, _)| width.saturating_sub(1).max(1))
+        .unwrap_or(79) as usize;
+    text.lines()
+        .map(|line| {
+            let chars = line.chars().count();
+            ((chars / width) + 1) as u16
+        })
+        .sum::<u16>()
+        .max(1)
 }
 
 fn handle_perm_command(server: &ServerState, args: &[&str]) {

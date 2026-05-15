@@ -6,13 +6,16 @@ use basis_protocol::{
     config::{BasisUserRestrictionMode, ServerConfig},
     io::{NetReader, NetWriter},
     messages::{
-        AdminRequest, AdminRequestMode, BasisDeserialize, BasisSerialize, BytesMessage,
-        ChatMessage, ClientCameraPipPositionMessage, ClientCameraPipStateMessage,
+        AdminRequest, AdminRequestMode, AvatarDataMessage, BasisDeserialize, BasisSerialize,
+        BytesMessage, CameraCountdownMessage, CameraShutterSoundMessage, ChatMessage,
+        ClientCameraCountdownMessage, ClientCameraPipPositionMessage, ClientCameraPipStateMessage,
         ClientMetaDataMessage, ContentShareCleanupMessage, ContentShareMessage, ContentShareType,
         DatabasePrimitiveMessage, LocalLoadResource, NetIdMessage, OwnershipTransferMessage,
-        PreloadReadyMessage, ReadyMessage, ServerChatMessage, ServerMetaDataMessage,
-        ServerNetIdMessage, ServerReadyMessage, ServerUniqueIdMessages, SpawnPreloadedMessage,
-        UnloadResource, UshortUniqueIdMessage,
+        PreloadReadyMessage, ReadyMessage, RemoteAvatarDataMessage, RemoteSceneDataMessage,
+        SceneDataMessage, ServerAudioSegmentMessage, ServerAvatarChangeMessage,
+        ServerAvatarDataMessage, ServerChatMessage, ServerMetaDataMessage, ServerNetIdMessage,
+        ServerReadyMessage, ServerSceneDataMessage, ServerStatisticMessage, ServerUniqueIdMessages,
+        SpawnPreloadedMessage, UnloadResource, UshortUniqueIdMessage, VoiceReceiversMessage,
     },
     server_info::ServerInfoResponse,
     version::SERVER_VERSION,
@@ -68,6 +71,7 @@ pub struct ServerState {
     pub ownership: OwnershipState,
     pub content_share: ContentShareState,
     pub pip: PipState,
+    pub voice_recipients: Arc<DashMap<PeerId, Vec<PeerId>>>,
     pub avatar_sync: AvatarSyncSystem,
     pub moderation: ModerationLists,
     pub global_state: Arc<RwLock<GlobalState>>,
@@ -113,13 +117,24 @@ impl ServerState {
 
         let avatar_sync = AvatarSyncSystem::new(AvatarSyncConfig {
             default_interval_ms: config.bsrsmillisecond_default_interval.max(1) as u64,
+            base_multiplier: config.bsrbase_multiplier as f32,
+            increase_rate: config.bsrsincrease_rate,
             high_distance_sq: config.high_quality_distance * config.high_quality_distance,
             medium_distance_sq: config.medium_quality_distance * config.medium_quality_distance,
             low_distance_sq: config.low_quality_distance * config.low_quality_distance,
             enable_bundle_compression: config.enable_avatar_bundle_compression,
             bundle_min_messages: config.avatar_bundle_min_messages.max(1) as usize,
             bundle_min_bytes: config.avatar_bundle_min_bytes.max(0) as usize,
-        });
+            min_receiver_slices: 1,
+            max_receiver_slices: 32,
+            tick_budget_ms: avatar_sync::DEFAULT_AVATAR_TICK_BUDGET_MS,
+            receiver_cycle_budget_ms: avatar_sync::DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
+        }
+        .apply_env_tuning());
+
+        let moderation = ModerationLists::file_backed(
+            base_dir.join(ServerConfig::CONFIG_FOLDER_NAME),
+        )?;
 
         let state = Self {
             config: Arc::new(RwLock::new(config.clone())),
@@ -133,16 +148,19 @@ impl ServerState {
             ownership: OwnershipState::default(),
             content_share: ContentShareState::default(),
             pip: PipState::default(),
+            voice_recipients: Arc::new(DashMap::new()),
             avatar_sync,
-            moderation: ModerationLists::default(),
+            moderation,
             global_state: Arc::new(RwLock::new(GlobalState::from(&config))),
             statistics: Statistics::default(),
             shutdown: Arc::new(AtomicBool::new(false)),
         };
-        state.avatar_sync.spawn_tick_loop(state.transport.clone(), {
-            let peers = state.authenticated_peers.clone();
-            move || peers.iter().map(|entry| *entry.key()).collect()
-        });
+        state
+            .avatar_sync
+            .spawn_tick_loop(state.transport.clone(), state.shutdown.clone(), {
+                let peers = state.authenticated_peers.clone();
+                move || peers.iter().map(|entry| *entry.key()).collect()
+            });
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         tokio::spawn(event_loop(state.clone(), events, shutdown_rx));
         Ok((state, shutdown_tx))
@@ -156,13 +174,20 @@ impl ServerState {
         let config = self.config.read().clone();
         self.avatar_sync.update_config(AvatarSyncConfig {
             default_interval_ms: config.bsrsmillisecond_default_interval.max(1) as u64,
+            base_multiplier: config.bsrbase_multiplier as f32,
+            increase_rate: config.bsrsincrease_rate,
             high_distance_sq: config.high_quality_distance * config.high_quality_distance,
             medium_distance_sq: config.medium_quality_distance * config.medium_quality_distance,
             low_distance_sq: config.low_quality_distance * config.low_quality_distance,
             enable_bundle_compression: config.enable_avatar_bundle_compression,
             bundle_min_messages: config.avatar_bundle_min_messages.max(1) as usize,
             bundle_min_bytes: config.avatar_bundle_min_bytes.max(0) as usize,
-        });
+            min_receiver_slices: 1,
+            max_receiver_slices: 32,
+            tick_budget_ms: avatar_sync::DEFAULT_AVATAR_TICK_BUDGET_MS,
+            receiver_cycle_budget_ms: avatar_sync::DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
+        }
+        .apply_env_tuning());
     }
 
     pub fn players_text(&self) -> String {
@@ -176,8 +201,64 @@ impl ServerState {
         text
     }
 
+    pub fn status_text(&self) -> String {
+        self.status_text_with_detail(false)
+    }
+
+    pub fn status_text_with_detail(&self, verbose: bool) -> String {
+        let transport = self.transport.stats_snapshot();
+        let avatar = self.avatar_sync.stats();
+        if !verbose {
+            return format!(
+                "Server is running and healthy. Players: {} PendingReliable: {} QueuedReliable: {} AppIn: {} AppOut: {} RawIn: {} RawOut: {} AvatarIn: {} AvatarOut: {} ProtocolErrors: {}",
+                self.player_count(),
+                self.transport.pending_reliable_count(),
+                self.transport.queued_reliable_count(),
+                self.statistics.inbound_packets.load(Ordering::Relaxed),
+                self.statistics.outbound_packets.load(Ordering::Relaxed),
+                transport.raw_packets_received,
+                transport.raw_packets_sent,
+                avatar.inbound_updates,
+                avatar.outbound_messages,
+                self.statistics.protocol_errors.load(Ordering::Relaxed),
+            );
+        }
+        format!(
+            "Server is running and healthy\nPlayers: {}\nReliable: pending={} queued={}\nApp messages: inbound={} outbound={} protocol_errors={}\nRaw UDP: packets_in={} packets_out={} bytes_in={} bytes_out={} would_block={}\nAvatar sync: inbound_updates={} outbound_messages={} outbound_batches={} active_states={} pending_updates={} receiver_slices={}\nAvatar timing: ticks={} avg_tick_us={} smooth_tick_us={} avg_build_us={} avg_flush_us={} max_tick_us={} receiver_cycle_ms={} cycle_budget_ms={} tick_budget_ms={}",
+            self.player_count(),
+            self.transport.pending_reliable_count(),
+            self.transport.queued_reliable_count(),
+            self.statistics.inbound_packets.load(Ordering::Relaxed),
+            self.statistics.outbound_packets.load(Ordering::Relaxed),
+            self.statistics.protocol_errors.load(Ordering::Relaxed),
+            transport.raw_packets_received,
+            transport.raw_packets_sent,
+            transport.raw_bytes_received,
+            transport.raw_bytes_sent,
+            transport.raw_send_would_block,
+            avatar.inbound_updates,
+            avatar.outbound_messages,
+            avatar.outbound_batches,
+            avatar.active_states,
+            avatar.pending_updates,
+            avatar.slice_count,
+            avatar.tick_count,
+            avatar.avg_tick_micros,
+            avatar.smoothed_tick_micros,
+            if avatar.tick_count == 0 { 0 } else { avatar.build_micros / avatar.tick_count },
+            if avatar.tick_count == 0 { 0 } else { avatar.flush_micros / avatar.tick_count },
+            avatar.max_tick_micros,
+            avatar.receiver_cycle_micros / 1000,
+            avatar.receiver_cycle_budget_micros / 1000,
+            avatar.tick_budget_micros / 1000,
+        )
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
-        self.shutdown.store(true, Ordering::SeqCst);
+        if self.shutdown.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.transport.shutdown();
         for peer in self.authenticated_peers.iter() {
             let _ = self
                 .transport
@@ -225,7 +306,6 @@ async fn event_loop(
     loop {
         tokio::select! {
             _ = &mut shutdown => {
-                let _ = state.shutdown().await;
                 break;
             }
             maybe_event = events.recv() => {
@@ -293,14 +373,16 @@ async fn handle_event(state: &ServerState, event: ServerEvent) -> Result<()> {
             delivery,
             payload,
         } => handle_message(state, peer, channel, delivery, payload).await,
-        ServerEvent::UnconnectedRequest { remote_addr, .. } => {
+        ServerEvent::UnconnectedRequest {
+            remote_addr, nonce, ..
+        } => {
             let config = state.config.read().clone();
             let response = ServerInfoResponse {
                 name: config.server_name,
                 motd: config.server_motd,
                 online: state.player_count() as u16,
                 max: config.peer_limit.clamp(0, u16::MAX as i32) as u16,
-                version: SERVER_VERSION,
+                nonce,
             };
             state
                 .transport
@@ -409,6 +491,17 @@ async fn handle_connection_request(
         state
             .transport
             .reject(&request, "You are not on the whitelist.")
+            .await?;
+        return Ok(());
+    }
+    if config.basis_user_restriction_mode == BasisUserRestrictionMode::BlackList
+        && state
+            .moderation
+            .is_blacklisted(&ready.player_meta_data_message.player_uuid)
+    {
+        state
+            .transport
+            .reject(&request, "You are on the blacklist.")
             .await?;
         return Ok(());
     }
@@ -647,6 +740,7 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
 
 async fn handle_disconnect(state: &ServerState, peer: PeerId, reason: DisconnectReason) {
     state.pending_identity.remove(&peer);
+    state.voice_recipients.remove(&peer);
     state.avatar_sync.remove_player(peer);
     for removed in state.ownership.remove_player(peer) {
         let mut writer = NetWriter::new();
@@ -790,6 +884,31 @@ async fn handle_message(
                     DeliveryMethod::ReliableOrdered,
                     writer.as_slice(),
                     None,
+                )
+                .await;
+        }
+        channels::AVATAR_CHANGE_MESSAGE => {
+            let mut reader = NetReader::new(&payload);
+            let avatar =
+                basis_protocol::messages::ClientAvatarChangeMessage::deserialize(&mut reader)?;
+            if state.global_state.read().avatars_locked && !has_protection_permission(state, peer) {
+                return Ok(());
+            }
+            if let Some(mut peer_state) = state.authenticated_peers.get_mut(&peer) {
+                peer_state.ready.client_avatar_change_message = avatar.clone();
+            }
+            let message = ServerAvatarChangeMessage {
+                player_id: peer,
+                client_avatar_change_message: avatar,
+            };
+            let mut writer = NetWriter::new();
+            message.serialize(&mut writer);
+            state
+                .broadcast(
+                    channels::AVATAR_CHANGE_MESSAGE,
+                    DeliveryMethod::ReliableOrdered,
+                    writer.as_slice(),
+                    Some(peer),
                 )
                 .await;
         }
@@ -1086,13 +1205,40 @@ async fn handle_message(
         channels::ADMIN => {
             handle_admin_message(state, peer, &payload).await?;
         }
-        channels::VOICE
-        | channels::VOICE_LARGE
-        | channels::SHOUT_VOICE
-        | channels::AVATAR
-        | channels::SCENE
-        | channels::SERVER_BOUND
-        | channels::EVENTS => {
+        channels::SERVER_STATISTICS => {
+            handle_statistics_request(state, peer, &payload).await?;
+        }
+        channels::AUDIO_RECIPIENTS => {
+            update_voice_recipients(state, peer, &payload, false, false).await?;
+        }
+        channels::AUDIO_RECIPIENTS_LARGE => {
+            update_voice_recipients(state, peer, &payload, true, false).await?;
+        }
+        channels::AUDIO_RECIPIENTS_INVERTED => {
+            update_voice_recipients(state, peer, &payload, false, true).await?;
+        }
+        channels::AUDIO_RECIPIENTS_INVERTED_LARGE => {
+            update_voice_recipients(state, peer, &payload, true, true).await?;
+        }
+        channels::AUDIO_RECIPIENTS_BITFIELD => {
+            update_voice_recipients_bitfield(state, peer, &payload);
+        }
+        channels::VOICE | channels::VOICE_LARGE => {
+            relay_voice_message(state, peer, &payload).await;
+        }
+        channels::SHOUT_VOICE => {
+            relay_shout_voice_message(state, peer, &payload).await;
+        }
+        channels::AVATAR => {
+            relay_avatar_generic(state, peer, delivery, &payload).await?;
+        }
+        channels::SCENE => {
+            relay_scene_generic(state, peer, delivery, &payload).await?;
+        }
+        channels::EVENTS => {
+            relay_event(state, peer, &payload).await?;
+        }
+        channels::SERVER_BOUND => {
             state
                 .broadcast(channel, delivery, &payload, Some(peer))
                 .await;
@@ -1106,6 +1252,295 @@ async fn handle_message(
         }
     }
     Ok(())
+}
+
+async fn relay_avatar_generic(
+    state: &ServerState,
+    peer: PeerId,
+    delivery: DeliveryMethod,
+    payload: &[u8],
+) -> Result<()> {
+    let mut reader = NetReader::new(payload);
+    let avatar = AvatarDataMessage::deserialize(&mut reader)?;
+    let message = ServerAvatarDataMessage {
+        player_id: peer,
+        avatar_data_message: RemoteAvatarDataMessage {
+            player_id: avatar.player_id,
+            avatar_link_index: avatar.avatar_link_index,
+            message_index: avatar.message_index,
+            payload: avatar.payload,
+        },
+    };
+    let mut writer = NetWriter::new();
+    message.serialize(&mut writer);
+    send_to_recipients_or_broadcast(
+        state,
+        peer,
+        delivery,
+        channels::AVATAR,
+        writer.as_slice(),
+        &avatar.recipients,
+    )
+    .await
+}
+
+async fn relay_scene_generic(
+    state: &ServerState,
+    peer: PeerId,
+    delivery: DeliveryMethod,
+    payload: &[u8],
+) -> Result<()> {
+    let mut reader = NetReader::new(payload);
+    let scene = SceneDataMessage::deserialize(&mut reader)?;
+    let message = ServerSceneDataMessage {
+        player_id: peer,
+        scene_data_message: RemoteSceneDataMessage {
+            message_index: scene.message_index,
+            payload: scene.payload,
+        },
+    };
+    let mut writer = NetWriter::new();
+    message.serialize(&mut writer);
+    send_to_recipients_or_broadcast(
+        state,
+        peer,
+        delivery,
+        channels::SCENE,
+        writer.as_slice(),
+        &scene.recipients,
+    )
+    .await
+}
+
+async fn send_to_recipients_or_broadcast(
+    state: &ServerState,
+    peer: PeerId,
+    delivery: DeliveryMethod,
+    channel: u8,
+    payload: &[u8],
+    recipients: &[PeerId],
+) -> Result<()> {
+    if recipients.is_empty() {
+        state
+            .broadcast(channel, delivery, payload, Some(peer))
+            .await;
+        return Ok(());
+    }
+    for recipient in recipients {
+        if *recipient == peer || !state.authenticated_peers.contains_key(recipient) {
+            continue;
+        }
+        let _ = state
+            .transport
+            .send(*recipient, channel, delivery, payload)
+            .await;
+    }
+    Ok(())
+}
+
+async fn relay_event(state: &ServerState, peer: PeerId, payload: &[u8]) -> Result<()> {
+    let Some((&event_type, rest)) = payload.split_first() else {
+        return Ok(());
+    };
+    let mut writer = NetWriter::new();
+    writer.put_u8(event_type);
+    match event_type {
+        channels::EVENT_TYPE_CAMERA_SHUTTER_SOUND => {
+            CameraShutterSoundMessage { player_id: peer }.serialize(&mut writer);
+            state
+                .broadcast(
+                    channels::EVENTS,
+                    DeliveryMethod::Sequenced,
+                    writer.as_slice(),
+                    Some(peer),
+                )
+                .await;
+        }
+        channels::EVENT_TYPE_CAMERA_COUNTDOWN => {
+            let mut reader = NetReader::new(rest);
+            let countdown = ClientCameraCountdownMessage::deserialize(&mut reader)?;
+            CameraCountdownMessage {
+                player_id: peer,
+                seconds: countdown.seconds,
+            }
+            .serialize(&mut writer);
+            state
+                .broadcast(
+                    channels::EVENTS,
+                    DeliveryMethod::Sequenced,
+                    writer.as_slice(),
+                    Some(peer),
+                )
+                .await;
+        }
+        channels::EVENT_TYPE_PLAYER_TEMP_BLOCK => {
+            if rest.len() < 3 {
+                return Ok(());
+            }
+            let target = u16::from_le_bytes([rest[0], rest[1]]);
+            if !state.authenticated_peers.contains_key(&target) {
+                return Ok(());
+            }
+            writer.put_u16(peer);
+            writer.put_bool(rest[2] != 0);
+            state
+                .transport
+                .send(
+                    target,
+                    channels::EVENTS,
+                    DeliveryMethod::ReliableOrdered,
+                    writer.as_slice(),
+                )
+                .await?;
+        }
+        _ => {
+            state
+                .statistics
+                .protocol_errors
+                .fetch_add(1, Ordering::Relaxed);
+            warn!("unknown event type {event_type} from peer {peer}");
+        }
+    }
+    Ok(())
+}
+
+async fn handle_statistics_request(
+    state: &ServerState,
+    peer: PeerId,
+    payload: &[u8],
+) -> Result<()> {
+    let mut reader = NetReader::new(payload);
+    let enabled = reader.get_bool().unwrap_or(false);
+    if !enabled {
+        return Ok(());
+    }
+    let text = state.status_text_with_detail(true).into_bytes();
+    let message = ServerStatisticMessage { data: text };
+    let mut writer = NetWriter::new();
+    message.serialize(&mut writer);
+    state
+        .transport
+        .send(
+            peer,
+            channels::SERVER_STATISTICS,
+            DeliveryMethod::ReliableOrdered,
+            writer.as_slice(),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn update_voice_recipients(
+    state: &ServerState,
+    peer: PeerId,
+    payload: &[u8],
+    large_count: bool,
+    inverted: bool,
+) -> Result<()> {
+    let mut reader = NetReader::new(payload);
+    let message = VoiceReceiversMessage::deserialize(&mut reader, large_count)?;
+    if inverted {
+        let excluded = message
+            .users
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let recipients = state
+            .authenticated_peers
+            .iter()
+            .filter_map(|entry| {
+                let id = *entry.key();
+                (id != peer && !excluded.contains(&id)).then_some(id)
+            })
+            .collect::<Vec<_>>();
+        state.voice_recipients.insert(peer, recipients);
+    } else {
+        let recipients = message
+            .users
+            .into_iter()
+            .filter(|id| *id != peer && state.authenticated_peers.contains_key(id))
+            .collect::<Vec<_>>();
+        state.voice_recipients.insert(peer, recipients);
+    }
+    Ok(())
+}
+
+fn update_voice_recipients_bitfield(state: &ServerState, peer: PeerId, payload: &[u8]) {
+    if payload.len() < 2 {
+        return;
+    }
+    let byte_count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    if payload.len() < 2 + byte_count {
+        return;
+    }
+    let mut recipients = Vec::new();
+    for (byte_index, byte) in payload[2..2 + byte_count].iter().enumerate() {
+        if *byte == 0 {
+            continue;
+        }
+        let base_id = byte_index * 8;
+        for bit in 0..8 {
+            if (byte & (1 << bit)) == 0 {
+                continue;
+            }
+            let id = (base_id + bit) as PeerId;
+            if id != peer && state.authenticated_peers.contains_key(&id) {
+                recipients.push(id);
+            }
+        }
+    }
+    state.voice_recipients.insert(peer, recipients);
+}
+
+async fn relay_voice_message(state: &ServerState, peer: PeerId, payload: &[u8]) {
+    let Some(recipients) = state.voice_recipients.get(&peer).map(|entry| entry.clone()) else {
+        return;
+    };
+    let large_id = peer > u8::MAX as u16;
+    let channel = if large_id {
+        channels::VOICE_LARGE
+    } else {
+        channels::VOICE
+    };
+    let message = ServerAudioSegmentMessage {
+        player_id: peer,
+        audio_segment: payload.to_vec(),
+    };
+    let mut writer = NetWriter::new();
+    message.serialize_with_id_size(&mut writer, large_id);
+    for recipient in recipients {
+        let _ = state
+            .transport
+            .send(
+                recipient,
+                channel,
+                DeliveryMethod::Unreliable,
+                writer.as_slice(),
+            )
+            .await;
+    }
+}
+
+async fn relay_shout_voice_message(state: &ServerState, peer: PeerId, payload: &[u8]) {
+    let large_id = peer > u8::MAX as u16;
+    let channel = if large_id {
+        channels::VOICE_LARGE
+    } else {
+        channels::SHOUT_VOICE
+    };
+    let message = ServerAudioSegmentMessage {
+        player_id: peer,
+        audio_segment: payload.to_vec(),
+    };
+    let mut writer = NetWriter::new();
+    message.serialize_with_id_size(&mut writer, large_id);
+    state
+        .broadcast(
+            channel,
+            DeliveryMethod::Unreliable,
+            writer.as_slice(),
+            Some(peer),
+        )
+        .await;
 }
 
 fn content_locked(state: &ServerState, content_type: ContentShareType, peer: PeerId) -> bool {
@@ -1434,9 +1869,12 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
         }
         AdminRequestMode::Ban => {
             if let Ok(uuid) = reader.get_string() {
-                state.moderation.add_ban(uuid.clone());
+                let reason = reader.get_string().unwrap_or_else(|_| "Banned".to_string());
+                state
+                    .moderation
+                    .add_ban_with_details(uuid.clone(), reason.clone(), None)?;
                 if let Some(target) = peer_by_uuid(state, &uuid) {
-                    let _ = state.transport.disconnect(target, "Banned").await;
+                    let _ = state.transport.disconnect(target, &reason).await;
                 }
             }
         }
@@ -1450,23 +1888,31 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
         }
         AdminRequestMode::IpAndBan => {
             if let Ok(uuid) = reader.get_string() {
-                state.moderation.add_ban(uuid.clone());
-                if let Ok(ip) = reader.get_string() {
-                    state.moderation.add_ip_ban(ip);
-                }
+                let reason = reader.get_string().unwrap_or_else(|_| "Banned".to_string());
+                let ip = peer_by_uuid(state, &uuid).and_then(|target| {
+                    state
+                        .transport
+                        .peer_snapshots()
+                        .into_iter()
+                        .find(|snapshot| snapshot.id == target)
+                        .map(|snapshot| snapshot.addr.ip().to_string())
+                });
+                state
+                    .moderation
+                    .add_ban_with_details(uuid.clone(), reason.clone(), ip)?;
                 if let Some(target) = peer_by_uuid(state, &uuid) {
-                    let _ = state.transport.disconnect(target, "Banned").await;
+                    let _ = state.transport.disconnect(target, &reason).await;
                 }
             }
         }
         AdminRequestMode::UnBan => {
             if let Ok(uuid) = reader.get_string() {
-                state.moderation.remove_ban(&uuid);
+                let _ = state.moderation.remove_ban(&uuid)?;
             }
         }
         AdminRequestMode::UnBanIP => {
             if let Ok(ip) = reader.get_string() {
-                state.moderation.remove_ip_ban(&ip);
+                let _ = state.moderation.remove_ip_ban(&ip)?;
             }
         }
         AdminRequestMode::SetServerName => {
@@ -1485,12 +1931,12 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
         }
         AdminRequestMode::AddWhitelist => {
             if let Ok(uuid) = reader.get_string() {
-                state.moderation.add_whitelist(uuid);
+                state.moderation.add_whitelist(uuid)?;
             }
         }
         AdminRequestMode::RemoveWhitelist => {
             if let Ok(uuid) = reader.get_string() {
-                state.moderation.remove_whitelist(&uuid);
+                let _ = state.moderation.remove_whitelist(&uuid)?;
             }
         }
         AdminRequestMode::AddDefaultLibraryItem | AdminRequestMode::RemoveDefaultLibraryItem => {

@@ -2,8 +2,8 @@ use basis_protocol::{
     channels,
     io::NetWriter,
     server_info::{
-        ServerInfoResponse, SERVER_INFO_MIN_REQUEST_BYTES, SERVER_INFO_PROTOCOL_VERSION,
-        SERVER_INFO_QUERY_MAGIC,
+        parse_server_info_query_nonce, ServerInfoResponse, SERVER_INFO_MIN_REQUEST_BYTES,
+        SERVER_INFO_PROTOCOL_VERSION, SERVER_INFO_QUERY_MAGIC,
     },
     version::LITENETLIB_PROTOCOL_ID,
 };
@@ -14,7 +14,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -31,6 +31,7 @@ const MAX_PENDING_RELIABLE_PER_PEER: usize = 4096;
 const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 const SOCKET_TTL: u32 = 255;
 const MAX_MERGED_PACKET_SIZE: usize = 1200;
+const DEFAULT_MAX_RECEIVE_WORKERS: usize = 8;
 
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -162,8 +163,27 @@ pub enum ServerEvent {
     NetworkError(String),
     UnconnectedRequest {
         remote_addr: SocketAddr,
+        nonce: u16,
         payload: Bytes,
     },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TransportStatsSnapshot {
+    pub raw_packets_received: u64,
+    pub raw_packets_sent: u64,
+    pub raw_bytes_received: u64,
+    pub raw_bytes_sent: u64,
+    pub raw_send_would_block: u64,
+}
+
+#[derive(Debug, Default)]
+struct TransportStats {
+    raw_packets_received: AtomicU64,
+    raw_packets_sent: AtomicU64,
+    raw_bytes_received: AtomicU64,
+    raw_bytes_sent: AtomicU64,
+    raw_send_would_block: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -173,9 +193,13 @@ struct PeerState {
     connection_number: u8,
     connect_time: i64,
     last_seen: parking_lot::Mutex<Instant>,
+    last_ping_sent: parking_lot::Mutex<Instant>,
+    next_ping_sequence: AtomicU16,
     next_reliable_sequence: parking_lot::Mutex<HashMap<u8, u16>>,
     next_sequenced_sequence: parking_lot::Mutex<HashMap<u8, u16>>,
     pending_reliable: parking_lot::Mutex<HashMap<PendingReliableKey, PendingReliable>>,
+    outgoing_reliable: parking_lot::Mutex<HashMap<u8, VecDeque<Vec<u8>>>>,
+    outgoing_acks: parking_lot::Mutex<HashMap<u8, AckState>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -188,6 +212,12 @@ struct PendingReliableKey {
 struct PendingReliable {
     bytes: Vec<u8>,
     last_sent: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct AckState {
+    window_start: u16,
+    bits: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -205,6 +235,8 @@ pub struct TransportHandle {
     next_peer_id: Arc<AtomicU16>,
     reusable_peer_ids: Arc<parking_lot::Mutex<VecDeque<PeerId>>>,
     retired_peer_ids: Arc<parking_lot::Mutex<HashSet<PeerId>>>,
+    shutdown: Arc<AtomicBool>,
+    stats: Arc<TransportStats>,
 }
 
 impl TransportHandle {
@@ -219,8 +251,12 @@ impl TransportHandle {
             next_peer_id: Arc::new(AtomicU16::new(0)),
             reusable_peer_ids: Arc::new(parking_lot::Mutex::new(VecDeque::new())),
             retired_peer_ids: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            stats: Arc::new(TransportStats::default()),
         };
-        tokio::spawn(read_loop(handle.clone(), tx.clone()));
+        for _ in 0..udp_receive_worker_count() {
+            tokio::spawn(read_loop(handle.clone(), tx.clone()));
+        }
         tokio::spawn(timeout_loop(handle.clone(), tx));
         tokio::spawn(reliable_resend_loop(handle.clone()));
         Ok((handle, rx))
@@ -232,6 +268,68 @@ impl TransportHandle {
 
     pub fn connected_peers_count(&self) -> usize {
         self.peers.len()
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+
+    pub fn pending_reliable_count(&self) -> usize {
+        self.peers
+            .iter()
+            .map(|peer| peer.pending_reliable.lock().len())
+            .sum()
+    }
+
+    pub fn queued_reliable_count(&self) -> usize {
+        self.peers
+            .iter()
+            .map(|peer| {
+                peer.outgoing_reliable
+                    .lock()
+                    .values()
+                    .map(VecDeque::len)
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
+    pub fn stats_snapshot(&self) -> TransportStatsSnapshot {
+        TransportStatsSnapshot {
+            raw_packets_received: self.stats.raw_packets_received.load(Ordering::Relaxed),
+            raw_packets_sent: self.stats.raw_packets_sent.load(Ordering::Relaxed),
+            raw_bytes_received: self.stats.raw_bytes_received.load(Ordering::Relaxed),
+            raw_bytes_sent: self.stats.raw_bytes_sent.load(Ordering::Relaxed),
+            raw_send_would_block: self.stats.raw_send_would_block.load(Ordering::Relaxed),
+        }
+    }
+
+    async fn send_raw_to(&self, bytes: &[u8], addr: SocketAddr) -> Result<usize> {
+        let sent = self.socket.send_to(bytes, addr).await?;
+        self.stats.raw_packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .raw_bytes_sent
+            .fetch_add(sent as u64, Ordering::Relaxed);
+        Ok(sent)
+    }
+
+    fn try_send_raw_to(&self, bytes: &[u8], addr: SocketAddr) -> Result<bool> {
+        match self.socket.try_send_to(bytes, addr) {
+            Ok(sent) => {
+                self.stats.raw_packets_sent.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .raw_bytes_sent
+                    .fetch_add(sent as u64, Ordering::Relaxed);
+                Ok(true)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                self.stats
+                    .raw_send_would_block
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(false)
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     pub fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
@@ -253,9 +351,13 @@ impl TransportHandle {
             connection_number: request.connection_number,
             connect_time: request.connect_time,
             last_seen: parking_lot::Mutex::new(Instant::now()),
+            last_ping_sent: parking_lot::Mutex::new(Instant::now()),
+            next_ping_sequence: AtomicU16::new(0),
             next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),
             next_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
             pending_reliable: parking_lot::Mutex::new(HashMap::new()),
+            outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
+            outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
         });
         self.by_addr.insert(request.remote_addr, id);
         self.peers.insert(id, state);
@@ -294,8 +396,7 @@ impl TransportHandle {
         writer.put_u8(PacketProperty::Disconnect as u8 | (request.connection_number << 5));
         writer.put_i64(request.connect_time);
         writer.put_bytes(payload.as_slice());
-        self.socket
-            .send_to(writer.as_slice(), request.remote_addr)
+        self.send_raw_to(writer.as_slice(), request.remote_addr)
             .await?;
         Ok(())
     }
@@ -323,9 +424,13 @@ impl TransportHandle {
         let Some(state) = self.peers.get(&peer).map(|p| p.clone()) else {
             return Ok(());
         };
+        if is_reliable_delivery(delivery) {
+            enqueue_reliable_payload(&state, channel, delivery, payload);
+            return Ok(());
+        }
         let built = build_outbound_packet(&state, channel, delivery, payload);
         record_pending_reliable(&state, &built);
-        self.socket.send_to(&built.bytes, state.addr).await?;
+        self.send_raw_to(&built.bytes, state.addr).await?;
         Ok(())
     }
 
@@ -339,6 +444,114 @@ impl TransportHandle {
             .map(|(channel, delivery, payload)| (*channel, *delivery, payload.as_slice()))
             .collect::<Vec<_>>();
         self.send_many_slices(peer, &borrowed).await
+    }
+
+    pub async fn send_many_bytes(
+        &self,
+        peer: PeerId,
+        packets: &[(u8, DeliveryMethod, Bytes)],
+    ) -> Result<()> {
+        let borrowed = packets
+            .iter()
+            .map(|(channel, delivery, payload)| (*channel, *delivery, payload.as_ref()))
+            .collect::<Vec<_>>();
+        self.send_many_slices(peer, &borrowed).await
+    }
+
+    pub fn try_send_many_bytes(
+        &self,
+        peer: PeerId,
+        packets: &[(u8, DeliveryMethod, Bytes)],
+    ) -> Result<usize> {
+        if packets.is_empty() {
+            return Ok(0);
+        }
+        let Some(state) = self.peers.get(&peer).map(|p| p.clone()) else {
+            return Ok(0);
+        };
+
+        let mut outbound = Vec::with_capacity(packets.len());
+        for (channel, delivery, payload) in packets {
+            if is_reliable_delivery(*delivery) {
+                enqueue_reliable_payload(&state, *channel, *delivery, payload);
+                continue;
+            }
+            let built = build_outbound_packet(&state, *channel, *delivery, payload.as_ref());
+            record_pending_reliable(&state, &built);
+            outbound.push(built.bytes);
+        }
+
+        let mut sent = 0usize;
+        for packet in build_merged_datagrams(state.connection_number, outbound) {
+            if self.try_send_raw_to(&packet, state.addr)? {
+                sent += 1;
+            }
+        }
+        Ok(sent)
+    }
+
+    pub fn try_send_many_unreliable_bytes(
+        &self,
+        peer: PeerId,
+        packets: &[(u8, Bytes)],
+    ) -> Result<usize> {
+        if packets.is_empty() {
+            return Ok(0);
+        }
+        let Some(state) = self.peers.get(&peer).map(|p| p.clone()) else {
+            return Ok(0);
+        };
+
+        if packets.len() == 1 {
+            let (channel, payload) = &packets[0];
+            let mut packet = Vec::with_capacity(payload.len() + 2);
+            packet.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
+            packet.push(*channel);
+            packet.extend_from_slice(payload.as_ref());
+            return self
+                .try_send_raw_to(&packet, state.addr)
+                .map(|sent| usize::from(sent));
+        }
+
+        let mut sent = 0usize;
+        let mut current = Vec::with_capacity(MAX_MERGED_PACKET_SIZE);
+        current.push(PacketProperty::Merged as u8 | (state.connection_number << 5));
+        let mut current_count = 0usize;
+
+        for (channel, payload) in packets {
+            let packet_len = payload.len() + 2;
+            let framed_len = packet_len + 2;
+            if current_count > 0 && current.len() + framed_len > MAX_MERGED_PACKET_SIZE {
+                if self.try_send_raw_to(&current, state.addr)? {
+                    sent += 1;
+                }
+                current.clear();
+                current.push(PacketProperty::Merged as u8 | (state.connection_number << 5));
+                current_count = 0;
+            }
+
+            if framed_len + 1 > MAX_MERGED_PACKET_SIZE {
+                let mut packet = Vec::with_capacity(packet_len);
+                packet.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
+                packet.push(*channel);
+                packet.extend_from_slice(payload.as_ref());
+                if self.try_send_raw_to(&packet, state.addr)? {
+                    sent += 1;
+                }
+                continue;
+            }
+
+            current.extend_from_slice(&(packet_len as u16).to_le_bytes());
+            current.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
+            current.push(*channel);
+            current.extend_from_slice(payload.as_ref());
+            current_count += 1;
+        }
+
+        if current_count > 0 && self.try_send_raw_to(&current, state.addr)? {
+            sent += 1;
+        }
+        Ok(sent)
     }
 
     pub async fn send_many_slices(
@@ -355,13 +568,17 @@ impl TransportHandle {
 
         let mut outbound = Vec::with_capacity(packets.len());
         for (channel, delivery, payload) in packets {
+            if is_reliable_delivery(*delivery) {
+                enqueue_reliable_payload(&state, *channel, *delivery, payload);
+                continue;
+            }
             let built = build_outbound_packet(&state, *channel, *delivery, payload);
             record_pending_reliable(&state, &built);
             outbound.push(built.bytes);
         }
 
         for packet in build_merged_datagrams(state.connection_number, outbound) {
-            self.socket.send_to(&packet, state.addr).await?;
+            self.send_raw_to(&packet, state.addr).await?;
         }
         Ok(())
     }
@@ -376,7 +593,7 @@ impl TransportHandle {
             writer.put_u8(PacketProperty::Disconnect as u8 | (state.connection_number << 5));
             writer.put_i64(state.connect_time);
             writer.put_bytes(payload.as_slice());
-            self.socket.send_to(writer.as_slice(), state.addr).await?;
+            self.send_raw_to(writer.as_slice(), state.addr).await?;
         }
         Ok(())
     }
@@ -390,9 +607,7 @@ impl TransportHandle {
         remote_addr: SocketAddr,
         response: &ServerInfoResponse,
     ) -> Result<()> {
-        self.socket
-            .send_to(&response.serialize(), remote_addr)
-            .await?;
+        self.send_raw_to(&response.serialize(), remote_addr).await?;
         Ok(())
     }
 }
@@ -419,6 +634,46 @@ fn record_pending_reliable(state: &PeerState, built: &BuiltPacket) {
                 last_sent: Instant::now(),
             },
         );
+    }
+}
+
+fn is_reliable_delivery(delivery: DeliveryMethod) -> bool {
+    matches!(
+        delivery,
+        DeliveryMethod::ReliableUnordered
+            | DeliveryMethod::ReliableOrdered
+            | DeliveryMethod::ReliableSequenced
+    )
+}
+
+fn enqueue_reliable_payload(
+    state: &PeerState,
+    channel: u8,
+    delivery: DeliveryMethod,
+    payload: &[u8],
+) {
+    let channel_id = DeliveryMethod::channel_id(channel, delivery);
+    let mut outgoing = state.outgoing_reliable.lock();
+    outgoing
+        .entry(channel_id)
+        .or_default()
+        .push_back(payload.to_vec());
+}
+
+fn build_queued_reliable_packet(
+    state: &PeerState,
+    channel_id: u8,
+    payload: Vec<u8>,
+) -> BuiltPacket {
+    let sequence = next_channel_sequence(&state.next_reliable_sequence, channel_id);
+    let mut writer = NetWriter::with_capacity(payload.len() + 4);
+    writer.put_u8(PacketProperty::Channeled as u8 | (state.connection_number << 5));
+    writer.put_u16(sequence);
+    writer.put_u8(channel_id);
+    writer.put_bytes(&payload);
+    BuiltPacket {
+        bytes: writer.into_vec(),
+        reliable_key: Some((channel_id, sequence)),
     }
 }
 
@@ -501,16 +756,39 @@ fn bind_udp_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     UdpSocket::from_std(socket.into())
 }
 
+fn udp_receive_worker_count() -> usize {
+    if let Ok(value) = std::env::var("BASIS_UDP_RECEIVE_WORKERS") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            return parsed.clamp(1, 64);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).max(1))
+        .unwrap_or(1)
+        .min(DEFAULT_MAX_RECEIVE_WORKERS)
+}
+
 async fn read_loop(handle: TransportHandle, tx: mpsc::Sender<ServerEvent>) {
     let mut buf = vec![0u8; 64 * 1024];
-    loop {
+    while !handle.shutdown.load(Ordering::Relaxed) {
         match handle.socket.recv_from(&mut buf).await {
             Ok((len, remote_addr)) => {
+                handle
+                    .stats
+                    .raw_packets_received
+                    .fetch_add(1, Ordering::Relaxed);
+                handle
+                    .stats
+                    .raw_bytes_received
+                    .fetch_add(len as u64, Ordering::Relaxed);
                 if let Err(err) = process_packet(&handle, &tx, remote_addr, &buf[..len]).await {
                     warn!("transport packet processing failed: {err}");
                 }
             }
             Err(err) => {
+                if err.kind() == std::io::ErrorKind::ConnectionReset {
+                    continue;
+                }
                 let _ = tx.send(ServerEvent::NetworkError(err.to_string())).await;
             }
         }
@@ -534,6 +812,7 @@ async fn process_packet(
                 tx,
                 ServerEvent::UnconnectedRequest {
                     remote_addr,
+                    nonce: parse_server_info_query_nonce(bytes).unwrap_or_default(),
                     payload: Bytes::copy_from_slice(bytes),
                 },
             )
@@ -696,8 +975,9 @@ async fn process_packet(
                     ) {
                         let sequence = u16::from_le_bytes([bytes[1], bytes[2]]);
                         let channel_id = bytes[3];
-                        send_ack(handle, remote_addr, connection_number, channel_id, sequence)
-                            .await?;
+                        if let Some(peer) = handle.peers.get(&peer_id) {
+                            queue_ack(&peer, channel_id, sequence);
+                        }
                     }
                     let event = ServerEvent::Message {
                         peer: peer_id,
@@ -794,10 +1074,7 @@ async fn send_simple_property(
     remote_addr: SocketAddr,
     property: PacketProperty,
 ) -> Result<()> {
-    handle
-        .socket
-        .send_to(&[property as u8], remote_addr)
-        .await?;
+    handle.send_raw_to(&[property as u8], remote_addr).await?;
     Ok(())
 }
 
@@ -814,10 +1091,7 @@ async fn send_connect_accept(
     writer.put_u8(connection_number);
     writer.put_u8(0);
     writer.put_i32(peer_id as i32);
-    handle
-        .socket
-        .send_to(writer.as_slice(), remote_addr)
-        .await?;
+    handle.send_raw_to(writer.as_slice(), remote_addr).await?;
     Ok(())
 }
 
@@ -940,21 +1214,41 @@ fn process_ack(peer: &PeerState, bytes: &[u8]) {
     });
 }
 
-async fn send_ack(
-    handle: &TransportHandle,
-    remote_addr: SocketAddr,
-    connection_number: u8,
-    channel_id: u8,
-    sequence: u16,
-) -> Result<()> {
-    let mut packet = vec![0u8; 4 + ((DEFAULT_WINDOW_SIZE - 1) / 8 + 2)];
-    packet[0] = PacketProperty::Ack as u8 | (connection_number << 5);
-    packet[1..3].copy_from_slice(&sequence.to_le_bytes());
-    packet[3] = channel_id;
-    let bit_index = sequence as usize % DEFAULT_WINDOW_SIZE;
-    packet[4 + bit_index / 8] |= 1 << (bit_index % 8);
-    handle.socket.send_to(&packet, remote_addr).await?;
-    Ok(())
+fn queue_ack(peer: &PeerState, channel_id: u8, sequence: u16) {
+    let mut acks = peer.outgoing_acks.lock();
+    let ack = acks.entry(channel_id).or_insert_with(|| AckState {
+        window_start: sequence,
+        bits: vec![0; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2],
+    });
+
+    let rel = relative_sequence(sequence, ack.window_start);
+    if rel < 0 {
+        return;
+    }
+    if rel as usize >= DEFAULT_WINDOW_SIZE {
+        let shift = rel as usize - DEFAULT_WINDOW_SIZE + 1;
+        for old_seq in ack.window_start..ack.window_start.wrapping_add(shift as u16) {
+            let idx = old_seq as usize % DEFAULT_WINDOW_SIZE;
+            if let Some(byte) = ack.bits.get_mut(idx / 8) {
+                *byte &= !(1 << (idx % 8));
+            }
+        }
+        ack.window_start = ack.window_start.wrapping_add(shift as u16) % MAX_SEQUENCE;
+    }
+
+    let idx = sequence as usize % DEFAULT_WINDOW_SIZE;
+    if let Some(byte) = ack.bits.get_mut(idx / 8) {
+        *byte |= 1 << (idx % 8);
+    }
+}
+
+fn build_ack_packet(connection_number: u8, channel_id: u8, ack: &AckState) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(4 + ack.bits.len());
+    packet.push(PacketProperty::Ack as u8 | (connection_number << 5));
+    packet.extend_from_slice(&ack.window_start.to_le_bytes());
+    packet.push(channel_id);
+    packet.extend_from_slice(&ack.bits);
+    packet
 }
 
 async fn send_pong(
@@ -967,11 +1261,15 @@ async fn send_pong(
     writer.put_u8(PacketProperty::Pong as u8 | (connection_number << 5));
     writer.put_u16(sequence);
     writer.put_i64(dotnet_utc_ticks());
-    handle
-        .socket
-        .send_to(writer.as_slice(), remote_addr)
-        .await?;
+    handle.send_raw_to(writer.as_slice(), remote_addr).await?;
     Ok(())
+}
+
+fn build_ping_packet(connection_number: u8, sequence: u16) -> Vec<u8> {
+    let mut writer = NetWriter::with_capacity(3);
+    writer.put_u8(PacketProperty::Ping as u8 | (connection_number << 5));
+    writer.put_u16(sequence);
+    writer.into_vec()
 }
 
 async fn send_mtu_ok(
@@ -984,7 +1282,7 @@ async fn send_mtu_ok(
     }
     let mut packet = mtu_check_packet.to_vec();
     packet[0] = (packet[0] & 0xe0) | PacketProperty::MtuOk as u8;
-    handle.socket.send_to(&packet, remote_addr).await?;
+    handle.send_raw_to(&packet, remote_addr).await?;
     Ok(())
 }
 
@@ -1038,7 +1336,7 @@ fn is_valid_merged_packet(bytes: &[u8]) -> bool {
 
 async fn timeout_loop(handle: TransportHandle, tx: mpsc::Sender<ServerEvent>) {
     let mut tick = time::interval(Duration::from_secs(5));
-    loop {
+    while !handle.shutdown.load(Ordering::Relaxed) {
         tick.tick().await;
         let now = Instant::now();
         let timed_out: Vec<_> = handle
@@ -1068,14 +1366,66 @@ async fn timeout_loop(handle: TransportHandle, tx: mpsc::Sender<ServerEvent>) {
 }
 
 async fn reliable_resend_loop(handle: TransportHandle) {
-    let mut tick = time::interval(Duration::from_millis(50));
-    loop {
+    let mut tick = time::interval(Duration::from_millis(15));
+    while !handle.shutdown.load(Ordering::Relaxed) {
         tick.tick().await;
         let now = Instant::now();
         let mut sends = Vec::new();
         for peer in handle.peers.iter() {
             let addr = peer.addr;
             let connection_number = peer.connection_number;
+
+            {
+                let mut last_ping = peer.last_ping_sent.lock();
+                if now.duration_since(*last_ping) >= Duration::from_millis(1500) {
+                    *last_ping = now;
+                    let sequence = peer.next_ping_sequence.fetch_add(1, Ordering::Relaxed);
+                    sends.push((
+                        addr,
+                        connection_number,
+                        build_ping_packet(connection_number, sequence),
+                    ));
+                }
+            }
+
+            let ack_packets = {
+                let mut acks = peer.outgoing_acks.lock();
+                acks.drain()
+                    .map(|(channel_id, ack)| build_ack_packet(connection_number, channel_id, &ack))
+                    .collect::<Vec<_>>()
+            };
+            for packet in ack_packets {
+                sends.push((addr, connection_number, packet));
+            }
+
+            let mut newly_queued = Vec::new();
+            {
+                let mut outgoing = peer.outgoing_reliable.lock();
+                let pending = peer.pending_reliable.lock();
+                let mut pending_by_channel = HashMap::<u8, usize>::new();
+                for key in pending.keys() {
+                    *pending_by_channel.entry(key.channel_id).or_default() += 1;
+                }
+                drop(pending);
+
+                for (channel_id, queue) in outgoing.iter_mut() {
+                    let pending_count = pending_by_channel.get(channel_id).copied().unwrap_or(0);
+                    let capacity = DEFAULT_WINDOW_SIZE.saturating_sub(pending_count);
+                    for _ in 0..capacity {
+                        let Some(payload) = queue.pop_front() else {
+                            break;
+                        };
+                        newly_queued.push((*channel_id, payload));
+                    }
+                }
+            }
+
+            for (channel_id, payload) in newly_queued {
+                let built = build_queued_reliable_packet(&peer, channel_id, payload);
+                record_pending_reliable(&peer, &built);
+                sends.push((addr, connection_number, built.bytes));
+            }
+
             let mut pending = peer.pending_reliable.lock();
             for item in pending.values_mut() {
                 if now.duration_since(item.last_sent) >= Duration::from_millis(150) {
@@ -1093,7 +1443,7 @@ async fn reliable_resend_loop(handle: TransportHandle) {
         }
         for ((addr, connection_number), packets) in by_peer {
             for bytes in build_merged_datagrams(connection_number, packets) {
-                let _ = handle.socket.send_to(&bytes, addr).await;
+                let _ = handle.send_raw_to(&bytes, addr).await;
             }
         }
     }
