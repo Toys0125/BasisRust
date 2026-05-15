@@ -1,0 +1,12 @@
+[package]
+name = "basis-server-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+basis-protocol = { path = "../basis-protocol" }
+parking_lot.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
