@@ -1,0 +1,1 @@
+<Configuration><Password>default_password</Password><Ip>localhost</Ip><Port>4296</Port><ClientCount>250</ClientCount><AvatarPassword>default_avatar_password</AvatarPassword><AvatarUrl>http://localhost/avatar</AvatarUrl><AvatarLoadMode>1</AvatarLoadMode></Configuration>
