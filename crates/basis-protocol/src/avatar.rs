@@ -222,7 +222,26 @@ pub struct AvatarBundleItem {
     pub payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AvatarBundleSlice<'a> {
+    pub original_channel: u8,
+    pub payload: &'a [u8],
+    pub interval_patch: Option<(usize, u8)>,
+}
+
 pub fn encode_avatar_bundle(items: &[AvatarBundleItem]) -> Result<Vec<u8>> {
+    let slices = items
+        .iter()
+        .map(|item| AvatarBundleSlice {
+            original_channel: item.original_channel,
+            payload: &item.payload,
+            interval_patch: None,
+        })
+        .collect::<Vec<_>>();
+    encode_avatar_bundle_slices(&slices)
+}
+
+pub fn encode_avatar_bundle_slices(items: &[AvatarBundleSlice<'_>]) -> Result<Vec<u8>> {
     anyhow::ensure!(items.len() <= u8::MAX as usize, "too many bundle items");
     let mut raw = NetWriter::new();
     for item in items {
@@ -232,7 +251,17 @@ pub fn encode_avatar_bundle(items: &[AvatarBundleItem]) -> Result<Vec<u8>> {
         );
         raw.put_u8(item.original_channel);
         raw.put_u16(item.payload.len() as u16);
-        raw.put_bytes(&item.payload);
+        if let Some((offset, value)) = item.interval_patch {
+            if offset < item.payload.len() {
+                raw.put_bytes(&item.payload[..offset]);
+                raw.put_u8(value);
+                raw.put_bytes(&item.payload[offset + 1..]);
+            } else {
+                raw.put_bytes(item.payload);
+            }
+        } else {
+            raw.put_bytes(item.payload);
+        }
     }
     let raw = raw.into_vec();
     anyhow::ensure!(

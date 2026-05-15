@@ -129,6 +129,7 @@ impl ServerState {
             max_receiver_slices: 32,
             tick_budget_ms: avatar_sync::DEFAULT_AVATAR_TICK_BUDGET_MS,
             receiver_cycle_budget_ms: avatar_sync::DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
+            spatial_cull_enabled: false,
         }
         .apply_env_tuning());
 
@@ -186,6 +187,7 @@ impl ServerState {
             max_receiver_slices: 32,
             tick_budget_ms: avatar_sync::DEFAULT_AVATAR_TICK_BUDGET_MS,
             receiver_cycle_budget_ms: avatar_sync::DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
+            spatial_cull_enabled: false,
         }
         .apply_env_tuning());
     }

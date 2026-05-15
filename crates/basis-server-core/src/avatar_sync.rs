@@ -1,7 +1,7 @@
 use anyhow::Result;
 use basis_protocol::{
     avatar::{
-        encode_avatar_bundle, read_position, repack_high_to_lower_into, AvatarBundleItem,
+        encode_avatar_bundle_slices, read_position, repack_high_to_lower_into, AvatarBundleSlice,
         BitQuality,
     },
     channels,
@@ -44,6 +44,7 @@ pub struct AvatarSyncConfig {
     pub max_receiver_slices: usize,
     pub tick_budget_ms: f64,
     pub receiver_cycle_budget_ms: f64,
+    pub spatial_cull_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +112,14 @@ struct OutboundAvatarBatch {
     sends: Vec<OutboundAvatarSend>,
 }
 
+#[derive(Debug, Clone)]
+struct BundleAvatarSend {
+    original_channel: u8,
+    payload: Bytes,
+    interval_offset: usize,
+    interval_byte: u8,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AvatarSyncStats {
     pub inbound_updates: u64,
@@ -144,20 +153,36 @@ struct AvatarSyncCounters {
 
 #[derive(Debug, Default)]
 struct BytePool {
-    buffers: parking_lot::Mutex<Vec<Vec<u8>>>,
+    shards: Vec<parking_lot::Mutex<Vec<Vec<u8>>>>,
+    next_shard: AtomicU64,
 }
 
 impl BytePool {
+    const SHARD_COUNT: usize = 32;
     const MAX_RETAINED_BUFFERS: usize = 4096;
     const MAX_RETAINED_CAPACITY: usize = 64 * 1024;
 
+    fn new() -> Self {
+        Self {
+            shards: (0..Self::SHARD_COUNT)
+                .map(|_| parking_lot::Mutex::new(Vec::new()))
+                .collect(),
+            next_shard: AtomicU64::new(0),
+        }
+    }
+
     fn take(&self, size: usize) -> Vec<u8> {
-        let mut buffers = self.buffers.lock();
-        if let Some(index) = buffers.iter().position(|buffer| buffer.capacity() >= size) {
-            let mut buffer = buffers.swap_remove(index);
-            buffer.clear();
-            buffer.resize(size, 0);
-            return buffer;
+        let start = self.next_index();
+        for offset in 0..Self::SHARD_COUNT {
+            let index = (start + offset) % Self::SHARD_COUNT;
+            let mut buffers = self.shards[index].lock();
+            if let Some(buffer_index) = buffers.iter().position(|buffer| buffer.capacity() >= size)
+            {
+                let mut buffer = buffers.swap_remove(buffer_index);
+                buffer.clear();
+                buffer.resize(size, 0);
+                return buffer;
+            }
         }
         vec![0; size]
     }
@@ -167,10 +192,14 @@ impl BytePool {
             return;
         }
         buffer.clear();
-        let mut buffers = self.buffers.lock();
-        if buffers.len() < Self::MAX_RETAINED_BUFFERS {
+        let mut buffers = self.shards[self.next_index()].lock();
+        if buffers.len() < Self::MAX_RETAINED_BUFFERS / Self::SHARD_COUNT {
             buffers.push(buffer);
         }
+    }
+
+    fn next_index(&self) -> usize {
+        self.next_shard.fetch_add(1, Ordering::Relaxed) as usize % Self::SHARD_COUNT
     }
 }
 
@@ -201,7 +230,7 @@ impl AvatarSyncSystem {
                 fanout_round: 0,
                 smoothed_tick_micros: 0,
             })),
-            payload_pool: Arc::new(BytePool::default()),
+            payload_pool: Arc::new(BytePool::new()),
             counters: Arc::new(AvatarSyncCounters::default()),
         }
     }
@@ -447,6 +476,7 @@ impl AvatarSyncSystem {
                         .inbound_sequence
                         .wrapping_sub(current.last_inbound_sequence);
                     if delta == 0 || delta >= 128 {
+                        self.payload_pool.put(update.payload);
                         continue;
                     }
                 }
@@ -519,6 +549,11 @@ impl AvatarSyncSystem {
             if sender_id == receiver_id {
                 continue;
             }
+            if config.spatial_cull_enabled
+                && outside_spatial_cull(receiver_state, sender_state, config.low_distance_sq)
+            {
+                continue;
+            }
             let tracking = receiver_tracking.entry(sender_id).or_insert_with(|| {
                 let dist_sq = distance_sq(receiver_state, sender_state);
                 let (interval_byte, interval_ms) =
@@ -565,16 +600,21 @@ impl AvatarSyncSystem {
             };
 
             if config.enable_bundle_compression {
-                let payload = patch_interval_vec(packet_bytes, interval_offset, interval_byte);
-                let item_raw_bytes = 3 + payload.len();
-                let item = AvatarBundleItem {
+                let item_raw_bytes = 3 + packet_bytes.len();
+                let item = BundleAvatarSend {
                     original_channel: channel,
-                    payload,
+                    payload: packet_bytes.clone(),
+                    interval_offset,
+                    interval_byte,
                 };
                 if item_raw_bytes > AVATAR_BUNDLE_RAW_TARGET_BYTES {
                     direct.push(OutboundAvatarSend {
                         channel,
-                        payload: Bytes::from(item.payload),
+                        payload: patch_interval_bytes(
+                            &item.payload,
+                            item.interval_offset,
+                            item.interval_byte,
+                        ),
                     });
                     continue;
                 }
@@ -594,11 +634,11 @@ impl AvatarSyncSystem {
             } else {
                 direct.push(OutboundAvatarSend {
                     channel,
-                    payload: Bytes::from(patch_interval_vec(
+                    payload: patch_interval_bytes(
                         packet_bytes,
                         interval_offset,
                         interval_byte,
-                    )),
+                    ),
                 });
             }
         }
@@ -690,6 +730,8 @@ impl AvatarSyncConfig {
             env_f64("BASIS_AVATAR_TICK_BUDGET_MS").unwrap_or(self.tick_budget_ms);
         self.receiver_cycle_budget_ms = env_f64("BASIS_AVATAR_RECEIVER_CYCLE_BUDGET_MS")
             .unwrap_or(self.receiver_cycle_budget_ms);
+        self.spatial_cull_enabled =
+            env_bool("BASIS_AVATAR_SPATIAL_CULL").unwrap_or(self.spatial_cull_enabled);
         self
     }
 }
@@ -700,6 +742,15 @@ fn env_usize(name: &str) -> Option<usize> {
 
 fn env_f64(name: &str) -> Option<f64> {
     env::var(name).ok()?.parse().ok()
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    let value = env::var(name).ok()?;
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 async fn flush_receiver_groups_parallel(
@@ -753,7 +804,7 @@ async fn flush_receiver_groups_parallel(
 
 fn flush_avatar_bundle_chunk(
     direct: &mut Vec<OutboundAvatarSend>,
-    bundle: &mut Vec<AvatarBundleItem>,
+    bundle: &mut Vec<BundleAvatarSend>,
     bundle_raw_bytes: &mut usize,
     min_messages: usize,
     min_bytes: usize,
@@ -762,7 +813,15 @@ fn flush_avatar_bundle_chunk(
         return;
     }
     if bundle.len() >= min_messages && *bundle_raw_bytes >= min_bytes {
-        if let Ok(encoded) = encode_avatar_bundle(bundle) {
+        let slices = bundle
+            .iter()
+            .map(|item| AvatarBundleSlice {
+                original_channel: item.original_channel,
+                payload: &item.payload,
+                interval_patch: Some((item.interval_offset, item.interval_byte)),
+            })
+            .collect::<Vec<_>>();
+        if let Ok(encoded) = encode_avatar_bundle_slices(&slices) {
             direct.push(OutboundAvatarSend {
                 channel: channels::COMPRESSED_AVATAR_BUNDLE,
                 payload: Bytes::from(encoded),
@@ -774,7 +833,7 @@ fn flush_avatar_bundle_chunk(
     }
     direct.extend(bundle.drain(..).map(|item| OutboundAvatarSend {
         channel: item.original_channel,
-        payload: Bytes::from(item.payload),
+        payload: patch_interval_bytes(&item.payload, item.interval_offset, item.interval_byte),
     }));
     *bundle_raw_bytes = 0;
 }
@@ -899,13 +958,19 @@ fn pre_serialize(
     }
 }
 
-fn patch_interval_vec(payload: &Bytes, interval_offset: usize, interval: u8) -> Vec<u8> {
+fn patch_interval_bytes(payload: &Bytes, interval_offset: usize, interval: u8) -> Bytes {
+    if payload
+        .get(interval_offset)
+        .is_some_and(|current| *current == interval)
+    {
+        return payload.clone();
+    }
     let mut bytes = Vec::with_capacity(payload.len());
     bytes.extend_from_slice(payload);
     if interval_offset < bytes.len() {
         bytes[interval_offset] = interval;
     }
-    bytes
+    Bytes::from(bytes)
 }
 
 #[cfg(windows)]
@@ -926,6 +991,17 @@ fn distance_sq(receiver: &PlayerAvatarState, sender: &PlayerAvatarState) -> f32 
     let dy = receiver.position[1] - sender.position[1];
     let dz = receiver.position[2] - sender.position[2];
     dx * dx + dy * dy + dz * dz
+}
+
+fn outside_spatial_cull(
+    receiver: &PlayerAvatarState,
+    sender: &PlayerAvatarState,
+    max_distance_sq: f32,
+) -> bool {
+    let dx = receiver.position[0] - sender.position[0];
+    let dy = receiver.position[1] - sender.position[1];
+    let dz = receiver.position[2] - sender.position[2];
+    dx * dx + dy * dy + dz * dz > max_distance_sq
 }
 
 fn quality_from_distance_sq(distance_sq: f32, config: &AvatarSyncConfig) -> u8 {
@@ -953,7 +1029,7 @@ fn calculate_interval_from_distance_sq(distance_sq: f32, config: &AvatarSyncConf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use basis_protocol::avatar::decode_avatar_bundle;
+    use basis_protocol::avatar::{decode_avatar_bundle, encode_avatar_bundle, AvatarBundleItem};
 
     #[test]
     fn packet_preserialization_uses_small_and_large_ids() {
@@ -981,6 +1057,7 @@ mod tests {
             max_receiver_slices: 32,
             tick_budget_ms: DEFAULT_AVATAR_TICK_BUDGET_MS,
             receiver_cycle_budget_ms: DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
+            spatial_cull_enabled: false,
         };
         let (interval_byte, actual_ms) = calculate_interval_from_distance_sq(100.0, &config);
         assert_eq!(interval_byte, 25);
