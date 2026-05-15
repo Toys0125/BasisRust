@@ -1,0 +1,21 @@
+[package]
+name = "basis-rust-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+basis-protocol = { path = "../BasisRustServer/crates/basis-protocol" }
+basis-transport = { path = "../BasisRustServer/crates/basis-transport" }
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = "2"
+flate2 = "1"
+num_cpus = "1"
+quick-xml = { version = "0.38", features = ["serialize"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+socket2 = "0.5"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "fast-rng"] }
