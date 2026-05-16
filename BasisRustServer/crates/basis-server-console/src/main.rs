@@ -385,29 +385,95 @@ fn handle_perm_command(server: &ServerState, args: &[&str]) {
         [] | ["help"] => {
             println!("Permission commands:");
             println!("/perm path");
+            println!("/perm path set <path>");
             println!("/perm load");
+            println!("/perm load from <path>");
             println!("/perm save");
+            println!("/perm save to <path>");
+            println!("/perm reload");
             println!("/perm defaults");
+            println!();
+            println!("/perm user list");
             println!("/perm check <uuid> <node>");
             println!("/perm user create <uuid>");
+            println!("/perm user info <uuid>");
             println!("/perm user node add <uuid> <node>");
+            println!("/perm user node remove <uuid> <node>");
             println!("/perm user group add <uuid> <group>");
+            println!("/perm user group remove <uuid> <group>");
+            println!("/perm user effective <uuid>");
+            println!();
+            println!("/perm group list");
+            println!("/perm group create <name>");
+            println!("/perm group info <name>");
+            println!("/perm group node add <group> <node>");
+            println!("/perm group node remove <group> <node>");
+            println!("/perm group parent add <group> <parent>");
+            println!("/perm group parent remove <group> <parent>");
+            println!();
+            println!("Notes: Use '-node' to deny when adding nodes.");
         }
         ["path"] => println!(
             "permissions.xml path: {}",
             server.permissions.get_xml_path().display()
         ),
+        ["path", "set", rest @ ..] if !rest.is_empty() => {
+            let path = PathBuf::from(rest.join(" "));
+            server.permissions.set_xml_path(path);
+            println!(
+                "Set permissions.xml path to: {}",
+                server.permissions.get_xml_path().display()
+            );
+        }
         ["load"] => match server.permissions.load_from_xml() {
-            Ok(()) => println!("Loaded permissions."),
+            Ok(()) => println!(
+                "Loaded permissions from: {}",
+                server.permissions.get_xml_path().display()
+            ),
             Err(err) => println!("Failed to load permissions: {err}"),
         },
+        ["load", "from", rest @ ..] if !rest.is_empty() => {
+            let path = PathBuf::from(rest.join(" "));
+            match server.permissions.load_from_xml_path(path.clone()) {
+                Ok(()) => println!("Loaded permissions from: {}", path.display()),
+                Err(err) => println!("Failed to load permissions: {err}"),
+            }
+        }
         ["save"] => match server.permissions.save_to_xml() {
-            Ok(()) => println!("Saved permissions."),
+            Ok(()) => println!(
+                "Saved permissions to: {}",
+                server.permissions.get_xml_path().display()
+            ),
+            Err(err) => println!("Failed to save permissions: {err}"),
+        },
+        ["save", "to", rest @ ..] if !rest.is_empty() => {
+            let path = PathBuf::from(rest.join(" "));
+            match server.permissions.save_to_xml_path(&path) {
+                Ok(()) => println!("Saved permissions to: {}", path.display()),
+                Err(err) => println!("Failed to save permissions: {err}"),
+            }
+        }
+        ["reload"] => match server.permissions.save_to_xml() {
+            Ok(()) => match server.permissions.load_from_xml() {
+                Ok(()) => println!("Reloaded permissions (save -> load)."),
+                Err(err) => println!("Saved permissions, but failed to load: {err}"),
+            },
             Err(err) => println!("Failed to save permissions: {err}"),
         },
         ["defaults"] => {
             server.permissions.ensure_defaults();
             println!("Ensured default permission groups.");
+        }
+        ["user", "list"] => {
+            let snapshot = server.permissions.snapshot();
+            if snapshot.users.is_empty() {
+                println!("No users.");
+            } else {
+                println!("Users ({}):", snapshot.users.len());
+                for uuid in sorted_keys(snapshot.users.keys()) {
+                    println!("- {uuid}");
+                }
+            }
         }
         ["check", uuid, rest @ ..] if !rest.is_empty() => {
             let node = rest.join(" ");
@@ -426,16 +492,149 @@ fn handle_perm_command(server: &ServerState, args: &[&str]) {
             server.permissions.get_or_create_user(uuid);
             println!("User ensured: {uuid}");
         }
+        ["user", "info", uuid] => {
+            let snapshot = server.permissions.snapshot();
+            if let Some(user) = snapshot.users.get(*uuid) {
+                println!("User: {}", user.uuid);
+                println!(
+                    "Groups ({}): {}",
+                    user.groups.len(),
+                    sorted_values(&user.groups)
+                );
+                println!(
+                    "Nodes ({}): {}",
+                    user.nodes.len(),
+                    sorted_values(&user.nodes)
+                );
+            } else {
+                println!("User not found: {uuid}");
+            }
+        }
         ["user", "node", "add", uuid, rest @ ..] if !rest.is_empty() => {
             let node = rest.join(" ");
             server.permissions.add_user_node(uuid, &node);
             println!("Added user node: {uuid} -> {node}");
+        }
+        ["user", "node", "remove", uuid, rest @ ..] if !rest.is_empty() => {
+            let node = rest.join(" ");
+            let snapshot = server.permissions.snapshot();
+            match snapshot.users.get(*uuid) {
+                Some(user) if user.nodes.contains(&node) => {
+                    server.permissions.remove_user_node(uuid, &node);
+                    println!("Removed user node: {uuid} -> {node}");
+                }
+                Some(_) => println!("User node not found: {uuid} -> {node}"),
+                None => println!("User not found: {uuid}"),
+            }
         }
         ["user", "group", "add", uuid, rest @ ..] if !rest.is_empty() => {
             let group = rest.join(" ");
             server.permissions.add_user_to_group(uuid, &group);
             println!("Added user to group: {uuid} -> {group}");
         }
+        ["user", "group", "remove", uuid, rest @ ..] if !rest.is_empty() => {
+            let group = rest.join(" ");
+            let snapshot = server.permissions.snapshot();
+            match snapshot.users.get(*uuid) {
+                Some(user) if user.groups.contains(&group) => {
+                    server.permissions.remove_user_from_group(uuid, &group);
+                    println!("Removed user from group: {uuid} -> {group}");
+                }
+                Some(_) => println!("User group not found: {uuid} -> {group}"),
+                None => println!("User not found: {uuid}"),
+            }
+        }
+        ["user", "effective", uuid] => {
+            let mut allowed = server.permissions.allowed_rules(uuid);
+            let mut denied = server.permissions.denied_rules(uuid);
+            sort_case_insensitive(&mut allowed);
+            sort_case_insensitive(&mut denied);
+            println!("Effective rules for {uuid}:");
+            println!("Allowed ({}): {}", allowed.len(), display_list(&allowed));
+            println!("Denied ({}): {}", denied.len(), display_list(&denied));
+        }
+        ["group", "list"] => {
+            let snapshot = server.permissions.snapshot();
+            if snapshot.groups.is_empty() {
+                println!("No groups.");
+            } else {
+                println!("Groups ({}):", snapshot.groups.len());
+                for group in sorted_keys(snapshot.groups.keys()) {
+                    println!("- {group}");
+                }
+            }
+        }
+        ["group", "create", rest @ ..] if !rest.is_empty() => {
+            let group = rest.join(" ");
+            server.permissions.get_or_create_group(&group);
+            println!("Group ensured: {group}");
+        }
+        ["group", "info", rest @ ..] if !rest.is_empty() => {
+            let group = rest.join(" ");
+            let snapshot = server.permissions.snapshot();
+            if let Some(group_info) = snapshot.groups.get(&group) {
+                println!("Group: {}", group_info.name);
+                println!(
+                    "Parents ({}): {}",
+                    group_info.parents.len(),
+                    sorted_values(&group_info.parents)
+                );
+                println!(
+                    "Nodes ({}): {}",
+                    group_info.nodes.len(),
+                    sorted_values(&group_info.nodes)
+                );
+            } else {
+                println!("Group not found: {group}");
+            }
+        }
+        ["group", "node", "add", group, rest @ ..] if !rest.is_empty() => {
+            let node = rest.join(" ");
+            server.permissions.add_group_node(group, &node);
+            println!("Added group node: {group} -> {node}");
+        }
+        ["group", "node", "remove", group, rest @ ..] if !rest.is_empty() => {
+            let node = rest.join(" ");
+            server.permissions.remove_group_node(group, &node);
+            println!("Removed group node: {group} -> {node}");
+        }
+        ["group", "parent", "add", group, rest @ ..] if !rest.is_empty() => {
+            let parent = rest.join(" ");
+            server.permissions.add_group_parent(group, &parent);
+            println!("Added parent: {group} -> {parent}");
+        }
+        ["group", "parent", "remove", group, rest @ ..] if !rest.is_empty() => {
+            let parent = rest.join(" ");
+            server.permissions.remove_group_parent(group, &parent);
+            println!("Removed parent: {group} -> {parent}");
+        }
         _ => println!("Unknown /perm command. Type /perm help"),
+    }
+}
+
+fn sorted_keys<'a, I>(keys: I) -> Vec<&'a String>
+where
+    I: Iterator<Item = &'a String>,
+{
+    let mut keys: Vec<_> = keys.collect();
+    keys.sort_by_key(|key| key.to_ascii_lowercase());
+    keys
+}
+
+fn sorted_values(values: &std::collections::HashSet<String>) -> String {
+    let mut values: Vec<_> = values.iter().cloned().collect();
+    sort_case_insensitive(&mut values);
+    display_list(&values)
+}
+
+fn sort_case_insensitive(values: &mut [String]) {
+    values.sort_by_key(|value| value.to_ascii_lowercase());
+}
+
+fn display_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "(none)".to_string()
+    } else {
+        values.join(", ")
     }
 }

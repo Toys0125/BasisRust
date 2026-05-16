@@ -66,9 +66,21 @@ impl PermissionManager {
         Ok(())
     }
 
+    pub fn load_from_xml_path(&self, path: impl Into<PathBuf>) -> Result<()> {
+        let path = path.into();
+        let store = load_permissions(&path)?;
+        *self.store.write() = store;
+        self.set_xml_path(path);
+        Ok(())
+    }
+
     pub fn save_to_xml(&self) -> Result<()> {
         let path = self.get_xml_path();
         save_permissions(&path, &self.snapshot())
+    }
+
+    pub fn save_to_xml_path(&self, path: impl AsRef<Path>) -> Result<()> {
+        save_permissions(path.as_ref(), &self.snapshot())
     }
 
     pub fn ensure_defaults(&self) {
@@ -152,10 +164,22 @@ impl PermissionManager {
         }
     }
 
+    pub fn remove_user_node(&self, uuid: &str, node: &str) {
+        if let Some(user) = self.store.write().users.get_mut(uuid) {
+            user.nodes.remove(node.trim());
+        }
+    }
+
     pub fn add_user_to_group(&self, uuid: &str, group: &str) {
         self.get_or_create_user(uuid);
         if let Some(user) = self.store.write().users.get_mut(uuid) {
             user.groups.insert(group.trim().to_string());
+        }
+    }
+
+    pub fn remove_user_from_group(&self, uuid: &str, group: &str) {
+        if let Some(user) = self.store.write().users.get_mut(uuid) {
+            user.groups.remove(group.trim());
         }
     }
 
@@ -181,11 +205,23 @@ impl PermissionManager {
         }
     }
 
+    pub fn remove_group_node(&self, group: &str, node: &str) {
+        if let Some(group) = self.store.write().groups.get_mut(group.trim()) {
+            group.nodes.remove(node.trim());
+        }
+    }
+
     pub fn add_group_parent(&self, group: &str, parent: &str) {
         self.get_or_create_group(group);
         self.get_or_create_group(parent);
         if let Some(group) = self.store.write().groups.get_mut(group.trim()) {
             group.parents.insert(parent.trim().to_string());
+        }
+    }
+
+    pub fn remove_group_parent(&self, group: &str, parent: &str) {
+        if let Some(group) = self.store.write().groups.get_mut(group.trim()) {
+            group.parents.remove(parent.trim());
         }
     }
 
