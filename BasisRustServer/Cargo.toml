@@ -12,6 +12,17 @@ members = [
     "crates/basis-server-resources",
     "tools/basis-source-sync",
 ]
+default-members = [
+    "crates/basis-protocol",
+    "crates/basis-transport",
+    "crates/basis-server-core",
+    "crates/basis-server-console",
+    "crates/basis-server-health",
+    "crates/basis-server-storage",
+    "crates/basis-server-permissions",
+    "crates/basis-server-admin",
+    "crates/basis-server-resources",
+]
 
 [workspace.package]
 version = "0.1.0"
