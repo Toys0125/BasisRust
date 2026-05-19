@@ -1,8 +1,9 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering},
         Arc,
@@ -19,7 +20,11 @@ use flate2::{write::DeflateEncoder, Compression};
 use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::{net::UdpSocket, sync::Mutex, time};
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, Mutex},
+    time,
+};
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
@@ -28,6 +33,12 @@ const MAX_SEQUENCE: u16 = 32768;
 const MOVEMENT_INTERVAL: Duration = Duration::from_millis(90);
 const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 const SOCKET_TTL: u32 = 255;
+const DEFAULT_VOICE_AUDIO_FOLDER: &str = "audio";
+const DEFAULT_VOICE_SPEAKER_PERCENT: u8 = 10;
+const DEFAULT_VOICE_HEARING_DISTANCE: f32 = 25.0;
+const DEFAULT_VOICE_FRAME_DURATION_MS: u64 = 20;
+const MAX_UNITY_VOICE_FRAME_DURATION_MS: u64 = 40;
+const MAX_VOICE_PACKET_BYTES: usize = 1200;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -60,6 +71,18 @@ struct Args {
     spawn_group_size: usize,
     #[arg(long, default_value_t = 1000.0)]
     spawn_group_spacing: f32,
+    #[arg(long)]
+    voice: bool,
+    #[arg(long)]
+    voice_audio_folder: Option<PathBuf>,
+    #[arg(long)]
+    voice_speaker_percent: Option<u8>,
+    #[arg(long)]
+    voice_hearing_distance: Option<f32>,
+    #[arg(long)]
+    voice_frame_duration_ms: Option<u64>,
+    #[arg(long)]
+    no_voice_reencode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +95,11 @@ struct Config {
     avatar_password: String,
     avatar_url: String,
     avatar_load_mode: u8,
+    voice_enabled: bool,
+    voice_audio_folder: String,
+    voice_speaker_percent: u8,
+    voice_hearing_distance: f32,
+    voice_frame_duration_ms: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -84,6 +112,11 @@ struct RawConfig {
     avatar_password: Option<String>,
     avatar_url: Option<String>,
     avatar_load_mode: Option<String>,
+    voice_enabled: Option<String>,
+    voice_audio_folder: Option<String>,
+    voice_speaker_percent: Option<String>,
+    voice_hearing_distance: Option<String>,
+    voice_frame_duration_ms: Option<String>,
 }
 
 impl Default for Config {
@@ -96,6 +129,11 @@ impl Default for Config {
             avatar_password: "default_avatar_password".to_string(),
             avatar_url: "http://localhost/avatar".to_string(),
             avatar_load_mode: 1,
+            voice_enabled: false,
+            voice_audio_folder: DEFAULT_VOICE_AUDIO_FOLDER.to_string(),
+            voice_speaker_percent: DEFAULT_VOICE_SPEAKER_PERCENT,
+            voice_hearing_distance: DEFAULT_VOICE_HEARING_DISTANCE,
+            voice_frame_duration_ms: DEFAULT_VOICE_FRAME_DURATION_MS,
         }
     }
 }
@@ -144,21 +182,84 @@ impl Config {
                 defaults.avatar_load_mode,
                 "AvatarLoadMode",
             ),
+            voice_enabled: parse_or_default(
+                raw.voice_enabled,
+                defaults.voice_enabled,
+                "VoiceEnabled",
+            ),
+            voice_audio_folder: raw
+                .voice_audio_folder
+                .filter(|s| !s.is_empty())
+                .unwrap_or(defaults.voice_audio_folder),
+            voice_speaker_percent: parse_or_default(
+                raw.voice_speaker_percent,
+                defaults.voice_speaker_percent,
+                "VoiceSpeakerPercent",
+            )
+            .min(100),
+            voice_hearing_distance: sanitize_voice_distance(parse_or_default(
+                raw.voice_hearing_distance,
+                defaults.voice_hearing_distance,
+                "VoiceHearingDistance",
+            )),
+            voice_frame_duration_ms: sanitize_voice_frame_duration(parse_or_default(
+                raw.voice_frame_duration_ms,
+                defaults.voice_frame_duration_ms,
+                "VoiceFrameDurationMs",
+            )),
         }
     }
 
     fn to_pretty_xml(&self) -> String {
         format!(
-            "<Configuration>\n  <Password>{}</Password>\n  <Ip>{}</Ip>\n  <Port>{}</Port>\n  <ClientCount>{}</ClientCount>\n  <AvatarPassword>{}</AvatarPassword>\n  <AvatarUrl>{}</AvatarUrl>\n  <AvatarLoadMode>{}</AvatarLoadMode>\n</Configuration>\n",
+            "<Configuration>\n  <Password>{}</Password>\n  <Ip>{}</Ip>\n  <Port>{}</Port>\n  <ClientCount>{}</ClientCount>\n  <AvatarPassword>{}</AvatarPassword>\n  <AvatarUrl>{}</AvatarUrl>\n  <AvatarLoadMode>{}</AvatarLoadMode>\n  <VoiceEnabled>{}</VoiceEnabled>\n  <VoiceAudioFolder>{}</VoiceAudioFolder>\n  <VoiceSpeakerPercent>{}</VoiceSpeakerPercent>\n  <VoiceHearingDistance>{}</VoiceHearingDistance>\n  <VoiceFrameDurationMs>{}</VoiceFrameDurationMs>\n</Configuration>\n",
             escape_xml(&self.password),
             escape_xml(&self.ip),
             self.port,
             self.client_count,
             escape_xml(&self.avatar_password),
             escape_xml(&self.avatar_url),
-            self.avatar_load_mode
+            self.avatar_load_mode,
+            self.voice_enabled,
+            escape_xml(&self.voice_audio_folder),
+            self.voice_speaker_percent,
+            self.voice_hearing_distance,
+            self.voice_frame_duration_ms
         )
     }
+}
+
+fn sanitize_voice_distance(value: f32) -> f32 {
+    if value.is_finite() && value >= 0.0 {
+        value
+    } else {
+        warn!(
+            "invalid voice hearing distance {value}; using default {}",
+            DEFAULT_VOICE_HEARING_DISTANCE
+        );
+        DEFAULT_VOICE_HEARING_DISTANCE
+    }
+}
+
+fn sanitize_voice_frame_duration(value: u64) -> u64 {
+    if value > 0 {
+        value
+    } else {
+        warn!(
+            "invalid voice frame duration {value}; using default {}ms",
+            DEFAULT_VOICE_FRAME_DURATION_MS
+        );
+        DEFAULT_VOICE_FRAME_DURATION_MS
+    }
+}
+
+fn resolve_relative_to_config(config_path: &Path, configured_path: &str) -> String {
+    let path = PathBuf::from(configured_path);
+    if path.is_absolute() {
+        return path.to_string_lossy().to_string();
+    }
+    let base = config_path.parent().unwrap_or_else(|| Path::new("."));
+    base.join(path).to_string_lossy().to_string()
 }
 
 fn escape_xml(value: &str) -> String {
@@ -178,7 +279,7 @@ where
         Some(text) if !text.is_empty() => match text.parse::<T>() {
             Ok(value) => value,
             Err(_) => {
-                warn!("invalid integer config field {field}={text:?}; using default");
+                warn!("invalid config field {field}={text:?}; using default");
                 default
             }
         },
@@ -418,6 +519,10 @@ impl PoseState {
         self.base[0] += rng.gen_range(-0.25..=0.25);
         self.base[1] += rng.gen_range(-0.25..=0.25);
         self.base[2] += rng.gen_range(-0.25..=0.25);
+    }
+
+    fn position(&self) -> [f32; 3] {
+        self.base
     }
 
     fn high_quality_payload(&mut self, elapsed_secs: f32) -> Vec<u8> {
@@ -692,6 +797,7 @@ struct BasisClient {
     connected: AtomicBool,
     in_use: AtomicBool,
     movement_sequence: AtomicU8,
+    voice_sequence: AtomicU8,
     reliable_sequence: AtomicU16,
     ping_sequence: AtomicU16,
     pending_reliable: Mutex<VecDeque<ReliableSend>>,
@@ -721,6 +827,7 @@ impl BasisClient {
             connected: AtomicBool::new(false),
             in_use: AtomicBool::new(false),
             movement_sequence: AtomicU8::new(0),
+            voice_sequence: AtomicU8::new(0),
             reliable_sequence: AtomicU16::new(0),
             ping_sequence: AtomicU16::new(0),
             pending_reliable: Mutex::new(VecDeque::new()),
@@ -806,6 +913,21 @@ impl BasisClient {
         );
         self.socket.send_to(&packet, self.server_addr).await?;
         Ok(())
+    }
+
+    async fn current_position(&self) -> [f32; 3] {
+        self.pose.lock().await.position()
+    }
+
+    async fn remote_peer_id(&self) -> Option<u16> {
+        let id = *self.remote_peer_id.lock().await;
+        id.and_then(|id| {
+            if (0..=u16::MAX as i32).contains(&id) {
+                Some(id as u16)
+            } else {
+                None
+            }
+        })
     }
 
     async fn send_reliable_ordered(&self, channel: u8, payload: &[u8]) -> Result<()> {
@@ -1074,6 +1196,354 @@ fn read_bytes_message(data: &[u8]) -> Option<&[u8]> {
     data.get(2..2 + len)
 }
 
+#[derive(Debug, Clone)]
+struct VoiceLibrary {
+    clips: Vec<VoiceClip>,
+}
+
+#[derive(Debug, Clone)]
+struct VoiceClip {
+    path: PathBuf,
+    packets: Arc<OggOpusPackets>,
+}
+
+impl VoiceLibrary {
+    fn load(folder: &str, reencode: bool, frame_duration_ms: u64) -> Result<Option<Self>> {
+        let folder = PathBuf::from(folder);
+        let folder = if folder.is_absolute() {
+            folder
+        } else {
+            std::env::current_dir()?.join(folder)
+        };
+        info!(
+            "scanning voice audio folder {} (ffmpeg_reencode={})",
+            folder.display(),
+            reencode
+        );
+        if !folder.exists() {
+            warn!("voice audio folder does not exist: {}", folder.display());
+            return Ok(None);
+        }
+        if !folder.is_dir() {
+            warn!("voice audio path is not a folder: {}", folder.display());
+            return Ok(None);
+        }
+
+        let mut clips = Vec::new();
+        for entry in std::fs::read_dir(&folder)
+            .with_context(|| format!("reading voice audio folder {}", folder.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() && is_ogg_opus_path(&path) {
+                let load_result = if reencode {
+                    OggOpusPackets::load_reencoded(&path, frame_duration_ms)
+                } else {
+                    OggOpusPackets::load(&path)
+                };
+                match load_result {
+                    Ok(packets) => clips.push(VoiceClip {
+                        path,
+                        packets: Arc::new(packets),
+                    }),
+                    Err(err) => warn!(
+                        "excluding unusable voice audio file {}: {err:#}",
+                        path.display()
+                    ),
+                }
+            }
+        }
+        clips.sort_by(|a, b| a.path.cmp(&b.path));
+
+        if clips.is_empty() {
+            warn!(
+                "voice audio folder contains no .opus or .ogg files: {}",
+                folder.display()
+            );
+            return Ok(None);
+        }
+
+        info!(
+            "voice audio folder loaded {} usable Ogg Opus file(s)",
+            clips.len()
+        );
+        Ok(Some(Self { clips }))
+    }
+
+    fn random_clip(&self) -> Option<VoiceClip> {
+        if self.clips.is_empty() {
+            return None;
+        }
+        let idx = rand::thread_rng().gen_range(0..self.clips.len());
+        Some(self.clips[idx].clone())
+    }
+}
+
+fn is_ogg_opus_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("opus") || ext.eq_ignore_ascii_case("ogg"))
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone)]
+struct OggOpusPackets {
+    packets: Vec<OpusPacket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpusPacket {
+    data: Vec<u8>,
+    duration_ms: u64,
+}
+
+impl OggOpusPackets {
+    fn load(path: &Path) -> Result<Self> {
+        let bytes =
+            std::fs::read(path).with_context(|| format!("reading Opus file {}", path.display()))?;
+        Self::parse(&bytes).with_context(|| format!("parsing Ogg Opus file {}", path.display()))
+    }
+
+    fn load_reencoded(path: &Path, frame_duration_ms: u64) -> Result<Self> {
+        let output_path =
+            std::env::temp_dir().join(format!("basis-rust-client-voice-{}.opus", Uuid::new_v4()));
+        let output = Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-y")
+            .arg("-i")
+            .arg(path)
+            .arg("-vn")
+            .arg("-ac")
+            .arg("1")
+            .arg("-ar")
+            .arg("48000")
+            .arg("-c:a")
+            .arg("libopus")
+            .arg("-b:a")
+            .arg("32000")
+            .arg("-application")
+            .arg("audio")
+            .arg("-frame_duration")
+            .arg(frame_duration_ms.to_string())
+            .arg(&output_path)
+            .output()
+            .with_context(|| {
+                format!(
+                    "running ffmpeg to re-encode {} to 48kHz mono Opus",
+                    path.display()
+                )
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let _ = std::fs::remove_file(&output_path);
+            return Err(anyhow!(
+                "ffmpeg failed to re-encode {}: {}",
+                path.display(),
+                stderr.trim()
+            ));
+        }
+
+        let result = Self::load(&output_path).with_context(|| {
+            format!(
+                "reading ffmpeg re-encoded Opus output for {}",
+                path.display()
+            )
+        });
+        let _ = std::fs::remove_file(&output_path);
+        result
+    }
+
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        let mut pos = 0;
+        let mut current_packet = Vec::new();
+        let mut packets = Vec::new();
+
+        while pos < bytes.len() {
+            if bytes.len() - pos < 27 {
+                return Err(anyhow!("truncated Ogg page header at byte {pos}"));
+            }
+            if &bytes[pos..pos + 4] != b"OggS" {
+                return Err(anyhow!("invalid Ogg capture pattern at byte {pos}"));
+            }
+            let page_segments = bytes[pos + 26] as usize;
+            let segment_table_start = pos + 27;
+            let segment_table_end = segment_table_start + page_segments;
+            if segment_table_end > bytes.len() {
+                return Err(anyhow!("truncated Ogg segment table at byte {pos}"));
+            }
+            let data_len: usize = bytes[segment_table_start..segment_table_end]
+                .iter()
+                .map(|segment| *segment as usize)
+                .sum();
+            let data_start = segment_table_end;
+            let data_end = data_start + data_len;
+            if data_end > bytes.len() {
+                return Err(anyhow!("truncated Ogg page data at byte {pos}"));
+            }
+
+            let mut data_pos = data_start;
+            for segment_len in &bytes[segment_table_start..segment_table_end] {
+                let segment_len = *segment_len as usize;
+                current_packet.extend_from_slice(&bytes[data_pos..data_pos + segment_len]);
+                data_pos += segment_len;
+                if segment_len < 255 {
+                    if is_playable_opus_packet(&current_packet) {
+                        let data = std::mem::take(&mut current_packet);
+                        let duration_ms = opus_packet_duration_ms(&data)
+                            .unwrap_or(DEFAULT_VOICE_FRAME_DURATION_MS);
+                        packets.push(OpusPacket { data, duration_ms });
+                    } else {
+                        current_packet.clear();
+                    }
+                }
+            }
+
+            pos = data_end;
+        }
+
+        if !current_packet.is_empty() {
+            return Err(anyhow!("truncated Ogg packet at end of stream"));
+        }
+        if packets.is_empty() {
+            return Err(anyhow!("Ogg Opus file contains no playable Opus packets"));
+        }
+
+        Ok(Self { packets })
+    }
+}
+
+fn is_playable_opus_packet(packet: &[u8]) -> bool {
+    !packet.is_empty() && !packet.starts_with(b"OpusHead") && !packet.starts_with(b"OpusTags")
+}
+
+fn opus_packet_duration_ms(packet: &[u8]) -> Option<u64> {
+    let toc = *packet.first()?;
+    let frame_count = match toc & 0x03 {
+        0 => 1,
+        1 | 2 => 2,
+        3 => {
+            let count_byte = *packet.get(1)?;
+            (count_byte & 0x3f) as u64
+        }
+        _ => return None,
+    };
+    if frame_count == 0 {
+        return None;
+    }
+    let config = toc >> 3;
+    let frame_duration_us = match config {
+        0..=11 => {
+            let index = config & 0x03;
+            match index {
+                0 => 10_000,
+                1 => 20_000,
+                2 => 40_000,
+                3 => 60_000,
+                _ => return None,
+            }
+        }
+        12..=15 => {
+            if (config & 0x01) == 0 {
+                10_000
+            } else {
+                20_000
+            }
+        }
+        16..=19 => {
+            let index = config & 0x03;
+            match index {
+                0 => 2_500,
+                1 => 5_000,
+                2 => 10_000,
+                3 => 20_000,
+                _ => return None,
+            }
+        }
+        20..=31 => {
+            let index = config & 0x03;
+            match index {
+                0 => 2_500,
+                1 => 5_000,
+                2 => 10_000,
+                3 => 20_000,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    Some(((frame_duration_us * frame_count) + 999) / 1000)
+}
+
+fn voice_speaker_target(connected_count: usize, percent: u8) -> usize {
+    let percent = percent.min(100) as usize;
+    if connected_count == 0 || percent == 0 {
+        return 0;
+    }
+    ((connected_count * percent) + 99) / 100
+}
+
+fn choose_next_speaker(
+    connected: &[usize],
+    active: &HashSet<usize>,
+    avoid: &HashSet<usize>,
+) -> Option<usize> {
+    let eligible = connected
+        .iter()
+        .copied()
+        .filter(|idx| !active.contains(idx))
+        .collect::<Vec<_>>();
+    if eligible.is_empty() {
+        return None;
+    }
+    let preferred = eligible
+        .iter()
+        .copied()
+        .filter(|idx| !avoid.contains(idx))
+        .collect::<Vec<_>>();
+    let candidates = if preferred.is_empty() {
+        eligible
+    } else {
+        preferred
+    };
+    Some(candidates[rand::thread_rng().gen_range(0..candidates.len())])
+}
+
+fn serialize_voice_recipients_small(recipients: &[u16]) -> Vec<u8> {
+    let mut writer = NetWriter::with_capacity(1 + recipients.len() * 2);
+    writer.put_u8(recipients.len().min(u8::MAX as usize) as u8);
+    for recipient in recipients.iter().take(u8::MAX as usize) {
+        writer.put_u16(*recipient);
+    }
+    writer.into_vec()
+}
+
+fn serialize_voice_recipients_large(recipients: &[u16]) -> Vec<u8> {
+    let mut writer = NetWriter::with_capacity(2 + recipients.len() * 2);
+    writer.put_u16(recipients.len().min(u16::MAX as usize) as u16);
+    for recipient in recipients.iter().take(u16::MAX as usize) {
+        writer.put_u16(*recipient);
+    }
+    writer.into_vec()
+}
+
+fn serialize_audio_segment(sequence: u8, opus_packet: &[u8]) -> Vec<u8> {
+    let mut writer = NetWriter::with_capacity(2 + opus_packet.len());
+    writer.put_u8(sequence);
+    writer.put_u8(0);
+    writer.put_bytes(opus_packet);
+    writer.into_vec()
+}
+
+fn distance_within(a: [f32; 3], b: [f32; 3], max_distance: f32) -> bool {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    dx * dx + dy * dy + dz * dz <= max_distance * max_distance
+}
+
 fn resolve_addr(ip: &str, port: u16) -> Result<SocketAddr> {
     (ip, port)
         .to_socket_addrs()?
@@ -1231,6 +1701,243 @@ async fn movement_workers(clients: Arc<Mutex<Vec<Arc<BasisClient>>>>, shutdown: 
     }
 }
 
+async fn voice_workers(
+    clients: Arc<Mutex<Vec<Arc<BasisClient>>>>,
+    config: Config,
+    library: Arc<VoiceLibrary>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<usize>();
+    let mut active = HashSet::<usize>::new();
+    let frame_duration = Duration::from_millis(config.voice_frame_duration_ms);
+    let mut refill_tick = time::interval(Duration::from_millis(250));
+
+    loop {
+        refill_tick.tick().await;
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let mut recently_finished = HashSet::new();
+        while let Ok(index) = done_rx.try_recv() {
+            active.remove(&index);
+            recently_finished.insert(index);
+        }
+
+        let snapshot = clients.lock().await.clone();
+        let connected = snapshot
+            .iter()
+            .filter(|client| client.connected.load(Ordering::Relaxed))
+            .map(|client| client.index)
+            .collect::<Vec<_>>();
+        let connected_set = connected.iter().copied().collect::<HashSet<_>>();
+        active.retain(|index| connected_set.contains(index));
+
+        let target = voice_speaker_target(connected.len(), config.voice_speaker_percent);
+        while active.len() < target {
+            let Some(index) = choose_next_speaker(&connected, &active, &recently_finished) else {
+                break;
+            };
+            let Some(client) = snapshot
+                .iter()
+                .find(|client| client.index == index)
+                .cloned()
+            else {
+                break;
+            };
+            let Some(clip) = library.random_clip() else {
+                active.remove(&index);
+                break;
+            };
+            active.insert(index);
+
+            let clients = clients.clone();
+            let shutdown = shutdown.clone();
+            let done_tx = done_tx.clone();
+            let hearing_distance = config.voice_hearing_distance;
+            tokio::spawn(async move {
+                voice_playback_task(
+                    client,
+                    clients,
+                    clip,
+                    hearing_distance,
+                    frame_duration,
+                    shutdown,
+                    done_tx,
+                )
+                .await;
+            });
+        }
+    }
+}
+
+async fn voice_playback_task(
+    client: Arc<BasisClient>,
+    clients: Arc<Mutex<Vec<Arc<BasisClient>>>>,
+    clip: VoiceClip,
+    hearing_distance: f32,
+    frame_duration: Duration,
+    shutdown: Arc<AtomicBool>,
+    done_tx: mpsc::UnboundedSender<usize>,
+) {
+    let index = client.index;
+    let result = async {
+        let non_default_packets = clip
+            .packets
+            .packets
+            .iter()
+            .filter(|packet| packet.duration_ms != frame_duration.as_millis() as u64)
+            .count();
+        if non_default_packets > 0 {
+            info!(
+                "voice file {} contains {}/{} packets not matching configured {}ms pacing; using per-packet Opus durations",
+                clip.path.display(),
+                non_default_packets,
+                clip.packets.packets.len(),
+                frame_duration.as_millis()
+            );
+        }
+        let mut last_recipients = Vec::<u16>::new();
+        let mut last_refresh = None::<time::Instant>;
+        let mut published_once = false;
+        let mut logged_first_send = false;
+        let mut next_packet_at = time::Instant::now();
+        let max_lag = Duration::from_millis(DEFAULT_VOICE_FRAME_DURATION_MS * 5);
+        let mut packets_sent = 0usize;
+        let mut packets_skipped = 0usize;
+        let mut playback_started = time::Instant::now();
+
+        for packet in clip.packets.packets.iter() {
+            if shutdown.load(Ordering::Relaxed) || !client.connected.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let now = time::Instant::now();
+            if next_packet_at > now {
+                time::sleep_until(next_packet_at).await;
+            } else if now.duration_since(next_packet_at) > max_lag {
+                next_packet_at = now;
+            }
+
+            let should_refresh = last_refresh
+                .map(|instant| instant.elapsed() >= Duration::from_secs(1))
+                .unwrap_or(true);
+            if !published_once || should_refresh {
+                let snapshot = clients.lock().await.clone();
+                let exclusions =
+                    voice_exclusions_for_inverted_recipients(&client, &snapshot, hearing_distance)
+                        .await;
+                if !published_once || exclusions != last_recipients {
+                    publish_voice_recipient_exclusions(&client, &exclusions).await?;
+                    last_recipients = exclusions;
+                    published_once = true;
+                }
+                last_refresh = Some(time::Instant::now());
+            }
+
+            if packet.data.len() > MAX_VOICE_PACKET_BYTES {
+                packets_skipped += 1;
+                warn!(
+                    "skipping oversized voice packet for client {} from {}: {} bytes",
+                    client.index,
+                    clip.path.display(),
+                    packet.data.len()
+                );
+            } else if packet.duration_ms > MAX_UNITY_VOICE_FRAME_DURATION_MS {
+                packets_skipped += 1;
+                warn!(
+                    "skipping voice packet for client {} from {}: {}ms exceeds Unity voice max {}ms",
+                    client.index,
+                    clip.path.display(),
+                    packet.duration_ms,
+                    MAX_UNITY_VOICE_FRAME_DURATION_MS
+                );
+            } else {
+                let sequence = client.voice_sequence.fetch_add(1, Ordering::SeqCst);
+                let payload = serialize_audio_segment(sequence, &packet.data);
+                client.send_unreliable(channels::VOICE, &payload).await?;
+                packets_sent += 1;
+                if !logged_first_send {
+                    logged_first_send = true;
+                    playback_started = time::Instant::now();
+                    info!(
+                        "client {} sent first voice packet from {} (opus_bytes={} wire_bytes={})",
+                        client.index,
+                        clip.path.display(),
+                        packet.data.len(),
+                        payload.len()
+                    );
+                }
+            }
+            next_packet_at += Duration::from_millis(packet.duration_ms.max(1));
+        }
+
+        if packets_sent > 0 || packets_skipped > 0 {
+            info!(
+                "client {} finished voice playback from {} (sent={} skipped={} elapsed_ms={})",
+                client.index,
+                clip.path.display(),
+                packets_sent,
+                packets_skipped,
+                playback_started.elapsed().as_millis()
+            );
+        }
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if let Err(err) = result {
+        warn!(
+            "voice playback failed for client {} using {}: {err:#}",
+            index,
+            clip.path.display()
+        );
+    }
+    let _ = done_tx.send(index);
+}
+
+async fn voice_exclusions_for_inverted_recipients(
+    speaker: &BasisClient,
+    clients: &[Arc<BasisClient>],
+    hearing_distance: f32,
+) -> Vec<u16> {
+    let speaker_position = speaker.current_position().await;
+    let mut exclusions = Vec::new();
+    for candidate in clients {
+        if candidate.index == speaker.index || !candidate.connected.load(Ordering::Relaxed) {
+            continue;
+        }
+        let Some(peer_id) = candidate.remote_peer_id().await else {
+            continue;
+        };
+        let position = candidate.current_position().await;
+        if !distance_within(speaker_position, position, hearing_distance) {
+            exclusions.push(peer_id);
+        }
+    }
+    exclusions.sort_unstable();
+    exclusions.dedup();
+    exclusions
+}
+
+async fn publish_voice_recipient_exclusions(
+    client: &BasisClient,
+    exclusions: &[u16],
+) -> Result<()> {
+    if exclusions.len() <= u8::MAX as usize {
+        let payload = serialize_voice_recipients_small(exclusions);
+        client
+            .send_reliable_ordered(channels::AUDIO_RECIPIENTS_INVERTED, &payload)
+            .await
+    } else {
+        let payload = serialize_voice_recipients_large(exclusions);
+        client
+            .send_reliable_ordered(channels::AUDIO_RECIPIENTS_INVERTED_LARGE, &payload)
+            .await
+    }
+}
+
 async fn random_reconnect_loop(
     clients: Arc<Mutex<Vec<Arc<BasisClient>>>>,
     config: Config,
@@ -1307,7 +2014,8 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let mut config = Config::load_or_create(&args.config)?;
+    let config_path = args.config.clone();
+    let mut config = Config::load_or_create(&config_path)?;
     if let Some(ip) = args.ip {
         config.ip = ip;
     }
@@ -1317,6 +2025,50 @@ async fn main() -> Result<()> {
     if let Some(clients) = args.clients {
         config.client_count = clients;
     }
+    if args.voice {
+        config.voice_enabled = true;
+    }
+    if let Some(folder) = args.voice_audio_folder {
+        config.voice_audio_folder = folder.to_string_lossy().to_string();
+    } else {
+        config.voice_audio_folder =
+            resolve_relative_to_config(&config_path, &config.voice_audio_folder);
+    }
+    if let Some(percent) = args.voice_speaker_percent {
+        config.voice_speaker_percent = percent.min(100);
+    }
+    if let Some(distance) = args.voice_hearing_distance {
+        config.voice_hearing_distance = sanitize_voice_distance(distance);
+    }
+    if let Some(frame_duration) = args.voice_frame_duration_ms {
+        config.voice_frame_duration_ms = sanitize_voice_frame_duration(frame_duration);
+    }
+    let voice_reencode = !args.no_voice_reencode;
+
+    let voice_library = if config.voice_enabled {
+        info!(
+            "voice simulation requested: folder={} speaker_percent={} hearing_distance={} frame_duration_ms={} ffmpeg_reencode={}",
+            config.voice_audio_folder,
+            config.voice_speaker_percent,
+            config.voice_hearing_distance,
+            config.voice_frame_duration_ms,
+            voice_reencode
+        );
+        match VoiceLibrary::load(
+            &config.voice_audio_folder,
+            voice_reencode,
+            config.voice_frame_duration_ms,
+        ) {
+            Ok(Some(library)) => Some(Arc::new(library)),
+            Ok(None) => None,
+            Err(err) => {
+                warn!("failed to load voice audio library: {err:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     info!(
         "starting {} clients against {}:{}",
@@ -1407,6 +2159,24 @@ async fn main() -> Result<()> {
     if !args.no_movement && !shutdown.load(Ordering::Relaxed) {
         movement_workers(managed_clients.clone(), shutdown.clone()).await;
     }
+    if let Some(voice_library) = voice_library {
+        if !shutdown.load(Ordering::Relaxed) {
+            info!(
+                "voice simulation enabled: folder={} speaker_percent={} hearing_distance={} frame_duration_ms={} ffmpeg_reencode={}",
+                config.voice_audio_folder,
+                config.voice_speaker_percent,
+                config.voice_hearing_distance,
+                config.voice_frame_duration_ms,
+                voice_reencode
+            );
+            tokio::spawn(voice_workers(
+                managed_clients.clone(),
+                config.clone(),
+                voice_library,
+                shutdown.clone(),
+            ));
+        }
+    }
     if !args.no_reconnect && !shutdown.load(Ordering::Relaxed) {
         tokio::spawn(random_reconnect_loop(
             managed_clients.clone(),
@@ -1445,10 +2215,154 @@ mod tests {
         let config = Config::default();
         let ready = ReadyMessage::new(&config, [0.0, 0.0, 0.0]).unwrap();
         let payload = build_connection_payload(&config, &ready);
-        assert_eq!(&payload[0..2], &[0x20, 0x00]);
+        assert_eq!(&payload[0..2], &SERVER_VERSION.to_le_bytes());
         let auth_len = u16::from_le_bytes([payload[2], payload[3]]) as usize;
         assert_eq!(&payload[4..4 + auth_len], b"default_password");
         assert!(payload.len() > 4 + auth_len);
+    }
+
+    #[test]
+    fn voice_config_defaults_are_disabled_and_conservative() {
+        let config = Config::default();
+        assert!(!config.voice_enabled);
+        assert_eq!(config.voice_audio_folder, "audio");
+        assert_eq!(config.voice_speaker_percent, 10);
+        assert_eq!(config.voice_hearing_distance, 25.0);
+        assert_eq!(config.voice_frame_duration_ms, 20);
+    }
+
+    #[test]
+    fn voice_config_parses_xml_fields() {
+        let raw = quick_xml::de::from_str::<RawConfig>(
+            r#"<Configuration>
+                <VoiceEnabled>true</VoiceEnabled>
+                <VoiceAudioFolder>samples</VoiceAudioFolder>
+                <VoiceSpeakerPercent>35</VoiceSpeakerPercent>
+                <VoiceHearingDistance>12.5</VoiceHearingDistance>
+                <VoiceFrameDurationMs>40</VoiceFrameDurationMs>
+            </Configuration>"#,
+        )
+        .unwrap();
+        let config = Config::from_raw(raw);
+        assert!(config.voice_enabled);
+        assert_eq!(config.voice_audio_folder, "samples");
+        assert_eq!(config.voice_speaker_percent, 35);
+        assert_eq!(config.voice_hearing_distance, 12.5);
+        assert_eq!(config.voice_frame_duration_ms, 40);
+    }
+
+    #[test]
+    fn invalid_voice_config_values_fall_back_or_clamp() {
+        let config = Config::from_raw(RawConfig {
+            voice_speaker_percent: Some("250".to_string()),
+            voice_hearing_distance: Some("NaN".to_string()),
+            voice_frame_duration_ms: Some("0".to_string()),
+            ..RawConfig::default()
+        });
+        assert_eq!(config.voice_speaker_percent, 100);
+        assert_eq!(
+            config.voice_hearing_distance,
+            DEFAULT_VOICE_HEARING_DISTANCE
+        );
+        assert_eq!(
+            config.voice_frame_duration_ms,
+            DEFAULT_VOICE_FRAME_DURATION_MS
+        );
+    }
+
+    #[test]
+    fn relative_voice_audio_folder_resolves_from_config_directory() {
+        let resolved = resolve_relative_to_config(
+            Path::new(r"C:\work\BasisRustClient\Config.xml"),
+            DEFAULT_VOICE_AUDIO_FOLDER,
+        );
+        assert!(resolved.ends_with(r"BasisRustClient\audio"));
+
+        let absolute = resolve_relative_to_config(
+            Path::new(r"C:\work\BasisRustClient\Config.xml"),
+            r"C:\samples\voice",
+        );
+        assert_eq!(absolute, r"C:\samples\voice");
+    }
+
+    #[test]
+    fn voice_recipient_serialization_uses_expected_wire_formats() {
+        assert_eq!(
+            serialize_voice_recipients_small(&[7, 300]),
+            vec![2, 7, 0, 44, 1]
+        );
+
+        let large = serialize_voice_recipients_large(&[7, 300]);
+        assert_eq!(large, vec![2, 0, 7, 0, 44, 1]);
+    }
+
+    #[test]
+    fn audio_segment_serialization_matches_unity_wire_header() {
+        assert_eq!(
+            serialize_audio_segment(9, &[0xaa, 0xbb, 0xcc]),
+            vec![9, 0, 0xaa, 0xbb, 0xcc]
+        );
+    }
+
+    #[test]
+    fn voice_distance_filter_includes_boundary() {
+        assert!(distance_within([0.0, 0.0, 0.0], [25.0, 0.0, 0.0], 25.0));
+        assert!(!distance_within([0.0, 0.0, 0.0], [25.01, 0.0, 0.0], 25.0));
+    }
+
+    #[test]
+    fn ogg_opus_parser_skips_headers_and_extracts_audio_packets() {
+        let mut bytes = Vec::new();
+        bytes.extend(build_ogg_page(&[
+            b"OpusHead".as_slice(),
+            b"OpusTags".as_slice(),
+            b"abc".as_slice(),
+        ]));
+        let packets = OggOpusPackets::parse(&bytes).unwrap();
+        assert_eq!(packets.packets[0].data, b"abc".to_vec());
+    }
+
+    #[test]
+    fn ogg_opus_parser_reconstructs_packet_across_pages() {
+        let mut bytes = Vec::new();
+        bytes.extend(build_ogg_page_from_segments(&[255], &[1; 255]));
+        bytes.extend(build_ogg_page_from_segments(&[3], &[2, 3, 4]));
+        let packets = OggOpusPackets::parse(&bytes).unwrap();
+        let mut expected = vec![1; 255];
+        expected.extend_from_slice(&[2, 3, 4]);
+        assert_eq!(packets.packets[0].data, expected);
+    }
+
+    #[test]
+    fn ogg_opus_parser_rejects_malformed_pages() {
+        assert!(OggOpusPackets::parse(b"not ogg").is_err());
+    }
+
+    #[test]
+    fn opus_packet_duration_parses_common_frame_sizes() {
+        assert_eq!(opus_packet_duration_ms(&[0x08]), Some(20));
+        assert_eq!(opus_packet_duration_ms(&[0x10]), Some(40));
+        assert_eq!(opus_packet_duration_ms(&[0x18]), Some(60));
+        assert_eq!(opus_packet_duration_ms(&[0x09]), Some(40));
+        assert_eq!(opus_packet_duration_ms(&[0x0b, 0x03]), Some(60));
+        assert_eq!(opus_packet_duration_ms(&[0xf8]), Some(20));
+    }
+
+    #[test]
+    fn voice_speaker_target_uses_ceil_and_clamping() {
+        assert_eq!(voice_speaker_target(250, 10), 25);
+        assert_eq!(voice_speaker_target(1, 10), 1);
+        assert_eq!(voice_speaker_target(250, 0), 0);
+        assert_eq!(voice_speaker_target(3, 250), 3);
+    }
+
+    #[test]
+    fn eof_replacement_prefers_another_peer_when_available() {
+        let connected = [1, 2, 3];
+        let active = HashSet::new();
+        let avoid = HashSet::from([1]);
+        let replacement = choose_next_speaker(&connected, &active, &avoid).unwrap();
+        assert_ne!(replacement, 1);
     }
 
     #[test]
@@ -1586,6 +2500,26 @@ mod tests {
             )),
             DeliveryMethod::Sequenced
         );
+    }
+
+    fn build_ogg_page(packets: &[&[u8]]) -> Vec<u8> {
+        let mut segments = Vec::new();
+        let mut data = Vec::new();
+        for packet in packets {
+            assert!(packet.len() < 255);
+            segments.push(packet.len() as u8);
+            data.extend_from_slice(packet);
+        }
+        build_ogg_page_from_segments(&segments, &data)
+    }
+
+    fn build_ogg_page_from_segments(segments: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut page = vec![0; 27];
+        page[0..4].copy_from_slice(b"OggS");
+        page[26] = segments.len() as u8;
+        page.extend_from_slice(segments);
+        page.extend_from_slice(data);
+        page
     }
 
     fn read_lnl_string(bytes: &[u8], offset: usize) -> (String, usize) {
