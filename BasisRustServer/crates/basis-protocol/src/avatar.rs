@@ -249,6 +249,19 @@ pub fn encode_avatar_bundle(items: &[AvatarBundleItem]) -> Result<Vec<u8>> {
 }
 
 pub fn encode_avatar_bundle_slices(items: &[AvatarBundleSlice<'_>]) -> Result<Vec<u8>> {
+    Ok(try_encode_avatar_bundle_slices(items)?.bytes)
+}
+
+#[derive(Debug, Clone)]
+pub struct EncodedAvatarBundle {
+    pub bytes: Vec<u8>,
+    pub raw_len: usize,
+    pub compressed_len: usize,
+}
+
+pub fn try_encode_avatar_bundle_slices(
+    items: &[AvatarBundleSlice<'_>],
+) -> Result<EncodedAvatarBundle> {
     anyhow::ensure!(items.len() <= u8::MAX as usize, "too many bundle items");
     let mut raw = NetWriter::new();
     for item in items {
@@ -280,7 +293,11 @@ pub fn encode_avatar_bundle_slices(items: &[AvatarBundleSlice<'_>]) -> Result<Ve
     out.put_u8(items.len() as u8);
     out.put_u16(raw.len() as u16);
     out.put_bytes(&compressed);
-    Ok(out.into_vec())
+    Ok(EncodedAvatarBundle {
+        bytes: out.into_vec(),
+        raw_len: raw.len(),
+        compressed_len: compressed.len(),
+    })
 }
 
 pub fn decode_avatar_bundle(bytes: &[u8]) -> Result<Vec<AvatarBundleItem>> {

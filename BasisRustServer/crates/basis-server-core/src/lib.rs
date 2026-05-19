@@ -134,6 +134,7 @@ impl ServerState {
                 tick_budget_ms: avatar_sync::DEFAULT_AVATAR_TICK_BUDGET_MS,
                 receiver_cycle_budget_ms: avatar_sync::DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
                 spatial_cull_enabled: false,
+                enable_bsr_profiling: config.enable_bsrprofiling,
             }
             .apply_env_tuning(),
         );
@@ -195,6 +196,7 @@ impl ServerState {
                 tick_budget_ms: avatar_sync::DEFAULT_AVATAR_TICK_BUDGET_MS,
                 receiver_cycle_budget_ms: avatar_sync::DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
                 spatial_cull_enabled: false,
+                enable_bsr_profiling: config.enable_bsrprofiling,
             }
             .apply_env_tuning(),
         );
