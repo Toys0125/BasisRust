@@ -14,6 +14,7 @@ This is a headless client implementation that mimics the behavior of the Basis V
 - Movement and camera simulation
 - Chat support
 - Resource loading simulation
+- Opt-in voice simulation from Ogg Opus files
 - Automatic reconnection
 
 ## Running
@@ -28,9 +29,30 @@ Configuration is read from `Config.xml` by default. You can specify a different 
 cargo run --release -- --help
 ```
 
+Voice simulation is disabled by default. By default, it requires `ffmpeg` on
+`PATH` to re-encode input files into Unity-compatible voice packets. To enable
+it, place `.opus` or `.ogg` Ogg Opus files in the configured audio folder, then run:
+
+```powershell
+cargo run --release -- --voice --voice-audio-folder audio --voice-speaker-percent 10
+```
+
+The client re-encodes each input file through `ffmpeg` into 48 kHz mono Opus with
+20 ms frames, then sends those packets over the Basis voice channel. Speaking
+clients send to peers within the configured hearing distance, which defaults to
+25 meters.
+
+To bypass the ffmpeg re-encode/cache path and send packetized input Opus directly:
+
+```powershell
+cargo run --release -- --voice --no-voice-reencode
+```
+
 ## Config
 
 The client reads a `Config.xml` file for configuration including avatar data, server settings, and behavior parameters.
+Voice settings include `VoiceEnabled`, `VoiceAudioFolder`, `VoiceSpeakerPercent`,
+`VoiceHearingDistance`, and `VoiceFrameDurationMs`.
 
 ## Building
 
