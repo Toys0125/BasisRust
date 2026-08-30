@@ -1,27 +1,35 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, RawFd};
+#[cfg(target_os = "linux")]
+use std::sync::mpsc as std_mpsc;
+
 use anyhow::{anyhow, Context, Result};
 use basis_protocol::{
+    avatar::{compress_scale, write_neutral_rotation_region, BitQuality as ProtocolBitQuality},
     channels,
-    io::{NetReader as ProtocolNetReader, NetWriter as ProtocolNetWriter},
+    io::NetWriter as ProtocolNetWriter,
     messages::{
-        BasisDeserialize, BasisSerialize, ClientAvatarChangeMessage as ProtocolClientAvatarChangeMessage,
+        BasisSerialize, ClientAvatarChangeMessage as ProtocolClientAvatarChangeMessage,
         ClientMetaDataMessage as ProtocolClientMetaDataMessage,
     },
     version::LITENETLIB_PROTOCOL_ID,
     version::SERVER_VERSION,
 };
+#[cfg(test)]
+use basis_protocol::{io::NetReader as ProtocolNetReader, messages::BasisDeserialize};
 use basis_transport::{DeliveryMethod, PacketProperty};
 use clap::Parser;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
@@ -48,6 +56,8 @@ const DEFAULT_VOICE_HEARING_DISTANCE: f32 = 25.0;
 const DEFAULT_VOICE_FRAME_DURATION_MS: u64 = 20;
 const MAX_UNITY_VOICE_FRAME_DURATION_MS: u64 = 40;
 const MAX_VOICE_PACKET_BYTES: usize = 1200;
+#[cfg(target_os = "linux")]
+static SHARED_RECEIVE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -66,8 +76,21 @@ struct Args {
     clients: Option<usize>,
     #[arg(long)]
     no_reconnect: bool,
+    #[arg(long, default_value_t = 60)]
+    reconnect_min_secs: u64,
+    #[arg(long, default_value_t = 1200)]
+    reconnect_max_secs: u64,
     #[arg(long)]
     no_movement: bool,
+    /// Use synchronized worker batches instead of the default per-client randomized cadence.
+    #[arg(long)]
+    sync_batching: bool,
+    /// Maximum movement interval jitter in percent when randomized cadence is active.
+    #[arg(long, default_value_t = 10)]
+    movement_jitter_percent: u8,
+    /// Maximum voice packet timing jitter in percent when randomized cadence is active.
+    #[arg(long, default_value_t = 5)]
+    voice_jitter_percent: u8,
     #[arg(long)]
     duration_secs: Option<u64>,
     #[arg(long, default_value_t = 100)]
@@ -135,8 +158,8 @@ impl Default for Config {
             ip: "localhost".to_string(),
             port: 4296,
             client_count: 250,
-            avatar_password: "default_avatar_password".to_string(),
-            avatar_url: "http://localhost/avatar".to_string(),
+            avatar_password: "N/A".to_string(),
+            avatar_url: "LoadingAvatar".to_string(),
             avatar_load_mode: 1,
             voice_enabled: false,
             voice_audio_folder: DEFAULT_VOICE_AUDIO_FOLDER.to_string(),
@@ -435,9 +458,12 @@ impl ClientAvatarChangeMessage {
 }
 
 fn encode_avatar_network_load(url: &str, unlock_password: &str) -> Result<Vec<u8>> {
-    let mut raw = NetWriter::with_capacity(url.len() + unlock_password.len() + 4);
+    let mut raw = NetWriter::with_capacity(url.len() + unlock_password.len() + 6);
     raw.put_raw_len_string(url);
     raw.put_raw_len_string(unlock_password);
+    // Current Basis clients append an optional content version tag. The built-in loading avatar has
+    // no external content version, so the canonical value is an empty string.
+    raw.put_raw_len_string("");
 
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(&raw.into_vec())?;
@@ -500,7 +526,7 @@ impl LocalAvatarSyncMessage {
 #[derive(Debug, Clone)]
 struct PoseState {
     base: [f32; 3],
-    packet: Vec<u8>,
+    datagram: Vec<u8>,
 }
 
 impl PoseState {
@@ -515,10 +541,14 @@ impl PoseState {
     }
 
     fn new_at(base: [f32; 3]) -> Self {
-        Self {
-            base,
-            packet: vec![0; 1 + BitQuality::High.payload_len()],
-        }
+        // Final hot-path datagram layout:
+        // [LiteNetLib Unreliable][Basis channel][movement sequence][159-byte High payload].
+        // Keeping the complete datagram here avoids allocating/copying twice per movement send.
+        let mut datagram = vec![0; 3 + BitQuality::High.payload_len()];
+        datagram[0] = PacketProperty::Unreliable as u8;
+        datagram[1] = channels::PLAYER_AVATAR_HIGH;
+        initialize_static_synthetic_payload(&mut datagram[3..]);
+        Self { base, datagram }
     }
 
     fn drift(&mut self) {
@@ -532,37 +562,39 @@ impl PoseState {
         self.base
     }
 
-    fn high_quality_payload(&mut self, elapsed_secs: f32) -> Vec<u8> {
+    fn update_dynamic_payload(&mut self, elapsed_secs: f32) {
         self.drift();
-        let mut writer = NetWriter::with_capacity(BitQuality::High.payload_len());
-        writer.put_bytes(&encode_axis_mm(self.base[0]));
-        writer.put_bytes(&encode_axis_mm(self.base[1] + elapsed_secs.sin() * 0.015));
-        writer.put_bytes(&encode_axis_mm(self.base[2]));
-
-        // v54's rotation block is 21 body fields plus 10 finger curl/splay fields. A zeroed
-        // block is sufficient for this synthetic load client; it no longer tries to emit the
-        // obsolete 51-bone v33 layout.
-        writer.put_bytes(&vec![0u8; BitQuality::High.rotation_len()]);
-
-        writer.put_u16(compress_scale(1.0));
-        let identity = smallest_three_quaternion([0.0, 0.0, 0.0, 1.0]);
-        writer.put_bytes(&identity);
-        writer.put_bytes(&[0; 5]);
-        writer.put_bytes(&identity);
-        writer.put_bytes(&[0; 35]);
-
-        let payload = writer.into_vec();
-        debug_assert_eq!(payload.len(), BitQuality::High.payload_len());
-        payload
+        let payload = &mut self.datagram[3..];
+        payload[0..3].copy_from_slice(&encode_axis_mm(self.base[0]));
+        payload[3..6].copy_from_slice(&encode_axis_mm(self.base[1] + elapsed_secs.sin() * 0.015));
+        payload[6..9].copy_from_slice(&encode_axis_mm(self.base[2]));
     }
 
-    fn write_movement_packet(&mut self, sequence: u8, start: SystemTime) -> &[u8] {
+    fn high_quality_payload(&mut self, elapsed_secs: f32) -> Vec<u8> {
+        self.update_dynamic_payload(elapsed_secs);
+        self.datagram[3..].to_vec()
+    }
+
+    fn write_movement_datagram(&mut self, sequence: u8, start: SystemTime) -> &[u8] {
         let elapsed = start.elapsed().unwrap_or_default().as_secs_f32();
-        let payload = self.high_quality_payload(elapsed);
-        self.packet[0] = sequence;
-        self.packet[1..].copy_from_slice(&payload);
-        &self.packet
+        self.update_dynamic_payload(elapsed);
+        self.datagram[2] = sequence;
+        &self.datagram
     }
+}
+
+fn initialize_static_synthetic_payload(payload: &mut [u8]) {
+    debug_assert_eq!(payload.len(), BitQuality::High.payload_len());
+    write_neutral_rotation_region(payload, ProtocolBitQuality::High)
+        .expect("high-quality synthetic pose has the protocol-defined payload size");
+
+    let tail = 9 + BitQuality::High.rotation_len();
+    payload[tail..tail + 2].copy_from_slice(&compress_scale(1.0).to_le_bytes());
+    let identity = smallest_three_quaternion([0.0, 0.0, 0.0, 1.0]);
+    payload[tail + 2..tail + 9].copy_from_slice(&identity);
+    payload[tail + 9..tail + 14].fill(0);
+    payload[tail + 14..tail + 21].copy_from_slice(&identity);
+    payload[tail + 21..].fill(0);
 }
 
 fn normalize_quat(mut q: [f32; 4]) -> [f32; 4] {
@@ -597,23 +629,18 @@ fn smallest_three_quaternion(q: [f32; 4]) -> [u8; 7] {
     let mut out = [0u8; 7];
     out[0] = largest as u8;
     let mut offset = 1;
-    for i in 0..4 {
+    let inv_sqrt_2 = std::f32::consts::FRAC_1_SQRT_2;
+    for (i, component) in q.iter().copied().enumerate() {
         if i == largest {
             continue;
         }
-        let value = (q[i] * sign).clamp(-0.70710677, 0.70710677);
-        let quantized = (((value + 0.70710677) / 1.4142135) * 65535.0).round() as u16;
+        let value = (component * sign).clamp(-inv_sqrt_2, inv_sqrt_2);
+        let quantized =
+            (((value + inv_sqrt_2) / std::f32::consts::SQRT_2) * 65535.0).round() as u16;
         out[offset..offset + 2].copy_from_slice(&quantized.to_le_bytes());
         offset += 2;
     }
     out
-}
-
-fn compress_scale(scale: f32) -> u16 {
-    const MIN: f32 = 0.005;
-    const MAX: f32 = 150.0;
-    const RANGE: f32 = MAX - MIN;
-    (((scale - MIN) / RANGE) * u16::MAX as f32).trunc() as u16
 }
 
 fn encode_axis_mm(meters: f32) -> [u8; 3] {
@@ -640,8 +667,12 @@ fn build_connection_payload(config: &Config, ready: &ReadyMessage) -> Vec<u8> {
     writer.into_vec()
 }
 
+#[cfg(test)]
 fn build_movement_packet(sequence: u8, pose: &mut PoseState, start: SystemTime) -> Vec<u8> {
-    pose.write_movement_packet(sequence, start).to_vec()
+    // Test/helper form excludes the LiteNetLib property/channel bytes and matches the Basis
+    // movement payload handed to send_unreliable(). The production hot path sends the reusable
+    // complete datagram directly instead.
+    pose.write_movement_datagram(sequence, start)[2..].to_vec()
 }
 
 #[derive(Debug)]
@@ -662,6 +693,16 @@ impl Identity {
             verifying_key,
             fragment: String::new(),
         }
+    }
+
+    fn did_key(&self) -> String {
+        // did:key for Ed25519 is multibase(base58-btc(multicodec-varint(0xED) || pubkey)).
+        // Unsigned LEB128 encoding of the Ed25519 multicodec id 0xED is [0xED, 0x01].
+        let mut multicodec = [0u8; 34];
+        multicodec[0] = 0xED;
+        multicodec[1] = 0x01;
+        multicodec[2..].copy_from_slice(&self.verifying_key.to_bytes());
+        format!("did:key:z{}", bs58::encode(multicodec).into_string())
     }
 
     fn response_payload(&self, challenge: &[u8]) -> Result<Vec<u8>> {
@@ -738,6 +779,58 @@ struct ReliableSend {
 }
 
 #[derive(Debug)]
+struct ReliableReceiveState {
+    seen: [bool; 256],
+    highest: [u16; 256],
+    windows: [u128; 256],
+}
+
+impl Default for ReliableReceiveState {
+    fn default() -> Self {
+        Self {
+            seen: [false; 256],
+            highest: [0; 256],
+            windows: [0; 256],
+        }
+    }
+}
+
+impl ReliableReceiveState {
+    fn mark_new(&mut self, channel_id: u8, sequence: u16) -> bool {
+        let index = channel_id as usize;
+        if !self.seen[index] {
+            self.seen[index] = true;
+            self.highest[index] = sequence;
+            self.windows[index] = 1;
+            return true;
+        }
+
+        let relative = relative_sequence(sequence, self.highest[index]);
+        if relative > 0 {
+            let advance = relative as usize;
+            self.windows[index] = if advance >= DEFAULT_WINDOW_SIZE {
+                1
+            } else {
+                (self.windows[index] << advance) | 1
+            };
+            self.highest[index] = sequence;
+            return true;
+        }
+
+        let age = (-relative) as usize;
+        if age >= DEFAULT_WINDOW_SIZE {
+            return false;
+        }
+        let bit = 1u128 << age;
+        if self.windows[index] & bit != 0 {
+            return false;
+        }
+        self.windows[index] |= bit;
+        true
+    }
+}
+
+#[derive(Debug)]
 struct BasisClient {
     index: usize,
     socket: Arc<UdpSocket>,
@@ -748,11 +841,17 @@ struct BasisClient {
     remote_peer_id: Mutex<Option<i32>>,
     connected: AtomicBool,
     in_use: AtomicBool,
+    intentional_reconnect: AtomicBool,
     movement_sequence: AtomicU8,
     voice_sequence: AtomicU8,
     reliable_sequence: AtomicU16,
     ping_sequence: AtomicU16,
     pending_reliable: Mutex<VecDeque<ReliableSend>>,
+    pending_reliable_active: AtomicBool,
+    shared_maintenance: AtomicBool,
+    shared_receive: AtomicBool,
+    shared_receive_eligible: AtomicBool,
+    received_reliable: StdMutex<ReliableReceiveState>,
     pose: Mutex<PoseState>,
     identity: Identity,
 }
@@ -761,13 +860,17 @@ impl BasisClient {
     async fn start(
         index: usize,
         config: &Config,
-        ready: ReadyMessage,
+        mut ready: ReadyMessage,
         spawn_base: [f32; 3],
     ) -> Result<Arc<Self>> {
         let server_addr = resolve_addr(&config.ip, config.port)?;
-        let socket = Arc::new(bind_udp_socket(any_local_addr(server_addr))?);
+        let socket = bind_udp_socket(any_local_addr(server_addr))?;
+        socket.connect(server_addr).await?;
+        let socket = Arc::new(socket);
         let connect_time = dotnet_utc_ticks();
         let local_peer_id = index as i32;
+        let identity = Identity::random();
+        ready.metadata.player_uuid = identity.did_key();
         let client = Arc::new(Self {
             index,
             socket,
@@ -778,13 +881,19 @@ impl BasisClient {
             remote_peer_id: Mutex::new(None),
             connected: AtomicBool::new(false),
             in_use: AtomicBool::new(false),
+            intentional_reconnect: AtomicBool::new(false),
             movement_sequence: AtomicU8::new(0),
             voice_sequence: AtomicU8::new(0),
             reliable_sequence: AtomicU16::new(0),
             ping_sequence: AtomicU16::new(0),
             pending_reliable: Mutex::new(VecDeque::new()),
+            pending_reliable_active: AtomicBool::new(false),
+            shared_maintenance: AtomicBool::new(false),
+            shared_receive: AtomicBool::new(false),
+            shared_receive_eligible: AtomicBool::new(false),
+            received_reliable: StdMutex::new(ReliableReceiveState::default()),
             pose: Mutex::new(PoseState::new_at(spawn_base)),
-            identity: Identity::random(),
+            identity,
         });
 
         client.start_client(config, &ready).await?;
@@ -798,12 +907,15 @@ impl BasisClient {
         }
         let payload = build_connection_payload(config, ready);
         let request = self.make_connect_request(&payload);
-        self.socket.send_to(&request, self.server_addr).await?;
+        self.send_connected(&request).await?;
         debug!(
             "client {} sent connect request to {}",
             self.index, self.server_addr
         );
 
+        // Every freshly-created client starts with a dedicated receive task so reconnect/auth
+        // always has a path for the DID challenge. On Linux, the shared receiver takes over only
+        // after the client has observed post-auth server traffic and marks itself eligible.
         let client = self.clone();
         tokio::spawn(async move {
             let index = client.index;
@@ -817,6 +929,11 @@ impl BasisClient {
             client.maintenance_loop().await;
         });
 
+        Ok(())
+    }
+
+    async fn send_connected(&self, bytes: &[u8]) -> Result<()> {
+        self.socket.send(bytes).await?;
         Ok(())
     }
 
@@ -840,10 +957,7 @@ impl BasisClient {
         let mut packet = NetWriter::with_capacity(9);
         packet.put_u8(PacketProperty::Disconnect as u8 | (self.connection_number << 5));
         packet.put_i64(self.connect_time);
-        let _ = self
-            .socket
-            .send_to(&packet.into_vec(), self.server_addr)
-            .await;
+        let _ = self.send_connected(&packet.into_vec()).await;
         info!("client {} worker thread stopped", self.index);
     }
 
@@ -863,7 +977,7 @@ impl BasisClient {
             packet[0],
             packet[1]
         );
-        self.socket.send_to(&packet, self.server_addr).await?;
+        self.send_connected(&packet).await?;
         Ok(())
     }
 
@@ -893,25 +1007,26 @@ impl BasisClient {
         packet.extend_from_slice(&sequence.to_le_bytes());
         packet.push(channel_id);
         packet.extend_from_slice(payload);
-        self.socket.send_to(&packet, self.server_addr).await?;
+        self.send_connected(&packet).await?;
         self.pending_reliable.lock().await.push_back(ReliableSend {
             channel_id,
             sequence,
             bytes: packet,
             last_sent: Some(SystemTime::now()),
         });
+        self.pending_reliable_active.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     async fn receive_loop(self: Arc<Self>) -> Result<()> {
         let mut buffer = vec![0u8; 65535];
         loop {
-            let (len, from) = self.socket.recv_from(&mut buffer).await?;
-            if from != self.server_addr {
-                continue;
+            if self.shared_receive.load(Ordering::Relaxed) {
+                break;
             }
+            let len = self.socket.recv(&mut buffer).await?;
             self.handle_packet(&buffer[..len]).await?;
-            if !self.in_use.load(Ordering::Relaxed) {
+            if !self.in_use.load(Ordering::Relaxed) || self.shared_receive.load(Ordering::Relaxed) {
                 break;
             }
         }
@@ -931,6 +1046,14 @@ impl BasisClient {
                 {
                     let remote_peer = i32::from_le_bytes(bytes[11..15].try_into().unwrap());
                     *self.remote_peer_id.lock().await = Some(remote_peer);
+                    if self.index != 0 {
+                        if let Err(err) = configure_load_sink_socket(&self.socket) {
+                            warn!(
+                                "client {} failed to enable load-sink receive filter: {err}",
+                                self.index
+                            );
+                        }
+                    }
                     self.connected.store(true, Ordering::SeqCst);
                     info!(
                         "client {} connected as remote peer {}",
@@ -941,9 +1064,21 @@ impl BasisClient {
             PacketProperty::Disconnect
             | PacketProperty::PeerNotFound
             | PacketProperty::InvalidProtocol => {
+                let reason =
+                    if packet.property == PacketProperty::Disconnect && packet.payload.len() >= 2 {
+                        let length =
+                            u16::from_le_bytes([packet.payload[0], packet.payload[1]]) as usize;
+                        if packet.payload.len() >= 2 + length {
+                            std::str::from_utf8(&packet.payload[2..2 + length]).ok()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                 warn!(
-                    "client {} disconnected/rejected by server: {:?}",
-                    self.index, packet.property
+                    "client {} disconnected/rejected by server: {:?} reason={:?}",
+                    self.index, packet.property, reason
                 );
                 self.connected.store(false, Ordering::SeqCst);
                 self.in_use.store(false, Ordering::SeqCst);
@@ -1024,7 +1159,10 @@ impl BasisClient {
                             break;
                         }
                         let property = PacketProperty::from_byte(payload[0]);
-                        if !matches!(property, Some(PacketProperty::Ack | PacketProperty::Channeled)) {
+                        if !matches!(
+                            property,
+                            Some(PacketProperty::Ack | PacketProperty::Channeled)
+                        ) {
                             break;
                         }
                         Box::pin(self.handle_packet(payload)).await?;
@@ -1045,11 +1183,28 @@ impl BasisClient {
     async fn handle_channeled(&self, channel_id: u8, sequence: u16, payload: &[u8]) -> Result<()> {
         let channel = channel_id / 4;
         let delivery = DeliveryMethod::from_channel_id(channel_id);
+        if channel != channels::AUTH_IDENTITY && self.connected.load(Ordering::Relaxed) {
+            self.shared_receive_eligible.store(true, Ordering::Release);
+        }
         if matches!(
             delivery,
             DeliveryMethod::ReliableOrdered | DeliveryMethod::ReliableUnordered
         ) {
             self.send_ack(channel_id, sequence).await?;
+            if !self
+                .received_reliable
+                .lock()
+                .expect("reliable receive state mutex poisoned")
+                .mark_new(channel_id, sequence)
+            {
+                trace!(
+                    "client {} suppressed duplicate reliable packet channel_id={} sequence={}",
+                    self.index,
+                    channel_id,
+                    sequence
+                );
+                return Ok(());
+            }
         }
 
         match channel {
@@ -1061,6 +1216,8 @@ impl BasisClient {
                 }
             }
             channels::META_DATA
+            | channels::CREATE_REMOTE_PLAYER
+            | channels::CREATE_REMOTE_PLAYERS_FOR_NEW_PEER
             | channels::DISCONNECTION
             | channels::PLAYER_AVATAR_VERY_LOW
             | channels::PLAYER_AVATAR_VERY_LOW_ADDITIONAL
@@ -1092,7 +1249,7 @@ impl BasisClient {
         packet[3] = channel_id;
         let bit_index = (sequence as usize) % DEFAULT_WINDOW_SIZE;
         packet[4 + bit_index / 8] |= 1 << (bit_index % 8);
-        self.socket.send_to(&packet, self.server_addr).await?;
+        self.send_connected(&packet).await?;
         Ok(())
     }
 
@@ -1101,9 +1258,7 @@ impl BasisClient {
         writer.put_u8(PacketProperty::Pong as u8 | (self.connection_number << 5));
         writer.put_u16(sequence);
         writer.put_i64(dotnet_utc_ticks());
-        self.socket
-            .send_to(&writer.into_vec(), self.server_addr)
-            .await?;
+        self.send_connected(&writer.into_vec()).await?;
         Ok(())
     }
 
@@ -1115,9 +1270,7 @@ impl BasisClient {
         let mut writer = NetWriter::with_capacity(3);
         writer.put_u8(PacketProperty::Ping as u8 | (self.connection_number << 5));
         writer.put_u16(sequence);
-        self.socket
-            .send_to(&writer.into_vec(), self.server_addr)
-            .await?;
+        self.send_connected(&writer.into_vec()).await?;
         Ok(())
     }
 
@@ -1138,31 +1291,41 @@ impl BasisClient {
                 .unwrap_or(false);
             !acked
         });
+        self.pending_reliable_active
+            .store(!pending.is_empty(), Ordering::Relaxed);
     }
 
     async fn maintenance_loop(self: Arc<Self>) {
-        let mut ping_tick = time::interval(Duration::from_millis(1500));
-        let mut reliable_tick = time::interval(Duration::from_millis(15));
+        const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
+        const PING_EVERY_TICKS: u8 = 15;
+
+        let mut tick = time::interval(MAINTENANCE_INTERVAL);
+        tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let mut ping_ticks = 0u8;
         loop {
-            tokio::select! {
-                _ = ping_tick.tick() => {
-                    if !self.in_use.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let _ = self.send_ping().await;
-                }
-                _ = reliable_tick.tick() => {
-                    if !self.in_use.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let _ = self.resend_reliable().await;
-                }
+            tick.tick().await;
+            if !self.in_use.load(Ordering::Relaxed)
+                || self.shared_maintenance.load(Ordering::Relaxed)
+            {
+                break;
+            }
+
+            if self.pending_reliable_active.load(Ordering::Relaxed) {
+                let _ = self.resend_reliable().await;
+            }
+
+            ping_ticks += 1;
+            if ping_ticks >= PING_EVERY_TICKS {
+                ping_ticks = 0;
+                let _ = self.send_ping().await;
             }
         }
     }
 
     async fn resend_reliable(&self) -> Result<()> {
-        if !self.connected.load(Ordering::Relaxed) {
+        if !self.connected.load(Ordering::Relaxed)
+            || !self.pending_reliable_active.load(Ordering::Relaxed)
+        {
             return Ok(());
         }
         let mut pending = self.pending_reliable.lock().await;
@@ -1174,7 +1337,7 @@ impl BasisClient {
                 .map(|elapsed| elapsed >= Duration::from_millis(150))
                 .unwrap_or(true);
             if should_send {
-                self.socket.send_to(&item.bytes, self.server_addr).await?;
+                self.send_connected(&item.bytes).await?;
                 item.last_sent = Some(now);
             }
         }
@@ -1481,7 +1644,7 @@ fn opus_packet_duration_ms(packet: &[u8]) -> Option<u64> {
         }
         _ => return None,
     };
-    Some(((frame_duration_us * frame_count) + 999) / 1000)
+    Some((frame_duration_us * frame_count).div_ceil(1000))
 }
 
 fn voice_speaker_target(connected_count: usize, percent: u8) -> usize {
@@ -1489,7 +1652,7 @@ fn voice_speaker_target(connected_count: usize, percent: u8) -> usize {
     if connected_count == 0 || percent == 0 {
         return 0;
     }
-    ((connected_count * percent) + 99) / 100
+    (connected_count * percent).div_ceil(100)
 }
 
 fn choose_next_speaker(
@@ -1582,6 +1745,109 @@ fn bind_udp_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     UdpSocket::from_std(socket.into())
 }
 
+#[cfg(target_os = "linux")]
+fn configure_load_sink_socket(socket: &UdpSocket) -> std::io::Result<()> {
+    // A simulated load client only needs reliable/control traffic after it has connected.
+    // Basis server avatar fanout is sent as top-level Unreliable, Merged, or CompactMerged
+    // datagrams. For non-observer load-sink clients we intentionally discard all three after the
+    // connection/authentication handshake; client 0 remains unfiltered and exercises the complete
+    // receive protocol. This is load-generator behavior, not general client semantics. These sockets
+    // are connected UDP sockets; the socket-filter view starts at the UDP header, so LiteNetLib byte
+    // 0 is at offset 8.
+    const BPF_LD_B_ABS: u16 = 0x30;
+    const BPF_ALU_AND_K: u16 = 0x54;
+    const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_RET_K: u16 = 0x06;
+    const ACCEPT_ALL: u32 = u32::MAX;
+
+    let mut filters = [
+        libc::sock_filter {
+            code: BPF_LD_B_ABS,
+            jt: 0,
+            jf: 0,
+            k: 8,
+        },
+        libc::sock_filter {
+            code: BPF_ALU_AND_K,
+            jt: 0,
+            jf: 0,
+            k: 0x1f,
+        },
+        libc::sock_filter {
+            code: BPF_JMP_JEQ_K,
+            jt: 3,
+            jf: 0,
+            k: PacketProperty::Unreliable as u32,
+        },
+        libc::sock_filter {
+            code: BPF_JMP_JEQ_K,
+            jt: 2,
+            jf: 0,
+            k: PacketProperty::Merged as u32,
+        },
+        libc::sock_filter {
+            code: BPF_JMP_JEQ_K,
+            jt: 1,
+            jf: 0,
+            k: PacketProperty::CompactMerged as u32,
+        },
+        libc::sock_filter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: ACCEPT_ALL,
+        },
+        libc::sock_filter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: filters.len() as u16,
+        filter: filters.as_mut_ptr(),
+    };
+    let fd = socket.as_raw_fd();
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ATTACH_FILTER,
+            (&program as *const libc::sock_fprog).cast(),
+            std::mem::size_of::<libc::sock_fprog>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Once bulk unreliable receive is filtered, synthetic peers do not need multi-megabyte
+    // socket queues. Keep enough room for bursts of ACK/auth/control traffic while reducing
+    // kernel memory pressure for 1000 sockets.
+    let buffer_bytes: libc::c_int = 64 * 1024;
+    for option in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&buffer_bytes as *const libc::c_int).cast(),
+                std::mem::size_of_val(&buffer_bytes) as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_load_sink_socket(_socket: &UdpSocket) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn socket_address_bytes(addr: SocketAddr) -> Vec<u8> {
     match addr {
         SocketAddr::V4(v4) => {
@@ -1657,11 +1923,10 @@ impl SpawnLayout {
 
     fn base_for_client(self, index: usize) -> [f32; 3] {
         let mut rng = rand::thread_rng();
-        let group_offset = if self.group_size == 0 {
-            0.0
-        } else {
-            (index / self.group_size) as f32 * self.group_spacing
-        };
+        let group_offset = index
+            .checked_div(self.group_size)
+            .map(|group| group as f32 * self.group_spacing)
+            .unwrap_or(0.0);
         [
             group_offset + rng.gen_range(-0.25..=0.25),
             rng.gen_range(-0.25..=0.25),
@@ -1670,42 +1935,169 @@ impl SpawnLayout {
     }
 }
 
-async fn movement_workers(clients: Arc<Mutex<Vec<Arc<BasisClient>>>>, shutdown: Arc<AtomicBool>) {
-    let initial_len = clients.lock().await.len();
+#[derive(Debug, Clone, Copy)]
+struct CadenceOptions {
+    sync_batching: bool,
+    movement_jitter_percent: u8,
+    voice_jitter_percent: u8,
+}
+
+fn cadence_seed(index: usize, stream: u64) -> u64 {
+    let mut x = (index as u64)
+        .wrapping_add(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(stream.rotate_left(17));
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+fn cadence_next(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+fn jittered_duration(base: Duration, jitter_percent: u8, state: &mut u64) -> Duration {
+    let base_us = base.as_micros().max(1) as u64;
+    let jitter = jitter_percent.min(95) as u64;
+    if jitter == 0 {
+        return Duration::from_micros(base_us);
+    }
+    let max_delta = base_us.saturating_mul(jitter) / 100;
+    let span = max_delta.saturating_mul(2).saturating_add(1);
+    let offset = cadence_next(state) % span;
+    Duration::from_micros(
+        base_us
+            .saturating_sub(max_delta)
+            .saturating_add(offset)
+            .max(1),
+    )
+}
+
+async fn movement_workers(
+    clients: Arc<Mutex<Vec<Arc<BasisClient>>>>,
+    shutdown: Arc<AtomicBool>,
+    cadence: CadenceOptions,
+) {
+    let initial_snapshot = clients.lock().await.clone();
+    let initial_len = initial_snapshot.len();
     let worker_count = num_cpus::get().max(1).min(initial_len.max(1));
     let start = SystemTime::now();
     for worker in 0..worker_count {
         let clients = clients.clone();
         let shutdown = shutdown.clone();
+        let mut snapshot = initial_snapshot.clone();
         tokio::spawn(async move {
-            time::sleep(Duration::from_millis((worker * 12) as u64)).await;
-            let mut ticker = time::interval(MOVEMENT_INTERVAL);
+            if cadence.sync_batching {
+                time::sleep(Duration::from_millis((worker * 12) as u64)).await;
+                let mut ticker = time::interval(MOVEMENT_INTERVAL);
+                ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+                let mut refresh_ticks = 0u8;
+                loop {
+                    ticker.tick().await;
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    refresh_ticks = refresh_ticks.wrapping_add(1);
+                    if refresh_ticks >= 10 {
+                        snapshot = clients.lock().await.clone();
+                        refresh_ticks = 0;
+                    }
+                    let mut idx = worker;
+                    while idx < snapshot.len() {
+                        let client = &snapshot[idx];
+                        if client.connected.load(Ordering::Relaxed) {
+                            let sequence = client.movement_sequence.fetch_add(1, Ordering::Relaxed);
+                            let mut pose = client.pose.lock().await;
+                            let datagram = pose.write_movement_datagram(sequence, start);
+                            if let Err(err) = client.send_connected(datagram).await {
+                                trace!("movement send failed for {}: {err}", client.index);
+                            }
+                        }
+                        idx += worker_count;
+                    }
+                }
+                return;
+            }
+
+            struct MovementDeadline {
+                index: usize,
+                next: time::Instant,
+                cadence_state: u64,
+            }
+
+            const RANDOMIZED_TICK: Duration = Duration::from_millis(1);
+            let now = time::Instant::now();
+            let interval_us = MOVEMENT_INTERVAL.as_micros() as u64;
+            let mut deadlines = Vec::with_capacity(initial_len.div_ceil(worker_count));
+            let mut idx = worker;
+            while idx < initial_len {
+                let mut cadence_state = cadence_seed(idx, 0x4d4f_5645_4d45_4e54);
+                let phase_us = cadence_next(&mut cadence_state) % interval_us.max(1);
+                deadlines.push(MovementDeadline {
+                    index: idx,
+                    next: now + Duration::from_micros(phase_us),
+                    cadence_state,
+                });
+                idx += worker_count;
+            }
+
+            let mut ticker = time::interval(RANDOMIZED_TICK);
+            ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+            let mut next_snapshot_refresh = now + Duration::from_secs(1);
             loop {
                 ticker.tick().await;
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                let snapshot = clients.lock().await.clone();
-                let mut idx = worker;
-                while idx < snapshot.len() {
-                    let client = &snapshot[idx];
-                    if client.connected.load(Ordering::Relaxed) {
-                        let sequence = client.movement_sequence.fetch_add(1, Ordering::SeqCst);
-                        let mut pose = client.pose.lock().await;
-                        let packet = build_movement_packet(sequence, &mut pose, start);
-                        drop(pose);
-                        if let Err(err) = client
-                            .send_unreliable(channels::PLAYER_AVATAR_HIGH, &packet)
-                            .await
-                        {
-                            trace!("movement send failed for {}: {err}", client.index);
+                let current = time::Instant::now();
+                if current >= next_snapshot_refresh {
+                    snapshot = clients.lock().await.clone();
+                    next_snapshot_refresh = current + Duration::from_secs(1);
+                }
+
+                for deadline in &mut deadlines {
+                    if deadline.next > current {
+                        continue;
+                    }
+                    if let Some(client) = snapshot.get(deadline.index) {
+                        if client.connected.load(Ordering::Relaxed) {
+                            let sequence = client.movement_sequence.fetch_add(1, Ordering::Relaxed);
+                            let mut pose = client.pose.lock().await;
+                            let datagram = pose.write_movement_datagram(sequence, start);
+                            if let Err(err) = client.send_connected(datagram).await {
+                                trace!("movement send failed for {}: {err}", client.index);
+                            }
                         }
                     }
-                    idx += worker_count;
+                    let interval = jittered_duration(
+                        MOVEMENT_INTERVAL,
+                        cadence.movement_jitter_percent,
+                        &mut deadline.cadence_state,
+                    );
+                    deadline.next += interval;
+                    if deadline.next < current {
+                        deadline.next = current + interval;
+                    }
                 }
             }
         });
     }
+}
+
+#[derive(Clone)]
+struct VoicePlaybackContext {
+    clients: Arc<Mutex<Vec<Arc<BasisClient>>>>,
+    hearing_distance: f32,
+    frame_duration: Duration,
+    shutdown: Arc<AtomicBool>,
+    done_tx: mpsc::UnboundedSender<usize>,
+    cadence: CadenceOptions,
 }
 
 async fn voice_workers(
@@ -1713,6 +2105,7 @@ async fn voice_workers(
     config: Config,
     library: Arc<VoiceLibrary>,
     shutdown: Arc<AtomicBool>,
+    cadence: CadenceOptions,
 ) {
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<usize>();
     let mut active = HashSet::<usize>::new();
@@ -1758,21 +2151,16 @@ async fn voice_workers(
             };
             active.insert(index);
 
-            let clients = clients.clone();
-            let shutdown = shutdown.clone();
-            let done_tx = done_tx.clone();
-            let hearing_distance = config.voice_hearing_distance;
+            let context = VoicePlaybackContext {
+                clients: clients.clone(),
+                hearing_distance: config.voice_hearing_distance,
+                frame_duration,
+                shutdown: shutdown.clone(),
+                done_tx: done_tx.clone(),
+                cadence,
+            };
             tokio::spawn(async move {
-                voice_playback_task(
-                    client,
-                    clients,
-                    clip,
-                    hearing_distance,
-                    frame_duration,
-                    shutdown,
-                    done_tx,
-                )
-                .await;
+                voice_playback_task(client, clip, context).await;
             });
         }
     }
@@ -1780,13 +2168,17 @@ async fn voice_workers(
 
 async fn voice_playback_task(
     client: Arc<BasisClient>,
-    clients: Arc<Mutex<Vec<Arc<BasisClient>>>>,
     clip: VoiceClip,
-    hearing_distance: f32,
-    frame_duration: Duration,
-    shutdown: Arc<AtomicBool>,
-    done_tx: mpsc::UnboundedSender<usize>,
+    context: VoicePlaybackContext,
 ) {
+    let VoicePlaybackContext {
+        clients,
+        hearing_distance,
+        frame_duration,
+        shutdown,
+        done_tx,
+        cadence,
+    } = context;
     let index = client.index;
     let result = async {
         let non_default_packets = clip
@@ -1796,7 +2188,7 @@ async fn voice_playback_task(
             .filter(|packet| packet.duration_ms != frame_duration.as_millis() as u64)
             .count();
         if non_default_packets > 0 {
-            info!(
+            debug!(
                 "voice file {} contains {}/{} packets not matching configured {}ms pacing; using per-packet Opus durations",
                 clip.path.display(),
                 non_default_packets,
@@ -1808,7 +2200,16 @@ async fn voice_playback_task(
         let mut last_refresh = None::<time::Instant>;
         let mut published_once = false;
         let mut logged_first_send = false;
-        let mut next_packet_at = time::Instant::now();
+        let mut cadence_state = cadence_seed(client.index, 0x564f_4943_455f_5458);
+        let initial_phase = if cadence.sync_batching {
+            Duration::ZERO
+        } else {
+            Duration::from_micros(
+                cadence_next(&mut cadence_state)
+                    % (frame_duration.as_micros().max(1) as u64),
+            )
+        };
+        let mut next_packet_at = time::Instant::now() + initial_phase;
         let max_lag = Duration::from_millis(DEFAULT_VOICE_FRAME_DURATION_MS * 5);
         let mut packets_sent = 0usize;
         let mut packets_skipped = 0usize;
@@ -1867,7 +2268,7 @@ async fn voice_playback_task(
                 if !logged_first_send {
                     logged_first_send = true;
                     playback_started = time::Instant::now();
-                    info!(
+                    debug!(
                         "client {} sent first voice packet from {} (opus_bytes={} wire_bytes={})",
                         client.index,
                         clip.path.display(),
@@ -1876,11 +2277,20 @@ async fn voice_playback_task(
                     );
                 }
             }
-            next_packet_at += Duration::from_millis(packet.duration_ms.max(1));
+            let packet_duration = Duration::from_millis(packet.duration_ms.max(1));
+            next_packet_at += if cadence.sync_batching {
+                packet_duration
+            } else {
+                jittered_duration(
+                    packet_duration,
+                    cadence.voice_jitter_percent,
+                    &mut cadence_state,
+                )
+            };
         }
 
         if packets_sent > 0 || packets_skipped > 0 {
-            info!(
+            debug!(
                 "client {} finished voice playback from {} (sent={} skipped={} elapsed_ms={})",
                 client.index,
                 clip.path.display(),
@@ -1945,15 +2355,454 @@ async fn publish_voice_recipient_exclusions(
     }
 }
 
+async fn failure_reconnect_loop(
+    clients: Arc<Mutex<Vec<Arc<BasisClient>>>>,
+    config: Config,
+    shutdown: Arc<AtomicBool>,
+    spawn_layout: SpawnLayout,
+    connect_timeout: Duration,
+) {
+    let mut pending_since = HashMap::<usize, time::Instant>::new();
+    let mut tick = time::interval(Duration::from_millis(250));
+
+    loop {
+        tick.tick().await;
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let snapshot = clients.lock().await.clone();
+        for (idx, client) in snapshot.into_iter().enumerate() {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
+            if client.connected.load(Ordering::Relaxed) {
+                pending_since.remove(&idx);
+                continue;
+            }
+            if client.intentional_reconnect.load(Ordering::Relaxed) {
+                pending_since.remove(&idx);
+                continue;
+            }
+
+            if client.in_use.load(Ordering::Relaxed) {
+                let started = pending_since.entry(idx).or_insert_with(time::Instant::now);
+                if started.elapsed() < connect_timeout {
+                    continue;
+                }
+                client.in_use.store(false, Ordering::SeqCst);
+                pending_since.remove(&idx);
+                warn!("client {idx} reconnect attempt timed out; recycling connection");
+            }
+
+            let spawn_base = spawn_layout.base_for_client(idx);
+            let result = match ReadyMessage::new(&config, spawn_base) {
+                Ok(ready) => BasisClient::start(idx, &config, ready, spawn_base).await,
+                Err(err) => Err(err),
+            };
+            match result {
+                Ok(new_client) => {
+                    clients.lock().await[idx] = new_client;
+                    pending_since.insert(idx, time::Instant::now());
+                    info!("failure reconnect started for client {idx}");
+                }
+                Err(err) => warn!("failed to restart client {idx}: {err}"),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct SharedReceivePacket {
+    index: usize,
+    fd: RawFd,
+    offset: usize,
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct SharedReceiveBatch {
+    data: Vec<u8>,
+    packets: Vec<SharedReceivePacket>,
+}
+
+#[cfg(target_os = "linux")]
+fn shared_receiver_send_ack(fd: RawFd, first_byte: u8, channel_id: u8, sequence: u16) {
+    let mut packet = [0u8; 4 + ((DEFAULT_WINDOW_SIZE - 1) / 8 + 2)];
+    packet[0] = PacketProperty::Ack as u8 | (first_byte & 0x60);
+    packet[1..3].copy_from_slice(&sequence.to_le_bytes());
+    packet[3] = channel_id;
+    let bit_index = sequence as usize % DEFAULT_WINDOW_SIZE;
+    packet[4 + bit_index / 8] |= 1 << (bit_index % 8);
+    unsafe {
+        libc::send(fd, packet.as_ptr().cast(), packet.len(), libc::MSG_DONTWAIT);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn shared_receiver_send_pong(fd: RawFd, first_byte: u8, sequence: u16) {
+    let mut packet = [0u8; 11];
+    packet[0] = PacketProperty::Pong as u8 | (first_byte & 0x60);
+    packet[1..3].copy_from_slice(&sequence.to_le_bytes());
+    packet[3..11].copy_from_slice(&dotnet_utc_ticks().to_le_bytes());
+    unsafe {
+        libc::send(fd, packet.as_ptr().cast(), packet.len(), libc::MSG_DONTWAIT);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_shared_epoll_receiver(
+    registrations: std_mpsc::Receiver<(usize, RawFd)>,
+    batches: mpsc::UnboundedSender<SharedReceiveBatch>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let profile_packet_mix = std::env::var("BASIS_CLIENT_PROFILE_RX_MIX")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "False" | "FALSE"))
+        .unwrap_or(false);
+    let mut packet_mix = [0u64; 32];
+    let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if epoll_fd < 0 {
+        warn!(
+            "failed to create shared epoll receiver: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+
+    let mut events = vec![unsafe { std::mem::zeroed::<libc::epoll_event>() }; 128];
+    let mut buffer = vec![0u8; 65535];
+    while !shutdown.load(Ordering::Relaxed) {
+        while let Ok((index, fd)) = registrations.try_recv() {
+            let mut event = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: ((index as u64) << 32) | (fd as u32 as u64),
+            };
+            let rc = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EEXIST) {
+                    warn!("failed to register client {index} fd {fd} with shared epoll receiver: {err}");
+                }
+            }
+        }
+
+        let ready =
+            unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), events.len() as i32, 100) };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            warn!("shared epoll receiver wait failed: {err}");
+            break;
+        }
+
+        let mut batch = Vec::with_capacity(ready as usize);
+        let mut batch_data = Vec::with_capacity((ready as usize).saturating_mul(64));
+        for event in events.iter().take(ready as usize) {
+            let index = (event.u64 >> 32) as usize;
+            let fd = event.u64 as u32 as RawFd;
+            loop {
+                let len = unsafe {
+                    libc::recv(
+                        fd,
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                if len > 0 {
+                    let len = len as usize;
+                    let property = buffer[0] & 0x1f;
+                    if profile_packet_mix {
+                        packet_mix[property as usize] += 1;
+                    }
+
+                    // Registered sockets are authenticated load sinks. Handle the overwhelmingly
+                    // common post-auth control traffic here so it never allocates/copies into the
+                    // epoll-thread -> Tokio handoff. Reliable payloads still receive protocol ACKs,
+                    // but their application data is intentionally discarded for synthetic peers.
+                    match property {
+                        p if p == PacketProperty::Channeled as u8 => {
+                            if len >= 4 {
+                                let sequence = u16::from_le_bytes([buffer[1], buffer[2]]);
+                                let channel_id = buffer[3];
+                                if matches!(channel_id % 4, 0 | 2) {
+                                    shared_receiver_send_ack(fd, buffer[0], channel_id, sequence);
+                                }
+                            }
+                            continue;
+                        }
+                        p if p == PacketProperty::Ping as u8 => {
+                            if len >= 3 {
+                                let sequence = u16::from_le_bytes([buffer[1], buffer[2]]);
+                                shared_receiver_send_pong(fd, buffer[0], sequence);
+                            }
+                            continue;
+                        }
+                        p if p == PacketProperty::Pong as u8
+                            || p == PacketProperty::MtuCheck as u8
+                            || p == PacketProperty::MtuOk as u8 =>
+                        {
+                            continue;
+                        }
+                        _ => {}
+                    }
+
+                    let offset = batch_data.len();
+                    batch_data.extend_from_slice(&buffer[..len]);
+                    batch.push(SharedReceivePacket {
+                        index,
+                        fd,
+                        offset,
+                        len,
+                    });
+                    continue;
+                }
+                if len == 0 {
+                    break;
+                }
+                let err = std::io::Error::last_os_error();
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) {
+                    break;
+                }
+                break;
+            }
+        }
+        if !batch.is_empty()
+            && batches
+                .send(SharedReceiveBatch {
+                    data: batch_data,
+                    packets: batch,
+                })
+                .is_err()
+        {
+            unsafe { libc::close(epoll_fd) };
+            return;
+        }
+    }
+
+    if profile_packet_mix {
+        let names = [
+            "Unreliable",
+            "Channeled",
+            "Ack",
+            "Ping",
+            "Pong",
+            "ConnectRequest",
+            "ConnectAccept",
+            "Disconnect",
+            "UnconnectedMessage",
+            "MtuCheck",
+            "MtuOk",
+            "Broadcast",
+            "Merged",
+            "ShutdownOk",
+            "PeerNotFound",
+            "InvalidProtocol",
+            "NatMessage",
+            "Empty",
+            "CompactMerged",
+        ];
+        for (property, count) in packet_mix.iter().copied().enumerate() {
+            if count != 0 {
+                let name = names.get(property).copied().unwrap_or("Unknown");
+                info!(
+                    "shared receive packet mix property={}({}) count={}",
+                    property, name, count
+                );
+            }
+        }
+    }
+    unsafe { libc::close(epoll_fd) };
+}
+
+#[cfg(target_os = "linux")]
+async fn shared_receive_loop(
+    clients: Arc<Mutex<Vec<Arc<BasisClient>>>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let (registration_tx, registration_rx) = std_mpsc::channel::<(usize, RawFd)>();
+    let (batch_tx, mut batch_rx) = mpsc::unbounded_channel::<SharedReceiveBatch>();
+    let thread_shutdown = shutdown.clone();
+    if let Err(err) = std::thread::Builder::new()
+        .name("basis-shared-rx".to_string())
+        .spawn(move || run_shared_epoll_receiver(registration_rx, batch_tx, thread_shutdown))
+    {
+        warn!("failed to start shared epoll receiver thread: {err}");
+        return;
+    }
+
+    SHARED_RECEIVE_ACTIVE.store(true, Ordering::Release);
+    let mut refresh = time::interval(Duration::from_millis(250));
+    refresh.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut snapshot = clients.lock().await.clone();
+    let mut registered_fds = vec![-1; snapshot.len()];
+
+    loop {
+        tokio::select! {
+            _ = refresh.tick() => {
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                snapshot = clients.lock().await.clone();
+                if registered_fds.len() < snapshot.len() {
+                    registered_fds.resize(snapshot.len(), -1);
+                }
+                for (index, client) in snapshot.iter().enumerate().skip(1) {
+                    if !client.in_use.load(Ordering::Relaxed)
+                        || !client.shared_receive_eligible.load(Ordering::Acquire)
+                    {
+                        continue;
+                    }
+                    let fd = client.socket.as_raw_fd();
+                    if registered_fds[index] == fd {
+                        continue;
+                    }
+                    client.shared_receive.store(true, Ordering::Release);
+                    if registration_tx.send((index, fd)).is_err() {
+                        return;
+                    }
+                    registered_fds[index] = fd;
+                }
+            }
+            maybe_batch = batch_rx.recv() => {
+                let Some(batch) = maybe_batch else { break; };
+                for packet in batch.packets {
+                    let Some(client) = snapshot.get(packet.index) else { continue; };
+                    if client.socket.as_raw_fd() != packet.fd
+                        || !client.in_use.load(Ordering::Relaxed)
+                    {
+                        continue;
+                    }
+                    let end = packet.offset.saturating_add(packet.len);
+                    let Some(bytes) = batch.data.get(packet.offset..end) else { continue; };
+                    if let Err(err) = client.handle_packet(bytes).await {
+                        debug!("client {} shared receive packet failed: {err}", packet.index);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn shared_receive_loop(
+    _clients: Arc<Mutex<Vec<Arc<BasisClient>>>>,
+    _shutdown: Arc<AtomicBool>,
+) {
+}
+
+async fn shared_maintenance_loop(
+    clients: Arc<Mutex<Vec<Arc<BasisClient>>>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    const TICK: Duration = Duration::from_millis(100);
+    const PING_INTERVAL_TICKS: usize = 15;
+    const SNAPSHOT_REFRESH_TICKS: usize = 10;
+
+    let mut ticker = time::interval(TICK);
+    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut snapshot = clients.lock().await.clone();
+    for client in &snapshot {
+        client.shared_maintenance.store(true, Ordering::Relaxed);
+    }
+    let mut tick_count = 0usize;
+    let mut ping_cursor = 0usize;
+
+    loop {
+        ticker.tick().await;
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        tick_count = tick_count.wrapping_add(1);
+        if tick_count.is_multiple_of(SNAPSHOT_REFRESH_TICKS) {
+            snapshot = clients.lock().await.clone();
+            for client in &snapshot {
+                client.shared_maintenance.store(true, Ordering::Relaxed);
+            }
+            if !snapshot.is_empty() {
+                ping_cursor %= snapshot.len();
+            }
+        }
+
+        for client in &snapshot {
+            if client.in_use.load(Ordering::Relaxed)
+                && client.pending_reliable_active.load(Ordering::Relaxed)
+            {
+                let _ = client.resend_reliable().await;
+            }
+        }
+
+        if snapshot.is_empty() {
+            continue;
+        }
+        let ping_count = snapshot.len().div_ceil(PING_INTERVAL_TICKS);
+        for _ in 0..ping_count {
+            let client = &snapshot[ping_cursor];
+            ping_cursor += 1;
+            if ping_cursor == snapshot.len() {
+                ping_cursor = 0;
+            }
+            if client.in_use.load(Ordering::Relaxed) && client.connected.load(Ordering::Relaxed) {
+                let _ = client.send_ping().await;
+            }
+        }
+    }
+}
+
+async fn wait_for_full_population(
+    clients: &Arc<Mutex<Vec<Arc<BasisClient>>>>,
+    shutdown: &AtomicBool,
+    timeout: Duration,
+) -> usize {
+    let deadline = time::Instant::now() + timeout;
+    loop {
+        let snapshot = clients.lock().await.clone();
+        let connected = snapshot
+            .iter()
+            .filter(|client| client.connected.load(Ordering::Relaxed))
+            .count();
+        if connected == snapshot.len() || shutdown.load(Ordering::Relaxed) {
+            info!(
+                "current connected population {}/{}",
+                connected,
+                snapshot.len()
+            );
+            return connected;
+        }
+        if time::Instant::now() >= deadline {
+            warn!(
+                "timed out waiting for full population: {}/{} currently connected",
+                connected,
+                snapshot.len()
+            );
+            return connected;
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn random_reconnect_loop(
     clients: Arc<Mutex<Vec<Arc<BasisClient>>>>,
     config: Config,
     shutdown: Arc<AtomicBool>,
     spawn_layout: SpawnLayout,
+    reconnect_min_secs: u64,
+    reconnect_max_secs: u64,
 ) {
+    let min_secs = reconnect_min_secs.max(1);
+    let max_secs = reconnect_max_secs.max(min_secs);
     loop {
-        let minutes = rand::thread_rng().gen_range(1..=20);
-        time::sleep(Duration::from_secs(minutes * 60)).await;
+        let delay_secs = rand::thread_rng().gen_range(min_secs..=max_secs);
+        time::sleep(Duration::from_secs(delay_secs)).await;
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
@@ -1963,6 +2812,7 @@ async fn random_reconnect_loop(
         }
         let idx = rand::thread_rng().gen_range(0..len);
         let old = { clients.lock().await[idx].clone() };
+        old.intentional_reconnect.store(true, Ordering::Relaxed);
         old.disconnect().await;
         time::sleep(Duration::from_secs(3)).await;
         let spawn_base = spawn_layout.base_for_client(idx);
@@ -1975,7 +2825,10 @@ async fn random_reconnect_loop(
                 clients.lock().await[idx] = new_client;
                 info!("reconnected client {idx}");
             }
-            Err(err) => warn!("failed to reconnect client {idx}: {err}"),
+            Err(err) => {
+                old.intentional_reconnect.store(false, Ordering::Relaxed);
+                warn!("failed to reconnect client {idx}: {err}");
+            }
         }
     }
 }
@@ -2012,8 +2865,21 @@ async fn wait_for_batch_connected(
     }
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let worker_threads = std::env::var("BASIS_CLIENT_TOKIO_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| num_cpus::get().saturating_sub(1).max(1))
+        .clamp(1, num_cpus::get().max(1));
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .thread_name("basis-tokio")
+        .build()?
+        .block_on(async_main(worker_threads))
+}
+
+async fn async_main(worker_threads: usize) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "basis_rust_client=info,info".to_string()),
@@ -2021,6 +2887,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    info!("tokio runtime workers={worker_threads}");
     let config_path = args.config.clone();
     let mut config = Config::load_or_create(&config_path)?;
     if let Some(ip) = args.ip {
@@ -2051,6 +2918,11 @@ async fn main() -> Result<()> {
         config.voice_frame_duration_ms = sanitize_voice_frame_duration(frame_duration);
     }
     let voice_reencode = !args.no_voice_reencode;
+    let cadence = CadenceOptions {
+        sync_batching: args.sync_batching,
+        movement_jitter_percent: args.movement_jitter_percent,
+        voice_jitter_percent: args.voice_jitter_percent,
+    };
 
     let voice_library = if config.voice_enabled {
         info!(
@@ -2163,8 +3035,51 @@ async fn main() -> Result<()> {
     }
 
     let managed_clients = Arc::new(Mutex::new(started));
+
+    // Hand authenticated sockets to the shared Linux receiver before failure recovery. This keeps
+    // the Tokio runtime free to complete/retry the small number of failed joins instead of asking
+    // it to service hundreds of already-connected per-client receive tasks during the recovery
+    // window.
+    let shared_receive_enabled = std::env::var("BASIS_CLIENT_SHARED_RECEIVE")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "False" | "FALSE"))
+        .unwrap_or(cfg!(target_os = "linux"));
+    if shared_receive_enabled && !shutdown.load(Ordering::Relaxed) {
+        info!("shared client receive enabled");
+        tokio::spawn(shared_receive_loop(
+            managed_clients.clone(),
+            shutdown.clone(),
+        ));
+    } else if !shared_receive_enabled {
+        info!("shared client receive disabled; using per-client receive tasks");
+    }
+
+    let shared_maintenance_enabled = std::env::var("BASIS_CLIENT_SHARED_MAINTENANCE")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "False" | "FALSE"))
+        .unwrap_or(true);
+    if shared_maintenance_enabled && !shutdown.load(Ordering::Relaxed) {
+        info!("shared client maintenance enabled");
+        tokio::spawn(shared_maintenance_loop(
+            managed_clients.clone(),
+            shutdown.clone(),
+        ));
+    } else if !shared_maintenance_enabled {
+        info!("shared client maintenance disabled; using per-client maintenance timers");
+    }
+
+    if !args.no_reconnect && !shutdown.load(Ordering::Relaxed) {
+        tokio::spawn(failure_reconnect_loop(
+            managed_clients.clone(),
+            config.clone(),
+            shutdown.clone(),
+            spawn_layout,
+            connect_timeout,
+        ));
+        let _ =
+            wait_for_full_population(&managed_clients, &shutdown, Duration::from_secs(120)).await;
+    }
+
     if !args.no_movement && !shutdown.load(Ordering::Relaxed) {
-        movement_workers(managed_clients.clone(), shutdown.clone()).await;
+        movement_workers(managed_clients.clone(), shutdown.clone(), cadence).await;
     }
     if let Some(voice_library) = voice_library {
         if !shutdown.load(Ordering::Relaxed) {
@@ -2181,6 +3096,7 @@ async fn main() -> Result<()> {
                 config.clone(),
                 voice_library,
                 shutdown.clone(),
+                cadence,
             ));
         }
     }
@@ -2190,6 +3106,8 @@ async fn main() -> Result<()> {
             config.clone(),
             shutdown.clone(),
             spawn_layout,
+            args.reconnect_min_secs,
+            args.reconnect_max_secs,
         ));
     }
 
@@ -2396,9 +3314,28 @@ mod tests {
         let mut raw = Vec::new();
         decoder.read_to_end(&mut raw).unwrap();
         let (url, next) = read_raw_len_string(&raw, 0);
-        let (pw, _) = read_raw_len_string(&raw, next);
+        let (pw, next) = read_raw_len_string(&raw, next);
+        let (version_tag, _) = read_raw_len_string(&raw, next);
         assert_eq!(url, "http://localhost/avatar");
         assert_eq!(pw, "pw");
+        assert_eq!(version_tag, "");
+    }
+
+    #[test]
+    fn default_avatar_is_basis_loading_avatar() {
+        let config = Config::default();
+        let message = ClientAvatarChangeMessage::new(&config).unwrap();
+        assert_eq!(message.load_mode, 1);
+
+        let mut decoder = DeflateDecoder::new(message.byte_array.as_slice());
+        let mut raw = Vec::new();
+        decoder.read_to_end(&mut raw).unwrap();
+        let (url, next) = read_raw_len_string(&raw, 0);
+        let (unlock_password, next) = read_raw_len_string(&raw, next);
+        let (version_tag, _) = read_raw_len_string(&raw, next);
+        assert_eq!(url, "LoadingAvatar");
+        assert_eq!(unlock_password, "N/A");
+        assert_eq!(version_tag, "");
     }
 
     #[test]
@@ -2419,11 +3356,37 @@ mod tests {
     }
 
     #[test]
+    fn randomized_cadence_is_default_and_sync_batching_is_opt_in() {
+        let defaults = Args::try_parse_from(["basis-rust-client"]).unwrap();
+        assert!(!defaults.sync_batching);
+        assert_eq!(defaults.movement_jitter_percent, 10);
+        assert_eq!(defaults.voice_jitter_percent, 5);
+
+        let synchronized = Args::try_parse_from(["basis-rust-client", "--sync-batching"]).unwrap();
+        assert!(synchronized.sync_batching);
+    }
+
+    #[test]
+    fn cadence_jitter_is_bounded_and_preserves_long_run_mean() {
+        let base = Duration::from_millis(50);
+        let mut state = cadence_seed(42, 0x4d4f_5645_4d45_4e54);
+        let mut total_us = 0u128;
+        for _ in 0..100_000 {
+            let interval = jittered_duration(base, 10, &mut state);
+            let us = interval.as_micros();
+            assert!((45_000..=55_000).contains(&us));
+            total_us += us;
+        }
+        let mean_us = total_us as f64 / 100_000.0;
+        assert!((49_900.0..=50_100.0).contains(&mean_us));
+    }
+
+    #[test]
     fn high_quality_payload_and_movement_packet_sizes_match() {
         let mut pose = PoseState::new_random();
         let payload = pose.high_quality_payload(0.0);
         assert_eq!(payload.len(), 159);
-        assert_eq!(u16::from_le_bytes([payload[103], payload[104]]), 434);
+        assert_eq!(u16::from_le_bytes([payload[103], payload[104]]), 0x4000);
         assert_eq!(&payload[112..117], &[0, 0, 0, 0, 0]);
         assert_eq!(&payload[124..159], &[0; 35]);
         let packet = build_movement_packet(7, &mut pose, SystemTime::now());

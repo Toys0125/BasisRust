@@ -41,8 +41,9 @@ impl BitQuality {
 pub const FLOAT_SIZE: usize = 4;
 pub const USHORT_SIZE: usize = 2;
 pub const VECTOR3_SIZE: usize = 12;
-pub const MIN_SCALE: f32 = 0.005;
-pub const MAX_SCALE: f32 = 150.0;
+const POSIT_SCALE_BITS: i32 = 16;
+const POSIT_SCALE_EXPONENT_BITS: i32 = 1;
+const POSIT_SCALE_USEED_SHIFT: i32 = 1 << POSIT_SCALE_EXPONENT_BITS;
 pub const WRITE_POSITION: usize = 9;
 pub const WRITE_SCALE: usize = 2;
 pub const WRITE_ROTATION: usize = 7;
@@ -102,8 +103,184 @@ pub fn encode_avatar_network_load(url: &str, unlock_password: &str) -> Result<Ve
 }
 
 pub fn compress_scale(scale: f32) -> u16 {
-    let range = MAX_SCALE - MIN_SCALE;
-    (((scale - MIN_SCALE) / range) * u16::MAX as f32).trunc() as u16
+    if !scale.is_finite() || scale <= 0.0 {
+        return 0;
+    }
+
+    let max_scale = decompress_scale(0x7fff);
+    let scale = scale.min(max_scale);
+    let remaining_bits = POSIT_SCALE_BITS - 1;
+    let k = (scale.log2() / POSIT_SCALE_USEED_SHIFT as f32).floor() as i32;
+    let useed_power = 2.0f32.powi(k * POSIT_SCALE_USEED_SHIFT);
+    let mut normalized = scale / useed_power;
+
+    let mut exponent = 0u32;
+    if normalized >= 2.0 {
+        exponent = 1;
+        normalized *= 0.5;
+    }
+
+    let mut fraction = (normalized - 1.0).clamp(0.0, 1.0);
+    let mut payload = 0u32;
+    let mut bit = remaining_bits - 1;
+
+    if k >= 0 {
+        let ones = k + 1;
+        for _ in 0..ones {
+            if bit < 0 {
+                break;
+            }
+            payload |= 1u32 << bit;
+            bit -= 1;
+        }
+        if bit >= 0 {
+            bit -= 1;
+        }
+    } else {
+        bit -= -k;
+        if bit >= 0 {
+            payload |= 1u32 << bit;
+            bit -= 1;
+        }
+    }
+
+    if bit >= 0 {
+        if exponent != 0 {
+            payload |= 1u32 << bit;
+        }
+        bit -= 1;
+    }
+
+    while bit >= 0 {
+        fraction *= 2.0;
+        if fraction >= 1.0 {
+            payload |= 1u32 << bit;
+            fraction -= 1.0;
+        }
+        bit -= 1;
+    }
+
+    let truncated = payload as u16;
+    let rounded_up = if truncated < 0x7fff {
+        truncated + 1
+    } else {
+        truncated
+    };
+    let lower = decompress_scale(truncated);
+    let upper = decompress_scale(rounded_up);
+    if (upper - scale).abs() < (scale - lower).abs() {
+        rounded_up
+    } else {
+        truncated
+    }
+}
+
+pub fn decompress_scale(mut value: u16) -> f32 {
+    if value == 0 {
+        return 0.0;
+    }
+
+    if value & 0x8000 != 0 {
+        value = (!value).wrapping_add(1);
+    }
+
+    let raw = value as u32;
+    let mut bit = POSIT_SCALE_BITS - 2;
+    let regime_sign = ((raw >> bit) & 1) != 0;
+    let mut run_length = 0i32;
+    while bit >= 0 && (((raw >> bit) & 1) != 0) == regime_sign {
+        run_length += 1;
+        bit -= 1;
+    }
+    if bit >= 0 {
+        bit -= 1;
+    }
+
+    let k = if regime_sign {
+        run_length - 1
+    } else {
+        -run_length
+    };
+    let mut exponent = 0i32;
+    if bit >= 0 {
+        exponent = ((raw >> bit) & 1) as i32;
+        bit -= 1;
+    }
+
+    let mut fraction = 1.0f32;
+    let mut fraction_bit = 0.5f32;
+    while bit >= 0 {
+        if ((raw >> bit) & 1) != 0 {
+            fraction += fraction_bit;
+        }
+        fraction_bit *= 0.5;
+        bit -= 1;
+    }
+
+    2.0f32.powi(k * POSIT_SCALE_USEED_SHIFT + exponent) * fraction
+}
+
+pub fn write_neutral_rotation_region(payload: &mut [u8], quality: BitQuality) -> Result<()> {
+    anyhow::ensure!(
+        payload.len() >= quality.payload_len(),
+        "avatar payload too small for {:?}",
+        quality
+    );
+
+    let offsets = rotation_field_offsets(quality);
+    let bpc = bpc_table(quality);
+    let rot_base = WRITE_POSITION;
+    payload[rot_base..rot_base + quality.rotation_len()].fill(0);
+
+    for slot in 0..WIRE_BONE_SLOT_COUNT {
+        let bit = offsets[slot];
+        let packed = match BONE_DOF[slot] {
+            3 => {
+                let bits = bpc[slot] as usize;
+                let midpoint = 1u64 << (bits - 1);
+                3u64
+                    | (midpoint << 2)
+                    | (midpoint << (2 + bits))
+                    | (midpoint << (2 + 2 * bits))
+            }
+            2 => {
+                let hinge_bits = HINGE_BITS[quality.index()] as usize;
+                let twist_bits = TWIST_BITS[quality.index()] as usize;
+                let hinge_mid = 1u64 << (hinge_bits - 1);
+                let twist_mid = 1u64 << (twist_bits - 1);
+                hinge_mid | (twist_mid << hinge_bits)
+            }
+            _ => {
+                let bits = SINGLE_BITS[quality.index()] as usize;
+                1u64 << (bits - 1)
+            }
+        };
+        write_bits(
+            payload,
+            rot_base,
+            bit,
+            packed,
+            bone_field_width(quality, slot),
+        );
+    }
+
+    let curl_bits = CURL_BITS[quality.index()] as usize;
+    let splay_bits = SPLAY_BITS[quality.index()] as usize;
+    let curl_mid = 1u64 << (curl_bits - 1);
+    let splay_mid = 1u64 << (splay_bits - 1);
+    let finger_packed = curl_mid | (splay_mid << curl_bits);
+    let finger_width = curl_bits + splay_bits;
+    for finger in 0..FINGER_CHANNEL_COUNT {
+        write_bits(
+            payload,
+            rot_base,
+            offsets[WIRE_BONE_SLOT_COUNT + finger],
+            finger_packed,
+            finger_width,
+        );
+    }
+
+    Ok(())
 }
 
 pub fn read_position(payload: &[u8]) -> Option<[f32; 3]> {
@@ -600,6 +777,60 @@ mod tests {
         assert_eq!(WRITE_POSITION, 9);
         assert_eq!(WRITE_HIPS_DELTA, 5);
         assert_eq!(TAIL_BYTES, 21);
+    }
+
+    #[test]
+    fn scale_posit16_matches_current_basis_neutral_value() {
+        assert_eq!(compress_scale(0.0), 0);
+        assert_eq!(compress_scale(1.0), 0x4000);
+        assert_eq!(decompress_scale(0x4000), 1.0);
+
+        for scale in [0.125f32, 0.5, 1.0, 2.0, 8.0, 64.0] {
+            let decoded = decompress_scale(compress_scale(scale));
+            let relative_error = ((decoded - scale) / scale).abs();
+            assert!(relative_error < 0.001, "scale={scale} decoded={decoded}");
+        }
+    }
+
+    #[test]
+    fn neutral_rotation_region_encodes_midpoints_not_zero_bits() {
+        let mut payload = vec![0u8; BitQuality::High.payload_len()];
+        write_neutral_rotation_region(&mut payload, BitQuality::High).unwrap();
+
+        let offsets = rotation_field_offsets(BitQuality::High);
+        let rot_base = WRITE_POSITION;
+
+        // 3-DOF identity: drop W (index 3), with all stored XYZ components at the signed midpoint.
+        let bits = BPC_HIGH[0] as usize;
+        let packed = read_bits(&payload, rot_base, offsets[0], 2 + 3 * bits);
+        let mask = (1u64 << bits) - 1;
+        assert_eq!(packed & 3, 3);
+        assert_eq!((packed >> 2) & mask, 1u64 << (bits - 1));
+        assert_eq!((packed >> (2 + bits)) & mask, 1u64 << (bits - 1));
+        assert_eq!((packed >> (2 + 2 * bits)) & mask, 1u64 << (bits - 1));
+
+        // Restricted and finger fields also encode zero at their signed midpoint, never as all-zero bits.
+        let hinge_bits = HINGE_BITS[BitQuality::High.index()] as usize;
+        let twist_bits = TWIST_BITS[BitQuality::High.index()] as usize;
+        let restricted = read_bits(
+            &payload,
+            rot_base,
+            offsets[9],
+            hinge_bits + twist_bits,
+        );
+        assert_eq!(restricted & ((1u64 << hinge_bits) - 1), 1u64 << (hinge_bits - 1));
+        assert_eq!(restricted >> hinge_bits, 1u64 << (twist_bits - 1));
+
+        let curl_bits = CURL_BITS[BitQuality::High.index()] as usize;
+        let splay_bits = SPLAY_BITS[BitQuality::High.index()] as usize;
+        let finger = read_bits(
+            &payload,
+            rot_base,
+            offsets[WIRE_BONE_SLOT_COUNT],
+            curl_bits + splay_bits,
+        );
+        assert_eq!(finger & ((1u64 << curl_bits) - 1), 1u64 << (curl_bits - 1));
+        assert_eq!(finger >> curl_bits, 1u64 << (splay_bits - 1));
     }
 
     #[test]
