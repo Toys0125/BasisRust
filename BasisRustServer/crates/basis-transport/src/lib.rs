@@ -31,6 +31,13 @@ const MAX_PENDING_RELIABLE_PER_PEER: usize = 4096;
 const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 const SOCKET_TTL: u32 = 255;
 const MAX_MERGED_PACKET_SIZE: usize = 1200;
+const LITENETLIB_INITIAL_MTU: usize = 1024;
+const LITENETLIB_CHANNELED_HEADER_SIZE: usize = 4;
+const LITENETLIB_FRAGMENT_HEADER_SIZE: usize = 6;
+const LITENETLIB_FRAGMENTED_HEADER_SIZE: usize =
+    LITENETLIB_CHANNELED_HEADER_SIZE + LITENETLIB_FRAGMENT_HEADER_SIZE;
+const RELIABLE_FRAGMENT_PAYLOAD_SIZE: usize =
+    LITENETLIB_INITIAL_MTU - LITENETLIB_FRAGMENTED_HEADER_SIZE;
 const DEFAULT_MAX_RECEIVE_WORKERS: usize = 8;
 
 #[derive(Debug, Error)]
@@ -204,8 +211,9 @@ struct PeerState {
     next_ping_sequence: AtomicU16,
     next_reliable_sequence: parking_lot::Mutex<HashMap<u8, u16>>,
     next_sequenced_sequence: parking_lot::Mutex<HashMap<u8, u16>>,
+    next_fragment_id: AtomicU16,
     pending_reliable: parking_lot::Mutex<HashMap<PendingReliableKey, PendingReliable>>,
-    outgoing_reliable: parking_lot::Mutex<HashMap<u8, VecDeque<Vec<u8>>>>,
+    outgoing_reliable: parking_lot::Mutex<HashMap<u8, VecDeque<OutgoingReliable>>>,
     outgoing_acks: parking_lot::Mutex<HashMap<u8, AckState>>,
 }
 
@@ -219,6 +227,19 @@ struct PendingReliableKey {
 struct PendingReliable {
     bytes: Vec<u8>,
     last_sent: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct OutgoingReliable {
+    payload: Vec<u8>,
+    fragment: Option<ReliableFragment>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReliableFragment {
+    id: u16,
+    part: u16,
+    total: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -362,6 +383,7 @@ impl TransportHandle {
             next_ping_sequence: AtomicU16::new(0),
             next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),
             next_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
+            next_fragment_id: AtomicU16::new(0),
             pending_reliable: parking_lot::Mutex::new(HashMap::new()),
             outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
             outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
@@ -701,23 +723,71 @@ fn enqueue_reliable_payload(
 ) {
     let channel_id = DeliveryMethod::channel_id(channel, delivery);
     let mut outgoing = state.outgoing_reliable.lock();
-    outgoing
-        .entry(channel_id)
-        .or_default()
-        .push_back(payload.to_vec());
+    let queue = outgoing.entry(channel_id).or_default();
+
+    if payload.len() + LITENETLIB_CHANNELED_HEADER_SIZE <= LITENETLIB_INITIAL_MTU
+        || !matches!(
+            delivery,
+            DeliveryMethod::ReliableOrdered | DeliveryMethod::ReliableUnordered
+        )
+    {
+        queue.push_back(OutgoingReliable {
+            payload: payload.to_vec(),
+            fragment: None,
+        });
+        return;
+    }
+
+    let total_fragments = payload.len().div_ceil(RELIABLE_FRAGMENT_PAYLOAD_SIZE);
+    if total_fragments > u16::MAX as usize {
+        warn!(
+            "dropping reliable payload requiring {total_fragments} fragments; LiteNetLib limit is {}",
+            u16::MAX
+        );
+        return;
+    }
+
+    let fragment_id = state
+        .next_fragment_id
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    for (part, chunk) in payload.chunks(RELIABLE_FRAGMENT_PAYLOAD_SIZE).enumerate() {
+        queue.push_back(OutgoingReliable {
+            payload: chunk.to_vec(),
+            fragment: Some(ReliableFragment {
+                id: fragment_id,
+                part: part as u16,
+                total: total_fragments as u16,
+            }),
+        });
+    }
 }
 
 fn build_queued_reliable_packet(
     state: &PeerState,
     channel_id: u8,
-    payload: Vec<u8>,
+    outgoing: OutgoingReliable,
 ) -> BuiltPacket {
     let sequence = next_channel_sequence(&state.next_reliable_sequence, channel_id);
-    let mut writer = NetWriter::with_capacity(payload.len() + 4);
-    writer.put_u8(PacketProperty::Channeled as u8 | (state.connection_number << 5));
+    let header_size = if outgoing.fragment.is_some() {
+        LITENETLIB_FRAGMENTED_HEADER_SIZE
+    } else {
+        LITENETLIB_CHANNELED_HEADER_SIZE
+    };
+    let mut writer = NetWriter::with_capacity(outgoing.payload.len() + header_size);
+    let mut header = PacketProperty::Channeled as u8 | (state.connection_number << 5);
+    if outgoing.fragment.is_some() {
+        header |= 0x80;
+    }
+    writer.put_u8(header);
     writer.put_u16(sequence);
     writer.put_u8(channel_id);
-    writer.put_bytes(&payload);
+    if let Some(fragment) = outgoing.fragment {
+        writer.put_u16(fragment.id);
+        writer.put_u16(fragment.part);
+        writer.put_u16(fragment.total);
+    }
+    writer.put_bytes(&outgoing.payload);
     BuiltPacket {
         bytes: writer.into_vec(),
         reliable_key: Some((channel_id, sequence)),
@@ -1826,6 +1896,78 @@ mod tests {
         let packet = vec![PacketProperty::Channeled as u8, 0, 0, 0x8a, 1];
         let datagrams = build_merged_datagrams(0, vec![packet.clone()]);
         assert_eq!(datagrams, vec![packet]);
+    }
+
+    #[test]
+    fn oversized_reliable_payload_uses_litenetlib_fragments() {
+        let state = PeerState {
+            id: 7,
+            addr: "127.0.0.1:4296".parse().unwrap(),
+            connection_number: 2,
+            connect_time: 123,
+            last_seen: parking_lot::Mutex::new(Instant::now()),
+            last_ping_sent: parking_lot::Mutex::new(Instant::now()),
+            next_ping_sequence: AtomicU16::new(0),
+            next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),
+            next_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
+            next_fragment_id: AtomicU16::new(0),
+            pending_reliable: parking_lot::Mutex::new(HashMap::new()),
+            outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
+            outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
+        };
+        let payload = (0..RELIABLE_FRAGMENT_PAYLOAD_SIZE * 2 + 1)
+            .map(|index| (index & 0xff) as u8)
+            .collect::<Vec<_>>();
+
+        enqueue_reliable_payload(
+            &state,
+            channels::CREATE_REMOTE_PLAYERS_FOR_NEW_PEER,
+            DeliveryMethod::ReliableOrdered,
+            &payload,
+        );
+
+        let channel_id = DeliveryMethod::channel_id(
+            channels::CREATE_REMOTE_PLAYERS_FOR_NEW_PEER,
+            DeliveryMethod::ReliableOrdered,
+        );
+        let queued = state
+            .outgoing_reliable
+            .lock()
+            .get_mut(&channel_id)
+            .unwrap()
+            .drain(..)
+            .collect::<Vec<_>>();
+        assert_eq!(queued.len(), 3);
+
+        let mut reassembled = Vec::new();
+        for (part, outgoing) in queued.into_iter().enumerate() {
+            let packet = build_queued_reliable_packet(&state, channel_id, outgoing);
+            assert!(packet.bytes.len() <= LITENETLIB_INITIAL_MTU);
+            assert_eq!(
+                packet.bytes[0],
+                PacketProperty::Channeled as u8 | (2 << 5) | 0x80
+            );
+            assert_eq!(
+                u16::from_le_bytes([packet.bytes[1], packet.bytes[2]]),
+                part as u16
+            );
+            assert_eq!(packet.bytes[3], channel_id);
+            assert_eq!(
+                u16::from_le_bytes([packet.bytes[4], packet.bytes[5]]),
+                1
+            );
+            assert_eq!(
+                u16::from_le_bytes([packet.bytes[6], packet.bytes[7]]),
+                part as u16
+            );
+            assert_eq!(
+                u16::from_le_bytes([packet.bytes[8], packet.bytes[9]]),
+                3
+            );
+            reassembled.extend_from_slice(&packet.bytes[LITENETLIB_FRAGMENTED_HEADER_SIZE..]);
+        }
+
+        assert_eq!(reassembled, payload);
     }
 
     #[test]
