@@ -1,1 +1,1 @@
-<Configuration><Password>default_password</Password><Ip>localhost</Ip><Port>4296</Port><ClientCount>250</ClientCount><AvatarPassword>N/A</AvatarPassword><AvatarUrl>LoadingAvatar</AvatarUrl><AvatarLoadMode>1</AvatarLoadMode></Configuration>
+<Configuration><Password>default_password</Password><Ip>localhost</Ip><Port>4296</Port><ClientCount>250</ClientCount><CompanyName>Basis Unity</CompanyName><ProductName>Basis Unity</ProductName><AvatarPassword>N/A</AvatarPassword><AvatarUrl>LoadingAvatar</AvatarUrl><AvatarLoadMode>1</AvatarLoadMode></Configuration>

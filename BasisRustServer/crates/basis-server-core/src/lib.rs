@@ -3,6 +3,7 @@ mod p2p;
 
 use anyhow::{Context, Result};
 use basis_protocol::{
+    application::NetworkApplication,
     avatar::BitQuality,
     avatar_delta::apply_delta,
     channels,
@@ -636,6 +637,27 @@ async fn handle_connection_request(
             ),
         )
         .await?;
+        return Ok(());
+    }
+
+    let application = match NetworkApplication::try_read(&mut reader) {
+        Some(application) => application,
+        None => {
+            state
+                .transport
+                .reject(&request, "Invalid client data.")
+                .await?;
+            return Ok(());
+        }
+    };
+    if !application.matches(&config.company_name, &config.product_name) {
+        state
+            .transport
+            .reject(
+                &request,
+                &application.unsupported_reason(&config.company_name, &config.product_name),
+            )
+            .await?;
         return Ok(());
     }
 

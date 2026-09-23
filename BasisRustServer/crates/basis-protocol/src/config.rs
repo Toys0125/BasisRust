@@ -19,6 +19,8 @@ pub struct ServerConfig {
     pub set_port: u16,
     pub server_name: String,
     pub server_motd: String,
+    pub company_name: String,
+    pub product_name: String,
     pub use_native_sockets: bool,
     pub nat_punch_enabled: bool,
     pub ping_interval: i32,
@@ -143,12 +145,14 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            config_version: 13,
+            config_version: 14,
             peer_limit: u16::MAX as i32,
             network_stack_id: String::new(),
             set_port: 4296,
             server_name: "Basis Server".to_string(),
             server_motd: String::new(),
+            company_name: crate::application::DEFAULT_COMPANY_NAME.to_string(),
+            product_name: crate::application::DEFAULT_PRODUCT_NAME.to_string(),
             use_native_sockets: true,
             nat_punch_enabled: false,
             ping_interval: 1500,
@@ -261,7 +265,7 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    pub const CURRENT_CONFIG_VERSION: i32 = 13;
+    pub const CURRENT_CONFIG_VERSION: i32 = 14;
     pub const CONFIG_FOLDER_NAME: &'static str = "config";
     pub const LOGS_FOLDER_NAME: &'static str = "logs";
     pub const INITIAL_RESOURCES_FOLDER_NAME: &'static str = "initialresources";
@@ -320,6 +324,8 @@ impl ServerConfig {
         override_field!("SetPort", set_port, u16);
         override_string!("ServerName", server_name);
         override_string!("ServerMotd", server_motd);
+        override_string!("CompanyName", company_name);
+        override_string!("ProductName", product_name);
         override_field!("UseNativeSockets", use_native_sockets, bool);
         override_field!("NatPunchEnabled", nat_punch_enabled, bool);
         override_field!("PingInterval", ping_interval, i32);
@@ -658,6 +664,9 @@ mod tests {
         assert_eq!(config.peer_limit, u16::MAX as i32);
         assert_eq!(config.set_port, 4296);
         assert_eq!(config.password, "default_password");
+        assert_eq!(config.config_version, ServerConfig::CURRENT_CONFIG_VERSION);
+        assert_eq!(config.company_name, crate::application::DEFAULT_COMPANY_NAME);
+        assert_eq!(config.product_name, crate::application::DEFAULT_PRODUCT_NAME);
         assert!(config.use_auth);
         assert!(config.use_auth_identity);
         assert!(config.worlds_locked);
@@ -670,6 +679,8 @@ mod tests {
         let xml = quick_xml::se::to_string(&config).unwrap();
         assert!(xml.contains("<SetPort>4296</SetPort>"));
         assert!(xml.contains("<ServerName>Basis Server</ServerName>"));
+        assert!(xml.contains("<CompanyName>Basis Unity</CompanyName>"));
+        assert!(xml.contains("<ProductName>Basis Unity</ProductName>"));
         assert!(xml.contains("<BSRSMillisecondDefaultInterval>50</BSRSMillisecondDefaultInterval>"));
         assert!(xml.contains("<IPv4Address>0.0.0.0</IPv4Address>"));
         assert!(xml.contains("<EndEffectorIKDisabled>false</EndEffectorIKDisabled>"));
@@ -684,9 +695,13 @@ mod tests {
         assert_eq!(config.get_field("BSRMaxDegreeOfParallelism").as_deref(), Some("0"));
         config.set_field("AvatarBundleZstdLevel", "-5").unwrap();
         config.set_field("ImagePickupRangeMeters", "42.5").unwrap();
+        config.set_field("CompanyName", "Custom Company").unwrap();
+        config.set_field("ProductName", "Custom Product").unwrap();
         config.set_field("BasisUserRestrictionMode", "blacklist").unwrap();
         assert_eq!(config.avatar_bundle_zstd_level, -5);
         assert_eq!(config.image_pickup_range_meters, 42.5);
+        assert_eq!(config.company_name, "Custom Company");
+        assert_eq!(config.product_name, "Custom Product");
         assert_eq!(config.basis_user_restriction_mode, BasisUserRestrictionMode::BlackList);
         assert!(config.set_field("DefinitelyNotAField", "1").is_err());
         assert!(ServerConfig::is_secret_field_name("ApiKey"));

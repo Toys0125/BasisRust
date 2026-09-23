@@ -1,3 +1,4 @@
+pub mod application;
 pub mod avatar;
 mod avatar_bundle_dictionary;
 pub mod avatar_delta;

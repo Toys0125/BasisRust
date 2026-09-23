@@ -19,6 +19,7 @@ use std::sync::mpsc as std_mpsc;
 
 use anyhow::{anyhow, Context, Result};
 use basis_protocol::{
+    application::{NetworkApplication, DEFAULT_COMPANY_NAME, DEFAULT_PRODUCT_NAME},
     avatar::{compress_scale, write_neutral_rotation_region, BitQuality as ProtocolBitQuality},
     channels,
     io::NetWriter as ProtocolNetWriter,
@@ -143,6 +144,8 @@ struct Config {
     ip: String,
     port: u16,
     client_count: usize,
+    company_name: String,
+    product_name: String,
     avatar_password: String,
     avatar_url: String,
     avatar_load_mode: u8,
@@ -160,6 +163,8 @@ struct RawConfig {
     ip: Option<String>,
     port: Option<String>,
     client_count: Option<String>,
+    company_name: Option<String>,
+    product_name: Option<String>,
     avatar_password: Option<String>,
     avatar_url: Option<String>,
     avatar_load_mode: Option<String>,
@@ -177,6 +182,8 @@ impl Default for Config {
             ip: "localhost".to_string(),
             port: 4296,
             client_count: 250,
+            company_name: DEFAULT_COMPANY_NAME.to_string(),
+            product_name: DEFAULT_PRODUCT_NAME.to_string(),
             avatar_password: "N/A".to_string(),
             avatar_url: "LoadingAvatar".to_string(),
             avatar_load_mode: 1,
@@ -220,6 +227,8 @@ impl Config {
             ip: raw.ip.filter(|s| !s.is_empty()).unwrap_or(defaults.ip),
             port: parse_or_default(raw.port, defaults.port, "Port"),
             client_count: parse_or_default(raw.client_count, defaults.client_count, "ClientCount"),
+            company_name: raw.company_name.unwrap_or(defaults.company_name),
+            product_name: raw.product_name.unwrap_or(defaults.product_name),
             avatar_password: raw
                 .avatar_password
                 .filter(|s| !s.is_empty())
@@ -263,11 +272,13 @@ impl Config {
 
     fn to_pretty_xml(&self) -> String {
         format!(
-            "<Configuration>\n  <Password>{}</Password>\n  <Ip>{}</Ip>\n  <Port>{}</Port>\n  <ClientCount>{}</ClientCount>\n  <AvatarPassword>{}</AvatarPassword>\n  <AvatarUrl>{}</AvatarUrl>\n  <AvatarLoadMode>{}</AvatarLoadMode>\n  <VoiceEnabled>{}</VoiceEnabled>\n  <VoiceAudioFolder>{}</VoiceAudioFolder>\n  <VoiceSpeakerPercent>{}</VoiceSpeakerPercent>\n  <VoiceHearingDistance>{}</VoiceHearingDistance>\n  <VoiceFrameDurationMs>{}</VoiceFrameDurationMs>\n</Configuration>\n",
+            "<Configuration>\n  <Password>{}</Password>\n  <Ip>{}</Ip>\n  <Port>{}</Port>\n  <ClientCount>{}</ClientCount>\n  <CompanyName>{}</CompanyName>\n  <ProductName>{}</ProductName>\n  <AvatarPassword>{}</AvatarPassword>\n  <AvatarUrl>{}</AvatarUrl>\n  <AvatarLoadMode>{}</AvatarLoadMode>\n  <VoiceEnabled>{}</VoiceEnabled>\n  <VoiceAudioFolder>{}</VoiceAudioFolder>\n  <VoiceSpeakerPercent>{}</VoiceSpeakerPercent>\n  <VoiceHearingDistance>{}</VoiceHearingDistance>\n  <VoiceFrameDurationMs>{}</VoiceFrameDurationMs>\n</Configuration>\n",
             escape_xml(&self.password),
             escape_xml(&self.ip),
             self.port,
             self.client_count,
+            escape_xml(&self.company_name),
+            escape_xml(&self.product_name),
             escape_xml(&self.avatar_password),
             escape_xml(&self.avatar_url),
             self.avatar_load_mode,
@@ -681,6 +692,10 @@ fn build_connection_payload(config: &Config, ready: &ReadyMessage) -> Vec<u8> {
     let auth = config.password.as_bytes();
     let mut writer = NetWriter::with_capacity(512);
     writer.put_u16(SERVER_VERSION);
+    writer.put_bytes(&NetworkApplication::encode(
+        &config.company_name,
+        &config.product_name,
+    ));
     put_bytes_message(&mut writer, auth);
     ready.serialize(&mut writer);
     writer.into_vec()
@@ -3704,14 +3719,34 @@ mod tests {
     }
 
     #[test]
-    fn connection_payload_starts_with_version_auth_and_ready() {
+    fn connection_payload_starts_with_v55_application_auth_and_ready() {
         let config = Config::default();
         let ready = ReadyMessage::new(&config, [0.0, 0.0, 0.0]).unwrap();
         let payload = build_connection_payload(&config, &ready);
+        assert_eq!(SERVER_VERSION, 55);
         assert_eq!(&payload[0..2], &SERVER_VERSION.to_le_bytes());
-        let auth_len = u16::from_le_bytes([payload[2], payload[3]]) as usize;
-        assert_eq!(&payload[4..4 + auth_len], b"default_password");
-        assert!(payload.len() > 4 + auth_len);
+        assert_eq!(payload[2], 1);
+        let auth_len = u16::from_le_bytes([payload[3], payload[4]]) as usize;
+        assert_eq!(&payload[5..5 + auth_len], b"default_password");
+        assert!(payload.len() > 5 + auth_len);
+    }
+
+    #[test]
+    fn connection_payload_supports_raw_application_names() {
+        let config = Config {
+            company_name: "Custom Company".to_string(),
+            product_name: "Custom Product".to_string(),
+            ..Config::default()
+        };
+        let ready = ReadyMessage::new(&config, [0.0, 0.0, 0.0]).unwrap();
+        let payload = build_connection_payload(&config, &ready);
+
+        let mut reader = ProtocolNetReader::new(&payload);
+        assert_eq!(reader.get_u16().unwrap(), SERVER_VERSION);
+        let application = NetworkApplication::try_read(&mut reader).unwrap();
+        assert_eq!(application.company_name, "Custom Company");
+        assert_eq!(application.product_name, "Custom Product");
+        assert_eq!(reader.get_bytes_with_length().unwrap(), b"default_password");
     }
 
     #[test]
