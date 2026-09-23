@@ -1,5 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
@@ -38,8 +39,9 @@ use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
+    io::{self, AsyncBufReadExt, BufReader},
     net::UdpSocket,
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Mutex, Notify},
     time,
 };
 use tracing::{debug, error, info, trace, warn};
@@ -47,6 +49,17 @@ use uuid::Uuid;
 
 const DEFAULT_WINDOW_SIZE: usize = 128;
 const MAX_SEQUENCE: u16 = 32768;
+const LITENETLIB_INITIAL_MTU: usize = 1024;
+const LITENETLIB_CHANNELED_HEADER_SIZE: usize = 4;
+const LITENETLIB_FRAGMENT_HEADER_SIZE: usize = 6;
+const LITENETLIB_FRAGMENTED_HEADER_SIZE: usize =
+    LITENETLIB_CHANNELED_HEADER_SIZE + LITENETLIB_FRAGMENT_HEADER_SIZE;
+const RELIABLE_FRAGMENT_PAYLOAD_SIZE: usize =
+    LITENETLIB_INITIAL_MTU - LITENETLIB_FRAGMENTED_HEADER_SIZE;
+const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
+const PING_INTERVAL_TICKS: usize = 15;
+const SNAPSHOT_REFRESH_TICKS: usize = 10;
+const INITIAL_START_ATTEMPTS: usize = 3;
 const MOVEMENT_INTERVAL: Duration = Duration::from_millis(90);
 const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 const SOCKET_TTL: u32 = 255;
@@ -97,6 +110,12 @@ struct Args {
     connect_batch_size: usize,
     #[arg(long, default_value_t = 250)]
     connect_batch_delay_ms: u64,
+    /// Number of clients to disconnect at a time during graceful shutdown.
+    #[arg(long, default_value_t = 100)]
+    quit_batch_size: usize,
+    /// Delay between graceful shutdown disconnect batches.
+    #[arg(long, default_value_t = 250)]
+    quit_batch_delay_ms: u64,
     #[arg(long, default_value_t = 5000)]
     connect_timeout_ms: u64,
     #[arg(long, default_value_t = 0)]
@@ -770,7 +789,21 @@ fn parse_packet(bytes: &[u8]) -> Option<ParsedPacket<'_>> {
     })
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
+struct MaintenanceOptions {
+    shared: bool,
+    refresh: Arc<Notify>,
+}
+
+#[derive(Clone, Copy)]
+struct ConnectOptions {
+    batch_size: usize,
+    batch_delay: Duration,
+    timeout: Duration,
+    shared_maintenance: bool,
+}
+
+#[derive(Debug, Clone)]
 struct ReliableSend {
     channel_id: u8,
     sequence: u16,
@@ -844,13 +877,14 @@ struct BasisClient {
     intentional_reconnect: AtomicBool,
     movement_sequence: AtomicU8,
     voice_sequence: AtomicU8,
-    reliable_sequence: AtomicU16,
+    reliable_sequences: [AtomicU16; 256],
+    fragment_id: AtomicU16,
     ping_sequence: AtomicU16,
     pending_reliable: Mutex<VecDeque<ReliableSend>>,
     pending_reliable_active: AtomicBool,
-    shared_maintenance: AtomicBool,
     shared_receive: AtomicBool,
     shared_receive_eligible: AtomicBool,
+    receive_shutdown: Notify,
     received_reliable: StdMutex<ReliableReceiveState>,
     pose: Mutex<PoseState>,
     identity: Identity,
@@ -862,6 +896,7 @@ impl BasisClient {
         config: &Config,
         mut ready: ReadyMessage,
         spawn_base: [f32; 3],
+        shared_maintenance_enabled: bool,
     ) -> Result<Arc<Self>> {
         let server_addr = resolve_addr(&config.ip, config.port)?;
         let socket = bind_udp_socket(any_local_addr(server_addr))?;
@@ -884,23 +919,31 @@ impl BasisClient {
             intentional_reconnect: AtomicBool::new(false),
             movement_sequence: AtomicU8::new(0),
             voice_sequence: AtomicU8::new(0),
-            reliable_sequence: AtomicU16::new(0),
+            reliable_sequences: std::array::from_fn(|_| AtomicU16::new(0)),
+            fragment_id: AtomicU16::new(0),
             ping_sequence: AtomicU16::new(0),
             pending_reliable: Mutex::new(VecDeque::new()),
             pending_reliable_active: AtomicBool::new(false),
-            shared_maintenance: AtomicBool::new(false),
             shared_receive: AtomicBool::new(false),
             shared_receive_eligible: AtomicBool::new(false),
+            receive_shutdown: Notify::new(),
             received_reliable: StdMutex::new(ReliableReceiveState::default()),
             pose: Mutex::new(PoseState::new_at(spawn_base)),
             identity,
         });
 
-        client.start_client(config, &ready).await?;
+        client
+            .start_client(config, &ready, shared_maintenance_enabled)
+            .await?;
         Ok(client)
     }
 
-    async fn start_client(self: &Arc<Self>, config: &Config, ready: &ReadyMessage) -> Result<()> {
+    async fn start_client(
+        self: &Arc<Self>,
+        config: &Config,
+        ready: &ReadyMessage,
+        shared_maintenance_enabled: bool,
+    ) -> Result<()> {
         if self.in_use.swap(true, Ordering::SeqCst) {
             error!("Call Shutdown First!");
             return Err(anyhow!("Call Shutdown First!"));
@@ -924,10 +967,12 @@ impl BasisClient {
             }
         });
 
-        let client = self.clone();
-        tokio::spawn(async move {
-            client.maintenance_loop().await;
-        });
+        if !shared_maintenance_enabled {
+            let client = self.clone();
+            tokio::spawn(async move {
+                client.maintenance_loop().await;
+            });
+        }
 
         Ok(())
     }
@@ -950,9 +995,20 @@ impl BasisClient {
         writer.into_vec()
     }
 
-    async fn disconnect(&self) {
+    fn stop_receive_loop(&self) {
+        // A UDP recv future otherwise keeps this Arc (and its socket FD) alive indefinitely when
+        // a connection attempt is replaced without receiving a final server packet.
+        self.receive_shutdown.notify_one();
+    }
+
+    fn deactivate(&self) {
         self.in_use.store(false, Ordering::SeqCst);
         self.connected.store(false, Ordering::SeqCst);
+        self.stop_receive_loop();
+    }
+
+    async fn disconnect(&self) {
+        self.deactivate();
         info!("client {} called disconnect", self.index);
         let mut packet = NetWriter::with_capacity(9);
         packet.put_u8(PacketProperty::Disconnect as u8 | (self.connection_number << 5));
@@ -996,39 +1052,101 @@ impl BasisClient {
         })
     }
 
+    fn next_reliable_sequence(&self, channel_id: u8) -> u16 {
+        self.reliable_sequences[channel_id as usize].fetch_add(1, Ordering::SeqCst) % MAX_SEQUENCE
+    }
+
+    async fn mark_reliable_sent(&self, sent: &ReliableSend, sent_at: SystemTime) {
+        let mut pending = self.pending_reliable.lock().await;
+        if let Some(item) = pending.iter_mut().find(|item| {
+            item.channel_id == sent.channel_id
+                && item.sequence == sent.sequence
+                && item.bytes == sent.bytes
+        }) {
+            item.last_sent = Some(sent_at);
+        }
+    }
+
     async fn send_reliable_ordered(&self, channel: u8, payload: &[u8]) -> Result<()> {
         if !self.connected.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let sequence = self.reliable_sequence.fetch_add(1, Ordering::SeqCst) % MAX_SEQUENCE;
+
         let channel_id = DeliveryMethod::channel_id(channel, DeliveryMethod::ReliableOrdered);
-        let mut packet = Vec::with_capacity(4 + payload.len());
-        packet.push(PacketProperty::Channeled as u8 | (self.connection_number << 5));
-        packet.extend_from_slice(&sequence.to_le_bytes());
-        packet.push(channel_id);
-        packet.extend_from_slice(payload);
-        self.send_connected(&packet).await?;
-        self.pending_reliable.lock().await.push_back(ReliableSend {
-            channel_id,
-            sequence,
-            bytes: packet,
-            last_sent: Some(SystemTime::now()),
-        });
-        self.pending_reliable_active.store(true, Ordering::Relaxed);
+        let mut packets = Vec::new();
+        if payload.len() + LITENETLIB_CHANNELED_HEADER_SIZE <= LITENETLIB_INITIAL_MTU {
+            let sequence = self.next_reliable_sequence(channel_id);
+            let mut packet = Vec::with_capacity(LITENETLIB_CHANNELED_HEADER_SIZE + payload.len());
+            packet.push(PacketProperty::Channeled as u8 | (self.connection_number << 5));
+            packet.extend_from_slice(&sequence.to_le_bytes());
+            packet.push(channel_id);
+            packet.extend_from_slice(payload);
+            packets.push(ReliableSend {
+                channel_id,
+                sequence,
+                bytes: packet,
+                last_sent: None,
+            });
+        } else {
+            let total_fragments = payload.len().div_ceil(RELIABLE_FRAGMENT_PAYLOAD_SIZE);
+            if total_fragments > u16::MAX as usize {
+                return Err(anyhow!(
+                    "reliable payload requires {} fragments, exceeding LiteNetLib limit",
+                    total_fragments
+                ));
+            }
+
+            let fragment_id = self
+                .fragment_id
+                .fetch_add(1, Ordering::SeqCst)
+                .wrapping_add(1);
+            packets.reserve(total_fragments);
+            for (part, chunk) in payload.chunks(RELIABLE_FRAGMENT_PAYLOAD_SIZE).enumerate() {
+                let sequence = self.next_reliable_sequence(channel_id);
+                let mut packet =
+                    Vec::with_capacity(LITENETLIB_FRAGMENTED_HEADER_SIZE + chunk.len());
+                packet.push(PacketProperty::Channeled as u8 | (self.connection_number << 5) | 0x80);
+                packet.extend_from_slice(&sequence.to_le_bytes());
+                packet.push(channel_id);
+                packet.extend_from_slice(&fragment_id.to_le_bytes());
+                packet.extend_from_slice(&(part as u16).to_le_bytes());
+                packet.extend_from_slice(&(total_fragments as u16).to_le_bytes());
+                packet.extend_from_slice(chunk);
+                packets.push(ReliableSend {
+                    channel_id,
+                    sequence,
+                    bytes: packet,
+                    last_sent: None,
+                });
+            }
+        }
+
+        // Record the complete message before its first datagram can elicit an ACK. If a send
+        // fails, every packet remains queued (unsent entries have last_sent == None) for retry.
+        {
+            let mut pending = self.pending_reliable.lock().await;
+            pending.extend(packets.iter().cloned());
+            self.pending_reliable_active.store(true, Ordering::Relaxed);
+        }
+
+        for packet in &packets {
+            self.send_connected(&packet.bytes).await?;
+            self.mark_reliable_sent(packet, SystemTime::now()).await;
+        }
         Ok(())
     }
 
     async fn receive_loop(self: Arc<Self>) -> Result<()> {
         let mut buffer = vec![0u8; 65535];
         loop {
-            if self.shared_receive.load(Ordering::Relaxed) {
-                break;
-            }
-            let len = self.socket.recv(&mut buffer).await?;
-            self.handle_packet(&buffer[..len]).await?;
             if !self.in_use.load(Ordering::Relaxed) || self.shared_receive.load(Ordering::Relaxed) {
                 break;
             }
+            let len = tokio::select! {
+                result = self.socket.recv(&mut buffer) => result?,
+                _ = self.receive_shutdown.notified() => break,
+            };
+            self.handle_packet(&buffer[..len]).await?;
         }
         Ok(())
     }
@@ -1080,8 +1198,7 @@ impl BasisClient {
                     "client {} disconnected/rejected by server: {:?} reason={:?}",
                     self.index, packet.property, reason
                 );
-                self.connected.store(false, Ordering::SeqCst);
-                self.in_use.store(false, Ordering::SeqCst);
+                self.deactivate();
             }
             PacketProperty::Ping => {
                 if let Some(sequence) = packet.sequence {
@@ -1296,17 +1413,12 @@ impl BasisClient {
     }
 
     async fn maintenance_loop(self: Arc<Self>) {
-        const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
-        const PING_EVERY_TICKS: u8 = 15;
-
         let mut tick = time::interval(MAINTENANCE_INTERVAL);
         tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-        let mut ping_ticks = 0u8;
+        let mut ping_ticks = 0usize;
         loop {
             tick.tick().await;
-            if !self.in_use.load(Ordering::Relaxed)
-                || self.shared_maintenance.load(Ordering::Relaxed)
-            {
+            if !self.in_use.load(Ordering::Relaxed) {
                 break;
             }
 
@@ -1314,8 +1426,8 @@ impl BasisClient {
                 let _ = self.resend_reliable().await;
             }
 
-            ping_ticks += 1;
-            if ping_ticks >= PING_EVERY_TICKS {
+            ping_ticks = ping_ticks.wrapping_add(1);
+            if ping_ticks >= PING_INTERVAL_TICKS {
                 ping_ticks = 0;
                 let _ = self.send_ping().await;
             }
@@ -1323,22 +1435,50 @@ impl BasisClient {
     }
 
     async fn resend_reliable(&self) -> Result<()> {
-        if !self.connected.load(Ordering::Relaxed)
-            || !self.pending_reliable_active.load(Ordering::Relaxed)
-        {
+        if !self.connected.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let mut pending = self.pending_reliable.lock().await;
+
+        // Reserve due packets while holding the queue lock, but never await a socket operation
+        // while holding it. This lets an ACK remove packets while a resend batch is in flight.
         let now = SystemTime::now();
-        for item in pending.iter_mut() {
-            let should_send = item
-                .last_sent
-                .and_then(|sent| now.duration_since(sent).ok())
-                .map(|elapsed| elapsed >= Duration::from_millis(150))
-                .unwrap_or(true);
-            if should_send {
-                self.send_connected(&item.bytes).await?;
-                item.last_sent = Some(now);
+        let due = {
+            let mut pending = self.pending_reliable.lock().await;
+            if pending.is_empty() {
+                self.pending_reliable_active.store(false, Ordering::Relaxed);
+                return Ok(());
+            }
+
+            let mut due = Vec::new();
+            for item in pending.iter_mut() {
+                let should_send = item
+                    .last_sent
+                    .and_then(|sent| now.duration_since(sent).ok())
+                    .map(|elapsed| elapsed >= Duration::from_millis(150))
+                    .unwrap_or(true);
+                if should_send {
+                    // Mark before sending so another maintenance pass cannot select the same
+                    // packet while this pass is awaiting the UDP write.
+                    item.last_sent = Some(now);
+                    due.push(item.clone());
+                }
+            }
+            due
+        };
+
+        for item in due {
+            if let Err(err) = self.send_connected(&item.bytes).await {
+                // Keep failed packets immediately eligible for the next retry. The full message
+                // remains in the queue, including fragments that were not reached yet.
+                let mut pending = self.pending_reliable.lock().await;
+                if let Some(current) = pending.iter_mut().find(|current| {
+                    current.channel_id == item.channel_id
+                        && current.sequence == item.sequence
+                        && current.bytes == item.bytes
+                }) {
+                    current.last_sent = None;
+                }
+                return Err(err);
             }
         }
         Ok(())
@@ -2025,47 +2165,56 @@ async fn movement_workers(
                 return;
             }
 
-            struct MovementDeadline {
-                index: usize,
-                next: time::Instant,
-                cadence_state: u64,
-            }
-
-            const RANDOMIZED_TICK: Duration = Duration::from_millis(1);
+            // Random phases make deadlines dense. A min-heap preserves those phases while
+            // allowing clients added from the console to join the schedule on the next refresh.
             let now = time::Instant::now();
             let interval_us = MOVEMENT_INTERVAL.as_micros() as u64;
-            let mut deadlines = Vec::with_capacity(initial_len.div_ceil(worker_count));
-            let mut idx = worker;
-            while idx < initial_len {
-                let mut cadence_state = cadence_seed(idx, 0x4d4f_5645_4d45_4e54);
-                let phase_us = cadence_next(&mut cadence_state) % interval_us.max(1);
-                deadlines.push(MovementDeadline {
-                    index: idx,
-                    next: now + Duration::from_micros(phase_us),
-                    cadence_state,
-                });
-                idx += worker_count;
-            }
+            let mut deadlines = BinaryHeap::<Reverse<(time::Instant, usize, u64)>>::with_capacity(
+                initial_len.div_ceil(worker_count),
+            );
+            let mut scheduled_len = 0;
+            let mut next_snapshot_refresh = now;
 
-            let mut ticker = time::interval(RANDOMIZED_TICK);
-            ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-            let mut next_snapshot_refresh = now + Duration::from_secs(1);
             loop {
-                ticker.tick().await;
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
+                let wake_at = deadlines
+                    .peek()
+                    .map(|Reverse((deadline, _, _))| (*deadline).min(next_snapshot_refresh))
+                    .unwrap_or(next_snapshot_refresh);
+                time::sleep_until(wake_at).await;
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+
                 let current = time::Instant::now();
                 if current >= next_snapshot_refresh {
                     snapshot = clients.lock().await.clone();
+                    for index in scheduled_len..snapshot.len() {
+                        if index % worker_count != worker {
+                            continue;
+                        }
+                        let mut cadence_state = cadence_seed(index, 0x4d4f_5645_4d45_4e54);
+                        let phase_us = cadence_next(&mut cadence_state) % interval_us.max(1);
+                        deadlines.push(Reverse((
+                            current + Duration::from_micros(phase_us),
+                            index,
+                            cadence_state,
+                        )));
+                    }
+                    scheduled_len = snapshot.len();
                     next_snapshot_refresh = current + Duration::from_secs(1);
                 }
 
-                for deadline in &mut deadlines {
-                    if deadline.next > current {
-                        continue;
+                while let Some(Reverse((next, _, _))) = deadlines.peek() {
+                    if *next > current {
+                        break;
                     }
-                    if let Some(client) = snapshot.get(deadline.index) {
+                    let Reverse((scheduled, index, mut cadence_state)) = deadlines
+                        .pop()
+                        .expect("movement deadline heap was non-empty");
+                    if let Some(client) = snapshot.get(index) {
                         if client.connected.load(Ordering::Relaxed) {
                             let sequence = client.movement_sequence.fetch_add(1, Ordering::Relaxed);
                             let mut pose = client.pose.lock().await;
@@ -2078,12 +2227,13 @@ async fn movement_workers(
                     let interval = jittered_duration(
                         MOVEMENT_INTERVAL,
                         cadence.movement_jitter_percent,
-                        &mut deadline.cadence_state,
+                        &mut cadence_state,
                     );
-                    deadline.next += interval;
-                    if deadline.next < current {
-                        deadline.next = current + interval;
+                    let mut next = scheduled + interval;
+                    if next < current {
+                        next = current + interval;
                     }
+                    deadlines.push(Reverse((next, index, cadence_state)));
                 }
             }
         });
@@ -2355,12 +2505,104 @@ async fn publish_voice_recipient_exclusions(
     }
 }
 
+async fn publish_client_batch(
+    managed_clients: &Arc<Mutex<Vec<Arc<BasisClient>>>>,
+    batch_start: usize,
+    batch_clients: &[Arc<BasisClient>],
+    maintenance: &MaintenanceOptions,
+) -> Result<()> {
+    let mut managed = managed_clients.lock().await;
+    if managed.len() != batch_start {
+        return Err(anyhow!(
+            "client batch {batch_start} published at dense index {}",
+            managed.len()
+        ));
+    }
+    if batch_clients
+        .iter()
+        .enumerate()
+        .any(|(offset, client)| client.index != batch_start + offset)
+    {
+        return Err(anyhow!(
+            "client batch {batch_start} contains a non-dense index"
+        ));
+    }
+    managed.extend(batch_clients.iter().cloned());
+    drop(managed);
+    if maintenance.shared {
+        maintenance.refresh.notify_one();
+    }
+    Ok(())
+}
+
+async fn replace_client_if_current(
+    clients: &Arc<Mutex<Vec<Arc<BasisClient>>>>,
+    index: usize,
+    old: &Arc<BasisClient>,
+    replacement: &Arc<BasisClient>,
+    maintenance: &MaintenanceOptions,
+) -> bool {
+    let replaced = {
+        let mut managed = clients.lock().await;
+        match managed.get(index) {
+            Some(current) if Arc::ptr_eq(current, old) => {
+                managed[index] = replacement.clone();
+                true
+            }
+            _ => false,
+        }
+    };
+    if replaced {
+        old.deactivate();
+        if maintenance.shared {
+            maintenance.refresh.notify_one();
+        }
+    }
+    replaced
+}
+
+async fn start_client_with_retries(
+    index: usize,
+    config: &Config,
+    spawn_base: [f32; 3],
+    shared_maintenance_enabled: bool,
+) -> Result<Arc<BasisClient>> {
+    let mut last_error = None;
+    for attempt in 1..=INITIAL_START_ATTEMPTS {
+        let ready = match ReadyMessage::new(config, spawn_base) {
+            Ok(ready) => ready,
+            Err(err) => {
+                last_error = Some(err);
+                break;
+            }
+        };
+        match BasisClient::start(index, config, ready, spawn_base, shared_maintenance_enabled).await
+        {
+            Ok(client) => return Ok(client),
+            Err(err) => {
+                warn!(
+                    "failed to start client {index} (attempt {attempt}/{INITIAL_START_ATTEMPTS}): {err}"
+                );
+                last_error = Some(err);
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "failed to start client {index} after {INITIAL_START_ATTEMPTS} attempts: {}",
+        last_error
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "unknown error".to_string())
+    ))
+}
+
 async fn failure_reconnect_loop(
     clients: Arc<Mutex<Vec<Arc<BasisClient>>>>,
     config: Config,
     shutdown: Arc<AtomicBool>,
     spawn_layout: SpawnLayout,
     connect_timeout: Duration,
+    maintenance: MaintenanceOptions,
 ) {
     let mut pending_since = HashMap::<usize, time::Instant>::new();
     let mut tick = time::interval(Duration::from_millis(250));
@@ -2391,21 +2633,29 @@ async fn failure_reconnect_loop(
                 if started.elapsed() < connect_timeout {
                     continue;
                 }
-                client.in_use.store(false, Ordering::SeqCst);
+                client.deactivate();
                 pending_since.remove(&idx);
                 warn!("client {idx} reconnect attempt timed out; recycling connection");
             }
 
             let spawn_base = spawn_layout.base_for_client(idx);
             let result = match ReadyMessage::new(&config, spawn_base) {
-                Ok(ready) => BasisClient::start(idx, &config, ready, spawn_base).await,
+                Ok(ready) => {
+                    BasisClient::start(idx, &config, ready, spawn_base, maintenance.shared).await
+                }
                 Err(err) => Err(err),
             };
             match result {
                 Ok(new_client) => {
-                    clients.lock().await[idx] = new_client;
-                    pending_since.insert(idx, time::Instant::now());
-                    info!("failure reconnect started for client {idx}");
+                    if replace_client_if_current(&clients, idx, &client, &new_client, &maintenance)
+                        .await
+                    {
+                        pending_since.insert(idx, time::Instant::now());
+                        info!("failure reconnect started for client {idx}");
+                    } else {
+                        warn!("discarding stale failure reconnect for client {idx}");
+                        new_client.disconnect().await;
+                    }
                 }
                 Err(err) => warn!("failed to restart client {idx}: {err}"),
             }
@@ -2666,6 +2916,7 @@ async fn shared_receive_loop(
                         continue;
                     }
                     client.shared_receive.store(true, Ordering::Release);
+                    client.stop_receive_loop();
                     if registration_tx.send((index, fd)).is_err() {
                         return;
                     }
@@ -2699,25 +2950,34 @@ async fn shared_receive_loop(
 ) {
 }
 
+fn ping_bucket_matches(slot: usize, tick: usize) -> bool {
+    slot % PING_INTERVAL_TICKS == tick % PING_INTERVAL_TICKS
+}
+
 async fn shared_maintenance_loop(
     clients: Arc<Mutex<Vec<Arc<BasisClient>>>>,
+    maintenance_refresh: Arc<Notify>,
     shutdown: Arc<AtomicBool>,
 ) {
-    const TICK: Duration = Duration::from_millis(100);
-    const PING_INTERVAL_TICKS: usize = 15;
-    const SNAPSHOT_REFRESH_TICKS: usize = 10;
-
-    let mut ticker = time::interval(TICK);
+    let mut ticker = time::interval(MAINTENANCE_INTERVAL);
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut snapshot = clients.lock().await.clone();
-    for client in &snapshot {
-        client.shared_maintenance.store(true, Ordering::Relaxed);
-    }
     let mut tick_count = 0usize;
-    let mut ping_cursor = 0usize;
 
     loop {
-        ticker.tick().await;
+        let ticked = tokio::select! {
+            _ = ticker.tick() => true,
+            _ = maintenance_refresh.notified() => {
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                snapshot = clients.lock().await.clone();
+                false
+            }
+        };
+        if !ticked {
+            continue;
+        }
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
@@ -2725,12 +2985,6 @@ async fn shared_maintenance_loop(
         tick_count = tick_count.wrapping_add(1);
         if tick_count.is_multiple_of(SNAPSHOT_REFRESH_TICKS) {
             snapshot = clients.lock().await.clone();
-            for client in &snapshot {
-                client.shared_maintenance.store(true, Ordering::Relaxed);
-            }
-            if !snapshot.is_empty() {
-                ping_cursor %= snapshot.len();
-            }
         }
 
         for client in &snapshot {
@@ -2741,15 +2995,10 @@ async fn shared_maintenance_loop(
             }
         }
 
-        if snapshot.is_empty() {
-            continue;
-        }
-        let ping_count = snapshot.len().div_ceil(PING_INTERVAL_TICKS);
-        for _ in 0..ping_count {
-            let client = &snapshot[ping_cursor];
-            ping_cursor += 1;
-            if ping_cursor == snapshot.len() {
-                ping_cursor = 0;
+        let ping_bucket = tick_count % PING_INTERVAL_TICKS;
+        for (slot, client) in snapshot.iter().enumerate() {
+            if !ping_bucket_matches(slot, ping_bucket) {
+                continue;
             }
             if client.in_use.load(Ordering::Relaxed) && client.connected.load(Ordering::Relaxed) {
                 let _ = client.send_ping().await;
@@ -2760,6 +3009,7 @@ async fn shared_maintenance_loop(
 
 async fn wait_for_full_population(
     clients: &Arc<Mutex<Vec<Arc<BasisClient>>>>,
+    expected_population: usize,
     shutdown: &AtomicBool,
     timeout: Duration,
 ) -> usize {
@@ -2770,19 +3020,19 @@ async fn wait_for_full_population(
             .iter()
             .filter(|client| client.connected.load(Ordering::Relaxed))
             .count();
-        if connected == snapshot.len() || shutdown.load(Ordering::Relaxed) {
+        if (snapshot.len() == expected_population && connected == expected_population)
+            || shutdown.load(Ordering::Relaxed)
+        {
             info!(
                 "current connected population {}/{}",
-                connected,
-                snapshot.len()
+                connected, expected_population
             );
             return connected;
         }
         if time::Instant::now() >= deadline {
             warn!(
                 "timed out waiting for full population: {}/{} currently connected",
-                connected,
-                snapshot.len()
+                connected, expected_population
             );
             return connected;
         }
@@ -2797,6 +3047,7 @@ async fn random_reconnect_loop(
     spawn_layout: SpawnLayout,
     reconnect_min_secs: u64,
     reconnect_max_secs: u64,
+    maintenance: MaintenanceOptions,
 ) {
     let min_secs = reconnect_min_secs.max(1);
     let max_secs = reconnect_max_secs.max(min_secs);
@@ -2817,13 +3068,19 @@ async fn random_reconnect_loop(
         time::sleep(Duration::from_secs(3)).await;
         let spawn_base = spawn_layout.base_for_client(idx);
         let result = match ReadyMessage::new(&config, spawn_base) {
-            Ok(ready) => BasisClient::start(idx, &config, ready, spawn_base).await,
+            Ok(ready) => {
+                BasisClient::start(idx, &config, ready, spawn_base, maintenance.shared).await
+            }
             Err(err) => Err(err),
         };
         match result {
             Ok(new_client) => {
-                clients.lock().await[idx] = new_client;
-                info!("reconnected client {idx}");
+                if replace_client_if_current(&clients, idx, &old, &new_client, &maintenance).await {
+                    info!("reconnected client {idx}");
+                } else {
+                    warn!("discarding stale reconnect for client {idx}");
+                    new_client.disconnect().await;
+                }
             }
             Err(err) => {
                 old.intentional_reconnect.store(false, Ordering::Relaxed);
@@ -2865,18 +3122,225 @@ async fn wait_for_batch_connected(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ConsoleCommand {
+    EnableVoice,
+    AddClients(usize),
+    Quit {
+        batch_size: Option<usize>,
+        delay_ms: Option<u64>,
+    },
+    Help,
+}
+
+fn parse_console_command(line: &str) -> Option<ConsoleCommand> {
+    let mut parts = line.split_whitespace();
+    let command = parts.next()?.to_ascii_lowercase();
+    match command.as_str() {
+        "voice" | "v" => Some(ConsoleCommand::EnableVoice),
+        "enable"
+            if parts
+                .next()
+                .is_some_and(|value| value.eq_ignore_ascii_case("voice")) =>
+        {
+            Some(ConsoleCommand::EnableVoice)
+        }
+        "add" | "clients" => {
+            let count = parts
+                .next()
+                .map(str::parse::<usize>)
+                .transpose()
+                .ok()?
+                .unwrap_or(100);
+            (count > 0).then_some(ConsoleCommand::AddClients(count))
+        }
+        "quit" | "exit" | "q" => {
+            let batch_size = parts.next().map(str::parse::<usize>).transpose().ok()?;
+            let delay_ms = parts.next().map(str::parse::<u64>).transpose().ok()?;
+            Some(ConsoleCommand::Quit {
+                batch_size,
+                delay_ms,
+            })
+        }
+        "help" | "h" | "?" => Some(ConsoleCommand::Help),
+        _ => None,
+    }
+}
+
+fn print_console_help() {
+    println!("Console commands:");
+    println!("  voice              enable voice simulation");
+    println!("  add [count]        add clients (default: 100)");
+    println!("  quit [batch] [ms]  disconnect in batches (default batch/delay: 100/250ms)");
+}
+
+async fn console_input(commands: mpsc::UnboundedSender<ConsoleCommand>) {
+    let stdin = BufReader::new(io::stdin());
+    let mut lines = stdin.lines();
+    print!("> ");
+    let _ = std::io::stdout().flush();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(command) = parse_console_command(&line) {
+            // Do not start another stdin read after quit. Tokio's stdin uses a blocking
+            // helper thread, which can otherwise keep the runtime alive after shutdown.
+            let quitting = matches!(command, ConsoleCommand::Quit { .. });
+            if commands.send(command).is_err() || quitting {
+                break;
+            }
+        } else if !line.trim().is_empty() {
+            println!("Unknown command. Type 'help' for available commands.");
+        }
+        print!("> ");
+        let _ = std::io::stdout().flush();
+    }
+}
+
+async fn add_clients(
+    managed_clients: &Arc<Mutex<Vec<Arc<BasisClient>>>>,
+    config: &Config,
+    count: usize,
+    spawn_layout: SpawnLayout,
+    connect: ConnectOptions,
+    maintenance: &MaintenanceOptions,
+    shutdown: &AtomicBool,
+) -> Result<usize> {
+    let start_index = managed_clients.lock().await.len();
+    let target = start_index
+        .checked_add(count)
+        .ok_or_else(|| anyhow!("client count overflow while adding {count} clients"))?;
+    let connect_batch_size = connect.batch_size.max(1);
+    let mut index = start_index;
+    while index < target {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let batch_end = (index + connect_batch_size).min(target);
+        let batch_start = index;
+        let mut batch_clients = Vec::with_capacity(batch_end - batch_start);
+        for client_index in batch_start..batch_end {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            let spawn_base = spawn_layout.base_for_client(client_index);
+            match start_client_with_retries(
+                client_index,
+                config,
+                spawn_base,
+                connect.shared_maintenance,
+            )
+            .await
+            {
+                Ok(client) => batch_clients.push(client),
+                Err(err) => {
+                    for client in batch_clients {
+                        client.disconnect().await;
+                    }
+                    let added = index.saturating_sub(start_index);
+                    if added > 0 {
+                        warn!(
+                            "stopped adding clients after {added}/{count}: client {client_index} failed: {err:#}"
+                        );
+                        return Ok(added);
+                    }
+                    return Err(err)
+                        .with_context(|| format!("failed adding client {client_index}"));
+                }
+            }
+        }
+        if shutdown.load(Ordering::Relaxed) {
+            for client in batch_clients {
+                client.disconnect().await;
+            }
+            break;
+        }
+        if batch_clients.len() != batch_end - batch_start {
+            for client in batch_clients {
+                client.disconnect().await;
+            }
+            return Err(anyhow!(
+                "client batch {batch_start}-{end} did not produce a complete dense population",
+                end = batch_end.saturating_sub(1)
+            ));
+        }
+        if let Err(err) =
+            publish_client_batch(managed_clients, batch_start, &batch_clients, maintenance).await
+        {
+            for client in batch_clients {
+                client.disconnect().await;
+            }
+            return Err(err);
+        }
+        let connected_in_batch =
+            wait_for_batch_connected(&batch_clients, connect.timeout, shutdown).await;
+        if connected_in_batch < batch_clients.len() {
+            for client in &batch_clients {
+                if !client.connected.load(Ordering::Relaxed) {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    client.deactivate();
+                    warn!(
+                        "client {} did not connect within {}ms",
+                        client.index,
+                        connect.timeout.as_millis()
+                    );
+                }
+            }
+        }
+        info!(
+            "connection batch {}-{} accepted {}/{} clients",
+            batch_start,
+            batch_end.saturating_sub(1),
+            connected_in_batch,
+            batch_clients.len()
+        );
+        index = batch_end;
+        if index < target && !connect.batch_delay.is_zero() {
+            sleep_or_shutdown(connect.batch_delay, shutdown).await;
+        }
+    }
+    Ok(index.saturating_sub(start_index))
+}
+
+async fn disconnect_clients_in_batches(
+    clients: &Arc<Mutex<Vec<Arc<BasisClient>>>>,
+    batch_size: usize,
+    delay: Duration,
+) {
+    let snapshot = clients.lock().await.clone();
+    let batch_size = batch_size.max(1);
+    for (batch_number, batch) in snapshot.chunks(batch_size).enumerate() {
+        info!(
+            "disconnecting client batch {} ({}/{} clients)",
+            batch_number + 1,
+            batch.len(),
+            snapshot.len()
+        );
+        for client in batch {
+            client.disconnect().await;
+        }
+        if batch_number + 1 < snapshot.len().div_ceil(batch_size) && !delay.is_zero() {
+            time::sleep(delay).await;
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let worker_threads = std::env::var("BASIS_CLIENT_TOKIO_WORKERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or_else(|| num_cpus::get().saturating_sub(1).max(1))
         .clamp(1, num_cpus::get().max(1));
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
         .enable_all()
         .thread_name("basis-tokio")
-        .build()?
-        .block_on(async_main(worker_threads))
+        .build()?;
+    let result = runtime.block_on(async_main(worker_threads));
+    // Tokio's async stdin is backed by a blocking helper. Give normal tasks time to finish,
+    // but do not wait forever for that helper when Ctrl+C interrupts the client.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
 }
 
 async fn async_main(worker_threads: usize) -> Result<()> {
@@ -2924,7 +3388,7 @@ async fn async_main(worker_threads: usize) -> Result<()> {
         voice_jitter_percent: args.voice_jitter_percent,
     };
 
-    let voice_library = if config.voice_enabled {
+    let mut voice_library = if config.voice_enabled {
         info!(
             "voice simulation requested: folder={} speaker_percent={} hearing_distance={} frame_duration_ms={} ffmpeg_reencode={}",
             config.voice_audio_folder,
@@ -2972,69 +3436,61 @@ async fn async_main(worker_threads: usize) -> Result<()> {
         signal_shutdown.store(true, Ordering::SeqCst);
     });
 
-    let connect_batch_size = args.connect_batch_size.max(1);
-    let connect_timeout = Duration::from_millis(args.connect_timeout_ms);
-    let connect_batch_delay = Duration::from_millis(args.connect_batch_delay_ms);
-    let mut started = Vec::with_capacity(config.client_count);
-    let mut index = 0;
-    while index < config.client_count {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-        let batch_end = (index + connect_batch_size).min(config.client_count);
-        let batch_start = index;
-        let mut batch_clients = Vec::with_capacity(batch_end - batch_start);
-        for client_index in batch_start..batch_end {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
+    let shared_maintenance_enabled = std::env::var("BASIS_CLIENT_SHARED_MAINTENANCE")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "False" | "FALSE"))
+        .unwrap_or(true);
+    let managed_clients = Arc::new(Mutex::new(Vec::with_capacity(config.client_count)));
+    let maintenance_refresh = Arc::new(Notify::new());
+    let maintenance = MaintenanceOptions {
+        shared: shared_maintenance_enabled,
+        refresh: maintenance_refresh.clone(),
+    };
+    if shared_maintenance_enabled {
+        info!("shared client maintenance enabled");
+        let maintenance_task = tokio::spawn(shared_maintenance_loop(
+            managed_clients.clone(),
+            maintenance_refresh.clone(),
+            shutdown.clone(),
+        ));
+        let maintenance_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let result = maintenance_task.await;
+            if maintenance_shutdown.load(Ordering::Relaxed) {
+                return;
             }
-            let spawn_base = spawn_layout.base_for_client(client_index);
-            let ready = ReadyMessage::new(&config, spawn_base)?;
-            match BasisClient::start(client_index, &config, ready, spawn_base).await {
-                Ok(client) => {
-                    batch_clients.push(client.clone());
-                    started.push(client);
-                }
-                Err(err) => error!("failed to start client {client_index}: {err}"),
+            match result {
+                Ok(()) => error!("shared client maintenance worker stopped unexpectedly"),
+                Err(err) => error!("shared client maintenance worker failed: {err}"),
             }
-        }
-
-        let connected_in_batch =
-            wait_for_batch_connected(&batch_clients, connect_timeout, &shutdown).await;
-        if connected_in_batch < batch_clients.len() {
-            for client in &batch_clients {
-                if !client.connected.load(Ordering::Relaxed) {
-                    if shutdown.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    client.in_use.store(false, Ordering::SeqCst);
-                    client.connected.store(false, Ordering::SeqCst);
-                    warn!(
-                        "client {} did not connect within {}ms",
-                        client.index, args.connect_timeout_ms
-                    );
-                }
-            }
-        }
-
-        info!(
-            "connection batch {}-{} accepted {}/{} clients",
-            batch_start,
-            batch_end.saturating_sub(1),
-            connected_in_batch,
-            batch_clients.len()
-        );
-
-        index = batch_end;
-        if index < config.client_count
-            && !connect_batch_delay.is_zero()
-            && !shutdown.load(Ordering::Relaxed)
-        {
-            sleep_or_shutdown(connect_batch_delay, &shutdown).await;
-        }
+            maintenance_shutdown.store(true, Ordering::SeqCst);
+        });
+    } else {
+        info!("shared client maintenance disabled; using per-client maintenance timers");
     }
 
-    let managed_clients = Arc::new(Mutex::new(started));
+    let connect = ConnectOptions {
+        batch_size: args.connect_batch_size.max(1),
+        batch_delay: Duration::from_millis(args.connect_batch_delay_ms),
+        timeout: Duration::from_millis(args.connect_timeout_ms),
+        shared_maintenance: shared_maintenance_enabled,
+    };
+    let initial_target = config.client_count;
+    let initial_added = add_clients(
+        &managed_clients,
+        &config,
+        initial_target,
+        spawn_layout,
+        connect,
+        &maintenance,
+        &shutdown,
+    )
+    .await?;
+    if initial_added != initial_target && !shutdown.load(Ordering::Relaxed) {
+        disconnect_clients_in_batches(&managed_clients, connect.batch_size, Duration::ZERO).await;
+        return Err(anyhow!(
+            "initial client startup stopped after {initial_added}/{initial_target} clients"
+        ));
+    }
 
     // Hand authenticated sockets to the shared Linux receiver before failure recovery. This keeps
     // the Tokio runtime free to complete/retry the small number of failed joins instead of asking
@@ -3053,35 +3509,29 @@ async fn async_main(worker_threads: usize) -> Result<()> {
         info!("shared client receive disabled; using per-client receive tasks");
     }
 
-    let shared_maintenance_enabled = std::env::var("BASIS_CLIENT_SHARED_MAINTENANCE")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "False" | "FALSE"))
-        .unwrap_or(true);
-    if shared_maintenance_enabled && !shutdown.load(Ordering::Relaxed) {
-        info!("shared client maintenance enabled");
-        tokio::spawn(shared_maintenance_loop(
-            managed_clients.clone(),
-            shutdown.clone(),
-        ));
-    } else if !shared_maintenance_enabled {
-        info!("shared client maintenance disabled; using per-client maintenance timers");
-    }
-
     if !args.no_reconnect && !shutdown.load(Ordering::Relaxed) {
         tokio::spawn(failure_reconnect_loop(
             managed_clients.clone(),
             config.clone(),
             shutdown.clone(),
             spawn_layout,
-            connect_timeout,
+            connect.timeout,
+            maintenance.clone(),
         ));
-        let _ =
-            wait_for_full_population(&managed_clients, &shutdown, Duration::from_secs(120)).await;
+        let _ = wait_for_full_population(
+            &managed_clients,
+            config.client_count,
+            &shutdown,
+            Duration::from_secs(120),
+        )
+        .await;
     }
 
     if !args.no_movement && !shutdown.load(Ordering::Relaxed) {
         movement_workers(managed_clients.clone(), shutdown.clone(), cadence).await;
     }
-    if let Some(voice_library) = voice_library {
+    let mut voice_running = false;
+    if let Some(voice_library) = voice_library.take() {
         if !shutdown.load(Ordering::Relaxed) {
             info!(
                 "voice simulation enabled: folder={} speaker_percent={} hearing_distance={} frame_duration_ms={} ffmpeg_reencode={}",
@@ -3098,6 +3548,7 @@ async fn async_main(worker_threads: usize) -> Result<()> {
                 shutdown.clone(),
                 cadence,
             ));
+            voice_running = true;
         }
     }
     if !args.no_reconnect && !shutdown.load(Ordering::Relaxed) {
@@ -3108,23 +3559,110 @@ async fn async_main(worker_threads: usize) -> Result<()> {
             spawn_layout,
             args.reconnect_min_secs,
             args.reconnect_max_secs,
+            maintenance.clone(),
         ));
     }
 
-    if !shutdown.load(Ordering::Relaxed) {
-        if let Some(duration_secs) = args.duration_secs {
-            sleep_or_shutdown(Duration::from_secs(duration_secs), &shutdown).await;
-        } else {
-            while !shutdown.load(Ordering::Relaxed) {
-                time::sleep(Duration::from_millis(100)).await;
+    let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+    tokio::spawn(console_input(commands_tx));
+    let mut console_closed = false;
+    let mut quit_batch_size = args.quit_batch_size.max(1);
+    let mut quit_batch_delay = Duration::from_millis(args.quit_batch_delay_ms);
+    let duration_deadline = args
+        .duration_secs
+        .map(|duration| time::Instant::now() + Duration::from_secs(duration));
+
+    print_console_help();
+    while !shutdown.load(Ordering::Relaxed) {
+        if duration_deadline
+            .map(|deadline| time::Instant::now() >= deadline)
+            .unwrap_or(false)
+        {
+            shutdown.store(true, Ordering::SeqCst);
+            break;
+        }
+
+        tokio::select! {
+            command = commands_rx.recv(), if !console_closed => {
+                match command {
+                    Some(ConsoleCommand::EnableVoice) => {
+                        if voice_running {
+                            info!("voice simulation is already enabled");
+                        } else {
+                            config.voice_enabled = true;
+                            match VoiceLibrary::load(
+                                &config.voice_audio_folder,
+                                voice_reencode,
+                                config.voice_frame_duration_ms,
+                            ) {
+                                Ok(Some(library)) => {
+                                    info!("voice simulation enabled from console");
+                                    tokio::spawn(voice_workers(
+                                        managed_clients.clone(),
+                                        config.clone(),
+                                        Arc::new(library),
+                                        shutdown.clone(),
+                                        cadence,
+                                    ));
+                                    voice_running = true;
+                                }
+                                Ok(None) => warn!("voice command ignored: no usable audio files found"),
+                                Err(err) => warn!("voice command failed: {err:#}"),
+                            }
+                        }
+                    }
+                    Some(ConsoleCommand::AddClients(count)) => {
+                        info!("adding {count} clients from console");
+                        match add_clients(
+                            &managed_clients,
+                            &config,
+                            count,
+                            spawn_layout,
+                            connect,
+                            &maintenance,
+                            &shutdown,
+                        ).await {
+                            Ok(added) => {
+                                config.client_count = config.client_count.saturating_add(added);
+                                info!("added {added} clients; population target is now {}", config.client_count);
+                            }
+                            Err(err) => {
+                                config.client_count = managed_clients.lock().await.len();
+                                warn!(
+                                    "failed to add clients: {err:#}; population target is {}",
+                                    config.client_count
+                                );
+                            }
+                        }
+                    }
+                    Some(ConsoleCommand::Quit { batch_size, delay_ms }) => {
+                        if let Some(batch_size) = batch_size {
+                            quit_batch_size = batch_size.max(1);
+                        }
+                        if let Some(delay_ms) = delay_ms {
+                            quit_batch_delay = Duration::from_millis(delay_ms);
+                        }
+                        info!(
+                            "shutdown requested from console (batch_size={} delay_ms={})",
+                            quit_batch_size,
+                            quit_batch_delay.as_millis()
+                        );
+                        shutdown.store(true, Ordering::SeqCst);
+                    }
+                    Some(ConsoleCommand::Help) => print_console_help(),
+                    None => console_closed = true,
+                }
             }
+            _ = time::sleep(Duration::from_millis(100)) => {}
         }
     }
     shutdown.store(true, Ordering::SeqCst);
-    info!("shutting down clients");
-    for client in managed_clients.lock().await.iter() {
-        client.disconnect().await;
-    }
+    info!(
+        "shutting down clients in batches of {} ({}ms between batches)",
+        quit_batch_size,
+        quit_batch_delay.as_millis()
+    );
+    disconnect_clients_in_batches(&managed_clients, quit_batch_size, quit_batch_delay).await;
     Ok(())
 }
 
@@ -3134,6 +3672,36 @@ mod tests {
     use ed25519_dalek::Signature;
     use flate2::read::DeflateDecoder;
     use std::io::Read;
+
+    async fn test_client(index: usize, server_addr: SocketAddr) -> Arc<BasisClient> {
+        let socket = bind_udp_socket(any_local_addr(server_addr)).unwrap();
+        socket.connect(server_addr).await.unwrap();
+        Arc::new(BasisClient {
+            index,
+            socket: Arc::new(socket),
+            server_addr,
+            connect_time: 0,
+            connection_number: 0,
+            local_peer_id: index as i32,
+            remote_peer_id: Mutex::new(None),
+            connected: AtomicBool::new(true),
+            in_use: AtomicBool::new(true),
+            intentional_reconnect: AtomicBool::new(false),
+            movement_sequence: AtomicU8::new(0),
+            voice_sequence: AtomicU8::new(0),
+            reliable_sequences: std::array::from_fn(|_| AtomicU16::new(0)),
+            fragment_id: AtomicU16::new(0),
+            ping_sequence: AtomicU16::new(0),
+            pending_reliable: Mutex::new(VecDeque::new()),
+            pending_reliable_active: AtomicBool::new(false),
+            shared_receive: AtomicBool::new(false),
+            shared_receive_eligible: AtomicBool::new(false),
+            receive_shutdown: Notify::new(),
+            received_reliable: StdMutex::new(ReliableReceiveState::default()),
+            pose: Mutex::new(PoseState::new_at([0.0; 3])),
+            identity: Identity::random(),
+        })
+    }
 
     #[test]
     fn connection_payload_starts_with_version_auth_and_ready() {
@@ -3356,6 +3924,41 @@ mod tests {
     }
 
     #[test]
+    fn console_commands_default_to_voice_add_100_and_batched_quit() {
+        assert_eq!(
+            parse_console_command("voice"),
+            Some(ConsoleCommand::EnableVoice)
+        );
+        assert_eq!(
+            parse_console_command("enable voice"),
+            Some(ConsoleCommand::EnableVoice)
+        );
+        assert_eq!(
+            parse_console_command("add"),
+            Some(ConsoleCommand::AddClients(100))
+        );
+        assert_eq!(
+            parse_console_command("add 250"),
+            Some(ConsoleCommand::AddClients(250))
+        );
+        assert_eq!(
+            parse_console_command("quit 25 500"),
+            Some(ConsoleCommand::Quit {
+                batch_size: Some(25),
+                delay_ms: Some(500),
+            })
+        );
+        assert_eq!(
+            parse_console_command("q"),
+            Some(ConsoleCommand::Quit {
+                batch_size: None,
+                delay_ms: None,
+            })
+        );
+        assert_eq!(parse_console_command("unknown"), None);
+    }
+
+    #[test]
     fn randomized_cadence_is_default_and_sync_batching_is_opt_in() {
         let defaults = Args::try_parse_from(["basis-rust-client"]).unwrap();
         assert!(!defaults.sync_batching);
@@ -3430,6 +4033,350 @@ mod tests {
         let seq = AtomicU8::new(255);
         assert_eq!(seq.fetch_add(1, Ordering::SeqCst), 255);
         assert_eq!(seq.fetch_add(1, Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn shared_ping_buckets_visit_each_population_once_per_interval() {
+        for population in [1, 14, 15, 1000] {
+            let mut visits = vec![0usize; population];
+            let mut bucket_total = 0;
+            for tick in 0..PING_INTERVAL_TICKS {
+                let bucket_count = (0..population)
+                    .filter(|slot| ping_bucket_matches(*slot, tick))
+                    .count();
+                assert!(bucket_count <= population.div_ceil(PING_INTERVAL_TICKS));
+                bucket_total += bucket_count;
+                for (slot, visits) in visits.iter_mut().enumerate() {
+                    if ping_bucket_matches(slot, tick) {
+                        *visits += 1;
+                    }
+                }
+            }
+            assert_eq!(bucket_total, population);
+            assert!(visits.iter().all(|visits| *visits == 1));
+        }
+    }
+
+    #[test]
+    fn reliable_receive_suppresses_duplicate_sequences() {
+        let mut state = ReliableReceiveState::default();
+        assert!(state.mark_new(7, 10));
+        assert!(!state.mark_new(7, 10));
+        assert!(state.mark_new(7, 11));
+        assert!(!state.mark_new(7, 11));
+    }
+
+    #[test]
+    fn reliable_receive_accepts_32767_to_0_wrap() {
+        let mut state = ReliableReceiveState::default();
+        assert!(state.mark_new(7, MAX_SEQUENCE - 1));
+        assert!(state.mark_new(7, 0));
+        assert!(!state.mark_new(7, 0));
+    }
+
+    #[tokio::test]
+    async fn reliable_sequences_are_independent_per_channel() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = test_client(0, server.local_addr().unwrap()).await;
+        let first_channel = 1;
+        let second_channel = 2;
+        client
+            .send_reliable_ordered(first_channel, b"first")
+            .await
+            .unwrap();
+        client
+            .send_reliable_ordered(second_channel, b"second")
+            .await
+            .unwrap();
+
+        let mut datagrams = Vec::new();
+        for _ in 0..2 {
+            let mut buffer = [0u8; LITENETLIB_INITIAL_MTU];
+            let len = time::timeout(Duration::from_secs(1), server.recv(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            datagrams.push(buffer[..len].to_vec());
+        }
+        let mut sequences = HashMap::new();
+        for datagram in datagrams {
+            let packet = parse_packet(&datagram).unwrap();
+            sequences.insert(packet.channel_id.unwrap(), packet.sequence.unwrap());
+        }
+        assert_eq!(
+            sequences.get(&DeliveryMethod::channel_id(
+                first_channel,
+                DeliveryMethod::ReliableOrdered,
+            )),
+            Some(&0)
+        );
+        assert_eq!(
+            sequences.get(&DeliveryMethod::channel_id(
+                second_channel,
+                DeliveryMethod::ReliableOrdered,
+            )),
+            Some(&0)
+        );
+    }
+
+    #[tokio::test]
+    async fn reliable_packets_are_enqueued_before_first_datagram() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = test_client(0, server.local_addr().unwrap()).await;
+        let pending_guard = client.pending_reliable.lock().await;
+        let sending = {
+            let client = client.clone();
+            tokio::spawn(async move { client.send_reliable_ordered(1, b"queued").await })
+        };
+        tokio::task::yield_now().await;
+
+        let mut buffer = [0u8; LITENETLIB_INITIAL_MTU];
+        assert!(
+            time::timeout(Duration::from_millis(50), server.recv(&mut buffer))
+                .await
+                .is_err()
+        );
+
+        drop(pending_guard);
+        let len = time::timeout(Duration::from_secs(1), server.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        sending.await.unwrap().unwrap();
+        assert_eq!(parse_packet(&buffer[..len]).unwrap().payload, b"queued");
+    }
+
+    #[tokio::test]
+    async fn fragmented_reliable_matches_litenetlib_wire_and_ack_lifecycle() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = test_client(0, server.local_addr().unwrap()).await;
+
+        let boundary_channel = 2;
+        let boundary = vec![0x5a; LITENETLIB_INITIAL_MTU - LITENETLIB_CHANNELED_HEADER_SIZE];
+        client
+            .send_reliable_ordered(boundary_channel, &boundary)
+            .await
+            .unwrap();
+        let mut buffer = [0u8; LITENETLIB_INITIAL_MTU];
+        let len = time::timeout(Duration::from_secs(1), server.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(len, LITENETLIB_INITIAL_MTU);
+        assert_eq!(buffer[0] & 0x80, 0);
+        assert_eq!(parse_packet(&buffer[..len]).unwrap().payload, boundary);
+        let boundary_channel_id =
+            DeliveryMethod::channel_id(boundary_channel, DeliveryMethod::ReliableOrdered);
+        client.process_ack(boundary_channel_id, 0, &[1]).await;
+
+        let channel = 1;
+        let channel_id = DeliveryMethod::channel_id(channel, DeliveryMethod::ReliableOrdered);
+        let payload_len = RELIABLE_FRAGMENT_PAYLOAD_SIZE * 2 + 1;
+        let payload = (0..payload_len)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        client
+            .send_reliable_ordered(channel, &payload)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            LITENETLIB_FRAGMENTED_HEADER_SIZE + RELIABLE_FRAGMENT_PAYLOAD_SIZE,
+            LITENETLIB_INITIAL_MTU
+        );
+        let mut fragments = Vec::new();
+        for _ in 0..3 {
+            let len = time::timeout(Duration::from_secs(1), server.recv(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(len <= LITENETLIB_INITIAL_MTU);
+            let packet = parse_packet(&buffer[..len]).unwrap();
+            assert_eq!(packet.property, PacketProperty::Channeled);
+            assert_eq!(packet.channel_id, Some(channel_id));
+            assert_eq!(buffer[0] & 0x80, 0x80);
+            assert!(packet.payload.len() >= LITENETLIB_FRAGMENT_HEADER_SIZE);
+            let fragment_id = u16::from_le_bytes([packet.payload[0], packet.payload[1]]);
+            let part = u16::from_le_bytes([packet.payload[2], packet.payload[3]]);
+            let total = u16::from_le_bytes([packet.payload[4], packet.payload[5]]);
+            fragments.push((
+                part,
+                total,
+                fragment_id,
+                packet.sequence.unwrap(),
+                packet.payload[6..].to_vec(),
+            ));
+        }
+        fragments.sort_by_key(|fragment| fragment.0);
+        assert_eq!(fragments.len(), 3);
+        let fragment_id = fragments[0].2;
+        let mut reassembled = Vec::new();
+        for (part, total, id, sequence, bytes) in &fragments {
+            assert_eq!(*id, fragment_id);
+            assert_eq!(*total, 3);
+            assert_eq!(
+                *part as usize,
+                reassembled.len() / RELIABLE_FRAGMENT_PAYLOAD_SIZE
+            );
+            assert_eq!(*sequence, *part);
+            reassembled.extend_from_slice(bytes);
+        }
+        assert_eq!(reassembled, payload);
+
+        let mut middle_ack = vec![0u8; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
+        middle_ack[0] |= 1 << 1;
+        client.process_ack(channel_id, 1, &middle_ack).await;
+        assert_eq!(client.pending_reliable.lock().await.len(), 2);
+        assert!(client.pending_reliable_active.load(Ordering::Relaxed));
+
+        let mut final_ack = vec![0u8; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
+        final_ack[0] |= 1;
+        final_ack[0] |= 1 << 2;
+        client.process_ack(channel_id, 0, &final_ack).await;
+        assert!(client.pending_reliable.lock().await.is_empty());
+        assert!(!client.pending_reliable_active.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn batch_publish_preserves_dense_indices_and_notifies_complete_snapshot() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let managed = Arc::new(Mutex::new(Vec::new()));
+        let refresh = Arc::new(Notify::new());
+        let maintenance = MaintenanceOptions {
+            shared: true,
+            refresh: refresh.clone(),
+        };
+        let batch = vec![
+            test_client(0, server_addr).await,
+            test_client(1, server_addr).await,
+            test_client(2, server_addr).await,
+        ];
+        let notified = refresh.notified();
+        publish_client_batch(&managed, 0, &batch, &maintenance)
+            .await
+            .unwrap();
+        time::timeout(Duration::from_secs(1), notified)
+            .await
+            .unwrap();
+        let snapshot = managed.lock().await;
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|client| client.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_reconnect_cannot_replace_or_notify() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let old = test_client(0, server_addr).await;
+        let current = test_client(0, server_addr).await;
+        let replacement = test_client(0, server_addr).await;
+        let managed = Arc::new(Mutex::new(vec![current.clone()]));
+        let refresh = Arc::new(Notify::new());
+        let maintenance = MaintenanceOptions {
+            shared: true,
+            refresh: refresh.clone(),
+        };
+        let notified = refresh.notified();
+
+        assert!(!replace_client_if_current(&managed, 0, &old, &replacement, &maintenance).await);
+        assert!(time::timeout(Duration::from_millis(50), notified)
+            .await
+            .is_err());
+        assert!(Arc::ptr_eq(&managed.lock().await[0], &current));
+    }
+
+    #[tokio::test]
+    async fn replacement_releases_the_old_blocked_receive_task() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let old = test_client(0, server_addr).await;
+        let replacement = test_client(0, server_addr).await;
+        let managed = Arc::new(Mutex::new(vec![old.clone()]));
+        let maintenance = MaintenanceOptions {
+            shared: false,
+            refresh: Arc::new(Notify::new()),
+        };
+        let weak = Arc::downgrade(&old);
+        let receiver = tokio::spawn(old.clone().receive_loop());
+        tokio::task::yield_now().await;
+
+        assert!(replace_client_if_current(&managed, 0, &old, &replacement, &maintenance).await);
+        time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("old receive task remained blocked")
+            .unwrap()
+            .unwrap();
+        assert!(!old.in_use.load(Ordering::Relaxed));
+        assert!(!old.connected.load(Ordering::Relaxed));
+        assert!(Arc::ptr_eq(&managed.lock().await[0], &replacement));
+
+        drop(old);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn connect_accept_filters_non_observers_only() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let observer = test_client(0, server_addr).await;
+        let load_sink = test_client(1, server_addr).await;
+        let mut accept = vec![0u8; 15];
+        accept[0] = PacketProperty::ConnectAccept as u8;
+        accept[1..9].copy_from_slice(&0i64.to_le_bytes());
+        accept[11..15].copy_from_slice(&1i32.to_le_bytes());
+        observer.handle_packet(&accept).await.unwrap();
+        load_sink.handle_packet(&accept).await.unwrap();
+
+        let unreliable = vec![
+            PacketProperty::Unreliable as u8,
+            channels::PLAYER_AVATAR_HIGH,
+            1,
+            2,
+            3,
+        ];
+        server
+            .send_to(&unreliable, observer.socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        server
+            .send_to(&unreliable, load_sink.socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut buffer = [0u8; 64];
+        let observer_len = time::timeout(Duration::from_secs(1), observer.socket.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..observer_len], unreliable);
+        assert!(time::timeout(
+            Duration::from_millis(50),
+            load_sink.socket.recv(&mut buffer)
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn pending_reliable_flag_tracks_enqueue_and_final_ack() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = test_client(0, server_addr).await;
+        let channel_id = DeliveryMethod::channel_id(1, DeliveryMethod::ReliableOrdered);
+
+        client.send_reliable_ordered(1, b"pending").await.unwrap();
+        assert!(client.pending_reliable_active.load(Ordering::Relaxed));
+        assert_eq!(client.pending_reliable.lock().await.len(), 1);
+
+        client.process_ack(channel_id, 0, &[1]).await;
+        assert!(!client.pending_reliable_active.load(Ordering::Relaxed));
+        assert!(client.pending_reliable.lock().await.is_empty());
     }
 
     #[test]

@@ -15,6 +15,7 @@ This is a headless client implementation that mimics the behavior of the Basis V
 - Chat support
 - Resource loading simulation
 - Opt-in voice simulation from Ogg Opus files
+- Interactive console controls for voice, client scaling, and graceful shutdown
 - Automatic reconnection
 
 ## Running
@@ -41,6 +42,20 @@ The client re-encodes each input file through `ffmpeg` into 48 kHz mono Opus wit
 20 ms frames, then sends those packets over the Basis voice channel. Speaking
 clients send to peers within the configured hearing distance, which defaults to
 25 meters.
+
+While running, the console accepts these commands:
+
+```text
+voice              enable voice simulation
+add [count]        add clients (defaults to 100)
+quit [batch] [ms]  disconnect clients in batches (defaults to 100 / 250 ms)
+help               show commands
+```
+
+Voice can therefore be enabled after startup with `voice`, and `add` grows the
+population without restarting. Ctrl+C uses the same graceful batched shutdown.
+The shutdown defaults can be changed with `--quit-batch-size` and
+`--quit-batch-delay-ms`.
 
 To bypass the ffmpeg re-encode/cache path and send packetized input Opus directly:
 
