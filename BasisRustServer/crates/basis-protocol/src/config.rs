@@ -294,9 +294,13 @@ impl ServerConfig {
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating config directory {}", parent.display()))?;
         }
-        let xml = quick_xml::se::to_string(self)?;
-        fs::write(path, format!("{xml}\n"))
-            .with_context(|| format!("writing config {}", path.display()))?;
+        let mut xml = String::new();
+        let mut serializer = quick_xml::se::Serializer::new(&mut xml);
+        serializer.indent(' ', 2);
+        self.serialize(serializer)?;
+        xml.push('\n');
+
+        fs::write(path, xml).with_context(|| format!("writing config {}", path.display()))?;
         Ok(())
     }
 
@@ -719,6 +723,17 @@ mod tests {
         let config = ServerConfig::load_or_create(&path).unwrap();
         assert_eq!(config.set_port, 4296);
         assert!(path.exists());
+
+        let xml = std::fs::read_to_string(&path).unwrap();
+        assert!(xml.starts_with("<Configuration>\n"));
+        assert!(xml.contains(
+            "\n  <ConfigVersion>14</ConfigVersion>\n  <PeerLimit>65535</PeerLimit>\n"
+        ));
+        assert!(xml.contains(
+            "\n  <CompanyName>Basis Unity</CompanyName>\n  <ProductName>Basis Unity</ProductName>\n"
+        ));
+        assert!(xml.ends_with("\n</Configuration>\n"));
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }
