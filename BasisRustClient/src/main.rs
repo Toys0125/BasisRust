@@ -4430,14 +4430,9 @@ mod tests {
         .await
         .is_err());
 
-        let channel_id = DeliveryMethod::channel_id(channels::META_DATA, DeliveryMethod::ReliableOrdered);
-        let nested = vec![
-            PacketProperty::Channeled as u8,
-            0,
-            0,
-            channel_id,
-            42,
-        ];
+        let channel_id =
+            DeliveryMethod::channel_id(channels::META_DATA, DeliveryMethod::ReliableOrdered);
+        let nested = vec![PacketProperty::Channeled as u8, 0, 0, channel_id, 42];
         let mut merged = vec![PacketProperty::Merged as u8, nested.len() as u8, 0];
         merged.extend_from_slice(&nested);
         server

@@ -485,7 +485,10 @@ mod tests {
     fn unknown_user_uses_default_without_materializing_an_entry() {
         let manager = PermissionManager::default();
         manager.ensure_defaults();
-        assert!(manager.has("unknown", basis_protocol::permissions::DEFAULT_GROUP_NODES[0]));
+        assert!(manager.has(
+            "unknown",
+            basis_protocol::permissions::DEFAULT_GROUP_NODES[0]
+        ));
         assert!(!manager.snapshot().users.contains_key("unknown"));
     }
 

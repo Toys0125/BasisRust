@@ -1,9 +1,8 @@
 use anyhow::Result;
 use basis_protocol::{
     avatar::{
-        read_position, repack_high_to_lower_into,
-        try_encode_avatar_bundle_slices_with_compression, AvatarBundleCompression,
-        AvatarBundleSlice, BitQuality,
+        read_position, repack_high_to_lower_into, try_encode_avatar_bundle_slices_with_compression,
+        AvatarBundleCompression, AvatarBundleSlice, BitQuality,
     },
     avatar_delta::build_delta,
     channels,
@@ -162,7 +161,10 @@ struct SpatialGrid {
 }
 
 impl SpatialGrid {
-    fn build(peer_states: &[(PeerId, Arc<PlayerAvatarState>)], low_distance_sq: f32) -> Option<Self> {
+    fn build(
+        peer_states: &[(PeerId, Arc<PlayerAvatarState>)],
+        low_distance_sq: f32,
+    ) -> Option<Self> {
         let cell_size = low_distance_sq.sqrt();
         if !cell_size.is_finite() || cell_size <= f32::EPSILON {
             return None;
@@ -849,13 +851,8 @@ impl AvatarSyncSystem {
                 peer_states.push((*peer, Arc::clone(state.value())));
             }
         }
-        let (
-            slice_count,
-            slice_start,
-            slice_end,
-            update_distances,
-            effective_tick_interval_ms,
-        ) = self.advance_slice_state(peer_states.len());
+        let (slice_count, slice_start, slice_end, update_distances, effective_tick_interval_ms) =
+            self.advance_slice_state(peer_states.len());
         let spatial_grid = if config.spatial_cull_enabled {
             SpatialGrid::build(&peer_states, config.low_distance_sq)
         } else {
@@ -866,7 +863,8 @@ impl AvatarSyncSystem {
         let build_start = Instant::now();
         // Avoid cloning states for receiver_states: par_iter over slice directly.
         // build_sends_for_receiver only needs position from receiver state.
-        let receiver_slice = &peer_states[slice_start.min(peer_states.len())..slice_end.min(peer_states.len())];
+        let receiver_slice =
+            &peer_states[slice_start.min(peer_states.len())..slice_end.min(peer_states.len())];
         let offloaded_empty = self.offloaded_pairs.is_empty();
         let bypass_empty = self.bypass_reduction_ids.is_empty();
         let receiver_groups = receiver_slice
@@ -1089,10 +1087,15 @@ impl AvatarSyncSystem {
             if sender_id == receiver_id {
                 continue;
             }
-            if !offloaded_empty && self.offloaded_pairs.contains_key(&pack_pair(receiver_id, sender_id)) {
+            if !offloaded_empty
+                && self
+                    .offloaded_pairs
+                    .contains_key(&pack_pair(receiver_id, sender_id))
+            {
                 continue;
             }
-            let bypass_reduction = !bypass_empty && self.bypass_reduction_ids.contains_key(&sender_id);
+            let bypass_reduction =
+                !bypass_empty && self.bypass_reduction_ids.contains_key(&sender_id);
             let tracking = receiver_tracking.entry(sender_id).or_insert_with(|| {
                 let dist_sq = distance_sq_position(receiver_position, sender_state.position);
                 let (interval_byte, interval_ms) =
@@ -1130,7 +1133,8 @@ impl AvatarSyncSystem {
             {
                 continue;
             }
-            let Some(current_packet) = sender_state.qualities[quality_index as usize].as_ref() else {
+            let Some(current_packet) = sender_state.qualities[quality_index as usize].as_ref()
+            else {
                 continue;
             };
             tracking.last_seen_generation = sender_state.generation;
@@ -1177,7 +1181,9 @@ impl AvatarSyncSystem {
                     if current_is_newer_than_keyframe {
                         current_packet
                     } else {
-                        let Some(keyframe) = sender_state.keyframe_qualities[quality_index as usize].as_ref() else {
+                        let Some(keyframe) =
+                            sender_state.keyframe_qualities[quality_index as usize].as_ref()
+                        else {
                             continue;
                         };
                         keyframe
@@ -1234,10 +1240,7 @@ impl AvatarSyncSystem {
         })
     }
 
-    fn advance_slice_state(
-        &self,
-        receiver_count: usize,
-    ) -> (usize, usize, usize, bool, u64) {
+    fn advance_slice_state(&self, receiver_count: usize) -> (usize, usize, usize, bool, u64) {
         let mut state = self.slice_state.lock();
         let now = Instant::now();
         let slice_count = state.slice_count.max(1);
@@ -1251,9 +1254,8 @@ impl AvatarSyncSystem {
         if update_distances {
             state.last_distance_update = now;
         }
-        let effective_tick_interval_ms = AVATAR_TICK_INTERVAL_MS.max(
-            state.smoothed_tick_micros.div_ceil(1_000),
-        );
+        let effective_tick_interval_ms =
+            AVATAR_TICK_INTERVAL_MS.max(state.smoothed_tick_micros.div_ceil(1_000));
         (
             slice_count,
             slice_start,
@@ -1443,13 +1445,19 @@ fn emit_greedy_avatar_bundles<'a>(
     if cursor < count {
         profiler.add_bundle_tail_uncompressed((count - cursor) as u64);
     }
-    direct.extend(bundle.drain(cursor..).map(|item| {
-        OutboundAvatarSend::Owned {
-            channel: item.original_channel,
-            payload: patch_interval_bytes(&item.payload, item.interval_offset, item.interval_byte),
-            patch: None,
-        }
-    }));
+    direct.extend(
+        bundle
+            .drain(cursor..)
+            .map(|item| OutboundAvatarSend::Owned {
+                channel: item.original_channel,
+                payload: patch_interval_bytes(
+                    &item.payload,
+                    item.interval_offset,
+                    item.interval_byte,
+                ),
+                patch: None,
+            }),
+    );
     bundle.clear();
 }
 
@@ -1483,15 +1491,14 @@ fn try_emit_bundle_range<'a>(
     let delta_only = bundle[start..end]
         .iter()
         .all(|item| item.original_channel == channels::DELTA_AVATAR);
-    let compression = if config.enable_bundle_zstd
-        && (config.bundle_zstd_delta_bundles || !delta_only)
-    {
-        AvatarBundleCompression::ZstdDictionary {
-            level: config.bundle_zstd_level,
-        }
-    } else {
-        AvatarBundleCompression::Lz4
-    };
+    let compression =
+        if config.enable_bundle_zstd && (config.bundle_zstd_delta_bundles || !delta_only) {
+            AvatarBundleCompression::ZstdDictionary {
+                level: config.bundle_zstd_level,
+            }
+        } else {
+            AvatarBundleCompression::Lz4
+        };
     let deflate_start = Instant::now();
     let encoded = try_encode_avatar_bundle_slices_with_compression(&slices, compression)?;
     let deflate_micros = deflate_start.elapsed().as_micros() as u64;
@@ -1592,7 +1599,10 @@ fn validate_additional_avatar_data(bytes: &[u8]) -> Result<()> {
     }
     let count = bytes[0] as usize;
     if count == 0 {
-        anyhow::ensure!(bytes.len() == 1, "trailing bytes after empty additional avatar data section");
+        anyhow::ensure!(
+            bytes.len() == 1,
+            "trailing bytes after empty additional avatar data section"
+        );
         return Ok(());
     }
     anyhow::ensure!(bytes.len() >= 2, "missing linked avatar index");
@@ -1604,12 +1614,21 @@ fn validate_additional_avatar_data(bytes: &[u8]) -> Result<()> {
         if len == 0 {
             continue;
         }
-        anyhow::ensure!(offset < bytes.len(), "missing additional avatar data message index");
+        anyhow::ensure!(
+            offset < bytes.len(),
+            "missing additional avatar data message index"
+        );
         offset += 1;
-        anyhow::ensure!(offset + len <= bytes.len(), "truncated additional avatar data payload");
+        anyhow::ensure!(
+            offset + len <= bytes.len(),
+            "truncated additional avatar data payload"
+        );
         offset += len;
     }
-    anyhow::ensure!(offset == bytes.len(), "trailing bytes after additional avatar data section");
+    anyhow::ensure!(
+        offset == bytes.len(),
+        "trailing bytes after additional avatar data section"
+    );
     Ok(())
 }
 
@@ -1637,9 +1656,7 @@ fn process_pending_update(peer_id: PeerId, update: PendingAvatarUpdate) -> Proce
     }
 }
 
-fn quality_payloads(
-    qualities: &[Option<PreSerializedQuality>; 4],
-) -> [Option<Bytes>; 4] {
+fn quality_payloads(qualities: &[Option<PreSerializedQuality>; 4]) -> [Option<Bytes>; 4] {
     std::array::from_fn(|index| {
         qualities[index].as_ref().and_then(|packet| {
             let quality = match index {
@@ -1705,20 +1722,18 @@ fn update_outbound_delta_state(
             state.keyframe_payloads[BitQuality::High as usize].as_ref(),
             current_payloads[BitQuality::High as usize].as_ref(),
         ) {
-            (Some(baseline), Some(current)) => match build_delta(
-                baseline.as_ref(),
-                current.as_ref(),
-                BitQuality::High,
-            ) {
-                Ok(delta) if delta.len() < BitQuality::High.payload_len() => {
-                    update_keyframe_stretch(state, config, delta.len());
+            (Some(baseline), Some(current)) => {
+                match build_delta(baseline.as_ref(), current.as_ref(), BitQuality::High) {
+                    Ok(delta) if delta.len() < BitQuality::High.payload_len() => {
+                        update_keyframe_stretch(state, config, delta.len());
+                    }
+                    Ok(_) | Err(_) => {
+                        is_keyframe = true;
+                        state.keyframe_stretch_shift = 0;
+                        state.small_delta_streak = 0;
+                    }
                 }
-                Ok(_) | Err(_) => {
-                    is_keyframe = true;
-                    state.keyframe_stretch_shift = 0;
-                    state.small_delta_streak = 0;
-                }
-            },
+            }
             _ => is_keyframe = true,
         }
     }
@@ -1787,7 +1802,12 @@ fn pre_serialize_delta(
     additional_data: &[u8],
 ) -> PreSerializedDelta {
     let has_additional = !additional_data.is_empty();
-    let header = quality as u8 | if has_additional { channels::DELTA_HEADER_ADDITIONAL_DATA } else { 0 };
+    let header = quality as u8
+        | if has_additional {
+            channels::DELTA_HEADER_ADDITIONAL_DATA
+        } else {
+            0
+        };
     let mut small = Vec::with_capacity(5 + body.len() + additional_data.len());
     small.push(header);
     small.push(peer_id as u8);
@@ -1978,9 +1998,11 @@ fn quality_from_distance_sq(distance_sq: f32, config: &AvatarSyncConfig) -> u8 {
 fn calculate_interval_from_distance_sq(distance_sq: f32, config: &AvatarSyncConfig) -> (u8, u64) {
     let base_interval_ms = config.default_interval_ms.max(1) as i32;
     let raw_interval = (base_interval_ms as f32
-        * (config.base_multiplier + distance_sq * config.increase_rate)) as i32;
+        * (config.base_multiplier + distance_sq * config.increase_rate))
+        as i32;
     let interval_byte = channels::encode_avatar_interval_byte(raw_interval, base_interval_ms);
-    let actual_interval = channels::decode_avatar_interval_ms(interval_byte, base_interval_ms).max(1) as u64;
+    let actual_interval =
+        channels::decode_avatar_interval_ms(interval_byte, base_interval_ms).max(1) as u64;
     (interval_byte, actual_interval)
 }
 
@@ -2025,13 +2047,22 @@ mod tests {
         let additional = [1, 0, 3, 9, 1, 2, 3];
         validate_additional_avatar_data(&additional).unwrap();
         let packet = pre_serialize(12, 7, BitQuality::High, &payload, &additional);
-        assert_eq!(packet.channel_small, channels::PLAYER_AVATAR_HIGH_ADDITIONAL);
-        assert_eq!(packet.channel_large, channels::PLAYER_AVATAR_HIGH_ADDITIONAL_LARGE);
+        assert_eq!(
+            packet.channel_small,
+            channels::PLAYER_AVATAR_HIGH_ADDITIONAL
+        );
+        assert_eq!(
+            packet.channel_large,
+            channels::PLAYER_AVATAR_HIGH_ADDITIONAL_LARGE
+        );
         assert_eq!(&packet.bytes_small[3 + payload.len()..], &additional);
         assert_eq!(packet.additional_data.as_ref(), &additional);
 
         let delta = pre_serialize_delta(12, 8, 7, BitQuality::High, &[0, 0, 0, 0, 0], &additional);
-        assert_ne!(delta.bytes_small[0] & channels::DELTA_HEADER_ADDITIONAL_DATA, 0);
+        assert_ne!(
+            delta.bytes_small[0] & channels::DELTA_HEADER_ADDITIONAL_DATA,
+            0
+        );
         assert_eq!(&delta.bytes_small[5 + 5..], &additional);
     }
 
@@ -2053,19 +2084,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            packets[BitQuality::High as usize].as_ref().unwrap().channel_small,
+            packets[BitQuality::High as usize]
+                .as_ref()
+                .unwrap()
+                .channel_small,
             channels::PLAYER_AVATAR_HIGH_ADDITIONAL
         );
         assert_eq!(
-            packets[BitQuality::Medium as usize].as_ref().unwrap().channel_small,
+            packets[BitQuality::Medium as usize]
+                .as_ref()
+                .unwrap()
+                .channel_small,
             channels::PLAYER_AVATAR_MEDIUM_ADDITIONAL
         );
         assert_eq!(
-            packets[BitQuality::Low as usize].as_ref().unwrap().channel_small,
+            packets[BitQuality::Low as usize]
+                .as_ref()
+                .unwrap()
+                .channel_small,
             channels::PLAYER_AVATAR_LOW
         );
         assert_eq!(
-            packets[BitQuality::VeryLow as usize].as_ref().unwrap().channel_small,
+            packets[BitQuality::VeryLow as usize]
+                .as_ref()
+                .unwrap()
+                .channel_small,
             channels::PLAYER_AVATAR_VERY_LOW
         );
     }
@@ -2229,9 +2272,7 @@ mod tests {
             10,
             base_interval_ms as u64,
         );
-        assert!(
-            channels::decode_avatar_interval_ms(overloaded, base_interval_ms) >= 320
-        );
+        assert!(channels::decode_avatar_interval_ms(overloaded, base_interval_ms) >= 320);
     }
 
     #[test]

@@ -214,14 +214,29 @@ impl P2pBroker {
         if session.initiator_link_up && session.target_link_up {
             let initiator = session.initiator_peer_id;
             let target = session.target_peer_id;
-            let newly_offloaded = self.offloaded_pairs.insert(pack_pair(initiator, target), ()).is_none();
+            let newly_offloaded = self
+                .offloaded_pairs
+                .insert(pack_pair(initiator, target), ())
+                .is_none();
             drop(session);
             if newly_offloaded {
                 info!("[P2P] offloaded pair ({initiator},{target})");
-                self.send_sub(transport, initiator, channels::P2P_SUB_OFFLOADED, &token, target)
-                    .await;
-                self.send_sub(transport, target, channels::P2P_SUB_OFFLOADED, &token, initiator)
-                    .await;
+                self.send_sub(
+                    transport,
+                    initiator,
+                    channels::P2P_SUB_OFFLOADED,
+                    &token,
+                    target,
+                )
+                .await;
+                self.send_sub(
+                    transport,
+                    target,
+                    channels::P2P_SUB_OFFLOADED,
+                    &token,
+                    initiator,
+                )
+                .await;
             }
         }
     }
@@ -241,11 +256,9 @@ impl P2pBroker {
         {
             return;
         }
-        if self
-            .peer_sessions
-            .get(&sender)
-            .is_some_and(|sessions| sessions.len() >= MAX_SESSIONS_PER_PEER && !sessions.contains(&message.session_token))
-        {
+        if self.peer_sessions.get(&sender).is_some_and(|sessions| {
+            sessions.len() >= MAX_SESSIONS_PER_PEER && !sessions.contains(&message.session_token)
+        }) {
             self.send_sub(
                 transport,
                 sender,

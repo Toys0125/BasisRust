@@ -3,9 +3,8 @@ use basis_protocol::messages::{
     CameraPipPositionMessage, CameraPipStateMessage, ClientCameraPipPositionMessage,
     ClientCameraPipStateMessage, ContentShareCleanupMessage, ContentShareMessage,
     LocalLoadResource, ModifyResource, OwnershipTransferMessage, PreloadReadyMessage,
-    ResourceManagementMessage,
-    ServerContentShareCleanupMessage, ServerContentShareMessage, SpawnPreloadedMessage,
-    UnloadResource,
+    ResourceManagementMessage, ServerContentShareCleanupMessage, ServerContentShareMessage,
+    SpawnPreloadedMessage, UnloadResource,
 };
 use parking_lot::RwLock;
 use std::{
@@ -432,7 +431,10 @@ impl ContentShareState {
         };
         let mut spheres = self.spheres.write();
         if spheres.contains_key(&server.content_share_message.sphere_net_id)
-            || spheres.values().filter(|sphere| sphere.player_id == player_id).count()
+            || spheres
+                .values()
+                .filter(|sphere| sphere.player_id == player_id)
+                .count()
                 >= max_per_player
         {
             return None;

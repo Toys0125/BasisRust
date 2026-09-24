@@ -3,7 +3,10 @@ use flate2::{write::DeflateEncoder, Compression};
 use lz4_flex::{compress, decompress};
 use std::io::Write;
 
-use crate::{avatar_bundle_dictionary, io::{NetReader, NetWriter}};
+use crate::{
+    avatar_bundle_dictionary,
+    io::{NetReader, NetWriter},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -56,35 +59,20 @@ pub const ROTATION_FIELD_COUNT: usize = WIRE_BONE_SLOT_COUNT + FINGER_CHANNEL_CO
 pub const END_EFFECTOR_BLOCK_BYTES: usize = 35;
 
 pub(crate) const BONE_DOF: [u8; WIRE_BONE_SLOT_COUNT] = [
-    3, 3, 3, 3, 3, 3, 3, 3, 3,
-    2, 2, 2, 2,
-    2, 2, 2, 2, 2, 2,
-    1, 1,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1,
 ];
 
 const BPC_HIGH: [u8; WIRE_BONE_SLOT_COUNT] = [
-    12, 12, 12, 12, 12, 12, 12, 12, 12,
-    12, 12, 12, 12,
-    12, 12, 12, 12, 12, 12,
-    5, 5,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 5, 5,
 ];
 const BPC_MEDIUM: [u8; WIRE_BONE_SLOT_COUNT] = [
-    8, 8, 8, 8, 8, 8, 8, 8, 8,
-    8, 8, 8, 8,
-    8, 8, 8, 8, 6, 6,
-    3, 3,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 6, 6, 3, 3,
 ];
 const BPC_LOW: [u8; WIRE_BONE_SLOT_COUNT] = [
-    6, 6, 6, 6, 6, 6, 6, 6, 6,
-    6, 6, 6, 6,
-    6, 6, 6, 6, 5, 5,
-    3, 3,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 5, 5, 3, 3,
 ];
 const BPC_VERY_LOW: [u8; WIRE_BONE_SLOT_COUNT] = [
-    5, 5, 5, 5, 5, 5, 5, 5, 5,
-    5, 5, 5, 5,
-    5, 5, 5, 5, 4, 4,
-    2, 2,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 4, 4, 2, 2,
 ];
 
 pub(crate) const HINGE_BITS: [u8; 4] = [6, 7, 9, 13];
@@ -238,10 +226,7 @@ pub fn write_neutral_rotation_region(payload: &mut [u8], quality: BitQuality) ->
             3 => {
                 let bits = bpc[slot] as usize;
                 let midpoint = 1u64 << (bits - 1);
-                3u64
-                    | (midpoint << 2)
-                    | (midpoint << (2 + bits))
-                    | (midpoint << (2 + 2 * bits))
+                3u64 | (midpoint << 2) | (midpoint << (2 + bits)) | (midpoint << (2 + 2 * bits))
             }
             2 => {
                 let hinge_bits = HINGE_BITS[quality.index()] as usize;
@@ -292,7 +277,11 @@ pub fn read_position(payload: &[u8]) -> Option<[f32; 3]> {
         let signed = (raw << 8) >> 8;
         signed as f32 * 0.001
     }
-    Some([axis(&payload[0..3]), axis(&payload[3..6]), axis(&payload[6..9])])
+    Some([
+        axis(&payload[0..3]),
+        axis(&payload[3..6]),
+        axis(&payload[6..9]),
+    ])
 }
 
 pub fn repack_high_to_lower(high_payload: &[u8], target: BitQuality) -> Result<Vec<u8>> {
@@ -311,7 +300,10 @@ pub fn repack_high_to_lower_into(
         high_payload.len() >= BitQuality::High.payload_len(),
         "high payload too small"
     );
-    anyhow::ensure!(out.len() >= target.payload_len(), "target output buffer too small");
+    anyhow::ensure!(
+        out.len() >= target.payload_len(),
+        "target output buffer too small"
+    );
 
     let out = &mut out[..target.payload_len()];
     out.fill(0);
@@ -330,12 +322,7 @@ pub fn repack_high_to_lower_into(
             3 => {
                 let src_bpc = BPC_HIGH[slot] as usize;
                 let dst_bpc = target_bpc[slot] as usize;
-                let raw = read_bits(
-                    high_payload,
-                    high_rot_base,
-                    src_bit,
-                    2 + 3 * src_bpc,
-                );
+                let raw = read_bits(high_payload, high_rot_base, src_bit, 2 + 3 * src_bpc);
                 let idx = raw & 3;
                 let src_mask = (1u64 << src_bpc) - 1;
                 let qa = (raw >> 2) & src_mask;
@@ -345,13 +332,7 @@ pub fn repack_high_to_lower_into(
                     | (rescale_quant(qa, src_bpc, dst_bpc) << 2)
                     | (rescale_quant(qb, src_bpc, dst_bpc) << (2 + dst_bpc))
                     | (rescale_quant(qc, src_bpc, dst_bpc) << (2 + 2 * dst_bpc));
-                write_bits(
-                    out,
-                    target_rot_base,
-                    dst_bit,
-                    packed,
-                    2 + 3 * dst_bpc,
-                );
+                write_bits(out, target_rot_base, dst_bit, packed, 2 + 3 * dst_bpc);
             }
             2 => {
                 let src_hinge = HINGE_BITS[BitQuality::High.index()] as usize;
@@ -359,21 +340,10 @@ pub fn repack_high_to_lower_into(
                 let dst_hinge = HINGE_BITS[target.index()] as usize;
                 let dst_twist = TWIST_BITS[target.index()] as usize;
                 let hinge = read_bits(high_payload, high_rot_base, src_bit, src_hinge);
-                let twist = read_bits(
-                    high_payload,
-                    high_rot_base,
-                    src_bit + src_hinge,
-                    src_twist,
-                );
+                let twist = read_bits(high_payload, high_rot_base, src_bit + src_hinge, src_twist);
                 let packed = rescale_quant(hinge, src_hinge, dst_hinge)
                     | (rescale_quant(twist, src_twist, dst_twist) << dst_hinge);
-                write_bits(
-                    out,
-                    target_rot_base,
-                    dst_bit,
-                    packed,
-                    dst_hinge + dst_twist,
-                );
+                write_bits(out, target_rot_base, dst_bit, packed, dst_hinge + dst_twist);
             }
             _ => {
                 let src_bits = SINGLE_BITS[BitQuality::High.index()] as usize;
@@ -554,7 +524,6 @@ pub fn try_encode_avatar_bundle_slices_with_compression(
     items: &[AvatarBundleSlice<'_>],
     compression: AvatarBundleCompression,
 ) -> Result<EncodedAvatarBundle> {
-
     let mut raw = NetWriter::new();
     // v50+ bundles are grouped by channel. Keep each channel's original item order while grouping
     // runs together; group counts are bytes, so runs longer than 255 continue as another group.
@@ -590,7 +559,11 @@ pub fn try_encode_avatar_bundle_slices_with_compression(
                 }
             } else {
                 // Current Basis transposes only delta bodies by byte column before compression.
-                let max_len = chunk.iter().map(|item| item.payload.len()).max().unwrap_or(0);
+                let max_len = chunk
+                    .iter()
+                    .map(|item| item.payload.len())
+                    .max()
+                    .unwrap_or(0);
                 for offset in 0..max_len {
                     for item in chunk {
                         if offset < item.payload.len() {
@@ -608,7 +581,10 @@ pub fn try_encode_avatar_bundle_slices_with_compression(
     }
 
     let raw = raw.into_vec();
-    anyhow::ensure!(raw.len() <= u16::MAX as usize, "bundle raw payload too large");
+    anyhow::ensure!(
+        raw.len() <= u16::MAX as usize,
+        "bundle raw payload too large"
+    );
     let (flags, compressed) = match compression {
         AvatarBundleCompression::Lz4 => (BUNDLE_CODEC_LZ4, compress(&raw)),
         AvatarBundleCompression::ZstdDictionary { level } => {
@@ -630,35 +606,75 @@ pub fn try_encode_avatar_bundle_slices_with_compression(
 }
 
 fn compress_avatar_bundle_zstd(raw: &[u8], level: i32) -> Result<Vec<u8>> {
-    use zstd_safe::{CParameter, CCtx, FrameFormat};
+    use zstd_safe::{CCtx, CParameter, FrameFormat};
 
     let mut context = CCtx::default();
     context
         .set_parameter(CParameter::CompressionLevel(level))
-        .map_err(|code| anyhow::anyhow!("setting zstd compression level: {}", zstd_safe::get_error_name(code)))?;
+        .map_err(|code| {
+            anyhow::anyhow!(
+                "setting zstd compression level: {}",
+                zstd_safe::get_error_name(code)
+            )
+        })?;
     context
         .set_parameter(CParameter::ContentSizeFlag(false))
-        .map_err(|code| anyhow::anyhow!("disabling zstd content-size flag: {}", zstd_safe::get_error_name(code)))?;
+        .map_err(|code| {
+            anyhow::anyhow!(
+                "disabling zstd content-size flag: {}",
+                zstd_safe::get_error_name(code)
+            )
+        })?;
     context
         .set_parameter(CParameter::ChecksumFlag(false))
-        .map_err(|code| anyhow::anyhow!("disabling zstd checksum: {}", zstd_safe::get_error_name(code)))?;
+        .map_err(|code| {
+            anyhow::anyhow!(
+                "disabling zstd checksum: {}",
+                zstd_safe::get_error_name(code)
+            )
+        })?;
     context
         .set_parameter(CParameter::DictIdFlag(false))
-        .map_err(|code| anyhow::anyhow!("disabling zstd dictionary id: {}", zstd_safe::get_error_name(code)))?;
+        .map_err(|code| {
+            anyhow::anyhow!(
+                "disabling zstd dictionary id: {}",
+                zstd_safe::get_error_name(code)
+            )
+        })?;
     context
         .set_parameter(CParameter::WindowLog(BUNDLE_ZSTD_WINDOW_LOG))
-        .map_err(|code| anyhow::anyhow!("setting zstd window log: {}", zstd_safe::get_error_name(code)))?;
+        .map_err(|code| {
+            anyhow::anyhow!(
+                "setting zstd window log: {}",
+                zstd_safe::get_error_name(code)
+            )
+        })?;
     context
         .set_parameter(CParameter::Format(FrameFormat::Magicless))
-        .map_err(|code| anyhow::anyhow!("setting magicless zstd format: {}", zstd_safe::get_error_name(code)))?;
+        .map_err(|code| {
+            anyhow::anyhow!(
+                "setting magicless zstd format: {}",
+                zstd_safe::get_error_name(code)
+            )
+        })?;
     context
         .load_dictionary(avatar_bundle_dictionary::bytes())
-        .map_err(|code| anyhow::anyhow!("loading avatar bundle zstd dictionary: {}", zstd_safe::get_error_name(code)))?;
+        .map_err(|code| {
+            anyhow::anyhow!(
+                "loading avatar bundle zstd dictionary: {}",
+                zstd_safe::get_error_name(code)
+            )
+        })?;
 
     let mut compressed = vec![0u8; zstd_safe::compress_bound(raw.len())];
     let written = context
         .compress2(&mut compressed[..], raw)
-        .map_err(|code| anyhow::anyhow!("compressing avatar bundle with zstd: {}", zstd_safe::get_error_name(code)))?;
+        .map_err(|code| {
+            anyhow::anyhow!(
+                "compressing avatar bundle with zstd: {}",
+                zstd_safe::get_error_name(code)
+            )
+        })?;
     compressed.truncate(written);
     Ok(compressed)
 }
@@ -683,7 +699,10 @@ pub fn decode_avatar_bundle(bytes: &[u8]) -> Result<Vec<AvatarBundleItem>> {
     let raw_len = u16::from_le_bytes([bytes[1], bytes[2]]) as usize;
     let raw = match codec {
         BUNDLE_CODEC_LZ4 => {
-            anyhow::ensure!(dictionary_generation == 0, "LZ4 bundle has dictionary generation");
+            anyhow::ensure!(
+                dictionary_generation == 0,
+                "LZ4 bundle has dictionary generation"
+            );
             decompress(&bytes[3..], raw_len).context("decompressing LZ4 bundle")?
         }
         BUNDLE_CODEC_ZSTD_DICTIONARY => {
@@ -711,7 +730,10 @@ pub fn decode_avatar_bundle(bytes: &[u8]) -> Result<Vec<AvatarBundleItem>> {
             body_total = body_total.saturating_add(len);
             lengths.push(len);
         }
-        anyhow::ensure!(body_total <= reader.remaining(), "bundle bodies exceed group data");
+        anyhow::ensure!(
+            body_total <= reader.remaining(),
+            "bundle bodies exceed group data"
+        );
 
         if channel != DELTA_CHANNEL {
             for len in lengths {
@@ -750,14 +772,29 @@ fn decompress_avatar_bundle_zstd(compressed: &[u8], raw_len: usize) -> Result<Ve
     let mut context = DCtx::default();
     context
         .set_parameter(DParameter::Format(FrameFormat::Magicless))
-        .map_err(|code| anyhow::anyhow!("setting magicless zstd decode format: {}", zstd_safe::get_error_name(code)))?;
+        .map_err(|code| {
+            anyhow::anyhow!(
+                "setting magicless zstd decode format: {}",
+                zstd_safe::get_error_name(code)
+            )
+        })?;
     context
         .load_dictionary(avatar_bundle_dictionary::bytes())
-        .map_err(|code| anyhow::anyhow!("loading avatar bundle zstd dictionary for decode: {}", zstd_safe::get_error_name(code)))?;
+        .map_err(|code| {
+            anyhow::anyhow!(
+                "loading avatar bundle zstd dictionary for decode: {}",
+                zstd_safe::get_error_name(code)
+            )
+        })?;
     let mut raw = vec![0u8; raw_len];
     let written = context
         .decompress(&mut raw[..], compressed)
-        .map_err(|code| anyhow::anyhow!("decompressing avatar bundle zstd: {}", zstd_safe::get_error_name(code)))?;
+        .map_err(|code| {
+            anyhow::anyhow!(
+                "decompressing avatar bundle zstd: {}",
+                zstd_safe::get_error_name(code)
+            )
+        })?;
     anyhow::ensure!(written == raw_len, "zstd bundle raw length mismatch");
     Ok(raw)
 }
@@ -812,13 +849,11 @@ mod tests {
         // Restricted and finger fields also encode zero at their signed midpoint, never as all-zero bits.
         let hinge_bits = HINGE_BITS[BitQuality::High.index()] as usize;
         let twist_bits = TWIST_BITS[BitQuality::High.index()] as usize;
-        let restricted = read_bits(
-            &payload,
-            rot_base,
-            offsets[9],
-            hinge_bits + twist_bits,
+        let restricted = read_bits(&payload, rot_base, offsets[9], hinge_bits + twist_bits);
+        assert_eq!(
+            restricted & ((1u64 << hinge_bits) - 1),
+            1u64 << (hinge_bits - 1)
         );
-        assert_eq!(restricted & ((1u64 << hinge_bits) - 1), 1u64 << (hinge_bits - 1));
         assert_eq!(restricted >> hinge_bits, 1u64 << (twist_bits - 1));
 
         let curl_bits = CURL_BITS[BitQuality::High.index()] as usize;
@@ -885,7 +920,10 @@ mod tests {
             AvatarBundleCompression::ZstdDictionary { level: -2 },
         )
         .unwrap();
-        assert_eq!(encoded.bytes[0] & BUNDLE_CODEC_MASK, BUNDLE_CODEC_ZSTD_DICTIONARY);
+        assert_eq!(
+            encoded.bytes[0] & BUNDLE_CODEC_MASK,
+            BUNDLE_CODEC_ZSTD_DICTIONARY
+        );
         assert_eq!(
             encoded.bytes[0] >> BUNDLE_DICTIONARY_SHIFT,
             avatar_bundle_dictionary::GENERATION

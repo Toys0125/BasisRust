@@ -100,7 +100,11 @@ fn write_compact_id(writer: &mut NetWriter, value: &str) {
     if let Ok(uuid) = Uuid::parse_str(value) {
         if value.len() == 32 || value.len() == 36 {
             let format = if value.len() == 36 {
-                if value.bytes().any(|b| matches!(b, b'A'..=b'F')) { 1 } else { 0 }
+                if value.bytes().any(|b| matches!(b, b'A'..=b'F')) {
+                    1
+                } else {
+                    0
+                }
             } else if value.bytes().any(|b| matches!(b, b'A'..=b'F')) {
                 3
             } else {
@@ -184,7 +188,11 @@ fn read_compact_id(reader: &mut NetReader<'_>) -> ReadResult<String> {
             let upper = reader.get_u8()? & 1 != 0;
             let len = reader.get_u8()? as usize;
             let bytes = reader.get_bytes(len)?;
-            let alphabet = if upper { b"0123456789ABCDEF" } else { b"0123456789abcdef" };
+            let alphabet = if upper {
+                b"0123456789ABCDEF"
+            } else {
+                b"0123456789abcdef"
+            };
             let mut out = String::with_capacity(len * 2);
             for &byte in bytes {
                 out.push(alphabet[(byte >> 4) as usize] as char);
@@ -202,15 +210,42 @@ fn read_compact_id(reader: &mut NetReader<'_>) -> ReadResult<String> {
 }
 
 const KNOWN_PLATFORMS: &[&str] = &[
-    "WindowsPlayer", "WindowsEditor", "WindowsServer",
-    "OSXPlayer", "OSXEditor", "OSXServer",
-    "LinuxPlayer", "LinuxEditor", "LinuxServer",
-    "Android", "IPhonePlayer", "VisionOS", "WebGLPlayer",
-    "PS4", "PS5", "XboxOne", "GameCoreXboxOne", "GameCoreXboxSeries", "Switch", "tvOS",
-    "WSAPlayerX86", "WSAPlayerX64", "WSAPlayerARM",
-    "EmbeddedLinuxArm64", "EmbeddedLinuxArm32", "EmbeddedLinuxX64", "EmbeddedLinuxX86",
-    "QNXArm32", "QNXArm64", "QNXX64", "QNXX86",
-    "Stadia", "CloudRendering", "LinuxHeadlessSimulation", "Lumin", "Headless",
+    "WindowsPlayer",
+    "WindowsEditor",
+    "WindowsServer",
+    "OSXPlayer",
+    "OSXEditor",
+    "OSXServer",
+    "LinuxPlayer",
+    "LinuxEditor",
+    "LinuxServer",
+    "Android",
+    "IPhonePlayer",
+    "VisionOS",
+    "WebGLPlayer",
+    "PS4",
+    "PS5",
+    "XboxOne",
+    "GameCoreXboxOne",
+    "GameCoreXboxSeries",
+    "Switch",
+    "tvOS",
+    "WSAPlayerX86",
+    "WSAPlayerX64",
+    "WSAPlayerARM",
+    "EmbeddedLinuxArm64",
+    "EmbeddedLinuxArm32",
+    "EmbeddedLinuxX64",
+    "EmbeddedLinuxX86",
+    "QNXArm32",
+    "QNXArm64",
+    "QNXX64",
+    "QNXX86",
+    "Stadia",
+    "CloudRendering",
+    "LinuxHeadlessSimulation",
+    "Lumin",
+    "Headless",
 ];
 
 fn write_platform(writer: &mut NetWriter, value: &str) {
@@ -227,7 +262,11 @@ fn read_platform(reader: &mut NetReader<'_>) -> ReadResult<String> {
     if tag == 0 {
         return reader.get_string();
     }
-    Ok(KNOWN_PLATFORMS.get(tag as usize - 1).copied().unwrap_or("").to_owned())
+    Ok(KNOWN_PLATFORMS
+        .get(tag as usize - 1)
+        .copied()
+        .unwrap_or("")
+        .to_owned())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -320,7 +359,11 @@ impl BasisDeserialize for ServerBodyFitMessage {
 }
 
 fn sanitize_fit_scale(value: f32) -> f32 {
-    if !value.is_finite() || value <= 0.0 { 1.0 } else { value.clamp(0.5, 1.5) }
+    if !value.is_finite() || value <= 0.0 {
+        1.0
+    } else {
+        value.clamp(0.5, 1.5)
+    }
 }
 
 fn compress_fit_scale(value: f32) -> u16 {
@@ -808,13 +851,21 @@ impl BasisDeserialize for ServerReadyBatchMessage {
         let compressed = reader.get_bool()?;
         let len = reader.get_i32()?;
         if len < 0 {
-            return Err(crate::io::NetReadError::Underflow { needed: 1, remaining: 0 });
+            return Err(crate::io::NetReadError::Underflow {
+                needed: 1,
+                remaining: 0,
+            });
         }
         let framed = reader.get_bytes(len as usize)?;
         let payload = if compressed {
             let mut decoder = DeflateDecoder::new(framed);
             let mut out = Vec::new();
-            decoder.read_to_end(&mut out).map_err(|_| crate::io::NetReadError::Underflow { needed: 1, remaining: 0 })?;
+            decoder
+                .read_to_end(&mut out)
+                .map_err(|_| crate::io::NetReadError::Underflow {
+                    needed: 1,
+                    remaining: 0,
+                })?;
             out
         } else {
             framed.to_vec()
@@ -2444,16 +2495,31 @@ mod tests {
     #[test]
     fn core_message_supply_matches_current_registry_shape() {
         let supply = core_message_supply();
-        assert!(supply.descriptors.iter().any(|d| d.id == 30 && d.name == "basis.core.avatar.delta"));
-        assert!(supply.descriptors.iter().any(|d| d.id == 55 && d.name == "basis.core.resource.modify"));
-        assert!(supply.descriptors.iter().any(|d| d.id == 60 && d.name == "basis.core.registry.control"));
+        assert!(supply
+            .descriptors
+            .iter()
+            .any(|d| d.id == 30 && d.name == "basis.core.avatar.delta"));
+        assert!(supply
+            .descriptors
+            .iter()
+            .any(|d| d.id == 55 && d.name == "basis.core.resource.modify"));
+        assert!(supply
+            .descriptors
+            .iter()
+            .any(|d| d.id == 60 && d.name == "basis.core.registry.control"));
         assert!(!supply.descriptors.iter().any(|d| d.id == 32 || d.id == 33));
-        assert!(supply.descriptors.iter().all(|d| d.version == 1 && d.flags == 0));
+        assert!(supply
+            .descriptors
+            .iter()
+            .all(|d| d.version == 1 && d.flags == 0));
 
         let mut writer = NetWriter::new();
         supply.serialize(&mut writer);
         let mut reader = NetReader::new(writer.as_slice());
-        assert_eq!(BasisMessageSupply::deserialize(&mut reader).unwrap(), supply);
+        assert_eq!(
+            BasisMessageSupply::deserialize(&mut reader).unwrap(),
+            supply
+        );
     }
 
     #[test]
@@ -2641,7 +2707,10 @@ mod tests {
         let mut writer = NetWriter::new();
         message.serialize(&mut writer);
         let mut reader = NetReader::new(writer.as_slice());
-        assert_eq!(BasisP2PSignalMessage::deserialize(&mut reader).unwrap(), message);
+        assert_eq!(
+            BasisP2PSignalMessage::deserialize(&mut reader).unwrap(),
+            message
+        );
         assert_eq!(reader.remaining(), 0);
     }
 

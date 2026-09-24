@@ -15,15 +15,13 @@ use basis_protocol::{
         CameraCountdownMessage, CameraShutterSoundMessage, ChatMessage, ClientBodyFitMessage,
         ClientCameraCountdownMessage, ClientCameraPipPositionMessage, ClientCameraPipStateMessage,
         ClientMetaDataMessage, ContentShareCleanupMessage, ContentShareMessage, ContentShareType,
-        LocalLoadResource, ModifyResource, NetIdMessage,
-        OwnershipTransferMessage,
+        LocalLoadResource, ModifyResource, NetIdMessage, OwnershipTransferMessage,
         PreloadReadyMessage, ReadyMessage, RemoteAvatarDataMessage, RemoteSceneDataMessage,
         SceneDataMessage, ServerAudioSegmentMessage, ServerAvatarChangeMessage,
         ServerAvatarDataMessage, ServerBodyFitMessage, ServerChatMessage, ServerMetaDataMessage,
         ServerNetIdMessage, ServerReadyBatchMessage, ServerReadyMessage, ServerSceneDataMessage,
-        ServerStatisticMessage,
-        ServerUniqueIdMessages,
-        SpawnPreloadedMessage, UnloadResource, UshortUniqueIdMessage, VoiceReceiversMessage,
+        ServerStatisticMessage, ServerUniqueIdMessages, SpawnPreloadedMessage, UnloadResource,
+        UshortUniqueIdMessage, VoiceReceiversMessage,
     },
     server_info::ServerInfoResponse,
     version::SERVER_VERSION,
@@ -124,10 +122,7 @@ impl JoinBroadcastState {
                 pending: Vec::new(),
             },
         );
-        existing
-            .into_iter()
-            .map(|(_, _, peer)| peer)
-            .collect()
+        existing.into_iter().map(|(_, _, peer)| peer).collect()
     }
 
     fn mark_initial_history_queued(&mut self, peer_id: PeerId) {
@@ -166,8 +161,7 @@ impl JoinBroadcastState {
             for record in &peer.pending {
                 let record_len = record.payload.read().len();
                 if take > 0
-                    && payload_bytes + record_len
-                        > ServerReadyBatchMessage::MAX_PAYLOAD_BYTES
+                    && payload_bytes + record_len > ServerReadyBatchMessage::MAX_PAYLOAD_BYTES
                 {
                     break;
                 }
@@ -182,12 +176,9 @@ impl JoinBroadcastState {
     fn ready_targets(&self) -> Vec<PeerId> {
         self.peers
             .iter()
-            .filter_map(|(peer_id, peer)| {
-                peer.initial_history_queued.then_some(*peer_id)
-            })
+            .filter_map(|(peer_id, peer)| peer.initial_history_queued.then_some(*peer_id))
             .collect()
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -311,7 +302,8 @@ impl ServerState {
                 bundle_zstd_level: config.avatar_bundle_zstd_level,
                 enable_delta_compression: config.enable_avatar_delta_compression,
                 delta_keyframe_interval_ms: config.avatar_delta_keyframe_interval_ms.max(1) as u64,
-                delta_keyframe_max_interval_ms: config.avatar_delta_keyframe_max_interval_ms.max(0) as u64,
+                delta_keyframe_max_interval_ms: config.avatar_delta_keyframe_max_interval_ms.max(0)
+                    as u64,
                 strip_additional_data_at_low_quality: config.strip_additional_data_at_low_quality,
                 bundle_min_messages: config.avatar_bundle_min_messages.max(1) as usize,
                 bundle_min_bytes: config.avatar_bundle_min_bytes.max(0) as usize,
@@ -374,7 +366,10 @@ impl ServerState {
     }
 
     fn scene_egress_allowed(&self, peer_id: PeerId, bytes: u64) -> bool {
-        let megabits = self.config.read().max_scene_relay_megabits_per_second_per_player;
+        let megabits = self
+            .config
+            .read()
+            .max_scene_relay_megabits_per_second_per_player;
         if megabits <= 0 || bytes == 0 {
             return true;
         }
@@ -382,10 +377,13 @@ impl ServerState {
         const BURST_SECONDS: f64 = 2.0;
         let rate = megabits as f64 * MEGABITS_TO_BYTES;
         let now = Instant::now();
-        let mut bucket = self.scene_egress.entry(peer_id).or_insert_with(|| SceneEgressBucket {
-            tokens: rate * BURST_SECONDS,
-            last_refill: now,
-        });
+        let mut bucket = self
+            .scene_egress
+            .entry(peer_id)
+            .or_insert_with(|| SceneEgressBucket {
+                tokens: rate * BURST_SECONDS,
+                last_refill: now,
+            });
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
         if elapsed > 0.0 {
             bucket.last_refill = now;
@@ -407,10 +405,13 @@ impl ServerState {
             self.jiggle_buckets.clear();
         }
         let now = Instant::now();
-        let mut bucket = self.jiggle_buckets.entry(peer_id).or_insert_with(|| JiggleTokenBucket {
-            tokens: TOKEN_BURST,
-            last_refill: now,
-        });
+        let mut bucket = self
+            .jiggle_buckets
+            .entry(peer_id)
+            .or_insert_with(|| JiggleTokenBucket {
+                tokens: TOKEN_BURST,
+                last_refill: now,
+            });
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f32();
         bucket.last_refill = now;
         bucket.tokens = (bucket.tokens + elapsed * TOKENS_PER_SECOND).min(TOKEN_BURST);
@@ -437,7 +438,8 @@ impl ServerState {
                 bundle_zstd_level: config.avatar_bundle_zstd_level,
                 enable_delta_compression: config.enable_avatar_delta_compression,
                 delta_keyframe_interval_ms: config.avatar_delta_keyframe_interval_ms.max(1) as u64,
-                delta_keyframe_max_interval_ms: config.avatar_delta_keyframe_max_interval_ms.max(0) as u64,
+                delta_keyframe_max_interval_ms: config.avatar_delta_keyframe_max_interval_ms.max(0)
+                    as u64,
                 strip_additional_data_at_low_quality: config.strip_additional_data_at_low_quality,
                 bundle_min_messages: config.avatar_bundle_min_messages.max(1) as usize,
                 bundle_min_bytes: config.avatar_bundle_min_bytes.max(0) as usize,
@@ -666,12 +668,7 @@ async fn flush_join_batches(state: &ServerState) {
             }
             let key = records
                 .iter()
-                .map(|record| {
-                    (
-                        record.sequence,
-                        record.revision.load(Ordering::Acquire),
-                    )
-                })
+                .map(|record| (record.sequence, record.revision.load(Ordering::Acquire)))
                 .collect::<Vec<_>>();
             let framed = framed_by_batch
                 .entry(key)
@@ -1157,7 +1154,10 @@ async fn send_accept_fanout(
             writer.into_vec(),
         ));
     }
-    state.transport.send_many(peer_id, &existing_player_packets).await?;
+    state
+        .transport
+        .send_many(peer_id, &existing_player_packets)
+        .await?;
     state
         .join_broadcast
         .lock()
@@ -1302,7 +1302,10 @@ async fn handle_disconnect(state: &ServerState, peer: PeerId, reason: Disconnect
             )
             .await;
     }
-    for unload in state.resources.remove_creator_non_persistent(&departed_uuid) {
+    for unload in state
+        .resources
+        .remove_creator_non_persistent(&departed_uuid)
+    {
         let mut writer = NetWriter::new();
         unload.serialize(&mut writer);
         state
@@ -1440,13 +1443,15 @@ async fn handle_uplink_avatar_delta(
         return Ok(());
     };
 
-    let (full_payload, delta_body_len) =
-        apply_delta(&baseline, &payload[3..], BitQuality::High)?;
+    let (full_payload, delta_body_len) = apply_delta(&baseline, &payload[3..], BitQuality::High)?;
     let has_additional = header & channels::DELTA_HEADER_ADDITIONAL_DATA != 0
         && !state.global_state.read().additional_avatar_data_lock;
     let additional_start = 3 + delta_body_len;
     let additional_data = if has_additional {
-        anyhow::ensure!(additional_start <= payload.len(), "uplink avatar delta body exceeds payload");
+        anyhow::ensure!(
+            additional_start <= payload.len(),
+            "uplink avatar delta body exceeds payload"
+        );
         &payload[additional_start..]
     } else {
         &[]
@@ -1486,17 +1491,22 @@ async fn handle_message(
         channels::PLAYER_AVATAR_HIGH | channels::PLAYER_AVATAR_HIGH_ADDITIONAL => {
             let strip_additional = state.global_state.read().additional_avatar_data_lock
                 && channels::channel_has_additional_data(channel);
-            let ingest_channel = if strip_additional { channel - 1 } else { channel };
+            let ingest_channel = if strip_additional {
+                channel - 1
+            } else {
+                channel
+            };
             let ingest_payload = if strip_additional {
                 let end = (1 + BitQuality::High.payload_len()).min(payload.len());
                 &payload[..end]
             } else {
                 payload.as_ref()
             };
-            match state
-                .avatar_sync
-                .upsert_from_channel_payload(peer, ingest_channel, ingest_payload)
-            {
+            match state.avatar_sync.upsert_from_channel_payload(
+                peer,
+                ingest_channel,
+                ingest_payload,
+            ) {
                 Ok(()) => capture_uplink_delta_baseline(state, peer, ingest_payload),
                 Err(err) => {
                     state
@@ -1523,7 +1533,11 @@ async fn handle_message(
         | channels::PLAYER_AVATAR_HIGH_ADDITIONAL_LARGE => {
             let strip_additional = state.global_state.read().additional_avatar_data_lock
                 && channels::channel_has_additional_data(channel);
-            let ingest_channel = if strip_additional { channel - 1 } else { channel };
+            let ingest_channel = if strip_additional {
+                channel - 1
+            } else {
+                channel
+            };
             let quality = match channels::quality_from_channel(channel) {
                 0 => BitQuality::VeryLow,
                 1 => BitQuality::Low,
@@ -1536,10 +1550,11 @@ async fn handle_message(
             } else {
                 payload.as_ref()
             };
-            match state
-                .avatar_sync
-                .upsert_from_channel_payload(peer, ingest_channel, ingest_payload)
-            {
+            match state.avatar_sync.upsert_from_channel_payload(
+                peer,
+                ingest_channel,
+                ingest_payload,
+            ) {
                 Ok(()) => {
                     if matches!(
                         channel,
@@ -1569,7 +1584,11 @@ async fn handle_message(
         }
         channels::CHAT => {
             if state.global_state.read().text_chat_locked
-                && !peer_has_permission(state, peer, basis_server_permissions::nodes::CHAT_LOCK_BYPASS)
+                && !peer_has_permission(
+                    state,
+                    peer,
+                    basis_server_permissions::nodes::CHAT_LOCK_BYPASS,
+                )
             {
                 return Ok(());
             }
@@ -1607,14 +1626,13 @@ async fn handle_message(
                     {
                         return Ok(());
                     }
-                    let updated_ready = if let Some(mut peer_state) =
-                        state.authenticated_peers.get_mut(&peer)
-                    {
-                        peer_state.ready.client_avatar_change_message = avatar.clone();
-                        Some(peer_state.ready.clone())
-                    } else {
-                        None
-                    };
+                    let updated_ready =
+                        if let Some(mut peer_state) = state.authenticated_peers.get_mut(&peer) {
+                            peer_state.ready.client_avatar_change_message = avatar.clone();
+                            Some(peer_state.ready.clone())
+                        } else {
+                            None
+                        };
                     if let Some(ready) = updated_ready {
                         state.join_broadcast.lock().update_peer_ready(peer, ready);
                     }
@@ -1636,16 +1654,18 @@ async fn handle_message(
                 }
                 channels::AVATAR_CHANGE_KIND_BODY_FIT => {
                     let body_fit = ClientBodyFitMessage::deserialize(&mut reader)?;
-                    let updated_ready = if let Some(mut peer_state) =
-                        state.authenticated_peers.get_mut(&peer)
-                    {
-                        peer_state.ready.client_avatar_change_message.arm_scale = body_fit.arm_scale;
-                        peer_state.ready.client_avatar_change_message.leg_scale = body_fit.leg_scale;
-                        peer_state.ready.client_avatar_change_message.torso_scale = body_fit.torso_scale;
-                        Some(peer_state.ready.clone())
-                    } else {
-                        None
-                    };
+                    let updated_ready =
+                        if let Some(mut peer_state) = state.authenticated_peers.get_mut(&peer) {
+                            peer_state.ready.client_avatar_change_message.arm_scale =
+                                body_fit.arm_scale;
+                            peer_state.ready.client_avatar_change_message.leg_scale =
+                                body_fit.leg_scale;
+                            peer_state.ready.client_avatar_change_message.torso_scale =
+                                body_fit.torso_scale;
+                            Some(peer_state.ready.clone())
+                        } else {
+                            None
+                        };
                     if let Some(ready) = updated_ready {
                         state.join_broadcast.lock().update_peer_ready(peer, ready);
                     }
@@ -1682,11 +1702,16 @@ async fn handle_message(
             }
             let max_ids = {
                 let configured = state.config.read().max_network_ids_per_player;
-                if configured > 0 { configured as usize } else { 32_768 }
+                if configured > 0 {
+                    configured as usize
+                } else {
+                    32_768
+                }
             };
-            let Some((id, existed)) = state
-                .net_ids
-                .add_or_find_for_peer(&request.player_id, peer, max_ids)
+            let Some((id, existed)) =
+                state
+                    .net_ids
+                    .add_or_find_for_peer(&request.player_id, peer, max_ids)
             else {
                 return Ok(());
             };
@@ -1732,7 +1757,11 @@ async fn handle_message(
             }
             let max_loaded_resources = {
                 let configured = state.config.read().max_loaded_resources_per_player;
-                if configured > 0 { configured as usize } else { 16_384 }
+                if configured > 0 {
+                    configured as usize
+                } else {
+                    16_384
+                }
             };
             let should_broadcast = if resource.load_strategy == 2 {
                 let peers: Vec<u16> = state.authenticated_peers.iter().map(|p| *p.key()).collect();
@@ -1797,8 +1826,8 @@ async fn handle_message(
             let target_admin_locked = request.static_admin_locked;
             let target_static = request.static_resource || target_admin_locked;
             let involves_admin_tier = resource.static_admin_locked || target_admin_locked;
-            let is_creator = !resource.uuid_of_creator.is_empty()
-                && requester_uuid == resource.uuid_of_creator;
+            let is_creator =
+                !resource.uuid_of_creator.is_empty() && requester_uuid == resource.uuid_of_creator;
             if (!is_creator || involves_admin_tier) && !is_moderator {
                 return Ok(());
             }
@@ -1923,7 +1952,11 @@ async fn handle_message(
                     };
                     let max_spheres = {
                         let configured = state.config.read().max_content_spheres_per_player;
-                        if configured < 1 { 32usize } else { configured.min(4096) as usize }
+                        if configured < 1 {
+                            32usize
+                        } else {
+                            configured.min(4096) as usize
+                        }
                     };
                     let Some(server_message) = state.content_share.add_with_limit(
                         peer,
@@ -2039,14 +2072,22 @@ async fn handle_message(
         }
         channels::VOICE | channels::VOICE_LARGE => {
             if !state.global_state.read().voice_chat_locked
-                || peer_has_permission(state, peer, basis_server_permissions::nodes::VOICE_LOCK_BYPASS)
+                || peer_has_permission(
+                    state,
+                    peer,
+                    basis_server_permissions::nodes::VOICE_LOCK_BYPASS,
+                )
             {
                 relay_voice_message(state, peer, &payload).await;
             }
         }
         channels::SHOUT_VOICE => {
             if !state.global_state.read().voice_chat_locked
-                || peer_has_permission(state, peer, basis_server_permissions::nodes::VOICE_LOCK_BYPASS)
+                || peer_has_permission(
+                    state,
+                    peer,
+                    basis_server_permissions::nodes::VOICE_LOCK_BYPASS,
+                )
             {
                 relay_shout_voice_message(state, peer, &payload).await;
             }
@@ -2055,13 +2096,27 @@ async fn handle_message(
             relay_avatar_generic(state, peer, delivery, channels::AVATAR, &payload).await?;
         }
         channels::DIRECT_AVATAR_SERVER => {
-            relay_avatar_generic(state, peer, delivery, channels::DIRECT_AVATAR_SERVER, &payload).await?;
+            relay_avatar_generic(
+                state,
+                peer,
+                delivery,
+                channels::DIRECT_AVATAR_SERVER,
+                &payload,
+            )
+            .await?;
         }
         channels::SCENE => {
             relay_scene_generic(state, peer, delivery, channels::SCENE, &payload).await?;
         }
         channels::DIRECT_SCENE_SERVER => {
-            relay_scene_generic(state, peer, delivery, channels::DIRECT_SCENE_SERVER, &payload).await?;
+            relay_scene_generic(
+                state,
+                peer,
+                delivery,
+                channels::DIRECT_SCENE_SERVER,
+                &payload,
+            )
+            .await?;
         }
         channels::EVENTS => {
             relay_event(state, peer, &payload).await?;
@@ -2131,17 +2186,15 @@ async fn relay_scene_generic(
 ) -> Result<()> {
     let mut reader = NetReader::new(payload);
     let scene = SceneDataMessage::deserialize(&mut reader)?;
-    let is_image_traffic = state.net_ids.find("BasisImagePickupManager") == Some(scene.message_index);
+    let is_image_traffic =
+        state.net_ids.find("BasisImagePickupManager") == Some(scene.message_index);
     if !is_image_traffic {
         let fan_out = if scene.recipients.is_empty() {
             state.authenticated_peers.len().saturating_sub(1)
         } else {
             scene.recipients.len()
         };
-        let egress_bytes = scene
-            .payload
-            .len()
-            .saturating_mul(fan_out.max(1)) as u64;
+        let egress_bytes = scene.payload.len().saturating_mul(fan_out.max(1)) as u64;
         if !state.scene_egress_allowed(peer, egress_bytes) {
             return Ok(());
         }
@@ -2348,11 +2401,7 @@ async fn relay_event(state: &ServerState, peer: PeerId, payload: &[u8]) -> Resul
     Ok(())
 }
 
-async fn handle_jiggle_grab_event(
-    state: &ServerState,
-    peer: PeerId,
-    payload: &[u8],
-) -> Result<()> {
+async fn handle_jiggle_grab_event(state: &ServerState, peer: PeerId, payload: &[u8]) -> Result<()> {
     let mut reader = NetReader::new(payload);
     let op = reader.get_u8()?;
     if !state.jiggle_token_allowed(peer) {
@@ -2565,7 +2614,8 @@ fn sanitize_log_file_name(value: &str) -> String {
     value
         .chars()
         .map(|ch| {
-            if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || ch.is_control() {
+            if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || ch.is_control()
+            {
                 '_'
             } else {
                 ch
@@ -2783,7 +2833,9 @@ fn peer_has_permission(state: &ServerState, peer: PeerId, node: &str) -> bool {
     let Some(peer_state) = state.authenticated_peers.get(&peer) else {
         return false;
     };
-    state.permissions.has(&peer_state.metadata.player_uuid, node)
+    state
+        .permissions
+        .has(&peer_state.metadata.player_uuid, node)
 }
 
 fn has_protection_permission(state: &ServerState, peer: PeerId) -> bool {
@@ -2825,7 +2877,12 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
             toggle_simple_lock(state, |s| &mut s.servers_locked, |c| &mut c.servers_locked).await;
         }
         AdminRequestMode::GlobalToggleThirdPerson => {
-            toggle_simple_lock(state, |s| &mut s.third_person_disabled, |c| &mut c.third_person_disabled).await;
+            toggle_simple_lock(
+                state,
+                |s| &mut s.third_person_disabled,
+                |c| &mut c.third_person_disabled,
+            )
+            .await;
         }
         AdminRequestMode::GlobalToggleAdditionalAvatarDataLock => {
             let value = {
@@ -2935,7 +2992,11 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
         }
         AdminRequestMode::SetGlobalResourceLimits => {
             let requested = reader.get_i32().unwrap_or(32);
-            let value = if requested < 1 { 32 } else { requested.min(4096) };
+            let value = if requested < 1 {
+                32
+            } else {
+                requested.min(4096)
+            };
             state.config.write().max_content_spheres_per_player = value;
             broadcast_admin_payload(
                 state,
@@ -2955,7 +3016,8 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
                 config.bsrsincrease_rate = reader.get_f32().unwrap_or(0.005).max(0.0);
                 config.bsrslowest_send_rate = reader.get_f32().unwrap_or(2.55).max(0.0);
                 config.high_quality_distance = reader.get_f32().unwrap_or(10.0).clamp(0.0, 1000.0);
-                config.medium_quality_distance = reader.get_f32().unwrap_or(20.0).clamp(0.0, 1000.0);
+                config.medium_quality_distance =
+                    reader.get_f32().unwrap_or(20.0).clamp(0.0, 1000.0);
                 config.low_quality_distance = reader.get_f32().unwrap_or(40.0).clamp(0.0, 1000.0);
                 config.enable_avatar_bundle_compression = reader.get_bool().unwrap_or(true);
                 config.avatar_bundle_min_messages = reader.get_i32().unwrap_or(2).max(1);
@@ -2963,7 +3025,8 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
                 config.enable_bsrprofiling = reader.get_bool().unwrap_or(false);
                 config.enable_avatar_bundle_zstd = reader.get_bool().unwrap_or(false);
                 config.avatar_bundle_zstd_delta_bundles = reader.get_bool().unwrap_or(false);
-                config.avatar_bundle_zstd_level = reader.get_i32().unwrap_or(-2).clamp(-131_072, 22);
+                config.avatar_bundle_zstd_level =
+                    reader.get_i32().unwrap_or(-2).clamp(-131_072, 22);
                 config.avatar_bundle_zstd_max_shed_tier = reader.get_i32().unwrap_or(0).clamp(0, 2);
             }
             state.refresh_runtime_config();
@@ -2977,8 +3040,10 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
         AdminRequestMode::SetGlobalImageBandwidth => {
             {
                 let mut config = state.config.write();
-                config.image_share_egress_megabits_per_second = reader.get_i32().unwrap_or(200).max(0);
-                config.image_share_download_megabits_per_second = reader.get_i32().unwrap_or(200).max(0);
+                config.image_share_egress_megabits_per_second =
+                    reader.get_i32().unwrap_or(200).max(0);
+                config.image_share_download_megabits_per_second =
+                    reader.get_i32().unwrap_or(200).max(0);
                 config.image_share_egress_enforcement_percent =
                     reader.get_i32().unwrap_or(150).clamp(100, 1000);
             }
@@ -3004,10 +3069,20 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
             .await;
         }
         AdminRequestMode::GlobalTogglePlayspaceMover => {
-            toggle_simple_lock(state, |s| &mut s.playspace_mover_locked, |c| &mut c.playspace_mover_locked).await;
+            toggle_simple_lock(
+                state,
+                |s| &mut s.playspace_mover_locked,
+                |c| &mut c.playspace_mover_locked,
+            )
+            .await;
         }
         AdminRequestMode::GlobalToggleDirectConnect => {
-            toggle_simple_lock(state, |s| &mut s.direct_connect_locked, |c| &mut c.direct_connect_locked).await;
+            toggle_simple_lock(
+                state,
+                |s| &mut s.direct_connect_locked,
+                |c| &mut c.direct_connect_locked,
+            )
+            .await;
         }
         AdminRequestMode::GlobalToggleCilbox => {
             toggle_simple_lock(state, |s| &mut s.cilbox_locked, |c| &mut c.cilbox_locked).await;
@@ -3016,25 +3091,60 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
             toggle_simple_lock(state, |s| &mut s.images_locked, |c| &mut c.images_locked).await;
         }
         AdminRequestMode::GlobalToggleEndEffectorIK => {
-            toggle_simple_lock(state, |s| &mut s.end_effector_ik_disabled, |c| &mut c.end_effector_ik_disabled).await;
+            toggle_simple_lock(
+                state,
+                |s| &mut s.end_effector_ik_disabled,
+                |c| &mut c.end_effector_ik_disabled,
+            )
+            .await;
         }
         AdminRequestMode::GlobalToggleTextChat => {
-            toggle_simple_lock(state, |s| &mut s.text_chat_locked, |c| &mut c.text_chat_locked).await;
+            toggle_simple_lock(
+                state,
+                |s| &mut s.text_chat_locked,
+                |c| &mut c.text_chat_locked,
+            )
+            .await;
         }
         AdminRequestMode::GlobalToggleVoiceChat => {
-            toggle_simple_lock(state, |s| &mut s.voice_chat_locked, |c| &mut c.voice_chat_locked).await;
+            toggle_simple_lock(
+                state,
+                |s| &mut s.voice_chat_locked,
+                |c| &mut c.voice_chat_locked,
+            )
+            .await;
         }
         AdminRequestMode::GlobalToggleMediaPlayer => {
-            toggle_simple_lock(state, |s| &mut s.media_player_locked, |c| &mut c.media_player_locked).await;
+            toggle_simple_lock(
+                state,
+                |s| &mut s.media_player_locked,
+                |c| &mut c.media_player_locked,
+            )
+            .await;
         }
         AdminRequestMode::GlobalToggleCameraCapture => {
-            toggle_simple_lock(state, |s| &mut s.camera_capture_locked, |c| &mut c.camera_capture_locked).await;
+            toggle_simple_lock(
+                state,
+                |s| &mut s.camera_capture_locked,
+                |c| &mut c.camera_capture_locked,
+            )
+            .await;
         }
         AdminRequestMode::GlobalTogglePropGrabbing => {
-            toggle_simple_lock(state, |s| &mut s.prop_grabbing_locked, |c| &mut c.prop_grabbing_locked).await;
+            toggle_simple_lock(
+                state,
+                |s| &mut s.prop_grabbing_locked,
+                |c| &mut c.prop_grabbing_locked,
+            )
+            .await;
         }
         AdminRequestMode::GlobalToggleSafeDisplayNames => {
-            toggle_simple_lock(state, |s| &mut s.safe_display_names_forced, |c| &mut c.safe_display_names_forced).await;
+            toggle_simple_lock(
+                state,
+                |s| &mut s.safe_display_names_forced,
+                |c| &mut c.safe_display_names_forced,
+            )
+            .await;
         }
         AdminRequestMode::GlobalGetLockState => {
             send_lock_state_to_peer(state, peer).await?;
@@ -3527,7 +3637,12 @@ async fn handle_locomotion_override(
     for target in targets {
         send_admin_payload_to_peer(state, target, payload.clone()).await?;
     }
-    send_admin_text(state, moderator, "Locomotion override updated for eligible players.").await?;
+    send_admin_text(
+        state,
+        moderator,
+        "Locomotion override updated for eligible players.",
+    )
+    .await?;
     Ok(())
 }
 
@@ -3719,8 +3834,10 @@ fn sanitize_log_bundle_name(value: &str) -> String {
     }
     let mut safe = String::with_capacity(trimmed.len());
     for ch in trimmed.chars() {
-        if matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | ' ')
-            || ch.is_control()
+        if matches!(
+            ch,
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | ' '
+        ) || ch.is_control()
         {
             safe.push('_');
         } else {
@@ -3860,13 +3977,8 @@ async fn send_initial_admin_state_to_peer(state: &ServerState, peer_id: PeerId) 
         encode_image_bandwidth_payload(&config),
         encode_i32_admin_state_payload(AdminRequestMode::GlobalGetPeerLimit, config.peer_limit),
     ];
-    let messages = payloads.map(|payload| {
-        (
-            channels::ADMIN,
-            DeliveryMethod::ReliableOrdered,
-            payload,
-        )
-    });
+    let messages =
+        payloads.map(|payload| (channels::ADMIN, DeliveryMethod::ReliableOrdered, payload));
     if let Err(err) = state.transport.send_many(peer_id, &messages).await {
         warn!("failed to send initial admin state to peer {peer_id}: {err:#}");
     }
@@ -3925,11 +4037,7 @@ fn encode_i32_admin_state_payload(mode: AdminRequestMode, value: i32) -> Vec<u8>
     writer.into_vec()
 }
 
-fn encode_f32_pair_admin_state_payload(
-    mode: AdminRequestMode,
-    first: f32,
-    second: f32,
-) -> Vec<u8> {
+fn encode_f32_pair_admin_state_payload(mode: AdminRequestMode, first: f32, second: f32) -> Vec<u8> {
     let mut writer = NetWriter::new();
     AdminRequest { mode }.serialize(&mut writer);
     writer.put_f32(first);
@@ -4376,7 +4484,8 @@ mod tests {
                 leg_scale: 1.0,
                 torso_scale: 1.0,
             },
-            local_avatar_sync_message: basis_protocol::messages::LocalAvatarSyncMessage::empty_high(),
+            local_avatar_sync_message: basis_protocol::messages::LocalAvatarSyncMessage::empty_high(
+            ),
         }
     }
 
@@ -4395,7 +4504,10 @@ mod tests {
             .register_peer(test_connected_peer(1), vec![1])
             .is_empty());
         let existing = state.register_peer(test_connected_peer(2), vec![2]);
-        assert_eq!(existing.iter().map(|peer| peer.id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            existing.iter().map(|peer| peer.id).collect::<Vec<_>>(),
+            vec![1]
+        );
         assert!(state.ready_targets().is_empty());
 
         state.mark_initial_history_queued(1);
@@ -4471,7 +4583,10 @@ mod tests {
         );
         let mut reader = NetReader::new(&payload);
         assert_eq!(reader.get_u32().unwrap(), channels::REJECT_MAGIC);
-        assert_eq!(reader.get_u8().unwrap(), channels::REJECT_KIND_VERSION_MISMATCH);
+        assert_eq!(
+            reader.get_u8().unwrap(),
+            channels::REJECT_KIND_VERSION_MISMATCH
+        );
         assert_eq!(reader.get_u16().unwrap(), SERVER_VERSION);
         assert_eq!(reader.get_u16().unwrap(), SERVER_VERSION - 1);
         assert_eq!(reader.get_string().unwrap(), "Update required");

@@ -151,7 +151,9 @@ fn clone_branch(repo_url: &str, branch: &str) -> Result<PathBuf> {
             .output()
             .context("resolving requested local source ref")?;
         if !output.status.success() {
-            return Err(anyhow::anyhow!("Failed to resolve local source ref: {branch}"));
+            return Err(anyhow::anyhow!(
+                "Failed to resolve local source ref: {branch}"
+            ));
         }
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
@@ -184,7 +186,9 @@ fn clone_branch(repo_url: &str, branch: &str) -> Result<PathBuf> {
             .output()
             .context("fetching exact local source commit")?;
         if !fetch.status.success() {
-            return Err(anyhow::anyhow!("Failed to fetch exact local source commit: {commit}"));
+            return Err(anyhow::anyhow!(
+                "Failed to fetch exact local source commit: {commit}"
+            ));
         }
         "FETCH_HEAD".to_string()
     } else {
@@ -220,11 +224,7 @@ fn detect_rust_source() -> Result<PathBuf> {
     Ok(std::env::current_dir()?)
 }
 
-fn check_version(
-    temp_dir: &Path,
-    rust_source: &Path,
-    findings: &mut Vec<Finding>,
-) -> Result<()> {
+fn check_version(temp_dir: &Path, rust_source: &Path, findings: &mut Vec<Finding>) -> Result<()> {
     let csharp = fs::read_to_string(
         temp_dir
             .join("Basis Server")
@@ -258,11 +258,7 @@ fn check_version(
     Ok(())
 }
 
-fn check_channels(
-    temp_dir: &Path,
-    rust_source: &Path,
-    findings: &mut Vec<Finding>,
-) -> Result<()> {
+fn check_channels(temp_dir: &Path, rust_source: &Path, findings: &mut Vec<Finding>) -> Result<()> {
     let csharp = fs::read_to_string(
         temp_dir
             .join("Basis Server")
@@ -401,7 +397,10 @@ fn first_number(text: &str) -> Option<u16> {
 
 fn parse_u8_literal(value: &str) -> Option<u8> {
     let value = value.trim().trim_end_matches(';').trim();
-    if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
         u8::from_str_radix(hex, 16).ok()
     } else {
         value.parse::<u8>().ok()
@@ -494,7 +493,10 @@ fn csharp_name_to_rust(name: &str) -> String {
         ("RejectKind_", "REJECT_KIND_"),
     ] {
         if let Some(rest) = name.strip_prefix(prefix) {
-            return format!("{rust_prefix}{}", pascal_to_snake(rest).to_ascii_uppercase());
+            return format!(
+                "{rust_prefix}{}",
+                pascal_to_snake(rest).to_ascii_uppercase()
+            );
         }
     }
     let name = name.strip_suffix("Channel").unwrap_or(name);

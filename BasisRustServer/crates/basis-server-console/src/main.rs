@@ -218,7 +218,15 @@ fn start_console_listener(server: ServerState, config_path: PathBuf, running: Ar
                     if args.len() == 1 {
                         match server.config.read().get_field(args[0]) {
                             Some(value) if ServerConfig::is_secret_field_name(args[0]) => {
-                                println!("{}: {}", args[0], if value.is_empty() { "<empty>" } else { "<redacted>" });
+                                println!(
+                                    "{}: {}",
+                                    args[0],
+                                    if value.is_empty() {
+                                        "<empty>"
+                                    } else {
+                                        "<redacted>"
+                                    }
+                                );
                             }
                             Some(value) => println!("{}: {}", args[0], value),
                             None => println!("Unknown config field {}", args[0]),

@@ -2,10 +2,10 @@ use anyhow::{bail, ensure, Result};
 use std::sync::OnceLock;
 
 use crate::avatar::{
-    bpc_table, rotation_field_offsets, BitQuality, BONE_DOF, CURL_BITS,
-    END_EFFECTOR_BLOCK_BYTES, FINGER_CHANNEL_COUNT, HINGE_BITS, ROTATION_FIELD_COUNT,
-    SINGLE_BITS, SPLAY_BITS, TAIL_BYTES, TWIST_BITS, WIRE_BONE_SLOT_COUNT,
-    WRITE_HIPS_DELTA, WRITE_POSITION, WRITE_ROTATION, WRITE_SCALE,
+    bpc_table, rotation_field_offsets, BitQuality, BONE_DOF, CURL_BITS, END_EFFECTOR_BLOCK_BYTES,
+    FINGER_CHANNEL_COUNT, HINGE_BITS, ROTATION_FIELD_COUNT, SINGLE_BITS, SPLAY_BITS, TAIL_BYTES,
+    TWIST_BITS, WIRE_BONE_SLOT_COUNT, WRITE_HIPS_DELTA, WRITE_POSITION, WRITE_ROTATION,
+    WRITE_SCALE,
 };
 
 pub const FIELD_COUNT: usize = 1 + ROTATION_FIELD_COUNT + 5;
@@ -241,8 +241,14 @@ fn add_byte_aligned_quaternion(field: &mut Vec<AvatarChannel>, bit_offset: usize
 /// Builds the current Basis dirty-mask/residual delta body against a keyframe baseline.
 pub fn build_delta(baseline: &[u8], current: &[u8], quality: BitQuality) -> Result<Vec<u8>> {
     let layout = layout(quality);
-    ensure!(baseline.len() >= layout.payload_bytes, "avatar delta baseline too small");
-    ensure!(current.len() >= layout.payload_bytes, "avatar delta current payload too small");
+    ensure!(
+        baseline.len() >= layout.payload_bytes,
+        "avatar delta baseline too small"
+    );
+    ensure!(
+        current.len() >= layout.payload_bytes,
+        "avatar delta current payload too small"
+    );
 
     let mut mask = [0u8; DIRTY_MASK_BYTES];
     for field in 0..FIELD_COUNT {
@@ -261,47 +267,47 @@ pub fn build_delta(baseline: &[u8], current: &[u8], quality: BitQuality) -> Resu
     let body_len = {
         let mut writer = ResidualBitWriter::new(&mut bytes, body_start_bit);
 
-    for field in 0..FIELD_COUNT {
-        if mask[field >> 3] & (1 << (field & 7)) == 0 {
-            continue;
-        }
-        let mut residual_bits = 0usize;
-        let mut raw_bits = 0usize;
-        for channel in &layout.fields[field] {
-            raw_bits += channel.width;
-            if channel.kind == ChannelKind::Raw {
-                residual_bits += channel.width;
-            } else {
-                let diff = wrap_signed(
-                    read_channel(current, *channel) as i32
-                        - read_channel(baseline, *channel) as i32,
-                    channel.width,
-                );
-                residual_bits += signed_eg_bits(diff);
+        for field in 0..FIELD_COUNT {
+            if mask[field >> 3] & (1 << (field & 7)) == 0 {
+                continue;
+            }
+            let mut residual_bits = 0usize;
+            let mut raw_bits = 0usize;
+            for channel in &layout.fields[field] {
+                raw_bits += channel.width;
+                if channel.kind == ChannelKind::Raw {
+                    residual_bits += channel.width;
+                } else {
+                    let diff = wrap_signed(
+                        read_channel(current, *channel) as i32
+                            - read_channel(baseline, *channel) as i32,
+                        channel.width,
+                    );
+                    residual_bits += signed_eg_bits(diff);
+                }
+            }
+
+            let raw_mode = raw_bits < residual_bits;
+            writer.write_bit(raw_mode as u32);
+            for channel in &layout.fields[field] {
+                let current_value = read_channel(current, *channel);
+                if raw_mode || channel.kind == ChannelKind::Raw {
+                    writer.write_bits(current_value as u64, channel.width);
+                } else {
+                    let diff = wrap_signed(
+                        current_value as i32 - read_channel(baseline, *channel) as i32,
+                        channel.width,
+                    );
+                    writer.write_signed_eg(diff);
+                }
             }
         }
 
-        let raw_mode = raw_bits < residual_bits;
-        writer.write_bit(raw_mode as u32);
-        for channel in &layout.fields[field] {
-            let current_value = read_channel(current, *channel);
-            if raw_mode || channel.kind == ChannelKind::Raw {
-                writer.write_bits(current_value as u64, channel.width);
-            } else {
-                let diff = wrap_signed(
-                    current_value as i32 - read_channel(baseline, *channel) as i32,
-                    channel.width,
-                );
-                writer.write_signed_eg(diff);
-            }
+        let body_bits = writer.bit_position - body_start_bit;
+        let pad = (8 - (body_bits & 7)) & 7;
+        if pad > 0 {
+            writer.write_bits(0, pad);
         }
-    }
-
-    let body_bits = writer.bit_position - body_start_bit;
-    let pad = (8 - (body_bits & 7)) & 7;
-    if pad > 0 {
-        writer.write_bits(0, pad);
-    }
         DIRTY_MASK_BYTES + ((body_bits + 7) >> 3)
     };
     bytes.truncate(body_len);
@@ -355,7 +361,10 @@ pub fn apply_delta(
 
     let consumed_bits = reader.bit_position - body_start_bit;
     let body_len = DIRTY_MASK_BYTES + ((consumed_bits + 7) >> 3);
-    ensure!(body_len <= delta_and_trailing.len(), "avatar delta body overrun");
+    ensure!(
+        body_len <= delta_and_trailing.len(),
+        "avatar delta body overrun"
+    );
     Ok((output, body_len))
 }
 
@@ -403,7 +412,10 @@ struct ResidualBitWriter<'a> {
 
 impl<'a> ResidualBitWriter<'a> {
     fn new(bytes: &'a mut [u8], bit_position: usize) -> Self {
-        Self { bytes, bit_position }
+        Self {
+            bytes,
+            bit_position,
+        }
     }
 
     fn write_bit(&mut self, value: u32) {

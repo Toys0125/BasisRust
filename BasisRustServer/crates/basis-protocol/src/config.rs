@@ -44,12 +44,18 @@ pub struct ServerConfig {
     pub health_check_host: String,
     pub health_check_port: u16,
     pub health_path: String,
-    #[serde(rename = "HealthIncludeBSRProfiling", alias = "HealthIncludeBsrProfiling")]
+    #[serde(
+        rename = "HealthIncludeBSRProfiling",
+        alias = "HealthIncludeBsrProfiling"
+    )]
     pub health_include_bsr_profiling: bool,
     pub idle_memory_reclaim_enabled: bool,
     pub idle_memory_reclaim_settle_seconds: i32,
     pub idle_memory_reclaim_minimum_peak: i32,
-    #[serde(rename = "BSRSMillisecondDefaultInterval", alias = "BsrsmillisecondDefaultInterval")]
+    #[serde(
+        rename = "BSRSMillisecondDefaultInterval",
+        alias = "BsrsmillisecondDefaultInterval"
+    )]
     pub bsrsmillisecond_default_interval: i32,
     #[serde(rename = "BSRBaseMultiplier", alias = "BsrbaseMultiplier")]
     pub bsrbase_multiplier: i32,
@@ -100,9 +106,15 @@ pub struct ServerConfig {
     #[serde(rename = "EnableBSRProfiling", alias = "EnableBsrprofiling")]
     pub enable_bsrprofiling: bool,
     pub log_connection_handshake: bool,
-    #[serde(rename = "BSRMaxDegreeOfParallelism", alias = "BsrmaxDegreeOfParallelism")]
+    #[serde(
+        rename = "BSRMaxDegreeOfParallelism",
+        alias = "BsrmaxDegreeOfParallelism"
+    )]
     pub bsrmax_degree_of_parallelism: i32,
-    #[serde(rename = "BSRSendPhaseBudgetPercent", alias = "BsrsendPhaseBudgetPercent")]
+    #[serde(
+        rename = "BSRSendPhaseBudgetPercent",
+        alias = "BsrsendPhaseBudgetPercent"
+    )]
     pub bsrsend_phase_budget_percent: i32,
     #[serde(rename = "BSRMaxSliceCount", alias = "BsrmaxSliceCount")]
     pub bsrmax_slice_count: i32,
@@ -418,8 +430,16 @@ impl ServerConfig {
             additional_avatar_data_lock,
             bool
         );
-        override_field!("HealthIncludeBSRProfiling", health_include_bsr_profiling, bool);
-        override_field!("IdleMemoryReclaimEnabled", idle_memory_reclaim_enabled, bool);
+        override_field!(
+            "HealthIncludeBSRProfiling",
+            health_include_bsr_profiling,
+            bool
+        );
+        override_field!(
+            "IdleMemoryReclaimEnabled",
+            idle_memory_reclaim_enabled,
+            bool
+        );
         override_field!(
             "IdleMemoryReclaimSettleSeconds",
             idle_memory_reclaim_settle_seconds,
@@ -430,7 +450,11 @@ impl ServerConfig {
             idle_memory_reclaim_minimum_peak,
             i32
         );
-        override_field!("DistanceUpdateIntervalTicks", distance_update_interval_ticks, i32);
+        override_field!(
+            "DistanceUpdateIntervalTicks",
+            distance_update_interval_ticks,
+            i32
+        );
         override_field!("EnableComputeOffload", enable_compute_offload, bool);
         override_string!("ComputeDevice", compute_device);
         override_field!(
@@ -513,11 +537,7 @@ impl ServerConfig {
             u8
         );
         override_field!("CrashReportingEnabled", crash_reporting_enabled, bool);
-        override_field!(
-            "MaxMicrophoneRangeMeters",
-            max_microphone_range_meters,
-            f32
-        );
+        override_field!("MaxMicrophoneRangeMeters", max_microphone_range_meters, f32);
         override_field!("MaxHearingRangeMeters", max_hearing_range_meters, f32);
         override_field!(
             "MinAvatarEyeHeightMeters",
@@ -669,8 +689,14 @@ mod tests {
         assert_eq!(config.set_port, 4296);
         assert_eq!(config.password, "default_password");
         assert_eq!(config.config_version, ServerConfig::CURRENT_CONFIG_VERSION);
-        assert_eq!(config.company_name, crate::application::DEFAULT_COMPANY_NAME);
-        assert_eq!(config.product_name, crate::application::DEFAULT_PRODUCT_NAME);
+        assert_eq!(
+            config.company_name,
+            crate::application::DEFAULT_COMPANY_NAME
+        );
+        assert_eq!(
+            config.product_name,
+            crate::application::DEFAULT_PRODUCT_NAME
+        );
         assert!(config.use_auth);
         assert!(config.use_auth_identity);
         assert!(config.worlds_locked);
@@ -695,18 +721,29 @@ mod tests {
     #[test]
     fn dynamic_config_access_covers_current_fields() {
         let mut config = ServerConfig::default();
-        assert!(config.field_names().iter().any(|name| name == "AvatarBundleZstdLevel"));
-        assert_eq!(config.get_field("BSRMaxDegreeOfParallelism").as_deref(), Some("0"));
+        assert!(config
+            .field_names()
+            .iter()
+            .any(|name| name == "AvatarBundleZstdLevel"));
+        assert_eq!(
+            config.get_field("BSRMaxDegreeOfParallelism").as_deref(),
+            Some("0")
+        );
         config.set_field("AvatarBundleZstdLevel", "-5").unwrap();
         config.set_field("ImagePickupRangeMeters", "42.5").unwrap();
         config.set_field("CompanyName", "Custom Company").unwrap();
         config.set_field("ProductName", "Custom Product").unwrap();
-        config.set_field("BasisUserRestrictionMode", "blacklist").unwrap();
+        config
+            .set_field("BasisUserRestrictionMode", "blacklist")
+            .unwrap();
         assert_eq!(config.avatar_bundle_zstd_level, -5);
         assert_eq!(config.image_pickup_range_meters, 42.5);
         assert_eq!(config.company_name, "Custom Company");
         assert_eq!(config.product_name, "Custom Product");
-        assert_eq!(config.basis_user_restriction_mode, BasisUserRestrictionMode::BlackList);
+        assert_eq!(
+            config.basis_user_restriction_mode,
+            BasisUserRestrictionMode::BlackList
+        );
         assert!(config.set_field("DefinitelyNotAField", "1").is_err());
         assert!(ServerConfig::is_secret_field_name("ApiKey"));
         assert!(ServerConfig::is_secret_field_name("Password"));
@@ -726,9 +763,9 @@ mod tests {
 
         let xml = std::fs::read_to_string(&path).unwrap();
         assert!(xml.starts_with("<Configuration>\n"));
-        assert!(xml.contains(
-            "\n  <ConfigVersion>14</ConfigVersion>\n  <PeerLimit>65535</PeerLimit>\n"
-        ));
+        assert!(
+            xml.contains("\n  <ConfigVersion>14</ConfigVersion>\n  <PeerLimit>65535</PeerLimit>\n")
+        );
         assert!(xml.contains(
             "\n  <CompanyName>Basis Unity</CompanyName>\n  <ProductName>Basis Unity</ProductName>\n"
         ));

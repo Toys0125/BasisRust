@@ -23,7 +23,11 @@ pub fn bytes() -> &'static [u8] {
             decoder
                 .read_to_end(&mut raw)
                 .expect("embedded avatar bundle dictionary zlib stream is valid");
-            assert_eq!(raw.len(), RAW_LEN, "embedded avatar bundle dictionary length drifted");
+            assert_eq!(
+                raw.len(),
+                RAW_LEN,
+                "embedded avatar bundle dictionary length drifted"
+            );
             raw
         })
         .as_slice()

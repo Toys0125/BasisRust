@@ -589,9 +589,7 @@ impl TransportHandle {
             packet.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
             packet.push(packets[0].channel());
             extend_payload_with_patch(&mut packet, payload, packets[0].interval_patch());
-            return self
-                .try_send_raw_to(&packet, state.addr)
-                .map(usize::from);
+            return self.try_send_raw_to(&packet, state.addr).map(usize::from);
         }
 
         let mut sent = 0usize;
@@ -1107,7 +1105,8 @@ async fn process_packet(
                     *peer.last_seen.lock() = Instant::now();
                 }
             }
-            process_compact_merged_packet(handle, tx, remote_addr, connection_number, bytes).await?;
+            process_compact_merged_packet(handle, tx, remote_addr, connection_number, bytes)
+                .await?;
         }
         PacketProperty::MtuCheck => {
             if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
@@ -1341,11 +1340,7 @@ struct BuiltPacket {
 }
 
 #[inline]
-fn extend_payload_with_patch(
-    output: &mut Vec<u8>,
-    payload: &[u8],
-    patch: Option<(usize, u8)>,
-) {
+fn extend_payload_with_patch(output: &mut Vec<u8>, payload: &[u8], patch: Option<(usize, u8)>) {
     let payload_start = output.len();
     output.extend_from_slice(payload);
     if let Some((offset, value)) = patch {
@@ -1692,7 +1687,10 @@ async fn process_compact_merged_packet(
             if payload_len < 4 {
                 break;
             }
-            let Some(property) = payload.first().and_then(|header| PacketProperty::from_byte(*header)) else {
+            let Some(property) = payload
+                .first()
+                .and_then(|header| PacketProperty::from_byte(*header))
+            else {
                 break;
             };
             if !matches!(property, PacketProperty::Ack | PacketProperty::Channeled) {
@@ -2028,18 +2026,12 @@ mod tests {
                 part as u16
             );
             assert_eq!(packet.bytes[3], channel_id);
-            assert_eq!(
-                u16::from_le_bytes([packet.bytes[4], packet.bytes[5]]),
-                1
-            );
+            assert_eq!(u16::from_le_bytes([packet.bytes[4], packet.bytes[5]]), 1);
             assert_eq!(
                 u16::from_le_bytes([packet.bytes[6], packet.bytes[7]]),
                 part as u16
             );
-            assert_eq!(
-                u16::from_le_bytes([packet.bytes[8], packet.bytes[9]]),
-                3
-            );
+            assert_eq!(u16::from_le_bytes([packet.bytes[8], packet.bytes[9]]), 3);
             reassembled.extend_from_slice(&packet.bytes[LITENETLIB_FRAGMENTED_HEADER_SIZE..]);
         }
 
