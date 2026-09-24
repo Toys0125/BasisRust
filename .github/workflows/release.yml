@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+jobs:
+  builds:
+    name: Cross-platform builds
+    uses: ./.github/workflows/build.yml
+
+  attach:
+    name: Attach cross-platform builds
+    needs: builds
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: basisrust-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Attach builds to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" release-assets/* --clobber
