@@ -8,6 +8,9 @@ use dashmap::DashMap;
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use tracing::{info, warn};
 
+const MAX_SESSIONS_PER_PEER: usize = 4096;
+const MAX_SESSION_TOKEN_LEN: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SessionState {
     Awaiting,
@@ -52,6 +55,7 @@ impl P2pBroker {
         transport: &TransportHandle,
         sender: PeerId,
         payload: &[u8],
+        direct_connect_allowed: bool,
         is_authenticated: F,
     ) where
         F: Fn(PeerId) -> bool,
@@ -66,6 +70,17 @@ impl P2pBroker {
         };
         match sub {
             channels::P2P_SUB_REQUEST => {
+                if !direct_connect_allowed {
+                    self.send_sub(
+                        transport,
+                        sender,
+                        channels::P2P_SUB_CANCEL,
+                        &message.session_token,
+                        message.other_player_id,
+                    )
+                    .await;
+                    return;
+                }
                 self.handle_request(transport, sender, message, is_authenticated)
                     .await;
             }
@@ -81,7 +96,7 @@ impl P2pBroker {
             channels::P2P_SUB_LINK_LOST => {
                 self.handle_link_lost(transport, sender, message).await;
             }
-            channels::P2P_SUB_LINK_UP => self.handle_link_up(sender, message),
+            channels::P2P_SUB_LINK_UP => self.handle_link_up(transport, sender, message).await,
             _ => warn!("[P2P] unknown sub-type {sub} from peer {sender}"),
         }
     }
@@ -127,8 +142,30 @@ impl P2pBroker {
         };
         session.state = SessionState::Punched;
         drop(session);
+
+        let same_nat = a_external.ip() == b_external.ip();
+        let same_host = same_nat && a_internal.ip() == b_internal.ip();
+        let (a_internal, b_internal) = if same_host {
+            (
+                SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), a_internal.port()),
+                SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), b_internal.port()),
+            )
+        } else {
+            (a_internal, b_internal)
+        };
+        // Match current LiteNetLib defaults: spray 32 predicted ports for different-NAT peers,
+        // but skip the spray when both peers already share the same external address.
+        let prediction_count = if same_nat { 0 } else { 32 };
         if let Err(err) = transport
-            .send_nat_introduce(a_internal, a_external, b_internal, b_external, &token)
+            .send_nat_introduce(
+                a_internal,
+                a_external,
+                prediction_count,
+                b_internal,
+                b_external,
+                prediction_count,
+                &token,
+            )
             .await
         {
             warn!(
@@ -157,8 +194,14 @@ impl P2pBroker {
         }
     }
 
-    fn handle_link_up(&self, sender: PeerId, message: BasisP2PSignalMessage) {
-        let Some(mut session) = self.sessions.get_mut(&message.session_token) else {
+    async fn handle_link_up(
+        &self,
+        transport: &TransportHandle,
+        sender: PeerId,
+        message: BasisP2PSignalMessage,
+    ) {
+        let token = message.session_token.clone();
+        let Some(mut session) = self.sessions.get_mut(&token) else {
             return;
         };
         if sender == session.initiator_peer_id {
@@ -169,14 +212,32 @@ impl P2pBroker {
             return;
         }
         if session.initiator_link_up && session.target_link_up {
-            self.offloaded_pairs.insert(
-                pack_pair(session.initiator_peer_id, session.target_peer_id),
-                (),
-            );
-            info!(
-                "[P2P] offloaded pair ({},{})",
-                session.initiator_peer_id, session.target_peer_id
-            );
+            let initiator = session.initiator_peer_id;
+            let target = session.target_peer_id;
+            let newly_offloaded = self
+                .offloaded_pairs
+                .insert(pack_pair(initiator, target), ())
+                .is_none();
+            drop(session);
+            if newly_offloaded {
+                info!("[P2P] offloaded pair ({initiator},{target})");
+                self.send_sub(
+                    transport,
+                    initiator,
+                    channels::P2P_SUB_OFFLOADED,
+                    &token,
+                    target,
+                )
+                .await;
+                self.send_sub(
+                    transport,
+                    target,
+                    channels::P2P_SUB_OFFLOADED,
+                    &token,
+                    initiator,
+                )
+                .await;
+            }
         }
     }
 
@@ -189,7 +250,23 @@ impl P2pBroker {
     ) where
         F: Fn(PeerId) -> bool,
     {
-        if message.session_token.is_empty() || message.other_player_id == sender {
+        if message.session_token.is_empty()
+            || message.session_token.len() > MAX_SESSION_TOKEN_LEN
+            || message.other_player_id == sender
+        {
+            return;
+        }
+        if self.peer_sessions.get(&sender).is_some_and(|sessions| {
+            sessions.len() >= MAX_SESSIONS_PER_PEER && !sessions.contains(&message.session_token)
+        }) {
+            self.send_sub(
+                transport,
+                sender,
+                channels::P2P_SUB_CANCEL,
+                &message.session_token,
+                message.other_player_id,
+            )
+            .await;
             return;
         }
         if !is_authenticated(message.other_player_id) {
@@ -217,12 +294,13 @@ impl P2pBroker {
         self.sessions.insert(message.session_token.clone(), session);
         self.track_peer_session(sender, &message.session_token);
         self.track_peer_session(message.other_player_id, &message.session_token);
-        self.send_sub(
+        self.send_sub_with_key(
             transport,
             message.other_player_id,
             channels::P2P_SUB_REQUEST,
             &message.session_token,
             sender,
+            message.ephemeral_public_key.as_ref(),
         )
         .await;
         self.send_sub(
@@ -251,12 +329,13 @@ impl P2pBroker {
         session.state = SessionState::ReadyForPunch;
         let initiator = session.initiator_peer_id;
         drop(session);
-        self.send_sub(
+        self.send_sub_with_key(
             transport,
             initiator,
             channels::P2P_SUB_ACCEPT,
             &message.session_token,
             sender,
+            message.ephemeral_public_key.as_ref(),
         )
         .await;
     }
@@ -344,11 +423,25 @@ impl P2pBroker {
         token: &str,
         other_player_id: PeerId,
     ) {
+        self.send_sub_with_key(transport, to, sub, token, other_player_id, None)
+            .await;
+    }
+
+    async fn send_sub_with_key(
+        &self,
+        transport: &TransportHandle,
+        to: PeerId,
+        sub: u8,
+        token: &str,
+        other_player_id: PeerId,
+        ephemeral_public_key: Option<&[u8; 32]>,
+    ) {
         let mut writer = NetWriter::new();
         writer.put_u8(sub);
         BasisP2PSignalMessage {
             other_player_id,
             session_token: token.to_string(),
+            ephemeral_public_key: ephemeral_public_key.copied(),
         }
         .serialize(&mut writer);
         let _ = transport

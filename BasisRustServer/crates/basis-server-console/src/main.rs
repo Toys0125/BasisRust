@@ -43,6 +43,10 @@ struct Args {
 
 type CommandHandler = Box<dyn Fn(&[&str]) + Send + Sync + 'static>;
 
+// Tokio's worker threads otherwise retain glibc per-thread arenas after burst churn.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -195,11 +199,35 @@ fn start_console_listener(server: ServerState, config_path: PathBuf, running: Ar
                 "/config".to_string(),
                 Box::new(move |args| {
                     if args.is_empty() {
-                        println!("Usage: /config <field> [value]");
+                        let config = server.config.read();
+                        let fields = config.field_names();
+                        println!("{} settings:", fields.len());
+                        for field in fields {
+                            let value = if ServerConfig::is_secret_field_name(&field) {
+                                match config.get_field(&field).as_deref() {
+                                    Some("") | None => "<empty>".to_string(),
+                                    Some(_) => "<redacted>".to_string(),
+                                }
+                            } else {
+                                config.get_field(&field).unwrap_or_default()
+                            };
+                            println!("  {field} = {value}");
+                        }
                         return;
                     }
                     if args.len() == 1 {
                         match server.config.read().get_field(args[0]) {
+                            Some(value) if ServerConfig::is_secret_field_name(args[0]) => {
+                                println!(
+                                    "{}: {}",
+                                    args[0],
+                                    if value.is_empty() {
+                                        "<empty>"
+                                    } else {
+                                        "<redacted>"
+                                    }
+                                );
+                            }
                             Some(value) => println!("{}: {}", args[0], value),
                             None => println!("Unknown config field {}", args[0]),
                         }

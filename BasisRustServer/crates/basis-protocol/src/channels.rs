@@ -1,4 +1,9 @@
 pub const TOTAL_CHANNELS: u8 = 64;
+pub const AVATAR_INTERVAL_EXTENDED_START: u8 = 200;
+pub const AVATAR_INTERVAL_EXTENDED_STEP_MS: i32 = 12;
+pub const REJECT_MAGIC: u32 = 0xBA515CE1;
+pub const REJECT_KIND_VERSION_MISMATCH: u8 = 1;
+pub const REJECT_KIND_SERVER_FULL: u8 = 2;
 
 pub const AUTH_IDENTITY: u8 = 0;
 pub const META_DATA: u8 = 1;
@@ -15,6 +20,8 @@ pub const PLAYER_AVATAR_MEDIUM_ADDITIONAL: u8 = 11;
 pub const PLAYER_AVATAR_HIGH: u8 = 12;
 pub const PLAYER_AVATAR_HIGH_ADDITIONAL: u8 = 13;
 pub const AVATAR_CHANGE_MESSAGE: u8 = 14;
+pub const AVATAR_CHANGE_KIND_FULL: u8 = 0;
+pub const AVATAR_CHANGE_KIND_BODY_FIT: u8 = 1;
 pub const AVATAR: u8 = 15;
 pub const CREATE_REMOTE_PLAYER: u8 = 16;
 pub const CREATE_REMOTE_PLAYERS_FOR_NEW_PEER: u8 = 17;
@@ -30,10 +37,18 @@ pub const UNLOAD_RESOURCE: u8 = 26;
 pub const PRELOAD_READY: u8 = 27;
 pub const SPAWN_PRELOADED: u8 = 28;
 pub const CONTENT_SHARE: u8 = 29;
-pub const CONTENT_SHARE_CLEANUP: u8 = 30;
+pub const CONTENT_SHARE_SUB_DROP: u8 = 0;
+pub const CONTENT_SHARE_SUB_CLEANUP: u8 = 1;
+pub const DELTA_AVATAR: u8 = 30;
+pub const DELTA_HEADER_CONTROL_BIT: u8 = 0x80;
+pub const DELTA_CONTROL_KEYFRAME_REQUEST: u8 = 0x80;
+pub const DELTA_CONTROL_UPLINK_KEYFRAME_REQUEST: u8 = 0xC0;
+pub const DELTA_HEADER_QUALITY_MASK: u8 = 0x03;
+pub const DELTA_HEADER_ADDITIONAL_DATA: u8 = 0x04;
+pub const DELTA_HEADER_LARGE_ID: u8 = 0x08;
 pub const SERVER_BOUND: u8 = 31;
-pub const STORE_DATABASE: u8 = 32;
-pub const REQUEST_STORE_DATABASE: u8 = 33;
+// 32/33 are retired in current Basis. Kept only so the Rust server's legacy database
+// subsystem remains buildable; current clients do not use these channels.
 pub const ADMIN: u8 = 34;
 pub const SERVER_STATISTICS: u8 = 35;
 pub const CAMERA_PIP_STATE: u8 = 36;
@@ -55,11 +70,30 @@ pub const AUDIO_RECIPIENTS_BITFIELD: u8 = 51;
 pub const COMPRESSED_AVATAR_BUNDLE: u8 = 52;
 pub const SERVER_LIBRARY: u8 = 53;
 pub const P2P: u8 = 54;
+pub const MODIFY_RESOURCE: u8 = 55;
+pub const DIRECT_SCENE: u8 = 56;
+pub const DIRECT_SCENE_SERVER: u8 = 57;
+pub const DIRECT_AVATAR: u8 = 58;
+pub const DIRECT_AVATAR_SERVER: u8 = 59;
+pub const REGISTRY_CONTROL: u8 = 60;
+pub const PLUGIN_RELIABLE: u8 = 61;
+pub const PLUGIN_SEQUENCED: u8 = 62;
+pub const PLUGIN_UNRELIABLE: u8 = 63;
 
 pub const EVENT_TYPE_CAMERA_SHUTTER_SOUND: u8 = 0;
 pub const EVENT_TYPE_CAMERA_COUNTDOWN: u8 = 1;
 pub const EVENT_TYPE_PLAYER_TEMP_BLOCK: u8 = 2;
 pub const EVENT_TYPE_AVATAR_RATE_CHANGE: u8 = 3;
+pub const EVENT_TYPE_TALK_MODE_CHANGED: u8 = 4;
+pub const EVENT_TYPE_MUTE_STATE_CHANGED: u8 = 5;
+pub const EVENT_TYPE_PLAYER_CHAT_TYPING: u8 = 6;
+pub const EVENT_TYPE_ERROR_REPORT: u8 = 7;
+pub const EVENT_TYPE_VOICE_RECORD_REQUEST: u8 = 8;
+pub const EVENT_TYPE_VOICE_RECORD_CONSENT: u8 = 9;
+pub const EVENT_TYPE_JIGGLE_GRAB: u8 = 10;
+pub const JIGGLE_GRAB_OP_START: u8 = 0;
+pub const JIGGLE_GRAB_OP_STOP: u8 = 1;
+pub const JIGGLE_GRAB_OP_DENY: u8 = 2;
 
 pub const P2P_SUB_REQUEST: u8 = 0;
 pub const P2P_SUB_ACCEPT: u8 = 1;
@@ -68,6 +102,37 @@ pub const P2P_SUB_CANCEL: u8 = 3;
 pub const P2P_SUB_LINK_LOST: u8 = 4;
 pub const P2P_SUB_SERVER_ARMED: u8 = 5;
 pub const P2P_SUB_LINK_UP: u8 = 6;
+pub const P2P_SUB_OFFLOADED: u8 = 7;
+
+pub const REGISTRY_SUB_SUPPLY: u8 = 0;
+pub const REGISTRY_SUB_SUBSCRIBE: u8 = 1;
+
+pub fn encode_avatar_interval_byte(interval_ms: i32, base_interval_ms: i32) -> u8 {
+    let relative = interval_ms - base_interval_ms;
+    if relative <= 0 {
+        return 0;
+    }
+    if relative < AVATAR_INTERVAL_EXTENDED_START as i32 {
+        return relative as u8;
+    }
+    let mut steps = (relative - AVATAR_INTERVAL_EXTENDED_START as i32
+        + (AVATAR_INTERVAL_EXTENDED_STEP_MS >> 1))
+        / AVATAR_INTERVAL_EXTENDED_STEP_MS;
+    let max_steps = u8::MAX as i32 - AVATAR_INTERVAL_EXTENDED_START as i32;
+    steps = steps.min(max_steps);
+    (AVATAR_INTERVAL_EXTENDED_START as i32 + steps) as u8
+}
+
+pub fn decode_avatar_interval_ms(encoded: u8, base_interval_ms: i32) -> i32 {
+    if encoded < AVATAR_INTERVAL_EXTENDED_START {
+        base_interval_ms + encoded as i32
+    } else {
+        base_interval_ms
+            + AVATAR_INTERVAL_EXTENDED_START as i32
+            + (encoded as i32 - AVATAR_INTERVAL_EXTENDED_START as i32)
+                * AVATAR_INTERVAL_EXTENDED_STEP_MS
+    }
+}
 
 pub const PLAYER_AVATAR_QUALITY_CHANNELS: [u8; 16] = [
     PLAYER_AVATAR_VERY_LOW,
@@ -114,5 +179,50 @@ pub fn channel_has_additional_data(channel: u8) -> bool {
         ((channel - PLAYER_AVATAR_VERY_LOW_LARGE) & 1) == 1
     } else {
         ((channel - PLAYER_AVATAR_VERY_LOW) & 1) == 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_delta_control_and_avatar_change_constants_match_v54() {
+        assert_eq!(DELTA_HEADER_CONTROL_BIT, 0x80);
+        assert_eq!(DELTA_CONTROL_KEYFRAME_REQUEST, 0x80);
+        assert_eq!(DELTA_CONTROL_UPLINK_KEYFRAME_REQUEST, 0xC0);
+        assert_eq!(AVATAR_CHANGE_KIND_FULL, 0);
+        assert_eq!(AVATAR_CHANGE_KIND_BODY_FIT, 1);
+        assert_eq!(REJECT_MAGIC, 0xBA51_5CE1);
+        assert_eq!(REJECT_KIND_VERSION_MISMATCH, 1);
+        assert_eq!(REJECT_KIND_SERVER_FULL, 2);
+    }
+
+    #[test]
+    fn avatar_interval_extended_codec_matches_current_csharp_boundaries() {
+        let base = 50;
+        assert_eq!(encode_avatar_interval_byte(base, base), 0);
+        assert_eq!(encode_avatar_interval_byte(base + 199, base), 199);
+        assert_eq!(encode_avatar_interval_byte(base + 200, base), 200);
+        assert_eq!(decode_avatar_interval_ms(200, base), base + 200);
+        assert_eq!(decode_avatar_interval_ms(201, base), base + 212);
+        assert_eq!(encode_avatar_interval_byte(base + 212, base), 201);
+        assert_eq!(decode_avatar_interval_ms(u8::MAX, base), base + 860);
+        assert_eq!(encode_avatar_interval_byte(base + 10_000, base), u8::MAX);
+    }
+
+    #[test]
+    fn current_event_and_jiggle_ids_match_v54() {
+        assert_eq!(EVENT_TYPE_AVATAR_RATE_CHANGE, 3);
+        assert_eq!(EVENT_TYPE_TALK_MODE_CHANGED, 4);
+        assert_eq!(EVENT_TYPE_MUTE_STATE_CHANGED, 5);
+        assert_eq!(EVENT_TYPE_PLAYER_CHAT_TYPING, 6);
+        assert_eq!(EVENT_TYPE_ERROR_REPORT, 7);
+        assert_eq!(EVENT_TYPE_VOICE_RECORD_REQUEST, 8);
+        assert_eq!(EVENT_TYPE_VOICE_RECORD_CONSENT, 9);
+        assert_eq!(EVENT_TYPE_JIGGLE_GRAB, 10);
+        assert_eq!(JIGGLE_GRAB_OP_START, 0);
+        assert_eq!(JIGGLE_GRAB_OP_STOP, 1);
+        assert_eq!(JIGGLE_GRAB_OP_DENY, 2);
     }
 }

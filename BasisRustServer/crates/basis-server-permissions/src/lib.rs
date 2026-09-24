@@ -262,7 +262,10 @@ impl PermissionManager {
     fn effective_decisions(&self, uuid: &str) -> HashMap<String, bool> {
         let store = self.store.read();
         let Some(user) = store.users.get(uuid) else {
-            return HashMap::new();
+            let mut decisions = HashMap::new();
+            let mut visited = HashSet::new();
+            apply_group("default", &store, &mut visited, &mut decisions);
+            return decisions;
         };
         let mut decisions = HashMap::new();
         let mut visited = HashSet::new();
@@ -477,6 +480,17 @@ fn unescape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_user_uses_default_without_materializing_an_entry() {
+        let manager = PermissionManager::default();
+        manager.ensure_defaults();
+        assert!(manager.has(
+            "unknown",
+            basis_protocol::permissions::DEFAULT_GROUP_NODES[0]
+        ));
+        assert!(!manager.snapshot().users.contains_key("unknown"));
+    }
 
     #[test]
     fn deny_wins_and_wildcards_work() {

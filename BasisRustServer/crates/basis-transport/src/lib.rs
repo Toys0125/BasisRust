@@ -31,6 +31,13 @@ const MAX_PENDING_RELIABLE_PER_PEER: usize = 4096;
 const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 const SOCKET_TTL: u32 = 255;
 const MAX_MERGED_PACKET_SIZE: usize = 1200;
+const LITENETLIB_INITIAL_MTU: usize = 1024;
+const LITENETLIB_CHANNELED_HEADER_SIZE: usize = 4;
+const LITENETLIB_FRAGMENT_HEADER_SIZE: usize = 6;
+const LITENETLIB_FRAGMENTED_HEADER_SIZE: usize =
+    LITENETLIB_CHANNELED_HEADER_SIZE + LITENETLIB_FRAGMENT_HEADER_SIZE;
+const RELIABLE_FRAGMENT_PAYLOAD_SIZE: usize =
+    LITENETLIB_INITIAL_MTU - LITENETLIB_FRAGMENTED_HEADER_SIZE;
 const DEFAULT_MAX_RECEIVE_WORKERS: usize = 8;
 
 #[derive(Debug, Error)]
@@ -42,6 +49,46 @@ pub enum TransportError {
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;
+
+pub trait UnreliablePacket {
+    fn channel(&self) -> u8;
+    fn payload(&self) -> &[u8];
+    fn interval_patch(&self) -> Option<(usize, u8)>;
+}
+
+impl<P: AsRef<[u8]>> UnreliablePacket for (u8, P, Option<(usize, u8)>) {
+    #[inline]
+    fn channel(&self) -> u8 {
+        self.0
+    }
+
+    #[inline]
+    fn payload(&self) -> &[u8] {
+        self.1.as_ref()
+    }
+
+    #[inline]
+    fn interval_patch(&self) -> Option<(usize, u8)> {
+        self.2
+    }
+}
+
+impl UnreliablePacket for (u8, Bytes) {
+    #[inline]
+    fn channel(&self) -> u8 {
+        self.0
+    }
+
+    #[inline]
+    fn payload(&self) -> &[u8] {
+        self.1.as_ref()
+    }
+
+    #[inline]
+    fn interval_patch(&self) -> Option<(usize, u8)> {
+        None
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -64,6 +111,7 @@ pub enum PacketProperty {
     InvalidProtocol = 15,
     NatMessage = 16,
     Empty = 17,
+    CompactMerged = 18,
 }
 
 impl PacketProperty {
@@ -87,6 +135,7 @@ impl PacketProperty {
             15 => Self::InvalidProtocol,
             16 => Self::NatMessage,
             17 => Self::Empty,
+            18 => Self::CompactMerged,
             _ => return None,
         })
     }
@@ -202,8 +251,9 @@ struct PeerState {
     next_ping_sequence: AtomicU16,
     next_reliable_sequence: parking_lot::Mutex<HashMap<u8, u16>>,
     next_sequenced_sequence: parking_lot::Mutex<HashMap<u8, u16>>,
+    next_fragment_id: AtomicU16,
     pending_reliable: parking_lot::Mutex<HashMap<PendingReliableKey, PendingReliable>>,
-    outgoing_reliable: parking_lot::Mutex<HashMap<u8, VecDeque<Vec<u8>>>>,
+    outgoing_reliable: parking_lot::Mutex<HashMap<u8, VecDeque<OutgoingReliable>>>,
     outgoing_acks: parking_lot::Mutex<HashMap<u8, AckState>>,
 }
 
@@ -217,6 +267,19 @@ struct PendingReliableKey {
 struct PendingReliable {
     bytes: Vec<u8>,
     last_sent: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct OutgoingReliable {
+    payload: Vec<u8>,
+    fragment: Option<ReliableFragment>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReliableFragment {
+    id: u16,
+    part: u16,
+    total: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -360,6 +423,7 @@ impl TransportHandle {
             next_ping_sequence: AtomicU16::new(0),
             next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),
             next_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
+            next_fragment_id: AtomicU16::new(0),
             pending_reliable: parking_lot::Mutex::new(HashMap::new()),
             outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
             outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
@@ -394,13 +458,17 @@ impl TransportHandle {
     }
 
     pub async fn reject(&self, request: &ConnectionRequest, reason: &str) -> Result<()> {
-        self.pending_requests.remove(&request.remote_addr);
         let mut payload = NetWriter::new();
         payload.put_string(reason);
+        self.reject_payload(request, payload.as_slice()).await
+    }
+
+    pub async fn reject_payload(&self, request: &ConnectionRequest, payload: &[u8]) -> Result<()> {
+        self.pending_requests.remove(&request.remote_addr);
         let mut writer = NetWriter::with_capacity(payload.len() + 9);
         writer.put_u8(PacketProperty::Disconnect as u8 | (request.connection_number << 5));
         writer.put_i64(request.connect_time);
-        writer.put_bytes(payload.as_slice());
+        writer.put_bytes(payload);
         self.send_raw_to(writer.as_slice(), request.remote_addr)
             .await?;
         Ok(())
@@ -500,6 +568,14 @@ impl TransportHandle {
         peer: PeerId,
         packets: &[(u8, Bytes)],
     ) -> Result<usize> {
+        self.try_send_many_unreliable_packets(peer, packets)
+    }
+
+    pub fn try_send_many_unreliable_packets<T: UnreliablePacket>(
+        &self,
+        peer: PeerId,
+        packets: &[T],
+    ) -> Result<usize> {
         if packets.is_empty() {
             return Ok(0);
         }
@@ -508,11 +584,11 @@ impl TransportHandle {
         };
 
         if packets.len() == 1 {
-            let (channel, payload) = &packets[0];
+            let payload = packets[0].payload();
             let mut packet = Vec::with_capacity(payload.len() + 2);
             packet.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
-            packet.push(*channel);
-            packet.extend_from_slice(payload.as_ref());
+            packet.push(packets[0].channel());
+            extend_payload_with_patch(&mut packet, payload, packets[0].interval_patch());
             return self.try_send_raw_to(&packet, state.addr).map(usize::from);
         }
 
@@ -521,7 +597,8 @@ impl TransportHandle {
         current.push(PacketProperty::Merged as u8 | (state.connection_number << 5));
         let mut current_count = 0usize;
 
-        for (channel, payload) in packets {
+        for packet in packets {
+            let payload = packet.payload();
             let packet_len = payload.len() + 2;
             let framed_len = packet_len + 2;
             if current_count > 0 && current.len() + framed_len > MAX_MERGED_PACKET_SIZE {
@@ -534,11 +611,11 @@ impl TransportHandle {
             }
 
             if framed_len + 1 > MAX_MERGED_PACKET_SIZE {
-                let mut packet = Vec::with_capacity(packet_len);
-                packet.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
-                packet.push(*channel);
-                packet.extend_from_slice(payload.as_ref());
-                if self.try_send_raw_to(&packet, state.addr)? {
+                let mut oversized = Vec::with_capacity(packet_len);
+                oversized.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
+                oversized.push(packet.channel());
+                extend_payload_with_patch(&mut oversized, payload, packet.interval_patch());
+                if self.try_send_raw_to(&oversized, state.addr)? {
                     sent += 1;
                 }
                 continue;
@@ -546,8 +623,8 @@ impl TransportHandle {
 
             current.extend_from_slice(&(packet_len as u16).to_le_bytes());
             current.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
-            current.push(*channel);
-            current.extend_from_slice(payload.as_ref());
+            current.push(packet.channel());
+            extend_payload_with_patch(&mut current, payload, packet.interval_patch());
             current_count += 1;
         }
 
@@ -618,17 +695,30 @@ impl TransportHandle {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_nat_introduce(
         &self,
         host_internal: SocketAddr,
         host_external: SocketAddr,
+        host_prediction_count: u8,
         client_internal: SocketAddr,
         client_external: SocketAddr,
+        client_prediction_count: u8,
         token: &str,
     ) -> Result<()> {
-        let to_client = build_nat_introduce_response(host_internal, host_external, token);
+        let to_client = build_nat_introduce_response(
+            host_internal,
+            host_external,
+            token,
+            host_prediction_count,
+        );
         self.send_raw_to(&to_client, client_external).await?;
-        let to_host = build_nat_introduce_response(client_internal, client_external, token);
+        let to_host = build_nat_introduce_response(
+            client_internal,
+            client_external,
+            token,
+            client_prediction_count,
+        );
         self.send_raw_to(&to_host, host_external).await?;
         Ok(())
     }
@@ -680,23 +770,71 @@ fn enqueue_reliable_payload(
 ) {
     let channel_id = DeliveryMethod::channel_id(channel, delivery);
     let mut outgoing = state.outgoing_reliable.lock();
-    outgoing
-        .entry(channel_id)
-        .or_default()
-        .push_back(payload.to_vec());
+    let queue = outgoing.entry(channel_id).or_default();
+
+    if payload.len() + LITENETLIB_CHANNELED_HEADER_SIZE <= LITENETLIB_INITIAL_MTU
+        || !matches!(
+            delivery,
+            DeliveryMethod::ReliableOrdered | DeliveryMethod::ReliableUnordered
+        )
+    {
+        queue.push_back(OutgoingReliable {
+            payload: payload.to_vec(),
+            fragment: None,
+        });
+        return;
+    }
+
+    let total_fragments = payload.len().div_ceil(RELIABLE_FRAGMENT_PAYLOAD_SIZE);
+    if total_fragments > u16::MAX as usize {
+        warn!(
+            "dropping reliable payload requiring {total_fragments} fragments; LiteNetLib limit is {}",
+            u16::MAX
+        );
+        return;
+    }
+
+    let fragment_id = state
+        .next_fragment_id
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    for (part, chunk) in payload.chunks(RELIABLE_FRAGMENT_PAYLOAD_SIZE).enumerate() {
+        queue.push_back(OutgoingReliable {
+            payload: chunk.to_vec(),
+            fragment: Some(ReliableFragment {
+                id: fragment_id,
+                part: part as u16,
+                total: total_fragments as u16,
+            }),
+        });
+    }
 }
 
 fn build_queued_reliable_packet(
     state: &PeerState,
     channel_id: u8,
-    payload: Vec<u8>,
+    outgoing: OutgoingReliable,
 ) -> BuiltPacket {
     let sequence = next_channel_sequence(&state.next_reliable_sequence, channel_id);
-    let mut writer = NetWriter::with_capacity(payload.len() + 4);
-    writer.put_u8(PacketProperty::Channeled as u8 | (state.connection_number << 5));
+    let header_size = if outgoing.fragment.is_some() {
+        LITENETLIB_FRAGMENTED_HEADER_SIZE
+    } else {
+        LITENETLIB_CHANNELED_HEADER_SIZE
+    };
+    let mut writer = NetWriter::with_capacity(outgoing.payload.len() + header_size);
+    let mut header = PacketProperty::Channeled as u8 | (state.connection_number << 5);
+    if outgoing.fragment.is_some() {
+        header |= 0x80;
+    }
+    writer.put_u8(header);
     writer.put_u16(sequence);
     writer.put_u8(channel_id);
-    writer.put_bytes(&payload);
+    if let Some(fragment) = outgoing.fragment {
+        writer.put_u16(fragment.id);
+        writer.put_u16(fragment.part);
+        writer.put_u16(fragment.total);
+    }
+    writer.put_bytes(&outgoing.payload);
     BuiltPacket {
         bytes: writer.into_vec(),
         reliable_key: Some((channel_id, sequence)),
@@ -961,6 +1099,15 @@ async fn process_packet(
             }
             process_merged_packet(handle, tx, remote_addr, bytes).await?;
         }
+        PacketProperty::CompactMerged => {
+            if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
+                if let Some(peer) = handle.peers.get(&peer_id) {
+                    *peer.last_seen.lock() = Instant::now();
+                }
+            }
+            process_compact_merged_packet(handle, tx, remote_addr, connection_number, bytes)
+                .await?;
+        }
         PacketProperty::MtuCheck => {
             if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
                 if let Some(peer) = handle.peers.get(&peer_id) {
@@ -1192,6 +1339,17 @@ struct BuiltPacket {
     reliable_key: Option<(u8, u16)>,
 }
 
+#[inline]
+fn extend_payload_with_patch(output: &mut Vec<u8>, payload: &[u8], patch: Option<(usize, u8)>) {
+    let payload_start = output.len();
+    output.extend_from_slice(payload);
+    if let Some((offset, value)) = patch {
+        if offset < payload.len() {
+            output[payload_start + offset] = value;
+        }
+    }
+}
+
 fn build_outbound_packet(
     state: &PeerState,
     channel: u8,
@@ -1343,6 +1501,7 @@ fn build_nat_introduce_response(
     internal: SocketAddr,
     external: SocketAddr,
     token: &str,
+    prediction_count: u8,
 ) -> Vec<u8> {
     let mut packet = Vec::with_capacity(1 + 8 + 2 * 19 + token.len() + 2);
     packet.push(PacketProperty::NatMessage as u8);
@@ -1350,6 +1509,8 @@ fn build_nat_introduce_response(
     write_litenet_endpoint(&mut packet, internal);
     write_litenet_endpoint(&mut packet, external);
     write_litenet_string(&mut packet, token);
+    // Current LiteNetLib appends NatIntroduceResponsePacket.PredictionCount.
+    packet.push(prediction_count);
     packet
 }
 
@@ -1471,6 +1632,78 @@ async fn process_merged_packet(
             Box::pin(process_packet(handle, tx, remote_addr, packet)).await?;
         }
         position += size;
+    }
+    Ok(())
+}
+
+async fn process_compact_merged_packet(
+    handle: &TransportHandle,
+    tx: &mpsc::Sender<ServerEvent>,
+    remote_addr: SocketAddr,
+    connection_number: u8,
+    bytes: &[u8],
+) -> Result<()> {
+    const LONG_LENGTH_FLAG: u8 = 0x80;
+    const RAW_PACKET_FLAG: u8 = 0x40;
+    const CHANNEL_MASK: u8 = 0x3f;
+
+    let mut position = 1usize;
+    while position < bytes.len() {
+        if bytes.len() - position < 2 {
+            break;
+        }
+
+        let tag = bytes[position];
+        position += 1;
+        let is_raw = tag & RAW_PACKET_FLAG != 0;
+        let channel = tag & CHANNEL_MASK;
+        if is_raw && channel != 0 {
+            break;
+        }
+
+        let payload_len = if tag & LONG_LENGTH_FLAG != 0 {
+            if bytes.len() - position < 2 {
+                break;
+            }
+            let len = u16::from_le_bytes([bytes[position], bytes[position + 1]]) as usize;
+            position += 2;
+            if len <= u8::MAX as usize {
+                break;
+            }
+            len
+        } else {
+            let len = bytes[position] as usize;
+            position += 1;
+            len
+        };
+
+        if payload_len > bytes.len() - position {
+            break;
+        }
+        let payload = &bytes[position..position + payload_len];
+        position += payload_len;
+
+        if is_raw {
+            if payload_len < 4 {
+                break;
+            }
+            let Some(property) = payload
+                .first()
+                .and_then(|header| PacketProperty::from_byte(*header))
+            else {
+                break;
+            };
+            if !matches!(property, PacketProperty::Ack | PacketProperty::Channeled) {
+                break;
+            }
+            Box::pin(process_packet(handle, tx, remote_addr, payload)).await?;
+        } else {
+            let mut packet = Vec::with_capacity(payload_len + 2);
+            packet.push(PacketProperty::Unreliable as u8 | (connection_number << 5));
+            packet.push(channel);
+            packet.extend_from_slice(payload);
+            Box::pin(process_packet(handle, tx, remote_addr, &packet)).await?;
+        }
     }
     Ok(())
 }
@@ -1697,6 +1930,18 @@ mod tests {
     }
 
     #[test]
+    fn payload_patch_is_applied_during_copy() {
+        let payload = Bytes::from_static(&[1, 2, 3, 4]);
+        let mut output = vec![0xaa, 0xbb];
+        extend_payload_with_patch(&mut output, &payload, Some((2, 9)));
+        assert_eq!(output, [0xaa, 0xbb, 1, 2, 9, 4]);
+
+        let mut unchanged = Vec::new();
+        extend_payload_with_patch(&mut unchanged, &payload, Some((99, 9)));
+        assert_eq!(unchanged, payload);
+    }
+
+    #[test]
     fn multiple_small_packets_are_sent_as_litenetlib_merged_datagram() {
         let datagrams = build_merged_datagrams(
             0,
@@ -1728,6 +1973,72 @@ mod tests {
     }
 
     #[test]
+    fn oversized_reliable_payload_uses_litenetlib_fragments() {
+        let state = PeerState {
+            id: 7,
+            addr: "127.0.0.1:4296".parse().unwrap(),
+            connection_number: 2,
+            connect_time: 123,
+            last_seen: parking_lot::Mutex::new(Instant::now()),
+            last_ping_sent: parking_lot::Mutex::new(Instant::now()),
+            next_ping_sequence: AtomicU16::new(0),
+            next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),
+            next_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
+            next_fragment_id: AtomicU16::new(0),
+            pending_reliable: parking_lot::Mutex::new(HashMap::new()),
+            outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
+            outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
+        };
+        let payload = (0..RELIABLE_FRAGMENT_PAYLOAD_SIZE * 2 + 1)
+            .map(|index| (index & 0xff) as u8)
+            .collect::<Vec<_>>();
+
+        enqueue_reliable_payload(
+            &state,
+            channels::CREATE_REMOTE_PLAYERS_FOR_NEW_PEER,
+            DeliveryMethod::ReliableOrdered,
+            &payload,
+        );
+
+        let channel_id = DeliveryMethod::channel_id(
+            channels::CREATE_REMOTE_PLAYERS_FOR_NEW_PEER,
+            DeliveryMethod::ReliableOrdered,
+        );
+        let queued = state
+            .outgoing_reliable
+            .lock()
+            .get_mut(&channel_id)
+            .unwrap()
+            .drain(..)
+            .collect::<Vec<_>>();
+        assert_eq!(queued.len(), 3);
+
+        let mut reassembled = Vec::new();
+        for (part, outgoing) in queued.into_iter().enumerate() {
+            let packet = build_queued_reliable_packet(&state, channel_id, outgoing);
+            assert!(packet.bytes.len() <= LITENETLIB_INITIAL_MTU);
+            assert_eq!(
+                packet.bytes[0],
+                PacketProperty::Channeled as u8 | (2 << 5) | 0x80
+            );
+            assert_eq!(
+                u16::from_le_bytes([packet.bytes[1], packet.bytes[2]]),
+                part as u16
+            );
+            assert_eq!(packet.bytes[3], channel_id);
+            assert_eq!(u16::from_le_bytes([packet.bytes[4], packet.bytes[5]]), 1);
+            assert_eq!(
+                u16::from_le_bytes([packet.bytes[6], packet.bytes[7]]),
+                part as u16
+            );
+            assert_eq!(u16::from_le_bytes([packet.bytes[8], packet.bytes[9]]), 3);
+            reassembled.extend_from_slice(&packet.bytes[LITENETLIB_FRAGMENTED_HEADER_SIZE..]);
+        }
+
+        assert_eq!(reassembled, payload);
+    }
+
+    #[test]
     fn server_info_payload_accepts_raw_and_litenetlib_unconnected() {
         let mut payload = vec![0u8; SERVER_INFO_MIN_REQUEST_BYTES];
         payload[0..4].copy_from_slice(&SERVER_INFO_QUERY_MAGIC.to_le_bytes());
@@ -1740,6 +2051,50 @@ mod tests {
         wrapped.push(PacketProperty::UnconnectedMessage as u8);
         wrapped.extend_from_slice(&payload);
         assert_eq!(server_info_payload(&wrapped).unwrap()[6..8], [0xFE, 0xCA]);
+    }
+
+    #[tokio::test]
+    async fn compact_merged_unreliable_entry_decodes_to_message_event() {
+        let (handle, _events) = TransportHandle::bind(any_addr(0)).await.unwrap();
+        let remote = UdpSocket::bind(any_addr(0)).await.unwrap();
+        let remote_addr = remote.local_addr().unwrap();
+        let request = ConnectionRequest {
+            remote_addr,
+            payload: Bytes::new(),
+            connection_number: 0,
+            connect_time: 123,
+            local_peer_id: 0,
+        };
+        let peer = handle.accept(&request).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+
+        let packet = [
+            PacketProperty::CompactMerged as u8,
+            channels::CHAT,
+            3,
+            1,
+            2,
+            3,
+        ];
+        process_compact_merged_packet(&handle, &tx, remote_addr, 0, &packet)
+            .await
+            .unwrap();
+
+        match rx.recv().await.unwrap() {
+            ServerEvent::Message {
+                peer: event_peer,
+                channel,
+                delivery,
+                payload,
+            } => {
+                assert_eq!(event_peer, peer);
+                assert_eq!(channel, channels::CHAT);
+                assert_eq!(delivery, DeliveryMethod::Unreliable);
+                assert_eq!(payload.as_ref(), &[1, 2, 3]);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        handle.shutdown();
     }
 
     #[tokio::test]

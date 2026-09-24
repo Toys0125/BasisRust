@@ -2,9 +2,9 @@ use anyhow::Result;
 use basis_protocol::messages::{
     CameraPipPositionMessage, CameraPipStateMessage, ClientCameraPipPositionMessage,
     ClientCameraPipStateMessage, ContentShareCleanupMessage, ContentShareMessage,
-    LocalLoadResource, OwnershipTransferMessage, PreloadReadyMessage, ResourceManagementMessage,
-    ServerContentShareCleanupMessage, ServerContentShareMessage, SpawnPreloadedMessage,
-    UnloadResource,
+    LocalLoadResource, ModifyResource, OwnershipTransferMessage, PreloadReadyMessage,
+    ResourceManagementMessage, ServerContentShareCleanupMessage, ServerContentShareMessage,
+    SpawnPreloadedMessage, UnloadResource,
 };
 use parking_lot::RwLock;
 use std::{
@@ -18,18 +18,36 @@ use std::{
 #[derive(Debug, Clone, Default)]
 pub struct ResourceState {
     resources: Arc<RwLock<HashMap<String, ResourceManagementMessage>>>,
+    creator_counts: Arc<RwLock<HashMap<String, usize>>>,
     preload_sessions: Arc<RwLock<HashMap<String, PreloadSession>>>,
 }
 
 impl ResourceState {
     pub fn load_resource(&self, message: ResourceManagementMessage) -> bool {
+        self.load_resource_with_limit(message, usize::MAX)
+    }
+
+    pub fn load_resource_with_limit(
+        &self,
+        message: ResourceManagementMessage,
+        max_per_creator: usize,
+    ) -> bool {
         let id = message.loaded_net_id.clone();
         if id.is_empty() {
             return false;
         }
+        let creator = message.uuid_of_creator.clone();
         let mut resources = self.resources.write();
         if resources.contains_key(&id) {
             return false;
+        }
+        if !creator.is_empty() {
+            let mut counts = self.creator_counts.write();
+            let count = counts.get(&creator).copied().unwrap_or(0);
+            if count >= max_per_creator {
+                return false;
+            }
+            counts.insert(creator.clone(), count + 1);
         }
         resources.insert(id, message);
         true
@@ -37,7 +55,40 @@ impl ResourceState {
 
     pub fn unload_resource(&self, id: &str) -> Option<ResourceManagementMessage> {
         self.preload_sessions.write().remove(id);
-        self.resources.write().remove(id)
+        let removed = self.resources.write().remove(id);
+        if let Some(resource) = removed.as_ref() {
+            self.note_resource_removed(&resource.uuid_of_creator);
+        }
+        removed
+    }
+
+    fn note_resource_removed(&self, creator: &str) {
+        if creator.is_empty() {
+            return;
+        }
+        let mut counts = self.creator_counts.write();
+        match counts.get(creator).copied() {
+            Some(0) | None => {}
+            Some(1) => {
+                counts.remove(creator);
+            }
+            Some(count) => {
+                counts.insert(creator.to_string(), count - 1);
+            }
+        }
+    }
+
+    pub fn modify_resource(&self, message: &ModifyResource) -> bool {
+        let mut resources = self.resources.write();
+        let Some(resource) = resources.get_mut(&message.loaded_net_id) else {
+            return false;
+        };
+        if resource.mode != message.mode {
+            return false;
+        }
+        resource.static_admin_locked = message.static_admin_locked;
+        resource.static_resource = message.static_resource || message.static_admin_locked;
+        true
     }
 
     pub fn all_scene_unloads(&self) -> Vec<UnloadResource> {
@@ -51,9 +102,12 @@ impl ResourceState {
         scene_ids
             .into_iter()
             .filter_map(|id| {
-                resources.remove(&id).map(|resource| UnloadResource {
-                    mode: resource.mode,
-                    loaded_net_id: id,
+                resources.remove(&id).map(|resource| {
+                    self.note_resource_removed(&resource.uuid_of_creator);
+                    UnloadResource {
+                        mode: resource.mode,
+                        loaded_net_id: id,
+                    }
                 })
             })
             .collect()
@@ -69,9 +123,12 @@ impl ResourceState {
         let mut resources = self.resources.write();
         ids.into_iter()
             .filter_map(|id| {
-                resources.remove(&id).map(|resource| UnloadResource {
-                    mode: resource.mode,
-                    loaded_net_id: id,
+                resources.remove(&id).map(|resource| {
+                    self.note_resource_removed(&resource.uuid_of_creator);
+                    UnloadResource {
+                        mode: resource.mode,
+                        loaded_net_id: id,
+                    }
                 })
             })
             .collect()
@@ -79,6 +136,7 @@ impl ResourceState {
 
     pub fn reset(&self) {
         self.resources.write().clear();
+        self.creator_counts.write().clear();
         self.preload_sessions.write().clear();
     }
 
@@ -86,8 +144,40 @@ impl ResourceState {
         self.resources.read().values().cloned().collect()
     }
 
-    pub fn start_preload(&self, resource: LocalLoadResource, peers: &[u16]) -> bool {
-        if !self.load_resource(resource.clone()) {
+    pub fn remove_creator_non_persistent(&self, creator: &str) -> Vec<UnloadResource> {
+        if creator.is_empty() {
+            return Vec::new();
+        }
+        let ids: Vec<String> = self
+            .resources
+            .read()
+            .iter()
+            .filter_map(|(id, resource)| {
+                (!resource.persist && resource.uuid_of_creator == creator).then_some(id.clone())
+            })
+            .collect();
+        let mut resources = self.resources.write();
+        ids.into_iter()
+            .filter_map(|id| {
+                resources.remove(&id).map(|resource| {
+                    self.preload_sessions.write().remove(&id);
+                    self.note_resource_removed(&resource.uuid_of_creator);
+                    UnloadResource {
+                        mode: resource.mode,
+                        loaded_net_id: id,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    pub fn start_preload(
+        &self,
+        resource: LocalLoadResource,
+        peers: &[u16],
+        max_per_creator: usize,
+    ) -> bool {
+        if !self.load_resource_with_limit(resource.clone(), max_per_creator) {
             return false;
         }
         self.preload_sessions.write().insert(
@@ -183,23 +273,46 @@ impl PreloadSession {
 #[derive(Debug, Clone, Default)]
 pub struct NetIdState {
     by_name: Arc<RwLock<HashMap<String, u16>>>,
-    next_id: Arc<RwLock<u16>>,
+    next_id: Arc<RwLock<u32>>,
+    per_peer_assigned: Arc<RwLock<HashMap<u16, usize>>>,
 }
 
 impl NetIdState {
-    pub fn add_or_find(&self, name: &str) -> u16 {
+    pub fn add_or_find_for_peer(
+        &self,
+        name: &str,
+        peer_id: u16,
+        max_per_peer: usize,
+    ) -> Option<(u16, bool)> {
         if let Some(id) = self.by_name.read().get(name).copied() {
-            return id;
+            return Some((id, true));
         }
         let mut by_name = self.by_name.write();
         if let Some(id) = by_name.get(name).copied() {
-            return id;
+            return Some((id, true));
+        }
+        let mut counts = self.per_peer_assigned.write();
+        let assigned = counts.get(&peer_id).copied().unwrap_or(0);
+        if assigned >= max_per_peer {
+            return None;
         }
         let mut next = self.next_id.write();
-        let id = *next;
-        *next = next.wrapping_add(1);
+        if *next > u16::MAX as u32 {
+            return None;
+        }
+        let id = *next as u16;
+        *next += 1;
         by_name.insert(name.to_string(), id);
-        id
+        counts.insert(peer_id, assigned + 1);
+        Some((id, false))
+    }
+
+    pub fn remove_peer(&self, peer_id: u16) {
+        self.per_peer_assigned.write().remove(&peer_id);
+    }
+
+    pub fn find(&self, name: &str) -> Option<u16> {
+        self.by_name.read().get(name).copied()
     }
 
     pub fn all(&self) -> Vec<(String, u16)> {
@@ -213,6 +326,7 @@ impl NetIdState {
     pub fn reset(&self) {
         self.by_name.write().clear();
         *self.next_id.write() = 0;
+        self.per_peer_assigned.write().clear();
     }
 }
 
@@ -292,6 +406,23 @@ impl ContentShareState {
         sharer_display_name: String,
         message: ContentShareMessage,
     ) -> Option<ServerContentShareMessage> {
+        self.add_with_limit(
+            player_id,
+            sharer_uuid,
+            sharer_display_name,
+            message,
+            usize::MAX,
+        )
+    }
+
+    pub fn add_with_limit(
+        &self,
+        player_id: u16,
+        sharer_uuid: String,
+        sharer_display_name: String,
+        message: ContentShareMessage,
+        max_per_player: usize,
+    ) -> Option<ServerContentShareMessage> {
         let server = ServerContentShareMessage {
             player_id,
             sharer_uuid,
@@ -299,7 +430,13 @@ impl ContentShareState {
             content_share_message: message,
         };
         let mut spheres = self.spheres.write();
-        if spheres.contains_key(&server.content_share_message.sphere_net_id) {
+        if spheres.contains_key(&server.content_share_message.sphere_net_id)
+            || spheres
+                .values()
+                .filter(|sphere| sphere.player_id == player_id)
+                .count()
+                >= max_per_player
+        {
             return None;
         }
         spheres.insert(
@@ -487,6 +624,8 @@ impl DefaultLibrary {
                     scale_y: 1.0,
                     scale_z: 1.0,
                     persist: false,
+                    static_resource: false,
+                    static_admin_locked: false,
                     modify_scale: false,
                 });
             }

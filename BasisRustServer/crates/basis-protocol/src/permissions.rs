@@ -12,6 +12,8 @@ pub mod nodes {
     pub const RESOURCE_LOCK_BYPASS_PROP: &str = "basis.resource.lockbypass.prop";
     pub const RESOURCE_LOCK_BYPASS_WORLD: &str = "basis.resource.lockbypass.world";
     pub const RESOURCE_LOCK_BYPASS_SERVER: &str = "basis.resource.lockbypass.server";
+    pub const CHAT_LOCK_BYPASS: &str = "basis.chat.lockbypass";
+    pub const VOICE_LOCK_BYPASS: &str = "basis.voice.lockbypass";
     pub const OWNERSHIP_TRANSFER: &str = "basis.ownership.transfer";
     pub const OWNERSHIP_REMOVE: &str = "basis.ownership.remove";
     pub const OWNERSHIP_GET: &str = "basis.ownership.get";
@@ -30,6 +32,10 @@ pub mod nodes {
     pub const MODERATION_TELEPORT: &str = "basis.moderation.teleport";
     pub const MODERATION_SHOUT: &str = "basis.moderation.shout";
     pub const MODERATION_GLOBAL_LOCK: &str = "basis.moderation.globallock";
+    pub const MODERATION_FORCE_AVATAR: &str = "basis.moderation.forceavatar";
+    pub const MODERATION_FULL_QUALITY_BROADCAST: &str = "basis.moderation.fullqualitybroadcast";
+    pub const MODERATION_LOCOMOTION: &str = "basis.moderation.locomotion";
+    pub const ADMIN_LOGS: &str = "basis.admin.logs";
     pub const MODERATION_HEADLESS_AUDIO: &str = "basis.moderation.headlessaudio";
     pub const MODERATION_OPUS_BITRATE: &str = "basis.moderation.opusbitrate";
     pub const MODERATION_WHITELIST: &str = "basis.moderation.whitelist";
