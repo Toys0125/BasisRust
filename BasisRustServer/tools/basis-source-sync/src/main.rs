@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -181,11 +181,7 @@ fn detect_rust_source() -> Result<PathBuf> {
     Ok(std::env::current_dir()?)
 }
 
-fn check_version(
-    temp_dir: &PathBuf,
-    rust_source: &PathBuf,
-    findings: &mut Vec<Finding>,
-) -> Result<()> {
+fn check_version(temp_dir: &Path, rust_source: &Path, findings: &mut Vec<Finding>) -> Result<()> {
     let csharp = fs::read_to_string(
         temp_dir
             .join("Basis Server")
@@ -218,11 +214,7 @@ fn check_version(
     Ok(())
 }
 
-fn check_channels(
-    temp_dir: &PathBuf,
-    rust_source: &PathBuf,
-    findings: &mut Vec<Finding>,
-) -> Result<()> {
+fn check_channels(temp_dir: &Path, rust_source: &Path, findings: &mut Vec<Finding>) -> Result<()> {
     let csharp = fs::read_to_string(
         temp_dir
             .join("Basis Server")
@@ -256,8 +248,8 @@ fn check_channels(
 }
 
 fn check_permission_nodes(
-    temp_dir: &PathBuf,
-    rust_source: &PathBuf,
+    temp_dir: &Path,
+    rust_source: &Path,
     findings: &mut Vec<Finding>,
 ) -> Result<()> {
     let csharp = fs::read_to_string(
@@ -289,8 +281,8 @@ fn check_permission_nodes(
 }
 
 fn check_config_fields(
-    temp_dir: &PathBuf,
-    rust_source: &PathBuf,
+    temp_dir: &Path,
+    rust_source: &Path,
     findings: &mut Vec<Finding>,
 ) -> Result<()> {
     let csharp = fs::read_to_string(

@@ -513,9 +513,7 @@ impl TransportHandle {
             packet.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
             packet.push(*channel);
             packet.extend_from_slice(payload.as_ref());
-            return self
-                .try_send_raw_to(&packet, state.addr)
-                .map(|sent| usize::from(sent));
+            return self.try_send_raw_to(&packet, state.addr).map(usize::from);
         }
 
         let mut sent = 0usize;

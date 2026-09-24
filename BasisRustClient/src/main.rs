@@ -616,11 +616,11 @@ impl<'a> BitWriter<'a> {
         let (largest, sign) = largest_component(normalized);
         self.write_bits(largest as u32, 2);
         let max_quantized = (1u32 << bits_per_component) - 1;
-        for i in 0..4 {
+        for (i, component) in normalized.iter().enumerate() {
             if i == largest {
                 continue;
             }
-            let normalized_component = ((normalized[i] * sign) / max_range).clamp(-1.0, 1.0);
+            let normalized_component = ((*component * sign) / max_range).clamp(-1.0, 1.0);
             let quantized =
                 ((normalized_component * 0.5 + 0.5) * max_quantized as f32).round() as u32;
             self.write_bits(quantized.min(max_quantized), bits_per_component);
@@ -660,12 +660,14 @@ fn smallest_three_quaternion(q: [f32; 4]) -> [u8; 7] {
     let mut out = [0u8; 7];
     out[0] = largest as u8;
     let mut offset = 1;
-    for i in 0..4 {
+    let component_limit = std::f32::consts::FRAC_1_SQRT_2;
+    for (i, component) in q.iter().enumerate() {
         if i == largest {
             continue;
         }
-        let value = (q[i] * sign).clamp(-0.70710677, 0.70710677);
-        let quantized = (((value + 0.70710677) / 1.4142135) * 65535.0).round() as u16;
+        let value = (*component * sign).clamp(-component_limit, component_limit);
+        let quantized =
+            (((value + component_limit) / std::f32::consts::SQRT_2) * 65535.0).round() as u16;
         out[offset..offset + 2].copy_from_slice(&quantized.to_le_bytes());
         offset += 2;
     }
@@ -1474,7 +1476,7 @@ fn opus_packet_duration_ms(packet: &[u8]) -> Option<u64> {
         }
         _ => return None,
     };
-    Some(((frame_duration_us * frame_count) + 999) / 1000)
+    Some((frame_duration_us * frame_count).div_ceil(1000))
 }
 
 fn voice_speaker_target(connected_count: usize, percent: u8) -> usize {
@@ -1482,7 +1484,7 @@ fn voice_speaker_target(connected_count: usize, percent: u8) -> usize {
     if connected_count == 0 || percent == 0 {
         return 0;
     }
-    ((connected_count * percent) + 99) / 100
+    (connected_count * percent).div_ceil(100)
 }
 
 fn choose_next_speaker(
@@ -1650,11 +1652,8 @@ impl SpawnLayout {
 
     fn base_for_client(self, index: usize) -> [f32; 3] {
         let mut rng = rand::thread_rng();
-        let group_offset = if self.group_size == 0 {
-            0.0
-        } else {
-            (index / self.group_size) as f32 * self.group_spacing
-        };
+        let group_offset =
+            index.checked_div(self.group_size).unwrap_or(0) as f32 * self.group_spacing;
         [
             group_offset + rng.gen_range(-0.25..=0.25),
             rng.gen_range(-0.25..=0.25),
@@ -2272,17 +2271,22 @@ mod tests {
 
     #[test]
     fn relative_voice_audio_folder_resolves_from_config_directory() {
-        let resolved = resolve_relative_to_config(
-            Path::new(r"C:\work\BasisRustClient\Config.xml"),
+        let config_path = PathBuf::from("work")
+            .join("BasisRustClient")
+            .join("Config.xml");
+        let resolved = PathBuf::from(resolve_relative_to_config(
+            &config_path,
             DEFAULT_VOICE_AUDIO_FOLDER,
+        ));
+        assert_eq!(
+            resolved,
+            PathBuf::from("work").join("BasisRustClient").join("audio")
         );
-        assert!(resolved.ends_with(r"BasisRustClient\audio"));
 
-        let absolute = resolve_relative_to_config(
-            Path::new(r"C:\work\BasisRustClient\Config.xml"),
-            r"C:\samples\voice",
-        );
-        assert_eq!(absolute, r"C:\samples\voice");
+        let absolute_path = std::env::temp_dir().join("samples").join("voice");
+        let absolute =
+            resolve_relative_to_config(&config_path, absolute_path.to_string_lossy().as_ref());
+        assert_eq!(PathBuf::from(absolute), absolute_path);
     }
 
     #[test]

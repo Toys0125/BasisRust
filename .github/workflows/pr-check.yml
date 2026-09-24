@@ -1,0 +1,77 @@
+name: Rust PR checks
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    name: Rust format
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check server formatting
+        run: cargo fmt --manifest-path BasisRustServer/Cargo.toml --all -- --check
+
+      - name: Check client formatting
+        run: cargo fmt --manifest-path BasisRustClient/Cargo.toml -- --check
+
+  validate:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Server check, test, clippy
+            manifest: BasisRustServer/Cargo.toml
+            workspace: "true"
+          - name: Client check, test, clippy
+            manifest: BasisRustClient/Cargo.toml
+            workspace: "false"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cargo check
+        if: matrix.workspace == 'false'
+        run: cargo check --manifest-path ${{ matrix.manifest }} --all-targets
+
+      - name: Cargo check workspace
+        if: matrix.workspace == 'true'
+        run: cargo check --manifest-path ${{ matrix.manifest }} --workspace --all-targets
+
+      - name: Cargo test
+        if: matrix.workspace == 'false'
+        run: cargo test --manifest-path ${{ matrix.manifest }}
+
+      - name: Cargo test workspace
+        if: matrix.workspace == 'true'
+        run: cargo test --manifest-path ${{ matrix.manifest }} --workspace
+
+      - name: Cargo clippy
+        if: matrix.workspace == 'false'
+        run: cargo clippy --manifest-path ${{ matrix.manifest }} --all-targets -- -D warnings
+
+      - name: Cargo clippy workspace
+        if: matrix.workspace == 'true'
+        run: cargo clippy --manifest-path ${{ matrix.manifest }} --workspace --all-targets -- -D warnings
