@@ -68,13 +68,15 @@ const JOIN_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 struct JoinBroadcastRecord {
     sequence: u64,
     peer_id: PeerId,
-    payload: Vec<u8>,
+    revision: AtomicU64,
+    payload: RwLock<Vec<u8>>,
 }
 
 #[derive(Debug)]
 struct JoinPeerState {
     sequence: u64,
     peer: ConnectedPeer,
+    spawn_record: Arc<JoinBroadcastRecord>,
     initial_history_queued: bool,
     pending: Vec<Arc<JoinBroadcastRecord>>,
 }
@@ -104,7 +106,8 @@ impl JoinBroadcastState {
         let record = Arc::new(JoinBroadcastRecord {
             sequence,
             peer_id: peer.id,
-            payload: record_payload,
+            revision: AtomicU64::new(0),
+            payload: RwLock::new(record_payload),
         });
         for state in self.peers.values_mut() {
             if state.sequence < sequence {
@@ -116,6 +119,7 @@ impl JoinBroadcastState {
             JoinPeerState {
                 sequence,
                 peer,
+                spawn_record: record,
                 initial_history_queued: false,
                 pending: Vec::new(),
             },
@@ -129,6 +133,14 @@ impl JoinBroadcastState {
     fn mark_initial_history_queued(&mut self, peer_id: PeerId) {
         if let Some(peer) = self.peers.get_mut(&peer_id) {
             peer.initial_history_queued = true;
+        }
+    }
+
+    fn update_peer_ready(&mut self, peer_id: PeerId, ready: ReadyMessage) {
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.peer.ready = ready.clone();
+            *peer.spawn_record.payload.write() = serialize_server_ready(peer_id, &ready);
+            peer.spawn_record.revision.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -152,13 +164,14 @@ impl JoinBroadcastState {
             let mut payload_bytes = 0usize;
             let mut take = 0usize;
             for record in &peer.pending {
+                let record_len = record.payload.read().len();
                 if take > 0
-                    && payload_bytes + record.payload.len()
+                    && payload_bytes + record_len
                         > ServerReadyBatchMessage::MAX_PAYLOAD_BYTES
                 {
                     break;
                 }
-                payload_bytes += record.payload.len();
+                payload_bytes += record_len;
                 take += 1;
             }
             batches.push(peer.pending.drain(..take).collect());
@@ -618,11 +631,21 @@ async fn flush_pending_leaves(state: &ServerState) {
     }
 }
 
+fn serialize_server_ready(peer_id: PeerId, ready: &ReadyMessage) -> Vec<u8> {
+    let message = ServerReadyMessage {
+        local_ready_message: ready.clone(),
+        player_id_message: basis_protocol::messages::PlayerIdMessage { player_id: peer_id },
+    };
+    let mut writer = NetWriter::new();
+    message.serialize(&mut writer);
+    writer.into_vec()
+}
+
 fn frame_join_records(records: &[Arc<JoinBroadcastRecord>]) -> Vec<u8> {
     let count = u16::try_from(records.len()).expect("join batch count fits u16");
-    let mut payload = Vec::with_capacity(records.iter().map(|record| record.payload.len()).sum());
+    let mut payload = Vec::new();
     for record in records {
-        payload.extend_from_slice(&record.payload);
+        payload.extend_from_slice(&record.payload.read());
     }
     let mut writer = NetWriter::with_capacity(payload.len() + 32);
     ServerReadyBatchMessage { count, payload }.serialize(&mut writer);
@@ -631,20 +654,25 @@ fn frame_join_records(records: &[Arc<JoinBroadcastRecord>]) -> Vec<u8> {
 
 async fn flush_join_batches(state: &ServerState) {
     let targets = state.join_broadcast.lock().ready_targets();
-    let mut framed_by_batch = HashMap::<(u64, u64, usize), Vec<u8>>::new();
+    let mut framed_by_batch = HashMap::<Vec<(u64, u64)>, Vec<u8>>::new();
     for peer_id in targets {
         if !state.authenticated_peers.contains_key(&peer_id) {
             continue;
         }
         let batches = state.join_broadcast.lock().take_batches(peer_id);
         for records in batches {
-            let Some(first) = records.first() else {
+            if records.is_empty() {
                 continue;
-            };
-            let Some(last) = records.last() else {
-                continue;
-            };
-            let key = (first.sequence, last.sequence, records.len());
+            }
+            let key = records
+                .iter()
+                .map(|record| {
+                    (
+                        record.sequence,
+                        record.revision.load(Ordering::Acquire),
+                    )
+                })
+                .collect::<Vec<_>>();
             let framed = framed_by_batch
                 .entry(key)
                 .or_insert_with(|| frame_join_records(&records));
@@ -1009,16 +1037,10 @@ async fn finalize_accept(state: &ServerState, peer_id: PeerId, ready: ReadyMessa
         metadata: metadata.clone(),
         ready: ready.clone(),
     };
-    let spawn = ServerReadyMessage {
-        local_ready_message: ready.clone(),
-        player_id_message: basis_protocol::messages::PlayerIdMessage { player_id: peer_id },
-    };
-    let mut spawn_writer = NetWriter::new();
-    spawn.serialize(&mut spawn_writer);
-    let existing_players = state.join_broadcast.lock().register_peer(
-        connected.clone(),
-        spawn_writer.into_vec(),
-    );
+    let existing_players = state
+        .join_broadcast
+        .lock()
+        .register_peer(connected.clone(), serialize_server_ready(peer_id, &ready));
     state.authenticated_peers.insert(peer_id, connected);
     info!("peer connected: {peer_id}");
 
@@ -1095,15 +1117,12 @@ async fn send_accept_fanout(
     let mut batch_payload = Vec::new();
     let mut batch_count = 0u16;
     for existing in existing_players {
-        let message = ServerReadyMessage {
-            local_ready_message: existing.ready.clone(),
-            player_id_message: basis_protocol::messages::PlayerIdMessage {
-                player_id: existing.id,
-            },
-        };
-        let mut record = NetWriter::new();
-        message.serialize(&mut record);
-        let record = record.into_vec();
+        let ready = state
+            .authenticated_peers
+            .get(&existing.id)
+            .map(|peer| peer.ready.clone())
+            .unwrap_or_else(|| existing.ready.clone());
+        let record = serialize_server_ready(existing.id, &ready);
 
         if batch_count > 0
             && batch_payload.len() + record.len() > ServerReadyBatchMessage::MAX_PAYLOAD_BYTES
@@ -1588,8 +1607,16 @@ async fn handle_message(
                     {
                         return Ok(());
                     }
-                    if let Some(mut peer_state) = state.authenticated_peers.get_mut(&peer) {
+                    let updated_ready = if let Some(mut peer_state) =
+                        state.authenticated_peers.get_mut(&peer)
+                    {
                         peer_state.ready.client_avatar_change_message = avatar.clone();
+                        Some(peer_state.ready.clone())
+                    } else {
+                        None
+                    };
+                    if let Some(ready) = updated_ready {
+                        state.join_broadcast.lock().update_peer_ready(peer, ready);
                     }
                     let message = ServerAvatarChangeMessage {
                         player_id: peer,
@@ -1609,10 +1636,18 @@ async fn handle_message(
                 }
                 channels::AVATAR_CHANGE_KIND_BODY_FIT => {
                     let body_fit = ClientBodyFitMessage::deserialize(&mut reader)?;
-                    if let Some(mut peer_state) = state.authenticated_peers.get_mut(&peer) {
+                    let updated_ready = if let Some(mut peer_state) =
+                        state.authenticated_peers.get_mut(&peer)
+                    {
                         peer_state.ready.client_avatar_change_message.arm_scale = body_fit.arm_scale;
                         peer_state.ready.client_avatar_change_message.leg_scale = body_fit.leg_scale;
                         peer_state.ready.client_avatar_change_message.torso_scale = body_fit.torso_scale;
+                        Some(peer_state.ready.clone())
+                    } else {
+                        None
+                    };
+                    if let Some(ready) = updated_ready {
+                        state.join_broadcast.lock().update_peer_ready(peer, ready);
                     }
                     let message = ServerBodyFitMessage {
                         player_id: peer,
@@ -4370,6 +4405,50 @@ mod tests {
         assert_eq!(first_batches[0].len(), 1);
         assert_eq!(first_batches[0][0].sequence, 1);
         assert!(state.take_batches(2).is_empty());
+    }
+
+    #[test]
+    fn join_ready_updates_refresh_pending_spawn_and_history() {
+        let mut state = JoinBroadcastState::default();
+        let peer_one = test_connected_peer(1);
+        let peer_two = test_connected_peer(2);
+        state.register_peer(
+            peer_one.clone(),
+            serialize_server_ready(peer_one.id, &peer_one.ready),
+        );
+        state.register_peer(
+            peer_two.clone(),
+            serialize_server_ready(peer_two.id, &peer_two.ready),
+        );
+
+        let mut updated_two = peer_two.ready.clone();
+        updated_two.client_avatar_change_message.arm_scale = 1.75;
+        state.update_peer_ready(peer_two.id, updated_two.clone());
+
+        state.mark_initial_history_queued(peer_one.id);
+        let pending = state.take_batches(peer_one.id);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].len(), 1);
+        assert_eq!(pending[0][0].revision.load(Ordering::Acquire), 1);
+        assert_eq!(
+            *pending[0][0].payload.read(),
+            serialize_server_ready(peer_two.id, &updated_two)
+        );
+
+        let mut updated_one = peer_one.ready.clone();
+        updated_one.client_avatar_change_message.torso_scale = 1.25;
+        state.update_peer_ready(peer_one.id, updated_one.clone());
+
+        let peer_three = test_connected_peer(3);
+        let existing = state.register_peer(
+            peer_three.clone(),
+            serialize_server_ready(peer_three.id, &peer_three.ready),
+        );
+        let current_one = existing.iter().find(|peer| peer.id == peer_one.id).unwrap();
+        assert_eq!(
+            current_one.ready.client_avatar_change_message.torso_scale,
+            updated_one.client_avatar_change_message.torso_scale
+        );
     }
 
     #[test]

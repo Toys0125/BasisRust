@@ -29,7 +29,7 @@ use tracing::warn;
 use crate::p2p::pack_pair;
 
 const DISTANCE_UPDATE_INTERVAL_MS: u64 = 500;
-const SCALE_RECEIVER_THRESHOLD: usize = 1_000;
+const AVATAR_TICK_INTERVAL_MS: u64 = 4;
 const RECEIVER_BUILD_MIN_BATCH: usize = 16;
 const RECEIVER_FLUSH_MIN_BATCH: usize = 8;
 const TICK_SPIN_RESERVE_MICROS: u64 = 100;
@@ -808,7 +808,7 @@ impl AvatarSyncSystem {
             .name("BSR-TickLoop".to_string())
             .spawn(move || {
                 set_avatar_thread_priority();
-                let tick = Duration::from_millis(4);
+                let tick = Duration::from_millis(AVATAR_TICK_INTERVAL_MS);
                 let spin_reserve = Duration::from_micros(TICK_SPIN_RESERVE_MICROS);
                 while !shutdown.load(Ordering::Relaxed) {
                     let started = Instant::now();
@@ -849,8 +849,13 @@ impl AvatarSyncSystem {
                 peer_states.push((*peer, Arc::clone(state.value())));
             }
         }
-        let (_, slice_start, slice_end, update_distances) =
-            self.advance_slice_state(peer_states.len());
+        let (
+            slice_count,
+            slice_start,
+            slice_end,
+            update_distances,
+            effective_tick_interval_ms,
+        ) = self.advance_slice_state(peer_states.len());
         let spatial_grid = if config.spatial_cull_enabled {
             SpatialGrid::build(&peer_states, config.low_distance_sq)
         } else {
@@ -875,6 +880,8 @@ impl AvatarSyncSystem {
                     spatial_grid.as_ref(),
                     &config,
                     now_ms,
+                    slice_count,
+                    effective_tick_interval_ms,
                     update_distances,
                     offloaded_empty,
                     bypass_empty,
@@ -911,7 +918,7 @@ impl AvatarSyncSystem {
         self.counters.tick_count.fetch_add(1, Ordering::Relaxed);
         self.profiler.add_tick(messages_processed as u64);
         update_max_atomic(&self.counters.max_tick_micros, tick_micros);
-        self.adapt_slice_count(tick_micros, &config, peer_states.len());
+        self.adapt_slice_count(tick_micros, &config);
         self.profiler.try_print();
         Ok(())
     }
@@ -1039,6 +1046,8 @@ impl AvatarSyncSystem {
         spatial_grid: Option<&SpatialGrid>,
         config: &AvatarSyncConfig,
         now_ms: u64,
+        slice_count: usize,
+        effective_tick_interval_ms: u64,
         update_distances: bool,
         offloaded_empty: bool,
         bypass_empty: bool,
@@ -1129,7 +1138,13 @@ impl AvatarSyncSystem {
             let interval_byte = if bypass_reduction {
                 0
             } else {
-                tracking.cached_interval_byte
+                advertised_interval_byte(
+                    tracking.cached_interval_byte,
+                    tracking.cached_interval_ms,
+                    slice_count,
+                    effective_tick_interval_ms,
+                    config.default_interval_ms,
+                )
             };
 
             let send_delta = config.enable_delta_compression
@@ -1219,7 +1234,10 @@ impl AvatarSyncSystem {
         })
     }
 
-    fn advance_slice_state(&self, receiver_count: usize) -> (usize, usize, usize, bool) {
+    fn advance_slice_state(
+        &self,
+        receiver_count: usize,
+    ) -> (usize, usize, usize, bool, u64) {
         let mut state = self.slice_state.lock();
         let now = Instant::now();
         let slice_count = state.slice_count.max(1);
@@ -1233,15 +1251,19 @@ impl AvatarSyncSystem {
         if update_distances {
             state.last_distance_update = now;
         }
-        (slice_count, slice_start, slice_end, update_distances)
+        let effective_tick_interval_ms = AVATAR_TICK_INTERVAL_MS.max(
+            state.smoothed_tick_micros.div_ceil(1_000),
+        );
+        (
+            slice_count,
+            slice_start,
+            slice_end,
+            update_distances,
+            effective_tick_interval_ms,
+        )
     }
 
-    fn adapt_slice_count(
-        &self,
-        elapsed_micros: u64,
-        config: &AvatarSyncConfig,
-        receiver_count: usize,
-    ) {
+    fn adapt_slice_count(&self, elapsed_micros: u64, config: &AvatarSyncConfig) {
         let mut state = self.slice_state.lock();
         state.smoothed_tick_micros = if state.smoothed_tick_micros == 0 {
             elapsed_micros
@@ -1249,16 +1271,11 @@ impl AvatarSyncSystem {
             ((state.smoothed_tick_micros as f64 * 0.85) + (elapsed_micros as f64 * 0.15)) as u64
         };
 
-        let configured_min_slices = config.min_receiver_slices.max(1);
+        let min_slices = config.min_receiver_slices.max(1);
         let max_slices = config
             .max_receiver_slices
-            .max(configured_min_slices)
+            .max(min_slices)
             .min(MAX_SLICE_COUNT);
-        let min_slices = if receiver_count >= SCALE_RECEIVER_THRESHOLD {
-            max_slices.max(configured_min_slices).min(MAX_SLICE_COUNT)
-        } else {
-            configured_min_slices.min(max_slices)
-        };
         state.slice_count = state.slice_count.clamp(min_slices, max_slices);
         let tick_budget_micros = (config.tick_budget_ms.max(1.0) * 1000.0) as u64;
         let cycle_budget_micros = (config.receiver_cycle_budget_ms.max(1.0) * 1000.0) as u64;
@@ -1967,6 +1984,26 @@ fn calculate_interval_from_distance_sq(distance_sq: f32, config: &AvatarSyncConf
     (interval_byte, actual_interval)
 }
 
+fn advertised_interval_byte(
+    cached_interval_byte: u8,
+    cached_interval_ms: u64,
+    slice_count: usize,
+    effective_tick_interval_ms: u64,
+    base_interval_ms: u64,
+) -> u8 {
+    let deliverable_interval_ms = effective_tick_interval_ms
+        .max(AVATAR_TICK_INTERVAL_MS)
+        .saturating_mul(slice_count.max(1) as u64);
+    if deliverable_interval_ms <= cached_interval_ms {
+        return cached_interval_byte;
+    }
+
+    channels::encode_avatar_interval_byte(
+        deliverable_interval_ms.min(i32::MAX as u64) as i32,
+        base_interval_ms.max(1).min(i32::MAX as u64) as i32,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2105,6 +2142,96 @@ mod tests {
 
         config.delta_keyframe_max_interval_ms = 500;
         assert_eq!(effective_keyframe_interval_ms(&config, 4), 500);
+    }
+
+    #[test]
+    fn slicing_remains_load_adaptive() {
+        let config = AvatarSyncConfig {
+            default_interval_ms: 50,
+            base_multiplier: 1.0,
+            increase_rate: 0.005,
+            high_distance_sq: 9.0,
+            medium_distance_sq: 100.0,
+            low_distance_sq: 400.0,
+            enable_bundle_compression: false,
+            enable_bundle_zstd: false,
+            bundle_zstd_delta_bundles: false,
+            bundle_zstd_level: -2,
+            enable_delta_compression: false,
+            delta_keyframe_interval_ms: 500,
+            delta_keyframe_max_interval_ms: 2000,
+            strip_additional_data_at_low_quality: true,
+            bundle_min_messages: 4,
+            bundle_min_bytes: 128,
+            min_receiver_slices: 1,
+            max_receiver_slices: 32,
+            tick_budget_ms: DEFAULT_AVATAR_TICK_BUDGET_MS,
+            receiver_cycle_budget_ms: DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
+            spatial_cull_enabled: false,
+            enable_bsr_profiling: false,
+        };
+        let system = AvatarSyncSystem::new(config.clone());
+
+        system.adapt_slice_count(1_000, &config);
+        assert_eq!(system.slice_state.lock().slice_count, 1);
+
+        system.adapt_slice_count(4_000, &config);
+        assert_eq!(system.slice_state.lock().slice_count, 2);
+    }
+
+    #[test]
+    fn advertised_interval_accounts_for_receiver_slicing() {
+        let base_interval_ms = 50;
+        let cached_interval_byte = channels::encode_avatar_interval_byte(50, base_interval_ms);
+        let cached_interval_ms =
+            channels::decode_avatar_interval_ms(cached_interval_byte, base_interval_ms) as u64;
+
+        assert_eq!(
+            advertised_interval_byte(
+                cached_interval_byte,
+                cached_interval_ms,
+                1,
+                AVATAR_TICK_INTERVAL_MS,
+                base_interval_ms as u64,
+            ),
+            cached_interval_byte
+        );
+
+        let sliced = advertised_interval_byte(
+            cached_interval_byte,
+            cached_interval_ms,
+            32,
+            AVATAR_TICK_INTERVAL_MS,
+            base_interval_ms as u64,
+        );
+        assert_eq!(
+            channels::decode_avatar_interval_ms(sliced, base_interval_ms),
+            (AVATAR_TICK_INTERVAL_MS * 32) as i32
+        );
+
+        let distant_byte = channels::encode_avatar_interval_byte(500, base_interval_ms);
+        let distant_ms = channels::decode_avatar_interval_ms(distant_byte, base_interval_ms) as u64;
+        assert_eq!(
+            advertised_interval_byte(
+                distant_byte,
+                distant_ms,
+                32,
+                AVATAR_TICK_INTERVAL_MS,
+                base_interval_ms as u64,
+            ),
+            distant_byte
+        );
+
+        let overloaded = advertised_interval_byte(
+            cached_interval_byte,
+            cached_interval_ms,
+            32,
+            10,
+            base_interval_ms as u64,
+        );
+        assert!(
+            channels::decode_avatar_interval_ms(overloaded, base_interval_ms) >= 320
+        );
     }
 
     #[test]
