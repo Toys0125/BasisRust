@@ -34,6 +34,7 @@ const RECEIVER_BUILD_MIN_BATCH: usize = 16;
 const RECEIVER_FLUSH_MIN_BATCH: usize = 8;
 const TICK_SPIN_RESERVE_MICROS: u64 = 100;
 const MAX_SLICE_COUNT: usize = 32;
+const NO_RECEIVER_BASELINE: u64 = u64::MAX;
 const AVATAR_BUNDLE_WIRE_BUDGET_BYTES: usize = 1100;
 const AVATAR_BUNDLE_INITIAL_RATIO: f32 = 0.60;
 const AVATAR_BUNDLE_MIN_RATIO: f32 = 0.05;
@@ -1148,16 +1149,33 @@ impl AvatarSyncSystem {
                     (channels::DELTA_AVATAR, &delta.bytes_large, 3)
                 }
             } else {
+                // A receiver can need a full frame after a quality/baseline transition even
+                // though the sender's newest state is already newer than the global keyframe.
+                // Re-sending that older keyframe makes additional avatar data move backwards.
+                // Send the current full frame instead and keep deltas paused until the next
+                // real keyframe establishes a baseline both sides agree on.
+                let current_is_newer_than_keyframe = config.enable_delta_compression
+                    && !bypass_reduction
+                    && !sender_state.current_is_keyframe
+                    && sender_state.generation != sender_state.keyframe_generation;
                 let packet = if config.enable_delta_compression && !bypass_reduction {
-                    let Some(keyframe) = sender_state.keyframe_qualities[quality_index as usize].as_ref() else {
-                        continue;
-                    };
-                    keyframe
+                    if current_is_newer_than_keyframe {
+                        current_packet
+                    } else {
+                        let Some(keyframe) = sender_state.keyframe_qualities[quality_index as usize].as_ref() else {
+                            continue;
+                        };
+                        keyframe
+                    }
                 } else {
                     current_packet
                 };
                 if config.enable_delta_compression && !bypass_reduction {
-                    tracking.baseline_keyframe_generation = sender_state.keyframe_generation;
+                    tracking.baseline_keyframe_generation = if current_is_newer_than_keyframe {
+                        NO_RECEIVER_BASELINE
+                    } else {
+                        sender_state.keyframe_generation
+                    };
                     tracking.baseline_quality = quality_index;
                 }
                 if sender_state.small_id {
