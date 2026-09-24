@@ -627,11 +627,12 @@ impl AvatarSyncSystem {
         let state = self.slice_state.lock();
         let config = self.config.read();
         let tick_count = self.counters.tick_count.load(Ordering::Relaxed);
-        let avg_tick_micros = if tick_count == 0 {
-            0
-        } else {
-            self.counters.tick_micros.load(Ordering::Relaxed) / tick_count
-        };
+        let avg_tick_micros = self
+            .counters
+            .tick_micros
+            .load(Ordering::Relaxed)
+            .checked_div(tick_count)
+            .unwrap_or(0);
         AvatarSyncStats {
             inbound_updates: self.counters.inbound_updates.load(Ordering::Relaxed),
             outbound_messages: self.counters.outbound_messages.load(Ordering::Relaxed),
@@ -865,6 +866,7 @@ impl AvatarSyncSystem {
         update_count
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_sends_for_receiver(
         &self,
         receiver_id: PeerId,
@@ -1059,8 +1061,7 @@ impl AvatarSyncConfig {
     pub fn apply_env_tuning(mut self) -> Self {
         self.min_receiver_slices = env_usize("BASIS_AVATAR_MIN_RECEIVER_SLICES")
             .unwrap_or(self.min_receiver_slices)
-            .max(1)
-            .min(MAX_SLICE_COUNT);
+            .clamp(1, MAX_SLICE_COUNT);
         self.max_receiver_slices = env_usize("BASIS_AVATAR_MAX_RECEIVER_SLICES")
             .unwrap_or(self.max_receiver_slices)
             .max(self.min_receiver_slices)
@@ -1361,10 +1362,10 @@ fn process_pending_update(peer_id: PeerId, update: PendingAvatarUpdate) -> Proce
         _ => BitQuality::High,
     };
     let expected = quality.payload_len();
-    debug_assert!(update.payload.len() >= 1 + expected);
+    debug_assert!(update.payload.len() > expected);
     let payload_len = expected.min(update.payload.len().saturating_sub(1));
     let avatar_payload = &update.payload[1..1 + payload_len];
-    let position = read_position(&avatar_payload).unwrap_or([0.0, 0.0, 0.0]);
+    let position = read_position(avatar_payload).unwrap_or([0.0, 0.0, 0.0]);
     ProcessedAvatarUpdate {
         peer_id,
         inbound_sequence,
