@@ -4,6 +4,12 @@ on:
   release:
     types:
       - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: GitHub release tag to build and attach
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -12,6 +18,8 @@ jobs:
   builds:
     name: Cross-platform builds
     uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ github.event.release.tag_name || inputs.tag }}
 
   attach:
     name: Attach cross-platform builds
@@ -32,5 +40,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: gh release upload "$RELEASE_TAG" release-assets/* --clobber
