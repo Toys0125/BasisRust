@@ -39,7 +39,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -60,6 +60,121 @@ pub struct ConnectedPeer {
     pub id: PeerId,
     pub metadata: ClientMetaDataMessage,
     pub ready: ReadyMessage,
+}
+
+const JOIN_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Debug)]
+struct JoinBroadcastRecord {
+    sequence: u64,
+    peer_id: PeerId,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct JoinPeerState {
+    sequence: u64,
+    peer: ConnectedPeer,
+    initial_history_queued: bool,
+    pending: Vec<Arc<JoinBroadcastRecord>>,
+}
+
+#[derive(Debug, Default)]
+struct JoinBroadcastState {
+    next_sequence: u64,
+    peers: HashMap<PeerId, JoinPeerState>,
+}
+
+impl JoinBroadcastState {
+    fn register_peer(
+        &mut self,
+        peer: ConnectedPeer,
+        record_payload: Vec<u8>,
+    ) -> Vec<ConnectedPeer> {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        let mut existing = self
+            .peers
+            .iter()
+            .filter(|(_, state)| state.sequence < sequence)
+            .map(|(peer_id, state)| (state.sequence, *peer_id, state.peer.clone()))
+            .collect::<Vec<_>>();
+        existing.sort_by_key(|(peer_sequence, _, _)| *peer_sequence);
+
+        let record = Arc::new(JoinBroadcastRecord {
+            sequence,
+            peer_id: peer.id,
+            payload: record_payload,
+        });
+        for state in self.peers.values_mut() {
+            if state.sequence < sequence {
+                state.pending.push(record.clone());
+            }
+        }
+        self.peers.insert(
+            peer.id,
+            JoinPeerState {
+                sequence,
+                peer,
+                initial_history_queued: false,
+                pending: Vec::new(),
+            },
+        );
+        existing
+            .into_iter()
+            .map(|(_, _, peer)| peer)
+            .collect()
+    }
+
+    fn mark_initial_history_queued(&mut self, peer_id: PeerId) {
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.initial_history_queued = true;
+        }
+    }
+
+    fn remove_peer(&mut self, peer_id: PeerId) {
+        self.peers.remove(&peer_id);
+        for peer in self.peers.values_mut() {
+            peer.pending.retain(|record| record.peer_id != peer_id);
+        }
+    }
+
+    fn take_batches(&mut self, peer_id: PeerId) -> Vec<Vec<Arc<JoinBroadcastRecord>>> {
+        let Some(peer) = self.peers.get_mut(&peer_id) else {
+            return Vec::new();
+        };
+        if !peer.initial_history_queued {
+            return Vec::new();
+        }
+        peer.pending.sort_by_key(|record| record.sequence);
+        let mut batches = Vec::new();
+        while !peer.pending.is_empty() {
+            let mut payload_bytes = 0usize;
+            let mut take = 0usize;
+            for record in &peer.pending {
+                if take > 0
+                    && payload_bytes + record.payload.len()
+                        > ServerReadyBatchMessage::MAX_PAYLOAD_BYTES
+                {
+                    break;
+                }
+                payload_bytes += record.payload.len();
+                take += 1;
+            }
+            batches.push(peer.pending.drain(..take).collect());
+        }
+        batches
+    }
+
+    fn ready_targets(&self) -> Vec<PeerId> {
+        self.peers
+            .iter()
+            .filter_map(|(peer_id, peer)| {
+                peer.initial_history_queued.then_some(*peer_id)
+            })
+            .collect()
+    }
+
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +220,7 @@ pub struct ServerState {
     config_path: Arc<PathBuf>,
     pub transport: TransportHandle,
     pub authenticated_peers: Arc<DashMap<PeerId, ConnectedPeer>>,
+    join_broadcast: Arc<Mutex<JoinBroadcastState>>,
     pub pending_identity: Arc<DashMap<PeerId, ReadyMessage>>,
     pub permissions: PermissionManager,
     pub database: PersistentDatabase,
@@ -205,6 +321,7 @@ impl ServerState {
             config_path: Arc::new(config_path),
             transport,
             authenticated_peers: Arc::new(DashMap::new()),
+            join_broadcast: Arc::new(Mutex::new(JoinBroadcastState::default())),
             pending_identity: Arc::new(DashMap::new()),
             permissions,
             database,
@@ -501,6 +618,56 @@ async fn flush_pending_leaves(state: &ServerState) {
     }
 }
 
+fn frame_join_records(records: &[Arc<JoinBroadcastRecord>]) -> Vec<u8> {
+    let count = u16::try_from(records.len()).expect("join batch count fits u16");
+    let mut payload = Vec::with_capacity(records.iter().map(|record| record.payload.len()).sum());
+    for record in records {
+        payload.extend_from_slice(&record.payload);
+    }
+    let mut writer = NetWriter::with_capacity(payload.len() + 32);
+    ServerReadyBatchMessage { count, payload }.serialize(&mut writer);
+    writer.into_vec()
+}
+
+async fn flush_join_batches(state: &ServerState) {
+    let targets = state.join_broadcast.lock().ready_targets();
+    let mut framed_by_batch = HashMap::<(u64, u64, usize), Vec<u8>>::new();
+    for peer_id in targets {
+        if !state.authenticated_peers.contains_key(&peer_id) {
+            continue;
+        }
+        let batches = state.join_broadcast.lock().take_batches(peer_id);
+        for records in batches {
+            let Some(first) = records.first() else {
+                continue;
+            };
+            let Some(last) = records.last() else {
+                continue;
+            };
+            let key = (first.sequence, last.sequence, records.len());
+            let framed = framed_by_batch
+                .entry(key)
+                .or_insert_with(|| frame_join_records(&records));
+            if state
+                .transport
+                .send(
+                    peer_id,
+                    channels::CREATE_REMOTE_PLAYERS_FOR_NEW_PEER,
+                    DeliveryMethod::ReliableOrdered,
+                    framed,
+                )
+                .await
+                .is_ok()
+            {
+                state
+                    .statistics
+                    .outbound_packets
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 async fn event_loop(
     state: ServerState,
     mut events: mpsc::Receiver<ServerEvent>,
@@ -510,8 +677,14 @@ async fn event_loop(
         .map(|count| (count.get() * 4).clamp(8, 256))
         .unwrap_or(32);
     let workers = Arc::new(Semaphore::new(worker_limit));
+    let mut join_flush = tokio::time::interval(JOIN_BATCH_FLUSH_INTERVAL);
+    join_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    join_flush.tick().await;
     loop {
         tokio::select! {
+            _ = join_flush.tick() => {
+                flush_join_batches(&state).await;
+            }
             _ = &mut shutdown => {
                 break;
             }
@@ -829,17 +1002,24 @@ fn password_matches(server_password: &str, auth_bytes: &[u8]) -> bool {
 
 async fn finalize_accept(state: &ServerState, peer_id: PeerId, ready: ReadyMessage) -> Result<()> {
     let uuid = ready.player_meta_data_message.player_uuid.clone();
-    state.permissions.get_or_create_user(&uuid);
     let config = state.config.read().clone();
     let metadata = ready.player_meta_data_message.clone();
-    state.authenticated_peers.insert(
-        peer_id,
-        ConnectedPeer {
-            id: peer_id,
-            metadata: metadata.clone(),
-            ready: ready.clone(),
-        },
+    let connected = ConnectedPeer {
+        id: peer_id,
+        metadata: metadata.clone(),
+        ready: ready.clone(),
+    };
+    let spawn = ServerReadyMessage {
+        local_ready_message: ready.clone(),
+        player_id_message: basis_protocol::messages::PlayerIdMessage { player_id: peer_id },
+    };
+    let mut spawn_writer = NetWriter::new();
+    spawn.serialize(&mut spawn_writer);
+    let existing_players = state.join_broadcast.lock().register_peer(
+        connected.clone(),
+        spawn_writer.into_vec(),
     );
+    state.authenticated_peers.insert(peer_id, connected);
     info!("peer connected: {peer_id}");
 
     let server_meta = ServerMetaDataMessage {
@@ -881,7 +1061,7 @@ async fn finalize_accept(state: &ServerState, peer_id: PeerId, ready: ReadyMessa
         .await?;
 
     cache_initial_avatar_sync(state, peer_id, &ready);
-    send_accept_fanout(state, peer_id, ready).await?;
+    send_accept_fanout(state, peer_id, &existing_players).await?;
     Ok(())
 }
 
@@ -909,34 +1089,16 @@ fn cache_initial_avatar_sync(state: &ServerState, peer_id: PeerId, ready: &Ready
 async fn send_accept_fanout(
     state: &ServerState,
     peer_id: PeerId,
-    ready: ReadyMessage,
+    existing_players: &[ConnectedPeer],
 ) -> Result<()> {
-    let spawn = ServerReadyMessage {
-        local_ready_message: ready.clone(),
-        player_id_message: basis_protocol::messages::PlayerIdMessage { player_id: peer_id },
-    };
-    let mut spawn_writer = NetWriter::new();
-    spawn.serialize(&mut spawn_writer);
-    state
-        .broadcast(
-            channels::CREATE_REMOTE_PLAYER,
-            DeliveryMethod::ReliableOrdered,
-            spawn_writer.as_slice(),
-            Some(peer_id),
-        )
-        .await;
-
     let mut existing_player_packets = Vec::new();
     let mut batch_payload = Vec::new();
     let mut batch_count = 0u16;
-    for existing in state.authenticated_peers.iter() {
-        if *existing.key() == peer_id {
-            continue;
-        }
+    for existing in existing_players {
         let message = ServerReadyMessage {
             local_ready_message: existing.ready.clone(),
             player_id_message: basis_protocol::messages::PlayerIdMessage {
-                player_id: *existing.key(),
+                player_id: existing.id,
             },
         };
         let mut record = NetWriter::new();
@@ -977,6 +1139,10 @@ async fn send_accept_fanout(
         ));
     }
     state.transport.send_many(peer_id, &existing_player_packets).await?;
+    state
+        .join_broadcast
+        .lock()
+        .mark_initial_history_queued(peer_id);
     replay_late_join_state(state, peer_id).await;
     Ok(())
 }
@@ -1074,6 +1240,7 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
 }
 
 async fn handle_disconnect(state: &ServerState, peer: PeerId, reason: DisconnectReason) {
+    state.join_broadcast.lock().remove_peer(peer);
     state.p2p_broker.remove_peer(&state.transport, peer).await;
     state.net_ids.remove_peer(peer);
     let departed_uuid = state
@@ -4158,6 +4325,62 @@ pub fn migrate_legacy_resource_dirs(base_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_ready_message() -> ReadyMessage {
+        ReadyMessage {
+            player_meta_data_message: ClientMetaDataMessage {
+                player_uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+                player_display_name: "test".to_string(),
+                player_platform: "linux".to_string(),
+            },
+            client_avatar_change_message: basis_protocol::messages::ClientAvatarChangeMessage {
+                load_mode: 0,
+                byte_array: Vec::new(),
+                local_avatar_index: 0,
+                arm_scale: 1.0,
+                leg_scale: 1.0,
+                torso_scale: 1.0,
+            },
+            local_avatar_sync_message: basis_protocol::messages::LocalAvatarSyncMessage::empty_high(),
+        }
+    }
+
+    fn test_connected_peer(peer_id: PeerId) -> ConnectedPeer {
+        ConnectedPeer {
+            id: peer_id,
+            metadata: test_ready_message().player_meta_data_message,
+            ready: test_ready_message(),
+        }
+    }
+
+    #[test]
+    fn join_batches_wait_for_initial_history_and_preserve_order() {
+        let mut state = JoinBroadcastState::default();
+        assert!(state
+            .register_peer(test_connected_peer(1), vec![1])
+            .is_empty());
+        let existing = state.register_peer(test_connected_peer(2), vec![2]);
+        assert_eq!(existing.iter().map(|peer| peer.id).collect::<Vec<_>>(), vec![1]);
+        assert!(state.ready_targets().is_empty());
+
+        state.mark_initial_history_queued(1);
+        state.mark_initial_history_queued(2);
+        let first_batches = state.take_batches(1);
+        assert_eq!(first_batches.len(), 1);
+        assert_eq!(first_batches[0].len(), 1);
+        assert_eq!(first_batches[0][0].sequence, 1);
+        assert!(state.take_batches(2).is_empty());
+    }
+
+    #[test]
+    fn removing_a_join_removes_it_from_pending_targets() {
+        let mut state = JoinBroadcastState::default();
+        state.register_peer(test_connected_peer(1), vec![1]);
+        state.register_peer(test_connected_peer(2), vec![2]);
+        state.mark_initial_history_queued(1);
+        state.remove_peer(2);
+        assert!(state.take_batches(1).is_empty());
+    }
 
     #[test]
     fn structured_reject_payload_matches_current_wire() {

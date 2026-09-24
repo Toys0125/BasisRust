@@ -1173,27 +1173,27 @@ impl BasisClient {
         };
         trace!("client {} received {:?}", self.index, packet.property);
         match packet.property {
-            PacketProperty::ConnectAccept => {
+            PacketProperty::ConnectAccept
                 if bytes.len() == 15
-                    && i64::from_le_bytes(bytes[1..9].try_into().unwrap()) == self.connect_time
-                {
-                    let remote_peer = i32::from_le_bytes(bytes[11..15].try_into().unwrap());
-                    *self.remote_peer_id.lock().await = Some(remote_peer);
-                    if self.index != 0 {
-                        if let Err(err) = configure_load_sink_socket(&self.socket) {
-                            warn!(
-                                "client {} failed to enable load-sink receive filter: {err}",
-                                self.index
-                            );
-                        }
+                    && i64::from_le_bytes(bytes[1..9].try_into().unwrap()) == self.connect_time =>
+            {
+                let remote_peer = i32::from_le_bytes(bytes[11..15].try_into().unwrap());
+                *self.remote_peer_id.lock().await = Some(remote_peer);
+                if self.index != 0 {
+                    if let Err(err) = configure_load_sink_socket(&self.socket) {
+                        warn!(
+                            "client {} failed to enable load-sink receive filter: {err}",
+                            self.index
+                        );
                     }
-                    self.connected.store(true, Ordering::SeqCst);
-                    info!(
-                        "client {} connected as remote peer {}",
-                        self.index, remote_peer
-                    );
                 }
+                self.connected.store(true, Ordering::SeqCst);
+                info!(
+                    "client {} connected as remote peer {}",
+                    self.index, remote_peer
+                );
             }
+            PacketProperty::ConnectAccept => {}
             PacketProperty::Disconnect
             | PacketProperty::PeerNotFound
             | PacketProperty::InvalidProtocol => {
@@ -1904,11 +1904,11 @@ fn bind_udp_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
 fn configure_load_sink_socket(socket: &UdpSocket) -> std::io::Result<()> {
     // A simulated load client only needs reliable/control traffic after it has connected.
     // Basis server avatar fanout is sent as top-level Unreliable, Merged, or CompactMerged
-    // datagrams. For non-observer load-sink clients we intentionally discard all three after the
-    // connection/authentication handshake; client 0 remains unfiltered and exercises the complete
-    // receive protocol. This is load-generator behavior, not general client semantics. These sockets
-    // are connected UDP sockets; the socket-filter view starts at the UDP header, so LiteNetLib byte
-    // 0 is at offset 8.
+    // datagrams. For non-observer load-sink clients we drop top-level Unreliable and CompactMerged,
+    // but allow Merged through so the shared receiver can ACK reliable channeled packets nested
+    // inside it. Client 0 remains unfiltered and exercises the complete receive protocol. These
+    // sockets are connected UDP sockets; the socket-filter view starts at the UDP header, so
+    // LiteNetLib byte 0 is at offset 8.
     const BPF_LD_B_ABS: u16 = 0x30;
     const BPF_ALU_AND_K: u16 = 0x54;
     const BPF_JMP_JEQ_K: u16 = 0x15;
@@ -1936,7 +1936,7 @@ fn configure_load_sink_socket(socket: &UdpSocket) -> std::io::Result<()> {
         },
         libc::sock_filter {
             code: BPF_JMP_JEQ_K,
-            jt: 2,
+            jt: 1,
             jf: 0,
             k: PacketProperty::Merged as u32,
         },
@@ -2719,6 +2719,35 @@ fn shared_receiver_send_pong(fd: RawFd, first_byte: u8, sequence: u16) {
 }
 
 #[cfg(target_os = "linux")]
+fn shared_receiver_process_merged(fd: RawFd, bytes: &[u8]) {
+    let mut pos = 1usize;
+    while pos + 2 <= bytes.len() {
+        let size = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+        pos += 2;
+        if size == 0 || pos + size > bytes.len() {
+            break;
+        }
+        let packet = &bytes[pos..pos + size];
+        let property = packet.first().copied().unwrap_or_default() & 0x1f;
+        match property {
+            p if p == PacketProperty::Channeled as u8 && packet.len() >= 4 => {
+                let sequence = u16::from_le_bytes([packet[1], packet[2]]);
+                let channel_id = packet[3];
+                if matches!(channel_id % 4, 0 | 2) {
+                    shared_receiver_send_ack(fd, packet[0], channel_id, sequence);
+                }
+            }
+            p if p == PacketProperty::Ping as u8 && packet.len() >= 3 => {
+                let sequence = u16::from_le_bytes([packet[1], packet[2]]);
+                shared_receiver_send_pong(fd, packet[0], sequence);
+            }
+            _ => {}
+        }
+        pos += size;
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn run_shared_epoll_receiver(
     registrations: std_mpsc::Receiver<(usize, RawFd)>,
     batches: mpsc::UnboundedSender<SharedReceiveBatch>,
@@ -2791,6 +2820,10 @@ fn run_shared_epoll_receiver(
                     // epoll-thread -> Tokio handoff. Reliable payloads still receive protocol ACKs,
                     // but their application data is intentionally discarded for synthetic peers.
                     match property {
+                        p if p == PacketProperty::Merged as u8 => {
+                            shared_receiver_process_merged(fd, &buffer[..len]);
+                            continue;
+                        }
                         p if p == PacketProperty::Channeled as u8 => {
                             if len >= 4 {
                                 let sequence = u16::from_le_bytes([buffer[1], buffer[2]]);
@@ -4396,6 +4429,36 @@ mod tests {
         )
         .await
         .is_err());
+
+        let channel_id = DeliveryMethod::channel_id(channels::META_DATA, DeliveryMethod::ReliableOrdered);
+        let nested = vec![
+            PacketProperty::Channeled as u8,
+            0,
+            0,
+            channel_id,
+            42,
+        ];
+        let mut merged = vec![PacketProperty::Merged as u8, nested.len() as u8, 0];
+        merged.extend_from_slice(&nested);
+        server
+            .send_to(&merged, observer.socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        server
+            .send_to(&merged, load_sink.socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        let observer_len = time::timeout(Duration::from_secs(1), observer.socket.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..observer_len], merged);
+        let load_sink_len =
+            time::timeout(Duration::from_secs(1), load_sink.socket.recv(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&buffer[..load_sink_len], merged);
     }
 
     #[tokio::test]

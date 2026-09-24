@@ -8,13 +8,14 @@ use basis_protocol::{
     avatar_delta::build_delta,
     channels,
 };
-use basis_transport::{PeerId, TransportHandle};
+use basis_transport::{PeerId, TransportHandle, UnreliablePacket};
 use bytes::Bytes;
 use dashmap::DashMap;
 use rayon::prelude::*;
 use std::{
     collections::HashMap,
     env,
+    hash::{BuildHasherDefault, Hasher},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -22,12 +23,16 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::{runtime::Handle, task::JoinSet};
+use tokio::runtime::Handle;
 use tracing::warn;
 
 use crate::p2p::pack_pair;
 
 const DISTANCE_UPDATE_INTERVAL_MS: u64 = 500;
+const SCALE_RECEIVER_THRESHOLD: usize = 1_000;
+const RECEIVER_BUILD_MIN_BATCH: usize = 16;
+const RECEIVER_FLUSH_MIN_BATCH: usize = 8;
+const TICK_SPIN_RESERVE_MICROS: u64 = 100;
 const MAX_SLICE_COUNT: usize = 32;
 const AVATAR_BUNDLE_WIRE_BUDGET_BYTES: usize = 1100;
 const AVATAR_BUNDLE_INITIAL_RATIO: f32 = 0.60;
@@ -37,6 +42,29 @@ const SMALL_HIGH_DELTA_BYTES: usize = 40;
 const SMALL_DELTA_STREAK_TO_STRETCH: u8 = 4;
 pub(crate) const DEFAULT_AVATAR_TICK_BUDGET_MS: f64 = 3.0;
 pub(crate) const DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS: f64 = 180.0;
+
+#[derive(Default)]
+struct PeerIdHasher {
+    state: u64,
+}
+
+impl Hasher for PeerIdHasher {
+    fn finish(&self) -> u64 {
+        self.state
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.state = (self.state << 8) | u64::from(*byte);
+        }
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.state = u64::from(value);
+    }
+}
+
+type PeerIdMap<V> = HashMap<PeerId, V, BuildHasherDefault<PeerIdHasher>>;
 
 #[derive(Debug, Clone)]
 pub struct AvatarSyncConfig {
@@ -82,6 +110,7 @@ struct PreSerializedDelta {
 #[derive(Debug, Clone)]
 struct PlayerAvatarState {
     peer_id: PeerId,
+    small_id: bool,
     position: [f32; 3],
     generation: u64,
     last_inbound_sequence: u8,
@@ -118,7 +147,7 @@ struct ProcessedAvatarUpdate {
 #[derive(Debug, Clone)]
 struct ReceiverTracking {
     last_seen_generation: u64,
-    last_sent: Instant,
+    last_sent_ms: u64,
     cached_quality_index: u8,
     cached_interval_byte: u8,
     cached_interval_ms: u64,
@@ -132,7 +161,7 @@ struct SpatialGrid {
 }
 
 impl SpatialGrid {
-    fn build(peer_states: &[(PeerId, PlayerAvatarState)], low_distance_sq: f32) -> Option<Self> {
+    fn build(peer_states: &[(PeerId, Arc<PlayerAvatarState>)], low_distance_sq: f32) -> Option<Self> {
         let cell_size = low_distance_sq.sqrt();
         if !cell_size.is_finite() || cell_size <= f32::EPSILON {
             return None;
@@ -190,16 +219,48 @@ struct SliceState {
     smoothed_tick_micros: u64,
 }
 
-#[derive(Debug, Clone)]
-struct OutboundAvatarSend {
-    channel: u8,
-    payload: Bytes,
+#[derive(Debug)]
+enum OutboundAvatarSend<'a> {
+    Borrowed {
+        channel: u8,
+        payload: &'a Bytes,
+        patch: Option<(usize, u8)>,
+    },
+    Owned {
+        channel: u8,
+        payload: Bytes,
+        patch: Option<(usize, u8)>,
+    },
 }
 
-#[derive(Debug, Clone)]
-struct OutboundAvatarBatch {
+impl UnreliablePacket for OutboundAvatarSend<'_> {
+    #[inline]
+    fn channel(&self) -> u8 {
+        match self {
+            Self::Borrowed { channel, .. } | Self::Owned { channel, .. } => *channel,
+        }
+    }
+
+    #[inline]
+    fn payload(&self) -> &[u8] {
+        match self {
+            Self::Borrowed { payload, .. } => payload.as_ref(),
+            Self::Owned { payload, .. } => payload.as_ref(),
+        }
+    }
+
+    #[inline]
+    fn interval_patch(&self) -> Option<(usize, u8)> {
+        match self {
+            Self::Borrowed { patch, .. } | Self::Owned { patch, .. } => *patch,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OutboundAvatarBatch<'a> {
     receiver: PeerId,
-    sends: Vec<OutboundAvatarSend>,
+    sends: Vec<OutboundAvatarSend<'a>>,
 }
 
 #[derive(Debug, Clone)]
@@ -547,11 +608,12 @@ impl BytePool {
 #[derive(Debug, Clone)]
 pub struct AvatarSyncSystem {
     config: Arc<parking_lot::RwLock<AvatarSyncConfig>>,
-    states: Arc<DashMap<PeerId, PlayerAvatarState>>,
+    states: Arc<DashMap<PeerId, Arc<PlayerAvatarState>>>,
     pending: Arc<DashMap<PeerId, PendingAvatarUpdate>>,
-    tracking: Arc<DashMap<PeerId, HashMap<PeerId, ReceiverTracking>>>,
+    tracking: Arc<DashMap<PeerId, PeerIdMap<ReceiverTracking>>>,
     bundle_ratios: Arc<DashMap<PeerId, f32>>,
     generation: Arc<AtomicU64>,
+    monotonic_origin: Instant,
     slice_state: Arc<parking_lot::Mutex<SliceState>>,
     payload_pool: Arc<BytePool>,
     counters: Arc<AvatarSyncCounters>,
@@ -570,6 +632,7 @@ impl AvatarSyncSystem {
             tracking: Arc::new(DashMap::new()),
             bundle_ratios: Arc::new(DashMap::new()),
             generation: Arc::new(AtomicU64::new(1)),
+            monotonic_origin: Instant::now(),
             slice_state: Arc::new(parking_lot::Mutex::new(SliceState {
                 slice_count: 1,
                 slice_index: 0,
@@ -649,6 +712,11 @@ impl AvatarSyncSystem {
         Ok(())
     }
 
+    #[inline]
+    fn monotonic_millis(&self) -> u64 {
+        self.monotonic_origin.elapsed().as_millis() as u64
+    }
+
     pub fn set_bypass_reduction(&self, sender_id: PeerId, enabled: bool) {
         if enabled {
             self.bypass_reduction_ids.insert(sender_id, ());
@@ -660,7 +728,7 @@ impl AvatarSyncSystem {
                 tracking.baseline_keyframe_generation = 0;
                 tracking.baseline_quality = u8::MAX;
                 tracking.last_seen_generation = 0;
-                tracking.last_sent = Instant::now() - Duration::from_secs(60);
+                tracking.last_sent_ms = 0;
             }
         }
     }
@@ -671,7 +739,7 @@ impl AvatarSyncSystem {
                 tracking.baseline_keyframe_generation = 0;
                 tracking.baseline_quality = u8::MAX;
                 tracking.last_seen_generation = 0;
-                tracking.last_sent = Instant::now() - Duration::from_secs(60);
+                tracking.last_sent_ms = 0;
             }
         }
     }
@@ -740,6 +808,7 @@ impl AvatarSyncSystem {
             .spawn(move || {
                 set_avatar_thread_priority();
                 let tick = Duration::from_millis(4);
+                let spin_reserve = Duration::from_micros(TICK_SPIN_RESERVE_MICROS);
                 while !shutdown.load(Ordering::Relaxed) {
                     let started = Instant::now();
                     if let Err(err) =
@@ -748,8 +817,8 @@ impl AvatarSyncSystem {
                         warn!("avatar sync tick failed: {err:#}");
                     }
                     let elapsed = started.elapsed();
-                    if elapsed + Duration::from_millis(1) < tick {
-                        thread::sleep(tick - elapsed - Duration::from_millis(1));
+                    if elapsed + spin_reserve < tick {
+                        thread::sleep(tick - elapsed - spin_reserve);
                     }
                     while started.elapsed() < tick {
                         if shutdown.load(Ordering::Relaxed) {
@@ -767,28 +836,20 @@ impl AvatarSyncSystem {
     {
         let config = self.config.read().clone();
         let tick_start = Instant::now();
-        let now = Instant::now();
+        let now_ms = self.monotonic_millis();
         let messages_processed = self.process_pending_updates(&config);
         let peers = peer_snapshot();
         if peers.len() <= 1 {
             return Ok(());
         }
-        let peer_states: Vec<(PeerId, PlayerAvatarState)> = peers
-            .iter()
-            .filter_map(|peer| {
-                self.states
-                    .get(peer)
-                    .map(|state| (*peer, state.value().clone()))
-            })
-            .collect();
+        let mut peer_states = Vec::with_capacity(peers.len());
+        for peer in &peers {
+            if let Some(state) = self.states.get(peer) {
+                peer_states.push((*peer, Arc::clone(state.value())));
+            }
+        }
         let (_, slice_start, slice_end, update_distances) =
             self.advance_slice_state(peer_states.len());
-        let receiver_states = peer_states
-            .get(slice_start..slice_end)
-            .unwrap_or(&[])
-            .iter()
-            .map(|(peer, state)| (*peer, state.clone()))
-            .collect::<Vec<_>>();
         let spatial_grid = if config.spatial_cull_enabled {
             SpatialGrid::build(&peer_states, config.low_distance_sq)
         } else {
@@ -797,17 +858,25 @@ impl AvatarSyncSystem {
         self.profiler.add_phase_micros(BsrPhase::Distance, 0);
 
         let build_start = Instant::now();
-        let receiver_groups = receiver_states
+        // Avoid cloning states for receiver_states: par_iter over slice directly.
+        // build_sends_for_receiver only needs position from receiver state.
+        let receiver_slice = &peer_states[slice_start.min(peer_states.len())..slice_end.min(peer_states.len())];
+        let offloaded_empty = self.offloaded_pairs.is_empty();
+        let bypass_empty = self.bypass_reduction_ids.is_empty();
+        let receiver_groups = receiver_slice
             .par_iter()
+            .with_min_len(RECEIVER_BUILD_MIN_BATCH)
             .filter_map(|(receiver_id, receiver_state)| {
                 self.build_sends_for_receiver(
                     *receiver_id,
-                    receiver_state,
+                    receiver_state.position,
                     &peer_states,
                     spatial_grid.as_ref(),
                     &config,
-                    now,
+                    now_ms,
                     update_distances,
+                    offloaded_empty,
+                    bypass_empty,
                 )
             })
             .collect::<Vec<_>>();
@@ -826,7 +895,7 @@ impl AvatarSyncSystem {
                 .fetch_add(1, Ordering::Relaxed);
         }
         let flush_start = Instant::now();
-        flush_receiver_groups_parallel(transport.clone(), receiver_groups).await?;
+        flush_receiver_groups_parallel(transport.clone(), receiver_groups)?;
         self.counters
             .flush_micros
             .fetch_add(flush_start.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -841,7 +910,7 @@ impl AvatarSyncSystem {
         self.counters.tick_count.fetch_add(1, Ordering::Relaxed);
         self.profiler.add_tick(messages_processed as u64);
         update_max_atomic(&self.counters.max_tick_micros, tick_micros);
-        self.adapt_slice_count(tick_micros, &config);
+        self.adapt_slice_count(tick_micros, &config, peer_states.len());
         self.profiler.try_print();
         Ok(())
     }
@@ -888,6 +957,7 @@ impl AvatarSyncSystem {
                         continue;
                     }
                 }
+                let current = Arc::make_mut(&mut current);
                 current.last_inbound_sequence = update.inbound_sequence;
                 current.outbound_sequence = current.outbound_sequence.wrapping_add(1);
                 current.has_received_first = true;
@@ -904,7 +974,7 @@ impl AvatarSyncSystem {
                     config.strip_additional_data_at_low_quality,
                 ) {
                     update_outbound_delta_state(
-                        &mut current,
+                        current,
                         qualities,
                         generation,
                         config,
@@ -929,8 +999,9 @@ impl AvatarSyncSystem {
                 let keyframe_payloads = quality_payloads(&qualities);
                 self.states.insert(
                     update.peer_id,
-                    PlayerAvatarState {
+                    Arc::new(PlayerAvatarState {
                         peer_id: update.peer_id,
+                        small_id: update.peer_id <= u8::MAX as u16,
                         position: update.position,
                         generation,
                         last_inbound_sequence: update.inbound_sequence,
@@ -946,7 +1017,7 @@ impl AvatarSyncSystem {
                         small_delta_streak: 0,
                         current_is_keyframe: true,
                         qualities,
-                    },
+                    }),
                 );
             }
             self.payload_pool.put(update.payload);
@@ -959,57 +1030,66 @@ impl AvatarSyncSystem {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build_sends_for_receiver(
+    fn build_sends_for_receiver<'a>(
         &self,
         receiver_id: PeerId,
-        receiver_state: &PlayerAvatarState,
-        peer_states: &[(PeerId, PlayerAvatarState)],
+        receiver_position: [f32; 3],
+        peer_states: &'a [(PeerId, Arc<PlayerAvatarState>)],
         spatial_grid: Option<&SpatialGrid>,
         config: &AvatarSyncConfig,
-        now: Instant,
+        now_ms: u64,
         update_distances: bool,
-    ) -> Option<OutboundAvatarBatch> {
-        let mut direct = Vec::new();
-        let mut bundle = Vec::new();
-        let mut bundle_raw_bytes = 0usize;
+        offloaded_empty: bool,
+        bypass_empty: bool,
+    ) -> Option<OutboundAvatarBatch<'a>> {
+        let peer_count = peer_states.len();
+        let mut spatial_candidates: Option<Vec<usize>> = None;
+        if let Some(grid) = spatial_grid {
+            spatial_candidates = Some(grid.ordered_indices(receiver_position, peer_count));
+        }
+        let initial_send_capacity = peer_count.saturating_sub(1);
+        let mut direct = if config.enable_bundle_compression {
+            Vec::new()
+        } else {
+            Vec::with_capacity(initial_send_capacity)
+        };
+        let mut bundle = if config.enable_bundle_compression {
+            Vec::with_capacity(initial_send_capacity)
+        } else {
+            Vec::new()
+        };
         let mut receiver_tracking = self.tracking.entry(receiver_id).or_default();
         let mut logical_sends = 0u64;
-        let mut bundle_ratio = self
-            .bundle_ratios
-            .get(&receiver_id)
-            .map(|ratio| *ratio)
-            .unwrap_or(AVATAR_BUNDLE_INITIAL_RATIO);
-
-        let spatial_candidates = spatial_grid
-            .map(|grid| grid.ordered_indices(receiver_state.position, peer_states.len()));
-        let peer_count = spatial_candidates
-            .as_ref()
-            .map_or(peer_states.len(), |indices| indices.len());
+        let mut bundle_ratio = if config.enable_bundle_compression {
+            self.bundle_ratios
+                .get(&receiver_id)
+                .map(|ratio| *ratio)
+                .unwrap_or(AVATAR_BUNDLE_INITIAL_RATIO)
+        } else {
+            AVATAR_BUNDLE_INITIAL_RATIO
+        };
+        let minimum_interval_ms = config.default_interval_ms.max(1);
         for offset in 0..peer_count {
-            let peer_index = if let Some(indices) = spatial_candidates.as_ref() {
-                indices[offset]
-            } else {
-                offset
+            let peer_index = match &spatial_candidates {
+                Some(indices) => indices[offset],
+                None => offset,
             };
             let (sender_id, sender_state) = &peer_states[peer_index];
             let sender_id = *sender_id;
             if sender_id == receiver_id {
                 continue;
             }
-            if self
-                .offloaded_pairs
-                .contains_key(&pack_pair(receiver_id, sender_id))
-            {
+            if !offloaded_empty && self.offloaded_pairs.contains_key(&pack_pair(receiver_id, sender_id)) {
                 continue;
             }
-            let bypass_reduction = self.bypass_reduction_ids.contains_key(&sender_id);
+            let bypass_reduction = !bypass_empty && self.bypass_reduction_ids.contains_key(&sender_id);
             let tracking = receiver_tracking.entry(sender_id).or_insert_with(|| {
-                let dist_sq = distance_sq(receiver_state, sender_state);
+                let dist_sq = distance_sq_position(receiver_position, sender_state.position);
                 let (interval_byte, interval_ms) =
                     calculate_interval_from_distance_sq(dist_sq, config);
                 ReceiverTracking {
                     last_seen_generation: 0,
-                    last_sent: now - Duration::from_secs(60),
+                    last_sent_ms: 0,
                     cached_quality_index: quality_from_distance_sq(dist_sq, config),
                     cached_interval_byte: interval_byte,
                     cached_interval_ms: interval_ms,
@@ -1018,7 +1098,7 @@ impl AvatarSyncSystem {
                 }
             });
             if update_distances {
-                let dist_sq = distance_sq(receiver_state, sender_state);
+                let dist_sq = distance_sq_position(receiver_position, sender_state.position);
                 tracking.cached_quality_index = quality_from_distance_sq(dist_sq, config);
                 let (interval_byte, interval_ms) =
                     calculate_interval_from_distance_sq(dist_sq, config);
@@ -1030,30 +1110,26 @@ impl AvatarSyncSystem {
             } else {
                 tracking.cached_quality_index
             };
-            let Some(current_packet) = sender_state.qualities[quality_index as usize].as_ref() else {
-                continue;
-            };
             if sender_state.generation <= tracking.last_seen_generation {
                 continue;
             }
-            if !bypass_reduction {
-                let required_interval_ms = tracking
-                    .cached_interval_ms
-                    .max(config.default_interval_ms.max(1));
-                if now.duration_since(tracking.last_sent)
-                    < Duration::from_millis(required_interval_ms)
-                {
-                    continue;
-                }
+            if !bypass_reduction
+                && tracking.last_seen_generation != 0
+                && now_ms.saturating_sub(tracking.last_sent_ms)
+                    < tracking.cached_interval_ms.max(minimum_interval_ms)
+            {
+                continue;
             }
+            let Some(current_packet) = sender_state.qualities[quality_index as usize].as_ref() else {
+                continue;
+            };
             tracking.last_seen_generation = sender_state.generation;
-            tracking.last_sent = now;
+            tracking.last_sent_ms = now_ms;
             let interval_byte = if bypass_reduction {
                 0
             } else {
                 tracking.cached_interval_byte
             };
-            let small_id = sender_state.peer_id <= u8::MAX as u16;
 
             let send_delta = config.enable_delta_compression
                 && !bypass_reduction
@@ -1066,7 +1142,7 @@ impl AvatarSyncSystem {
                 let delta = sender_state.deltas[quality_index as usize]
                     .as_ref()
                     .expect("checked above");
-                if small_id {
+                if sender_state.small_id {
                     (channels::DELTA_AVATAR, &delta.bytes_small, 2)
                 } else {
                     (channels::DELTA_AVATAR, &delta.bytes_large, 3)
@@ -1084,7 +1160,7 @@ impl AvatarSyncSystem {
                     tracking.baseline_keyframe_generation = sender_state.keyframe_generation;
                     tracking.baseline_quality = quality_index;
                 }
-                if small_id {
+                if sender_state.small_id {
                     (packet.channel_small, &packet.bytes_small, 1)
                 } else {
                     (packet.channel_large, &packet.bytes_large, 2)
@@ -1093,8 +1169,6 @@ impl AvatarSyncSystem {
             logical_sends += 1;
 
             if config.enable_bundle_compression {
-                let item_raw_bytes = 3 + packet_bytes.len();
-                bundle_raw_bytes += item_raw_bytes;
                 bundle.push(BundleAvatarSend {
                     original_channel: channel,
                     payload: packet_bytes.clone(),
@@ -1102,9 +1176,10 @@ impl AvatarSyncSystem {
                     interval_byte,
                 });
             } else {
-                direct.push(OutboundAvatarSend {
+                direct.push(OutboundAvatarSend::Borrowed {
                     channel,
-                    payload: patch_interval_bytes(packet_bytes, interval_offset, interval_byte),
+                    payload: packet_bytes,
+                    patch: Some((interval_offset, interval_byte)),
                 });
             }
         }
@@ -1113,7 +1188,6 @@ impl AvatarSyncSystem {
             emit_greedy_avatar_bundles(
                 &mut direct,
                 &mut bundle,
-                &mut bundle_raw_bytes,
                 &mut bundle_ratio,
                 &self.profiler,
                 config,
@@ -1144,7 +1218,12 @@ impl AvatarSyncSystem {
         (slice_count, slice_start, slice_end, update_distances)
     }
 
-    fn adapt_slice_count(&self, elapsed_micros: u64, config: &AvatarSyncConfig) {
+    fn adapt_slice_count(
+        &self,
+        elapsed_micros: u64,
+        config: &AvatarSyncConfig,
+        receiver_count: usize,
+    ) {
         let mut state = self.slice_state.lock();
         state.smoothed_tick_micros = if state.smoothed_tick_micros == 0 {
             elapsed_micros
@@ -1152,11 +1231,16 @@ impl AvatarSyncSystem {
             ((state.smoothed_tick_micros as f64 * 0.85) + (elapsed_micros as f64 * 0.15)) as u64
         };
 
-        let min_slices = config.min_receiver_slices.max(1);
+        let configured_min_slices = config.min_receiver_slices.max(1);
         let max_slices = config
             .max_receiver_slices
-            .max(min_slices)
+            .max(configured_min_slices)
             .min(MAX_SLICE_COUNT);
+        let min_slices = if receiver_count >= SCALE_RECEIVER_THRESHOLD {
+            max_slices.max(configured_min_slices).min(MAX_SLICE_COUNT)
+        } else {
+            configured_min_slices.min(max_slices)
+        };
         state.slice_count = state.slice_count.clamp(min_slices, max_slices);
         let tick_budget_micros = (config.tick_budget_ms.max(1.0) * 1000.0) as u64;
         let cycle_budget_micros = (config.receiver_cycle_budget_ms.max(1.0) * 1000.0) as u64;
@@ -1229,59 +1313,24 @@ fn env_bool(name: &str) -> Option<bool> {
     }
 }
 
-async fn flush_receiver_groups_parallel(
+fn flush_receiver_groups_parallel<'a>(
     transport: TransportHandle,
-    receiver_groups: Vec<OutboundAvatarBatch>,
+    receiver_groups: Vec<OutboundAvatarBatch<'a>>,
 ) -> Result<()> {
-    if receiver_groups.is_empty() {
-        return Ok(());
-    }
-    let worker_count = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(1).max(1))
-        .unwrap_or(4)
-        .min(receiver_groups.len());
-    let chunk_size = receiver_groups.len().div_ceil(worker_count);
-    let mut chunks = Vec::with_capacity(worker_count);
-    let mut current = Vec::with_capacity(chunk_size);
-    for batch in receiver_groups {
-        current.push(batch);
-        if current.len() >= chunk_size {
-            chunks.push(current);
-            current = Vec::with_capacity(chunk_size);
-        }
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    let mut join_set = JoinSet::new();
-    for chunk in chunks {
-        let transport = transport.clone();
-        join_set.spawn(async move {
-            for batch in chunk {
-                let packets = batch
-                    .sends
-                    .into_iter()
-                    .map(|send| (send.channel, send.payload))
-                    .collect::<Vec<_>>();
-                transport.try_send_many_unreliable_bytes(batch.receiver, &packets)?;
-            }
-            Ok::<(), basis_transport::TransportError>(())
-        });
-    }
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => return Err(err.into()),
-            Err(err) => anyhow::bail!("avatar send worker failed: {err}"),
-        }
-    }
+    receiver_groups
+        .par_iter()
+        .with_min_len(RECEIVER_FLUSH_MIN_BATCH)
+        .try_for_each(|batch| {
+            transport
+                .try_send_many_unreliable_packets(batch.receiver, &batch.sends)
+                .map(|_| ())
+        })?;
     Ok(())
 }
 
-fn emit_greedy_avatar_bundles(
-    direct: &mut Vec<OutboundAvatarSend>,
+fn emit_greedy_avatar_bundles<'a>(
+    direct: &mut Vec<OutboundAvatarSend<'a>>,
     bundle: &mut Vec<BundleAvatarSend>,
-    bundle_raw_bytes: &mut usize,
     bundle_ratio: &mut f32,
     profiler: &BsrProfiler,
     config: &AvatarSyncConfig,
@@ -1359,12 +1408,14 @@ fn emit_greedy_avatar_bundles(
     if cursor < count {
         profiler.add_bundle_tail_uncompressed((count - cursor) as u64);
     }
-    direct.extend(bundle.drain(cursor..).map(|item| OutboundAvatarSend {
-        channel: item.original_channel,
-        payload: patch_interval_bytes(&item.payload, item.interval_offset, item.interval_byte),
+    direct.extend(bundle.drain(cursor..).map(|item| {
+        OutboundAvatarSend::Owned {
+            channel: item.original_channel,
+            payload: patch_interval_bytes(&item.payload, item.interval_offset, item.interval_byte),
+            patch: None,
+        }
     }));
     bundle.clear();
-    *bundle_raw_bytes = 0;
 }
 
 enum BundleEmit {
@@ -1378,8 +1429,8 @@ enum BundleEmit {
     },
 }
 
-fn try_emit_bundle_range(
-    direct: &mut Vec<OutboundAvatarSend>,
+fn try_emit_bundle_range<'a>(
+    direct: &mut Vec<OutboundAvatarSend<'a>>,
     bundle: &[BundleAvatarSend],
     start: usize,
     end: usize,
@@ -1416,9 +1467,10 @@ fn try_emit_bundle_range(
             compressed_len,
         });
     }
-    direct.push(OutboundAvatarSend {
+    direct.push(OutboundAvatarSend::Owned {
         channel: channels::COMPRESSED_AVATAR_BUNDLE,
         payload: Bytes::from(encoded.bytes),
+        patch: None,
     });
     profiler.add_bundle_emitted(
         (end - start) as u64,
@@ -1869,10 +1921,10 @@ fn set_avatar_thread_priority() {
 #[cfg(not(windows))]
 fn set_avatar_thread_priority() {}
 #[inline(always)]
-fn distance_sq(receiver: &PlayerAvatarState, sender: &PlayerAvatarState) -> f32 {
-    let dx = receiver.position[0] - sender.position[0];
-    let dy = receiver.position[1] - sender.position[1];
-    let dz = receiver.position[2] - sender.position[2];
+fn distance_sq_position(receiver: [f32; 3], sender: [f32; 3]) -> f32 {
+    let dx = receiver[0] - sender[0];
+    let dy = receiver[1] - sender[1];
+    let dz = receiver[2] - sender[2];
     dx * dx + dy * dy + dz * dz
 }
 

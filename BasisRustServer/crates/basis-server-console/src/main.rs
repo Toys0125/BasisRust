@@ -43,6 +43,10 @@ struct Args {
 
 type CommandHandler = Box<dyn Fn(&[&str]) + Send + Sync + 'static>;
 
+// Tokio's worker threads otherwise retain glibc per-thread arenas after burst churn.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();

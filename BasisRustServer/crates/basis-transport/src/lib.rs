@@ -50,6 +50,46 @@ pub enum TransportError {
 
 pub type Result<T> = std::result::Result<T, TransportError>;
 
+pub trait UnreliablePacket {
+    fn channel(&self) -> u8;
+    fn payload(&self) -> &[u8];
+    fn interval_patch(&self) -> Option<(usize, u8)>;
+}
+
+impl<P: AsRef<[u8]>> UnreliablePacket for (u8, P, Option<(usize, u8)>) {
+    #[inline]
+    fn channel(&self) -> u8 {
+        self.0
+    }
+
+    #[inline]
+    fn payload(&self) -> &[u8] {
+        self.1.as_ref()
+    }
+
+    #[inline]
+    fn interval_patch(&self) -> Option<(usize, u8)> {
+        self.2
+    }
+}
+
+impl UnreliablePacket for (u8, Bytes) {
+    #[inline]
+    fn channel(&self) -> u8 {
+        self.0
+    }
+
+    #[inline]
+    fn payload(&self) -> &[u8] {
+        self.1.as_ref()
+    }
+
+    #[inline]
+    fn interval_patch(&self) -> Option<(usize, u8)> {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PacketProperty {
@@ -528,6 +568,14 @@ impl TransportHandle {
         peer: PeerId,
         packets: &[(u8, Bytes)],
     ) -> Result<usize> {
+        self.try_send_many_unreliable_packets(peer, packets)
+    }
+
+    pub fn try_send_many_unreliable_packets<T: UnreliablePacket>(
+        &self,
+        peer: PeerId,
+        packets: &[T],
+    ) -> Result<usize> {
         if packets.is_empty() {
             return Ok(0);
         }
@@ -536,11 +584,11 @@ impl TransportHandle {
         };
 
         if packets.len() == 1 {
-            let (channel, payload) = &packets[0];
+            let payload = packets[0].payload();
             let mut packet = Vec::with_capacity(payload.len() + 2);
             packet.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
-            packet.push(*channel);
-            packet.extend_from_slice(payload.as_ref());
+            packet.push(packets[0].channel());
+            extend_payload_with_patch(&mut packet, payload, packets[0].interval_patch());
             return self
                 .try_send_raw_to(&packet, state.addr)
                 .map(usize::from);
@@ -551,7 +599,8 @@ impl TransportHandle {
         current.push(PacketProperty::Merged as u8 | (state.connection_number << 5));
         let mut current_count = 0usize;
 
-        for (channel, payload) in packets {
+        for packet in packets {
+            let payload = packet.payload();
             let packet_len = payload.len() + 2;
             let framed_len = packet_len + 2;
             if current_count > 0 && current.len() + framed_len > MAX_MERGED_PACKET_SIZE {
@@ -564,11 +613,11 @@ impl TransportHandle {
             }
 
             if framed_len + 1 > MAX_MERGED_PACKET_SIZE {
-                let mut packet = Vec::with_capacity(packet_len);
-                packet.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
-                packet.push(*channel);
-                packet.extend_from_slice(payload.as_ref());
-                if self.try_send_raw_to(&packet, state.addr)? {
+                let mut oversized = Vec::with_capacity(packet_len);
+                oversized.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
+                oversized.push(packet.channel());
+                extend_payload_with_patch(&mut oversized, payload, packet.interval_patch());
+                if self.try_send_raw_to(&oversized, state.addr)? {
                     sent += 1;
                 }
                 continue;
@@ -576,8 +625,8 @@ impl TransportHandle {
 
             current.extend_from_slice(&(packet_len as u16).to_le_bytes());
             current.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
-            current.push(*channel);
-            current.extend_from_slice(payload.as_ref());
+            current.push(packet.channel());
+            extend_payload_with_patch(&mut current, payload, packet.interval_patch());
             current_count += 1;
         }
 
@@ -1291,6 +1340,21 @@ struct BuiltPacket {
     reliable_key: Option<(u8, u16)>,
 }
 
+#[inline]
+fn extend_payload_with_patch(
+    output: &mut Vec<u8>,
+    payload: &[u8],
+    patch: Option<(usize, u8)>,
+) {
+    let payload_start = output.len();
+    output.extend_from_slice(payload);
+    if let Some((offset, value)) = patch {
+        if offset < payload.len() {
+            output[payload_start + offset] = value;
+        }
+    }
+}
+
 fn build_outbound_packet(
     state: &PeerState,
     channel: u8,
@@ -1865,6 +1929,18 @@ mod tests {
     fn relative_sequence_wrap_shape_is_known() {
         assert_eq!(relative_sequence(0, MAX_SEQUENCE - 1), 1);
         assert_eq!(relative_sequence(MAX_SEQUENCE - 1, 0), -1);
+    }
+
+    #[test]
+    fn payload_patch_is_applied_during_copy() {
+        let payload = Bytes::from_static(&[1, 2, 3, 4]);
+        let mut output = vec![0xaa, 0xbb];
+        extend_payload_with_patch(&mut output, &payload, Some((2, 9)));
+        assert_eq!(output, [0xaa, 0xbb, 1, 2, 9, 4]);
+
+        let mut unchanged = Vec::new();
+        extend_payload_with_patch(&mut unchanged, &payload, Some((99, 9)));
+        assert_eq!(unchanged, payload);
     }
 
     #[test]

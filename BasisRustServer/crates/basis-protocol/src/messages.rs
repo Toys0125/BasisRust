@@ -778,23 +778,27 @@ impl ServerReadyBatchMessage {
 
 impl BasisSerialize for ServerReadyBatchMessage {
     fn serialize(&self, writer: &mut NetWriter) {
-        let mut framed = self.payload.clone();
-        let mut compressed = false;
+        let mut compressed_payload = None;
         if self.payload.len() >= Self::MIN_COMPRESS_BYTES {
             let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
             if encoder.write_all(&self.payload).is_ok() {
                 if let Ok(deflated) = encoder.finish() {
                     if deflated.len() < self.payload.len() {
-                        framed = deflated;
-                        compressed = true;
+                        compressed_payload = Some(deflated);
                     }
                 }
             }
         }
+
         writer.put_u16(self.count);
-        writer.put_bool(compressed);
-        writer.put_i32(framed.len() as i32);
-        writer.put_bytes(&framed);
+        writer.put_bool(compressed_payload.is_some());
+        if let Some(compressed) = compressed_payload.as_ref() {
+            writer.put_i32(compressed.len() as i32);
+            writer.put_bytes(compressed);
+        } else {
+            writer.put_i32(self.payload.len() as i32);
+            writer.put_bytes(&self.payload);
+        }
     }
 }
 
