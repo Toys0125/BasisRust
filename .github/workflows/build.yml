@@ -52,6 +52,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            BasisRustServer -> target
+            BasisRustClient -> target
+          key: ${{ matrix.target }}
+
       - name: Build server
         run: cargo build --release --target ${{ matrix.target }} --manifest-path BasisRustServer/Cargo.toml -p basis-server-console
 
