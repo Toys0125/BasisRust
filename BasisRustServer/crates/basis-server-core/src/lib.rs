@@ -37,7 +37,7 @@ use basis_server_storage::PersistentDatabase;
 use basis_transport::{DeliveryMethod, DisconnectReason, PeerId, ServerEvent, TransportHandle};
 use bytes::Bytes;
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
@@ -124,6 +124,7 @@ pub struct ServerState {
     pub moderation: ModerationLists,
     pub global_state: Arc<RwLock<GlobalState>>,
     pub statistics: Statistics,
+    pending_leaves: Arc<Mutex<Vec<PeerId>>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -223,6 +224,7 @@ impl ServerState {
             moderation,
             global_state: Arc::new(RwLock::new(GlobalState::from(&config))),
             statistics: Statistics::default(),
+            pending_leaves: Arc::new(Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         state
@@ -231,6 +233,7 @@ impl ServerState {
                 let peers = state.authenticated_peers.clone();
                 move || peers.iter().map(|entry| *entry.key()).collect()
             });
+        spawn_leave_broadcast_loop(state.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         tokio::spawn(event_loop(state.clone(), events, shutdown_rx));
         Ok((state, shutdown_tx))
@@ -434,6 +437,68 @@ fn is_p2p_offload_channel(channel: u8) -> bool {
         channel,
         channels::VOICE | channels::VOICE_LARGE | channels::SHOUT_VOICE | channels::AVATAR
     )
+}
+
+const LEAVE_BROADCAST_INTERVAL: Duration = Duration::from_millis(50);
+
+fn spawn_leave_broadcast_loop(state: ServerState) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(LEAVE_BROADCAST_INTERVAL).await;
+            if state.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            flush_pending_leaves(&state).await;
+        }
+    });
+}
+
+fn serialize_leave_batch(leaves: &[PeerId]) -> Vec<u8> {
+    let mut writer = NetWriter::with_capacity(std::mem::size_of_val(leaves));
+    for peer in leaves {
+        writer.put_u16(*peer);
+    }
+    writer.into_vec()
+}
+
+async fn flush_pending_leaves(state: &ServerState) {
+    let mut leaves = {
+        let mut pending = state.pending_leaves.lock();
+        if pending.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *pending)
+    };
+    leaves.sort_unstable();
+    leaves.dedup();
+
+    let payload = serialize_leave_batch(&leaves);
+    let leavers = leaves.iter().copied().collect::<HashSet<_>>();
+    let recipients = state
+        .authenticated_peers
+        .iter()
+        .map(|entry| *entry.key())
+        .filter(|peer| !leavers.contains(peer))
+        .collect::<Vec<_>>();
+
+    for peer in recipients {
+        if state
+            .transport
+            .send(
+                peer,
+                channels::DISCONNECTION,
+                DeliveryMethod::ReliableOrdered,
+                &payload,
+            )
+            .await
+            .is_ok()
+        {
+            state
+                .statistics
+                .outbound_packets
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 async fn event_loop(
@@ -1080,16 +1145,7 @@ async fn handle_disconnect(state: &ServerState, peer: PeerId, reason: Disconnect
         for spawn in state.resources.remove_preload_peer(peer) {
             broadcast_spawn_preloaded(state, spawn).await;
         }
-        let mut writer = NetWriter::new();
-        writer.put_u16(peer);
-        state
-            .broadcast(
-                channels::DISCONNECTION,
-                DeliveryMethod::ReliableOrdered,
-                writer.as_slice(),
-                Some(peer),
-            )
-            .await;
+        state.pending_leaves.lock().push(peer);
         if state.authenticated_peers.is_empty() {
             for unload in state.resources.reset_non_persistent() {
                 let mut writer = NetWriter::new();
@@ -4117,6 +4173,18 @@ mod tests {
         assert_eq!(reader.get_u16().unwrap(), SERVER_VERSION);
         assert_eq!(reader.get_u16().unwrap(), SERVER_VERSION - 1);
         assert_eq!(reader.get_string().unwrap(), "Update required");
+    }
+
+    #[test]
+    fn leave_batch_matches_current_basis_disconnect_wire() {
+        let leaves = [1u16, 2, 513, u16::MAX];
+        assert_eq!(
+            serialize_leave_batch(&leaves),
+            vec![1, 0, 2, 0, 1, 2, 255, 255]
+        );
+
+        let mass_leave = serialize_leave_batch(&(0..1500u16).collect::<Vec<_>>());
+        assert_eq!(mass_leave.len(), 3000);
     }
 
     #[test]
