@@ -154,7 +154,7 @@ fn write_compact_id(writer: &mut NetWriter, value: &str) {
         let has_lower = value.bytes().any(|b| matches!(b, b'a'..=b'f'));
         if !(has_upper && has_lower) {
             let mut bytes = Vec::with_capacity(value.len() / 2);
-            for chunk in value.as_bytes().chunks_exact(2) {
+            for chunk in value.as_bytes().as_chunks::<2>().0 {
                 let pair = std::str::from_utf8(chunk).expect("hex is ASCII");
                 bytes.push(u8::from_str_radix(pair, 16).expect("validated hex"));
             }
