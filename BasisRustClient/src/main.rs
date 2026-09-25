@@ -473,6 +473,10 @@ fn parse_server_avatar_metadata(payload: &[u8]) -> Result<ServerAvatarMetadata> 
     })
 }
 
+fn shared_receive_handoff_ready(connected: bool, avatar_metadata_ready: bool) -> bool {
+    connected && avatar_metadata_ready
+}
+
 fn unity_interval_tick_due(accumulator: &mut f64, frame_delta: f64, interval: f64) -> bool {
     *accumulator = (*accumulator + frame_delta).min(interval * 2.0);
     if *accumulator < interval {
@@ -1953,6 +1957,7 @@ impl BasisClient {
                     }
                 }
                 self.connected.store(true, Ordering::SeqCst);
+                self.refresh_shared_receive_eligibility();
                 info!(
                     "client {} connected as remote peer {}",
                     self.index, remote_peer
@@ -2095,12 +2100,20 @@ impl BasisClient {
             );
     }
 
+    fn refresh_shared_receive_eligibility(&self) {
+        let metadata_ready = self
+            .server_avatar_metadata
+            .lock()
+            .expect("server metadata mutex poisoned")
+            .is_some();
+        if shared_receive_handoff_ready(self.connected.load(Ordering::Acquire), metadata_ready) {
+            self.shared_receive_eligible.store(true, Ordering::Release);
+        }
+    }
+
     async fn handle_channeled(&self, channel_id: u8, sequence: u16, payload: &[u8]) -> Result<()> {
         let channel = channel_id / 4;
         let delivery = DeliveryMethod::from_channel_id(channel_id);
-        if channel != channels::AUTH_IDENTITY && self.connected.load(Ordering::Relaxed) {
-            self.shared_receive_eligible.store(true, Ordering::Release);
-        }
         if matches!(
             delivery,
             DeliveryMethod::ReliableOrdered | DeliveryMethod::ReliableUnordered
@@ -2147,6 +2160,7 @@ impl BasisClient {
                         .server_avatar_metadata
                         .lock()
                         .expect("server metadata mutex poisoned") = Some(metadata);
+                    self.refresh_shared_receive_eligibility();
                 }
                 Err(err) => warn!(
                     "client {} could not parse server avatar metadata: {err}",
@@ -4687,6 +4701,39 @@ mod tests {
     use ed25519_dalek::Signature;
     use flate2::read::DeflateDecoder;
     use std::io::Read;
+
+    #[test]
+    fn shared_receive_handoff_waits_for_valid_avatar_metadata() {
+        // Other reliable channels may arrive before META_DATA. They must not enable the shared
+        // receiver, which acknowledges but intentionally discards application payloads.
+        assert!(!shared_receive_handoff_ready(false, false));
+        assert!(!shared_receive_handoff_ready(true, false));
+
+        // The metadata handler publishes readiness only after successful parsing. A malformed or
+        // truncated packet therefore leaves the dedicated handler responsible for retries.
+        assert!(parse_server_avatar_metadata(&[]).is_err());
+        assert!(!shared_receive_handoff_ready(true, false));
+
+        let mut writer = ProtocolNetWriter::new();
+        ProtocolClientMetaDataMessage {
+            player_uuid: "test-uuid".to_string(),
+            player_display_name: "test".to_string(),
+            player_platform: "Headless".to_string(),
+        }
+        .serialize(&mut writer);
+        writer.put_i32(20);
+        writer.put_i32(1);
+        writer.put_f32(0.0);
+        writer.put_f32(2.5);
+        writer.put_i32(1500);
+        writer.put_bytes_with_length(&[]);
+        writer.put_u16(0);
+        writer.put_u8(1);
+        assert!(parse_server_avatar_metadata(writer.as_slice()).is_ok());
+        assert!(shared_receive_handoff_ready(true, true));
+        // Repeated valid META_DATA is harmless and retains eligibility.
+        assert!(shared_receive_handoff_ready(true, true));
+    }
 
     #[test]
     fn avatar_observer_measures_applied_full_delta_and_bundle_gaps() {
