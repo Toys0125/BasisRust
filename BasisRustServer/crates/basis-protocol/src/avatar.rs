@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use flate2::{write::DeflateEncoder, Compression};
 use lz4_flex::{compress, decompress};
-use std::io::Write;
+use std::{cell::RefCell, io::Write};
 
 use crate::{
     avatar_bundle_dictionary,
@@ -605,76 +605,113 @@ pub fn try_encode_avatar_bundle_slices_with_compression(
     })
 }
 
+struct AvatarBundleZstdContext {
+    level: i32,
+    context: zstd_safe::CCtx<'static>,
+}
+
+impl AvatarBundleZstdContext {
+    fn new(level: i32) -> Result<Self> {
+        use zstd_safe::{CParameter, FrameFormat};
+
+        let mut context = zstd_safe::CCtx::try_create()
+            .ok_or_else(|| anyhow::anyhow!("creating avatar bundle zstd context failed"))?;
+        context
+            .set_parameter(CParameter::CompressionLevel(level))
+            .map_err(|code| zstd_error("setting zstd compression level", code))?;
+        context
+            .set_parameter(CParameter::ContentSizeFlag(false))
+            .map_err(|code| zstd_error("disabling zstd content-size flag", code))?;
+        context
+            .set_parameter(CParameter::ChecksumFlag(false))
+            .map_err(|code| zstd_error("disabling zstd checksum", code))?;
+        context
+            .set_parameter(CParameter::DictIdFlag(false))
+            .map_err(|code| zstd_error("disabling zstd dictionary id", code))?;
+        context
+            .set_parameter(CParameter::WindowLog(BUNDLE_ZSTD_WINDOW_LOG))
+            .map_err(|code| zstd_error("setting zstd window log", code))?;
+        context
+            .set_parameter(CParameter::Format(FrameFormat::Magicless))
+            .map_err(|code| zstd_error("setting magicless zstd format", code))?;
+        context
+            .load_dictionary(avatar_bundle_dictionary::bytes())
+            .map_err(|code| zstd_error("loading avatar bundle zstd dictionary", code))?;
+
+        Ok(Self { level, context })
+    }
+
+    fn compress(&mut self, raw: &[u8]) -> Result<Vec<u8>> {
+        use zstd_safe::ResetDirective;
+
+        // Reset only the frame session. zstd-safe guarantees that this preserves both the
+        // parameters and the loaded dictionary for the next independent frame.
+        self.context
+            .reset(ResetDirective::SessionOnly)
+            .map_err(|code| zstd_error("resetting avatar bundle zstd session", code))?;
+        let mut compressed = vec![0u8; zstd_safe::compress_bound(raw.len())];
+        let written = self
+            .context
+            .compress2(&mut compressed[..], raw)
+            .map_err(|code| zstd_error("compressing avatar bundle with zstd", code))?;
+        compressed.truncate(written);
+        Ok(compressed)
+    }
+}
+
+thread_local! {
+    // Rayon may call this compressor on multiple workers. Each worker owns one context, so
+    // compression stays lock-free and retained native workspace is bounded by worker count.
+    static AVATAR_BUNDLE_ZSTD_CONTEXT: RefCell<Option<AvatarBundleZstdContext>> = const { RefCell::new(None) };
+}
+
 fn compress_avatar_bundle_zstd(raw: &[u8], level: i32) -> Result<Vec<u8>> {
+    AVATAR_BUNDLE_ZSTD_CONTEXT.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.as_ref().is_none_or(|context| context.level != level) {
+            *cached = Some(AvatarBundleZstdContext::new(level)?);
+        }
+        cached
+            .as_mut()
+            .expect("avatar bundle zstd context initialized")
+            .compress(raw)
+    })
+}
+
+fn zstd_error(operation: &str, code: usize) -> anyhow::Error {
+    anyhow::anyhow!("{operation}: {}", zstd_safe::get_error_name(code))
+}
+
+#[cfg(test)]
+fn compress_avatar_bundle_zstd_fresh(raw: &[u8], level: i32) -> Result<Vec<u8>> {
     use zstd_safe::{CCtx, CParameter, FrameFormat};
 
     let mut context = CCtx::default();
     context
         .set_parameter(CParameter::CompressionLevel(level))
-        .map_err(|code| {
-            anyhow::anyhow!(
-                "setting zstd compression level: {}",
-                zstd_safe::get_error_name(code)
-            )
-        })?;
+        .map_err(|code| zstd_error("setting zstd compression level", code))?;
     context
         .set_parameter(CParameter::ContentSizeFlag(false))
-        .map_err(|code| {
-            anyhow::anyhow!(
-                "disabling zstd content-size flag: {}",
-                zstd_safe::get_error_name(code)
-            )
-        })?;
+        .map_err(|code| zstd_error("disabling zstd content-size flag", code))?;
     context
         .set_parameter(CParameter::ChecksumFlag(false))
-        .map_err(|code| {
-            anyhow::anyhow!(
-                "disabling zstd checksum: {}",
-                zstd_safe::get_error_name(code)
-            )
-        })?;
+        .map_err(|code| zstd_error("disabling zstd checksum", code))?;
     context
         .set_parameter(CParameter::DictIdFlag(false))
-        .map_err(|code| {
-            anyhow::anyhow!(
-                "disabling zstd dictionary id: {}",
-                zstd_safe::get_error_name(code)
-            )
-        })?;
+        .map_err(|code| zstd_error("disabling zstd dictionary id", code))?;
     context
         .set_parameter(CParameter::WindowLog(BUNDLE_ZSTD_WINDOW_LOG))
-        .map_err(|code| {
-            anyhow::anyhow!(
-                "setting zstd window log: {}",
-                zstd_safe::get_error_name(code)
-            )
-        })?;
+        .map_err(|code| zstd_error("setting zstd window log", code))?;
     context
         .set_parameter(CParameter::Format(FrameFormat::Magicless))
-        .map_err(|code| {
-            anyhow::anyhow!(
-                "setting magicless zstd format: {}",
-                zstd_safe::get_error_name(code)
-            )
-        })?;
+        .map_err(|code| zstd_error("setting magicless zstd format", code))?;
     context
         .load_dictionary(avatar_bundle_dictionary::bytes())
-        .map_err(|code| {
-            anyhow::anyhow!(
-                "loading avatar bundle zstd dictionary: {}",
-                zstd_safe::get_error_name(code)
-            )
-        })?;
-
+        .map_err(|code| zstd_error("loading avatar bundle zstd dictionary", code))?;
     let mut compressed = vec![0u8; zstd_safe::compress_bound(raw.len())];
     let written = context
         .compress2(&mut compressed[..], raw)
-        .map_err(|code| {
-            anyhow::anyhow!(
-                "compressing avatar bundle with zstd: {}",
-                zstd_safe::get_error_name(code)
-            )
-        })?;
+        .map_err(|code| zstd_error("compressing avatar bundle with zstd", code))?;
     compressed.truncate(written);
     Ok(compressed)
 }
@@ -931,6 +968,77 @@ mod tests {
         let decoded = decode_avatar_bundle(&encoded.bytes).unwrap();
         assert_eq!(decoded[0].payload, payload_a);
         assert_eq!(decoded[1].payload, payload_b);
+    }
+
+    #[test]
+    fn avatar_bundle_zstd_cached_context_matches_fresh_frames_across_levels() {
+        let payloads = [
+            vec![7u8; 159],
+            (0..251).map(|index| (index * 37) as u8).collect(),
+            vec![0x5a; 4096],
+        ];
+        let mut raw = NetWriter::new();
+        raw.put_u8(12);
+        raw.put_u8(payloads.len() as u8);
+        for payload in &payloads {
+            raw.put_u16(payload.len() as u16);
+        }
+        for payload in &payloads {
+            raw.put_bytes(payload);
+        }
+        let raw = raw.into_vec();
+
+        // Reusing the context must produce independent frames identical to the former fresh
+        // context path, even after changing levels and returning to the previous level.
+        for level in [-2, 3, -2] {
+            let cached = compress_avatar_bundle_zstd(&raw, level).unwrap();
+            let fresh = compress_avatar_bundle_zstd_fresh(&raw, level).unwrap();
+            assert_eq!(cached, fresh, "compressed frame differs at level {level}");
+
+            let mut frame = Vec::with_capacity(cached.len() + 3);
+            frame.push(
+                BUNDLE_CODEC_ZSTD_DICTIONARY
+                    | (avatar_bundle_dictionary::GENERATION << BUNDLE_DICTIONARY_SHIFT),
+            );
+            frame.extend_from_slice(&(raw.len() as u16).to_le_bytes());
+            frame.extend_from_slice(&cached);
+            let decoded = decode_avatar_bundle(&frame).unwrap();
+            assert_eq!(decoded.len(), payloads.len());
+            for (item, expected) in decoded.iter().zip(&payloads) {
+                assert_eq!(&item.payload, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn avatar_bundle_zstd_cached_contexts_are_thread_local_and_concurrent() {
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                scope.spawn(move || {
+                    for iteration in 0..40 {
+                        let level = if iteration % 2 == 0 { -2 } else { 1 };
+                        let payload = (0..(128 + worker * 17 + iteration * 3))
+                            .map(|index| (index * 31 + worker) as u8)
+                            .collect::<Vec<_>>();
+                        let items = [AvatarBundleItem {
+                            original_channel: 12,
+                            payload: payload.clone(),
+                        }];
+                        let slices = [AvatarBundleSlice {
+                            original_channel: 12,
+                            payload: &payload,
+                            interval_patch: None,
+                        }];
+                        let encoded = try_encode_avatar_bundle_slices_with_compression(
+                            &slices,
+                            AvatarBundleCompression::ZstdDictionary { level },
+                        )
+                        .unwrap();
+                        assert_eq!(decode_avatar_bundle(&encoded.bytes).unwrap(), items);
+                    }
+                });
+            }
+        });
     }
 
     #[test]

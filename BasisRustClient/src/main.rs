@@ -20,7 +20,11 @@ use std::sync::mpsc as std_mpsc;
 use anyhow::{anyhow, Context, Result};
 use basis_protocol::{
     application::{NetworkApplication, DEFAULT_COMPANY_NAME, DEFAULT_PRODUCT_NAME},
-    avatar::{compress_scale, write_neutral_rotation_region, BitQuality as ProtocolBitQuality},
+    avatar::{
+        compress_scale, decode_avatar_bundle, read_position, write_neutral_rotation_region,
+        BitQuality as ProtocolBitQuality,
+    },
+    avatar_delta::apply_delta,
     channels,
     io::NetWriter as ProtocolNetWriter,
     messages::{
@@ -31,7 +35,12 @@ use basis_protocol::{
     version::SERVER_VERSION,
 };
 #[cfg(test)]
-use basis_protocol::{io::NetReader as ProtocolNetReader, messages::BasisDeserialize};
+use basis_protocol::{
+    avatar::{encode_avatar_bundle, AvatarBundleItem},
+    avatar_delta::build_delta,
+    io::NetReader as ProtocolNetReader,
+    messages::BasisDeserialize,
+};
 use basis_transport::{DeliveryMethod, PacketProperty};
 use clap::Parser;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
@@ -135,6 +144,21 @@ struct Args {
     voice_frame_duration_ms: Option<u64>,
     #[arg(long)]
     no_voice_reencode: bool,
+    /// Enable applied-avatar interval metrics for the first client and write them at shutdown.
+    #[arg(long)]
+    observe_avatar_csv: Option<PathBuf>,
+    /// Radius around the observing client's current position used to select nearby senders.
+    #[arg(long, default_value_t = 40.0)]
+    avatar_observe_radius: f32,
+    /// Expected number of nearby senders, used to report senders never observed.
+    #[arg(long, default_value_t = 9)]
+    avatar_observe_expected_peers: usize,
+    /// Begin collecting observer cadence after this file appears; used to align with load readiness.
+    #[arg(long)]
+    observe_avatar_start_file: Option<PathBuf>,
+    /// Length of the applied-avatar observation window.
+    #[arg(long, default_value_t = 60)]
+    observe_avatar_window_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +178,16 @@ struct Config {
     voice_speaker_percent: u8,
     voice_hearing_distance: f32,
     voice_frame_duration_ms: u64,
+    #[serde(skip)]
+    observe_avatar_csv: Option<PathBuf>,
+    #[serde(skip)]
+    avatar_observe_radius: f32,
+    #[serde(skip)]
+    avatar_observe_expected_peers: usize,
+    #[serde(skip)]
+    observe_avatar_start_file: Option<PathBuf>,
+    #[serde(skip)]
+    observe_avatar_window: Duration,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -192,6 +226,11 @@ impl Default for Config {
             voice_speaker_percent: DEFAULT_VOICE_SPEAKER_PERCENT,
             voice_hearing_distance: DEFAULT_VOICE_HEARING_DISTANCE,
             voice_frame_duration_ms: DEFAULT_VOICE_FRAME_DURATION_MS,
+            observe_avatar_csv: None,
+            avatar_observe_radius: 40.0,
+            avatar_observe_expected_peers: 9,
+            observe_avatar_start_file: None,
+            observe_avatar_window: Duration::from_secs(60),
         }
     }
 }
@@ -267,6 +306,11 @@ impl Config {
                 defaults.voice_frame_duration_ms,
                 "VoiceFrameDurationMs",
             )),
+            observe_avatar_csv: defaults.observe_avatar_csv,
+            avatar_observe_radius: defaults.avatar_observe_radius,
+            avatar_observe_expected_peers: defaults.avatar_observe_expected_peers,
+            observe_avatar_start_file: defaults.observe_avatar_start_file,
+            observe_avatar_window: defaults.observe_avatar_window,
         }
     }
 
@@ -878,6 +922,399 @@ impl ReliableReceiveState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct AvatarObservationBaseline {
+    sequence: u8,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct ObservedAvatarPeer {
+    baselines: [Option<AvatarObservationBaseline>; 4],
+    last_sequence: Option<u8>,
+    last_near_update: Option<std::time::Instant>,
+    near_update_count: u64,
+    near_gaps_micros: Vec<u64>,
+    was_near: bool,
+    last_position: Option<[f32; 3]>,
+}
+
+#[derive(Debug)]
+struct AvatarObserver {
+    radius: f32,
+    expected_near_peers: usize,
+    peers: HashMap<u16, ObservedAvatarPeer>,
+    decode_errors: u64,
+    unapplied_deltas: u64,
+    start_marker_path: Option<PathBuf>,
+    window_duration: Duration,
+    window_started_at: Option<std::time::Instant>,
+}
+
+impl AvatarObserver {
+    const STALE_AFTER: Duration = Duration::from_millis(500);
+
+    fn new(
+        radius: f32,
+        expected_near_peers: usize,
+        start_marker_path: Option<PathBuf>,
+        window_duration: Duration,
+    ) -> Self {
+        Self {
+            radius: if radius.is_finite() {
+                radius.max(0.0)
+            } else {
+                40.0
+            },
+            expected_near_peers,
+            peers: HashMap::new(),
+            decode_errors: 0,
+            unapplied_deltas: 0,
+            start_marker_path,
+            window_duration,
+            window_started_at: None,
+        }
+    }
+
+    fn begin_window(&mut self, observer_position: [f32; 3], now: std::time::Instant) {
+        self.window_started_at = Some(now);
+        for peer in self.peers.values_mut() {
+            peer.near_gaps_micros.clear();
+            peer.near_update_count = 0;
+            peer.last_near_update = None;
+            peer.was_near = peer
+                .last_position
+                .map(|position| within_avatar_radius(self.radius, position, observer_position))
+                .unwrap_or(false);
+        }
+    }
+
+    fn tracking_window(&mut self, observer_position: [f32; 3], now: std::time::Instant) -> bool {
+        if self.window_started_at.is_none() {
+            let should_start = self
+                .start_marker_path
+                .as_ref()
+                .map(|path| path.exists())
+                .unwrap_or(true);
+            if should_start {
+                self.begin_window(observer_position, now);
+            }
+        }
+        self.window_started_at
+            .map(|start| now.saturating_duration_since(start) <= self.window_duration)
+            .unwrap_or(false)
+    }
+
+    fn observe_channel(
+        &mut self,
+        channel: u8,
+        payload: &[u8],
+        observer_position: [f32; 3],
+        now: std::time::Instant,
+    ) {
+        let tracking = self.tracking_window(observer_position, now);
+        if channel == channels::COMPRESSED_AVATAR_BUNDLE {
+            match decode_avatar_bundle(payload) {
+                Ok(items) => {
+                    for item in items {
+                        if !self.observe_item(
+                            item.original_channel,
+                            &item.payload,
+                            observer_position,
+                            now,
+                            tracking,
+                        ) {
+                            self.decode_errors = self.decode_errors.saturating_add(1);
+                        }
+                    }
+                }
+                Err(_) => self.decode_errors = self.decode_errors.saturating_add(1),
+            }
+        } else if !self.observe_item(channel, payload, observer_position, now, tracking) {
+            self.decode_errors = self.decode_errors.saturating_add(1);
+        }
+    }
+
+    fn observe_item(
+        &mut self,
+        channel: u8,
+        payload: &[u8],
+        observer_position: [f32; 3],
+        now: std::time::Instant,
+        tracking: bool,
+    ) -> bool {
+        let (quality_index, quality) = if (channels::PLAYER_AVATAR_VERY_LOW
+            ..=channels::PLAYER_AVATAR_HIGH_ADDITIONAL)
+            .contains(&channel)
+        {
+            let quality_index = channels::quality_from_channel(channel);
+            (quality_index, observer_quality(quality_index))
+        } else if (channels::PLAYER_AVATAR_VERY_LOW_LARGE
+            ..=channels::PLAYER_AVATAR_HIGH_ADDITIONAL_LARGE)
+            .contains(&channel)
+        {
+            let quality_index = channels::quality_from_channel(channel);
+            (quality_index, observer_quality(quality_index))
+        } else if channel == channels::DELTA_AVATAR {
+            return self.observe_delta(payload, observer_position, now, tracking);
+        } else {
+            return true;
+        };
+        let Some(quality) = quality else {
+            return false;
+        };
+        let id_len: usize = if channels::is_large_player_id_channel(channel) {
+            2
+        } else {
+            1
+        };
+        let Some(header_len) = id_len.checked_add(2) else {
+            return false;
+        };
+        if payload.len() < header_len + quality.payload_len() {
+            return false;
+        }
+        let peer_id = if id_len == 1 {
+            payload[0] as u16
+        } else {
+            u16::from_le_bytes([payload[0], payload[1]])
+        };
+        let sequence = payload[id_len + 1];
+        let avatar_payload = &payload[header_len..header_len + quality.payload_len()];
+        let Some(position) = read_position(avatar_payload) else {
+            return false;
+        };
+        let state = self.peers.entry(peer_id).or_default();
+        if !observer_sequence_is_newer(sequence, state.last_sequence) {
+            return true;
+        }
+        state.last_sequence = Some(sequence);
+        state.baselines[quality_index as usize] = Some(AvatarObservationBaseline {
+            sequence,
+            payload: avatar_payload.to_vec(),
+        });
+        state.last_position = Some(position);
+        if tracking {
+            record_observer_near_update(self.radius, position, observer_position, state, now);
+        }
+        true
+    }
+
+    fn observe_delta(
+        &mut self,
+        payload: &[u8],
+        observer_position: [f32; 3],
+        now: std::time::Instant,
+        tracking: bool,
+    ) -> bool {
+        if payload.is_empty() || payload[0] & channels::DELTA_HEADER_CONTROL_BIT != 0 {
+            return true;
+        }
+        let header = payload[0];
+        let quality_index = header & channels::DELTA_HEADER_QUALITY_MASK;
+        let Some(quality) = observer_quality(quality_index) else {
+            return false;
+        };
+        let id_len = if header & channels::DELTA_HEADER_LARGE_ID != 0 {
+            2
+        } else {
+            1
+        };
+        let id_start = 1;
+        let sequence_offset = id_start + id_len + 2;
+        let base_offset = sequence_offset + 1;
+        let body_offset = base_offset + 1;
+        if payload.len() <= body_offset {
+            return false;
+        }
+        let peer_id = if id_len == 1 {
+            payload[id_start] as u16
+        } else {
+            u16::from_le_bytes([payload[id_start], payload[id_start + 1]])
+        };
+        let sequence = payload[sequence_offset];
+        let base_sequence = payload[base_offset];
+        let state = self.peers.entry(peer_id).or_default();
+        if !observer_sequence_is_newer(sequence, state.last_sequence) {
+            return true;
+        }
+        let Some(baseline) = state.baselines[quality_index as usize]
+            .as_ref()
+            .filter(|baseline| baseline.sequence == base_sequence)
+        else {
+            self.unapplied_deltas = self.unapplied_deltas.saturating_add(1);
+            return true;
+        };
+        let Ok((avatar_payload, _consumed)) =
+            apply_delta(&baseline.payload, &payload[body_offset..], quality)
+        else {
+            return false;
+        };
+        let Some(position) = read_position(&avatar_payload) else {
+            return false;
+        };
+        state.last_sequence = Some(sequence);
+        state.last_position = Some(position);
+        if tracking {
+            record_observer_near_update(self.radius, position, observer_position, state, now);
+        }
+        true
+    }
+
+    fn summary_and_csv(&self, now: std::time::Instant) -> (String, String) {
+        let report_time = self
+            .window_started_at
+            .map(|start| now.min(start + self.window_duration))
+            .unwrap_or(now);
+        let observed_ms = self
+            .window_started_at
+            .map(|start| report_time.saturating_duration_since(start).as_millis())
+            .unwrap_or(0);
+        let near = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.was_near)
+            .collect::<Vec<_>>();
+        let mut gaps = near
+            .iter()
+            .flat_map(|(_, peer)| peer.near_gaps_micros.iter().copied())
+            .collect::<Vec<_>>();
+        let p50 = avatar_gap_percentile(&mut gaps.clone(), 0.50);
+        let p95 = avatar_gap_percentile(&mut gaps, 0.95);
+        let stale = near
+            .iter()
+            .filter(|(_, peer)| {
+                peer.last_near_update
+                    .map(|last| report_time.saturating_duration_since(last) > Self::STALE_AFTER)
+                    .unwrap_or(true)
+            })
+            .count();
+        let missing = self.expected_near_peers.saturating_sub(near.len());
+        let summary = format!(
+            "avatar observer: window_started={} window_ms={} near_peers={} expected={} missing={} stale_500ms={} applied_gaps={} p50_ms={:.2} p95_ms={:.2} decode_errors={} unapplied_deltas={}",
+            self.window_started_at.is_some(),
+            observed_ms,
+            near.len(),
+            self.expected_near_peers,
+            missing,
+            stale,
+            gaps.len(),
+            p50 as f64 / 1000.0,
+            p95 as f64 / 1000.0,
+            self.decode_errors,
+            self.unapplied_deltas,
+        );
+        let mut csv = String::from("metric,value\n");
+        let summary_values = format!(
+            "{},{},{},{},{},{},{},{:.2},{:.2},{},{}",
+            self.window_started_at.is_some(),
+            observed_ms,
+            near.len(),
+            self.expected_near_peers,
+            missing,
+            stale,
+            gaps.len(),
+            p50 as f64 / 1000.0,
+            p95 as f64 / 1000.0,
+            self.decode_errors,
+            self.unapplied_deltas,
+        );
+        let metrics = [
+            "window_started",
+            "window_ms",
+            "near_peers",
+            "expected_near_peers",
+            "missing_expected_peers",
+            "stale_peers_500ms",
+            "applied_gaps",
+            "gap_p50_ms",
+            "gap_p95_ms",
+            "decode_errors",
+            "unapplied_deltas",
+        ];
+        for (key, value) in metrics.iter().zip(summary_values.split(',')) {
+            csv.push_str(key);
+            csv.push(',');
+            csv.push_str(value);
+            csv.push('\n');
+        }
+        csv.push_str("peer_id,updates,p50_gap_ms,p95_gap_ms,last_near_age_ms,stale_500ms\n");
+        for (peer_id, peer) in near {
+            let last_age = peer
+                .last_near_update
+                .map(|last| report_time.saturating_duration_since(last).as_millis())
+                .unwrap_or(u128::MAX);
+            let peer_p50 = avatar_gap_percentile(&mut peer.near_gaps_micros.clone(), 0.50);
+            let peer_p95 = avatar_gap_percentile(&mut peer.near_gaps_micros.clone(), 0.95);
+            let peer_stale = last_age > Self::STALE_AFTER.as_millis();
+            csv.push_str(&format!(
+                "{peer_id},{},{:.2},{:.2},{last_age},{}\n",
+                peer.near_update_count,
+                peer_p50 as f64 / 1000.0,
+                peer_p95 as f64 / 1000.0,
+                peer_stale,
+            ));
+        }
+        (summary, csv)
+    }
+}
+
+fn record_observer_near_update(
+    radius: f32,
+    position: [f32; 3],
+    observer_position: [f32; 3],
+    state: &mut ObservedAvatarPeer,
+    now: std::time::Instant,
+) {
+    if !within_avatar_radius(radius, position, observer_position) {
+        return;
+    }
+    state.was_near = true;
+    if let Some(last) = state.last_near_update {
+        state
+            .near_gaps_micros
+            .push(now.saturating_duration_since(last).as_micros() as u64);
+    }
+    state.last_near_update = Some(now);
+    state.near_update_count = state.near_update_count.saturating_add(1);
+}
+
+fn within_avatar_radius(radius: f32, position: [f32; 3], observer_position: [f32; 3]) -> bool {
+    let distance_sq = (0..3)
+        .map(|axis| (position[axis] - observer_position[axis]).powi(2))
+        .sum::<f32>();
+    distance_sq <= radius * radius
+}
+
+fn observer_quality(index: u8) -> Option<ProtocolBitQuality> {
+    match index {
+        0 => Some(ProtocolBitQuality::VeryLow),
+        1 => Some(ProtocolBitQuality::Low),
+        2 => Some(ProtocolBitQuality::Medium),
+        3 => Some(ProtocolBitQuality::High),
+        _ => None,
+    }
+}
+
+fn observer_sequence_is_newer(sequence: u8, last: Option<u8>) -> bool {
+    last.map(|last| {
+        let delta = sequence.wrapping_sub(last);
+        delta != 0 && delta < 128
+    })
+    .unwrap_or(true)
+}
+
+fn avatar_gap_percentile(gaps_micros: &mut Vec<u64>, percentile: f64) -> u64 {
+    if gaps_micros.is_empty() {
+        return 0;
+    }
+    gaps_micros.sort_unstable();
+    let index = ((gaps_micros.len() as f64 * percentile).ceil() as usize)
+        .saturating_sub(1)
+        .min(gaps_micros.len() - 1);
+    gaps_micros[index]
+}
+
 #[derive(Debug)]
 struct BasisClient {
     index: usize,
@@ -902,6 +1339,7 @@ struct BasisClient {
     receive_shutdown: Notify,
     received_reliable: StdMutex<ReliableReceiveState>,
     pose: Mutex<PoseState>,
+    avatar_observer: Option<StdMutex<AvatarObserver>>,
     identity: Identity,
 }
 
@@ -944,6 +1382,14 @@ impl BasisClient {
             receive_shutdown: Notify::new(),
             received_reliable: StdMutex::new(ReliableReceiveState::default()),
             pose: Mutex::new(PoseState::new_at(spawn_base)),
+            avatar_observer: (index == 0 && config.observe_avatar_csv.is_some()).then(|| {
+                StdMutex::new(AvatarObserver::new(
+                    config.avatar_observe_radius,
+                    config.avatar_observe_expected_peers,
+                    config.observe_avatar_start_file.clone(),
+                    config.observe_avatar_window,
+                ))
+            }),
             identity,
         });
 
@@ -1235,7 +1681,9 @@ impl BasisClient {
                 }
             }
             PacketProperty::Unreliable => {
-                let _channel = bytes.get(1).copied().unwrap_or_default();
+                if let (Some(channel), Some(payload)) = (bytes.get(1).copied(), bytes.get(2..)) {
+                    self.observe_avatar_channel(channel, payload).await;
+                }
             }
             PacketProperty::Merged => {
                 let mut pos = 1;
@@ -1310,6 +1758,22 @@ impl BasisClient {
             _ => {}
         }
         Ok(())
+    }
+
+    async fn observe_avatar_channel(&self, channel: u8, payload: &[u8]) {
+        let Some(observer) = &self.avatar_observer else {
+            return;
+        };
+        let observer_position = self.pose.lock().await.position();
+        observer
+            .lock()
+            .expect("avatar observer mutex poisoned")
+            .observe_channel(
+                channel,
+                payload,
+                observer_position,
+                std::time::Instant::now(),
+            );
     }
 
     async fn handle_channeled(&self, channel_id: u8, sequence: u16, payload: &[u8]) -> Result<()> {
@@ -3429,6 +3893,15 @@ async fn async_main(worker_threads: usize) -> Result<()> {
     if let Some(frame_duration) = args.voice_frame_duration_ms {
         config.voice_frame_duration_ms = sanitize_voice_frame_duration(frame_duration);
     }
+    config.observe_avatar_csv = args.observe_avatar_csv.clone();
+    config.avatar_observe_radius = if args.avatar_observe_radius.is_finite() {
+        args.avatar_observe_radius.max(0.0)
+    } else {
+        40.0
+    };
+    config.avatar_observe_expected_peers = args.avatar_observe_expected_peers;
+    config.observe_avatar_start_file = args.observe_avatar_start_file.clone();
+    config.observe_avatar_window = Duration::from_secs(args.observe_avatar_window_secs.max(1));
     let voice_reencode = !args.no_voice_reencode;
     let cadence = CadenceOptions {
         sync_batching: args.sync_batching,
@@ -3705,6 +4178,22 @@ async fn async_main(worker_threads: usize) -> Result<()> {
         }
     }
     shutdown.store(true, Ordering::SeqCst);
+    if let Some(path) = &config.observe_avatar_csv {
+        let observer_client = managed_clients.lock().await.first().cloned();
+        if let Some(observer_client) = observer_client {
+            if let Some(observer) = &observer_client.avatar_observer {
+                let now = std::time::Instant::now();
+                let observer = observer.lock().expect("avatar observer mutex poisoned");
+                let (summary, csv) = observer.summary_and_csv(now);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(path, csv)
+                    .with_context(|| format!("writing avatar observer CSV {}", path.display()))?;
+                info!("{summary}; csv={}", path.display());
+            }
+        }
+    }
     info!(
         "shutting down clients in batches of {} ({}ms between batches)",
         quit_batch_size,
@@ -3720,6 +4209,60 @@ mod tests {
     use ed25519_dalek::Signature;
     use flate2::read::DeflateDecoder;
     use std::io::Read;
+
+    #[test]
+    fn avatar_observer_measures_applied_full_delta_and_bundle_gaps() {
+        let mut observer = AvatarObserver::new(40.0, 1, None, Duration::from_secs(1));
+        let start = std::time::Instant::now();
+        let observer_position = [0.0; 3];
+        let mut baseline = vec![0u8; ProtocolBitQuality::High.payload_len()];
+        baseline[..4].copy_from_slice(&0.0f32.to_le_bytes());
+        let mut full = vec![1, 0, 1];
+        full.extend_from_slice(&baseline);
+        observer.observe_channel(
+            channels::PLAYER_AVATAR_HIGH,
+            &full,
+            observer_position,
+            start,
+        );
+
+        let mut changed = baseline.clone();
+        changed[20] = 1;
+        let delta_body = build_delta(&baseline, &changed, ProtocolBitQuality::High).unwrap();
+        let mut delta = vec![3, 1, 0, 0, 2, 1];
+        delta.extend_from_slice(&delta_body);
+        observer.observe_channel(
+            channels::DELTA_AVATAR,
+            &delta,
+            observer_position,
+            start + Duration::from_millis(100),
+        );
+
+        let mut bundled_full = vec![1, 0, 3];
+        bundled_full.extend_from_slice(&baseline);
+        let bundle = encode_avatar_bundle(&[AvatarBundleItem {
+            original_channel: channels::PLAYER_AVATAR_HIGH,
+            payload: bundled_full,
+        }])
+        .unwrap();
+        observer.observe_channel(
+            channels::COMPRESSED_AVATAR_BUNDLE,
+            &bundle,
+            observer_position,
+            start + Duration::from_millis(250),
+        );
+
+        let (summary, csv) = observer.summary_and_csv(start + Duration::from_millis(300));
+        assert!(
+            summary.contains(
+                "window_started=true window_ms=300 near_peers=1 expected=1 missing=0 stale_500ms=0"
+            ),
+            "{summary}"
+        );
+        assert!(summary.contains("applied_gaps=2 p50_ms=100.00 p95_ms=150.00"));
+        assert!(csv.contains("1,3,100.00,150.00"));
+        assert!(summary.contains("decode_errors=0 unapplied_deltas=0"));
+    }
 
     async fn test_client(index: usize, server_addr: SocketAddr) -> Arc<BasisClient> {
         let socket = bind_udp_socket(any_local_addr(server_addr)).unwrap();
@@ -3747,6 +4290,7 @@ mod tests {
             receive_shutdown: Notify::new(),
             received_reliable: StdMutex::new(ReliableReceiveState::default()),
             pose: Mutex::new(PoseState::new_at([0.0; 3])),
+            avatar_observer: None,
             identity: Identity::random(),
         })
     }
