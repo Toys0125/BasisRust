@@ -1756,7 +1756,7 @@ fn update_outbound_delta_state(
         || now.duration_since(state.last_keyframe)
             >= Duration::from_millis(keyframe_interval.max(1));
 
-    if !is_keyframe {
+    let high_delta = if !is_keyframe {
         match (
             state.keyframe_payloads[BitQuality::High as usize].as_ref(),
             current_payloads[BitQuality::High as usize].as_ref(),
@@ -1765,17 +1765,24 @@ fn update_outbound_delta_state(
                 match build_delta(baseline.as_ref(), current.as_ref(), BitQuality::High) {
                     Ok(delta) if delta.len() < BitQuality::High.payload_len() => {
                         update_keyframe_stretch(state, config, delta.len());
+                        Some(delta)
                     }
                     Ok(_) | Err(_) => {
                         is_keyframe = true;
                         state.keyframe_stretch_shift = 0;
                         state.small_delta_streak = 0;
+                        None
                     }
                 }
             }
-            _ => is_keyframe = true,
+            _ => {
+                is_keyframe = true;
+                None
+            }
         }
-    }
+    } else {
+        None
+    };
 
     if is_keyframe {
         state.keyframe_qualities = qualities.clone();
@@ -1793,6 +1800,7 @@ fn update_outbound_delta_state(
             &state.keyframe_payloads,
             &current_payloads,
             &qualities,
+            high_delta.as_deref(),
         );
         state.current_is_keyframe = false;
     }
@@ -1806,6 +1814,7 @@ fn build_delta_packets(
     baselines: &[Option<Bytes>; 4],
     current: &[Option<Bytes>; 4],
     qualities: &[Option<PreSerializedQuality>; 4],
+    reusable_high_delta: Option<&[u8]>,
 ) -> [Option<PreSerializedDelta>; 4] {
     std::array::from_fn(|index| {
         let baseline = baselines[index].as_ref()?;
@@ -1816,7 +1825,17 @@ fn build_delta_packets(
             2 => BitQuality::Medium,
             _ => BitQuality::High,
         };
-        let body = build_delta(baseline.as_ref(), current.as_ref(), quality).ok()?;
+        let body = if quality == BitQuality::High {
+            if let Some(delta) = reusable_high_delta {
+                std::borrow::Cow::Borrowed(delta)
+            } else {
+                std::borrow::Cow::Owned(
+                    build_delta(baseline.as_ref(), current.as_ref(), quality).ok()?,
+                )
+            }
+        } else {
+            std::borrow::Cow::Owned(build_delta(baseline.as_ref(), current.as_ref(), quality).ok()?)
+        };
         let additional_data = qualities[index]
             .as_ref()
             .map(|packet| packet.additional_data.as_ref())
@@ -1826,7 +1845,7 @@ fn build_delta_packets(
             outbound_sequence,
             base_sequence,
             quality,
-            &body,
+            body.as_ref(),
             additional_data,
         ))
     })
@@ -2095,6 +2114,76 @@ mod tests {
             spatial_cull_enabled: false,
             enable_bsr_profiling: true,
         }
+    }
+
+    fn reference_build_delta_packets(
+        peer_id: PeerId,
+        outbound_sequence: u8,
+        base_sequence: u8,
+        baselines: &[Option<Bytes>; 4],
+        current: &[Option<Bytes>; 4],
+        qualities: &[Option<PreSerializedQuality>; 4],
+    ) -> [Option<PreSerializedDelta>; 4] {
+        std::array::from_fn(|index| {
+            let baseline = baselines[index].as_ref()?;
+            let current = current[index].as_ref()?;
+            let quality = match index {
+                0 => BitQuality::VeryLow,
+                1 => BitQuality::Low,
+                2 => BitQuality::Medium,
+                _ => BitQuality::High,
+            };
+            let body = build_delta(baseline.as_ref(), current.as_ref(), quality).ok()?;
+            let additional_data = qualities[index]
+                .as_ref()
+                .map(|packet| packet.additional_data.as_ref())
+                .unwrap_or(&[]);
+            Some(pre_serialize_delta(
+                peer_id,
+                outbound_sequence,
+                base_sequence,
+                quality,
+                &body,
+                additional_data,
+            ))
+        })
+    }
+
+    fn delta_test_qualities(
+        peer_id: PeerId,
+        sequence: u8,
+        payload_byte: u8,
+        with_additional_data: bool,
+    ) -> [Option<PreSerializedQuality>; 4] {
+        std::array::from_fn(|index| {
+            let quality = match index {
+                0 => BitQuality::VeryLow,
+                1 => BitQuality::Low,
+                2 => BitQuality::Medium,
+                _ => BitQuality::High,
+            };
+            let payload = vec![payload_byte; quality.payload_len()];
+            let additional = if with_additional_data {
+                if matches!(quality, BitQuality::Low | BitQuality::VeryLow) {
+                    Vec::new()
+                } else {
+                    vec![0]
+                }
+            } else {
+                Vec::new()
+            };
+            Some(pre_serialize(
+                peer_id,
+                sequence,
+                quality,
+                &payload,
+                &additional,
+            ))
+        })
+    }
+
+    fn delta_test_payloads(qualities: &[Option<PreSerializedQuality>; 4]) -> [Option<Bytes>; 4] {
+        quality_payloads(qualities)
     }
 
     fn receiver_build_test_peers(
@@ -2481,6 +2570,223 @@ mod tests {
 
         config.delta_keyframe_max_interval_ms = 500;
         assert_eq!(effective_keyframe_interval_ms(&config, 4), 500);
+    }
+
+    #[test]
+    fn reused_high_delta_matches_recomputed_packet_bytes() {
+        for (peer_id, base_sequence, outbound_sequence, base_byte, current_byte, additional) in [
+            (42, 255, 0, 0, 0, false),
+            (300, 17, 18, 0, 1, true),
+            (65_000, 128, 129, 0x55, 0xa1, true),
+        ] {
+            let baseline_qualities =
+                delta_test_qualities(peer_id, base_sequence, base_byte, additional);
+            let current_qualities =
+                delta_test_qualities(peer_id, outbound_sequence, current_byte, additional);
+            let mut baselines = delta_test_payloads(&baseline_qualities);
+            let mut current = delta_test_payloads(&current_qualities);
+            // Missing non-High qualities preserve the all-or-nothing behavior for those slots.
+            if peer_id == 300 {
+                baselines[BitQuality::Low as usize] = None;
+                current[BitQuality::Medium as usize] = None;
+            }
+            let high_delta = build_delta(
+                baselines[BitQuality::High as usize].as_ref().unwrap(),
+                current[BitQuality::High as usize].as_ref().unwrap(),
+                BitQuality::High,
+            )
+            .unwrap();
+
+            let expected = reference_build_delta_packets(
+                peer_id,
+                outbound_sequence,
+                base_sequence,
+                &baselines,
+                &current,
+                &current_qualities,
+            );
+            let actual = build_delta_packets(
+                peer_id,
+                outbound_sequence,
+                base_sequence,
+                &baselines,
+                &current,
+                &current_qualities,
+                Some(&high_delta),
+            );
+            for (expected, actual) in expected.iter().zip(&actual) {
+                assert_eq!(
+                    expected.as_ref().map(|packet| packet.bytes_small.as_ref()),
+                    actual.as_ref().map(|packet| packet.bytes_small.as_ref()),
+                );
+                assert_eq!(
+                    expected.as_ref().map(|packet| packet.bytes_large.as_ref()),
+                    actual.as_ref().map(|packet| packet.bytes_large.as_ref()),
+                );
+            }
+
+            // A malformed lower-quality baseline still drops only that slot.
+            let mut malformed_baseline = baselines.clone();
+            malformed_baseline[BitQuality::Medium as usize] = Some(Bytes::from_static(&[0, 1, 2]));
+            let expected = reference_build_delta_packets(
+                peer_id,
+                outbound_sequence,
+                base_sequence,
+                &malformed_baseline,
+                &current,
+                &current_qualities,
+            );
+            let actual = build_delta_packets(
+                peer_id,
+                outbound_sequence,
+                base_sequence,
+                &malformed_baseline,
+                &current,
+                &current_qualities,
+                Some(&high_delta),
+            );
+            assert!(expected[BitQuality::Medium as usize].is_none());
+            assert!(actual[BitQuality::Medium as usize].is_none());
+            for (expected, actual) in expected.iter().zip(&actual) {
+                assert_eq!(
+                    expected.as_ref().map(|packet| packet.bytes_small.as_ref()),
+                    actual.as_ref().map(|packet| packet.bytes_small.as_ref()),
+                );
+            }
+
+            // A missing High baseline has no reusable delta and follows the old recompute path.
+            let mut missing_high = baselines.clone();
+            missing_high[BitQuality::High as usize] = None;
+            assert_eq!(
+                reference_build_delta_packets(
+                    peer_id,
+                    outbound_sequence,
+                    base_sequence,
+                    &missing_high,
+                    &current,
+                    &current_qualities,
+                )
+                .map(|packet| packet.map(|p| (p.bytes_small, p.bytes_large))),
+                build_delta_packets(
+                    peer_id,
+                    outbound_sequence,
+                    base_sequence,
+                    &missing_high,
+                    &current,
+                    &current_qualities,
+                    None,
+                )
+                .map(|packet| packet.map(|p| (p.bytes_small, p.bytes_large))),
+            );
+        }
+    }
+
+    #[test]
+    fn high_delta_reuse_keeps_stretch_and_keyframe_transitions() {
+        let mut config = receiver_build_test_config();
+        config.enable_delta_compression = true;
+        let now = Instant::now();
+        let baseline_qualities = delta_test_qualities(42, 10, 0, false);
+        let baseline_payloads = delta_test_payloads(&baseline_qualities);
+        let make_state = |keyframe_payloads: [Option<Bytes>; 4],
+                          last_keyframe: Instant,
+                          keyframe_stretch_shift,
+                          small_delta_streak| PlayerAvatarState {
+            peer_id: 42,
+            small_id: true,
+            position: [0.0; 3],
+            generation: 1,
+            last_inbound_sequence: 10,
+            outbound_sequence: 10,
+            has_received_first: true,
+            qualities: baseline_qualities.clone(),
+            keyframe_qualities: baseline_qualities.clone(),
+            keyframe_payloads,
+            deltas: [None, None, None, None],
+            keyframe_generation: 1,
+            keyframe_sequence: 10,
+            last_keyframe,
+            keyframe_stretch_shift,
+            small_delta_streak,
+            current_is_keyframe: true,
+        };
+
+        let mut small_delta_state = make_state(baseline_payloads.clone(), now, 0, 3);
+        let identical = delta_test_qualities(42, 11, 0, false);
+        update_outbound_delta_state(&mut small_delta_state, identical.clone(), 2, &config, now);
+        assert!(!small_delta_state.current_is_keyframe);
+        assert_eq!(small_delta_state.keyframe_stretch_shift, 1);
+        assert_eq!(small_delta_state.small_delta_streak, 0);
+        assert!(small_delta_state.deltas[BitQuality::High as usize].is_some());
+
+        let mut large_delta_state = make_state(baseline_payloads.clone(), now, 2, 3);
+        let changed = delta_test_qualities(42, 12, u8::MAX, false);
+        let large_high_delta = build_delta(
+            baseline_payloads[BitQuality::High as usize]
+                .as_ref()
+                .unwrap(),
+            delta_test_payloads(&changed)[BitQuality::High as usize]
+                .as_ref()
+                .unwrap(),
+            BitQuality::High,
+        )
+        .unwrap();
+        assert!(large_high_delta.len() > SMALL_HIGH_DELTA_BYTES);
+        assert!(large_high_delta.len() < BitQuality::High.payload_len());
+        update_outbound_delta_state(&mut large_delta_state, changed.clone(), 3, &config, now);
+        assert!(!large_delta_state.current_is_keyframe);
+        assert_eq!(large_delta_state.keyframe_stretch_shift, 0);
+        assert_eq!(large_delta_state.small_delta_streak, 0);
+
+        let mut seed = 0x1357_9bdfu32;
+        let noisy_high: Vec<_> = (0..BitQuality::High.payload_len())
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let noisy_high_delta = build_delta(
+            baseline_payloads[BitQuality::High as usize]
+                .as_ref()
+                .unwrap(),
+            &noisy_high,
+            BitQuality::High,
+        )
+        .unwrap();
+        assert!(noisy_high_delta.len() >= BitQuality::High.payload_len());
+        let mut oversized_current = changed;
+        oversized_current[BitQuality::High as usize] =
+            Some(pre_serialize(42, 13, BitQuality::High, &noisy_high, &[]));
+        let mut oversized_delta_state = make_state(baseline_payloads.clone(), now, 2, 3);
+        update_outbound_delta_state(
+            &mut oversized_delta_state,
+            oversized_current,
+            4,
+            &config,
+            now,
+        );
+        assert!(oversized_delta_state.current_is_keyframe);
+        assert_eq!(oversized_delta_state.keyframe_stretch_shift, 0);
+        assert_eq!(oversized_delta_state.small_delta_streak, 0);
+        assert_eq!(oversized_delta_state.keyframe_sequence, 10);
+
+        let mut missing_baseline_state = make_state([None, None, None, None], now, 1, 2);
+        update_outbound_delta_state(
+            &mut missing_baseline_state,
+            identical.clone(),
+            4,
+            &config,
+            now,
+        );
+        assert!(missing_baseline_state.current_is_keyframe);
+        assert_eq!(missing_baseline_state.keyframe_stretch_shift, 1);
+        assert_eq!(missing_baseline_state.small_delta_streak, 2);
+
+        let due_time = now - Duration::from_millis(config.delta_keyframe_interval_ms);
+        let mut due_keyframe_state = make_state(baseline_payloads, due_time, 0, 2);
+        update_outbound_delta_state(&mut due_keyframe_state, identical, 5, &config, now);
+        assert!(due_keyframe_state.current_is_keyframe);
+        assert_eq!(due_keyframe_state.keyframe_sequence, 10);
     }
 
     #[test]
