@@ -274,6 +274,11 @@ struct BundleAvatarSend {
     interval_byte: u8,
 }
 
+#[derive(Default)]
+struct ReceiverBuildScratch {
+    bundle: Vec<BundleAvatarSend>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AvatarSyncStats {
     pub inbound_updates: u64,
@@ -870,21 +875,26 @@ impl AvatarSyncSystem {
         let receiver_groups = receiver_slice
             .par_iter()
             .with_min_len(RECEIVER_BUILD_MIN_BATCH)
-            .filter_map(|(receiver_id, receiver_state)| {
-                self.build_sends_for_receiver(
-                    *receiver_id,
-                    receiver_state.position,
-                    &peer_states,
-                    spatial_grid.as_ref(),
-                    &config,
-                    now_ms,
-                    slice_count,
-                    effective_tick_interval_ms,
-                    update_distances,
-                    offloaded_empty,
-                    bypass_empty,
-                )
-            })
+            .map_init(
+                ReceiverBuildScratch::default,
+                |scratch, (receiver_id, receiver_state)| {
+                    self.build_sends_for_receiver(
+                        *receiver_id,
+                        receiver_state.position,
+                        &peer_states,
+                        spatial_grid.as_ref(),
+                        &config,
+                        now_ms,
+                        slice_count,
+                        effective_tick_interval_ms,
+                        update_distances,
+                        offloaded_empty,
+                        bypass_empty,
+                        scratch,
+                    )
+                },
+            )
+            .filter_map(|batch| batch)
             .collect::<Vec<_>>();
         self.counters
             .build_micros
@@ -1049,6 +1059,7 @@ impl AvatarSyncSystem {
         update_distances: bool,
         offloaded_empty: bool,
         bypass_empty: bool,
+        scratch: &mut ReceiverBuildScratch,
     ) -> Option<OutboundAvatarBatch<'a>> {
         let peer_count = peer_states.len();
         let mut spatial_candidates: Option<Vec<usize>> = None;
@@ -1061,11 +1072,13 @@ impl AvatarSyncSystem {
         } else {
             Vec::with_capacity(initial_send_capacity)
         };
-        let mut bundle = if config.enable_bundle_compression {
-            Vec::with_capacity(initial_send_capacity)
-        } else {
-            Vec::new()
-        };
+        let bundle = &mut scratch.bundle;
+        bundle.clear();
+        if config.enable_bundle_compression && bundle.capacity() < initial_send_capacity {
+            // Keep the existing sender-count capacity policy, but reserve it once per Rayon
+            // folder instead of allocating a new vector for every receiver in that folder.
+            bundle.reserve_exact(initial_send_capacity);
+        }
         let mut receiver_tracking = self.tracking.entry(receiver_id).or_default();
         let mut logical_sends = 0u64;
         let mut bundle_ratio = if config.enable_bundle_compression {
@@ -1226,7 +1239,7 @@ impl AvatarSyncSystem {
         if config.enable_bundle_compression {
             emit_greedy_avatar_bundles(
                 &mut direct,
-                &mut bundle,
+                bundle,
                 &mut bundle_ratio,
                 &self.profiler,
                 config,
@@ -1234,6 +1247,9 @@ impl AvatarSyncSystem {
             self.bundle_ratios.insert(receiver_id, bundle_ratio);
         }
         self.profiler.add_sends(logical_sends);
+        // Only the independently owned `direct` sends escape this receiver build. In
+        // particular, release every Bytes clone held by scratch before it is reused.
+        bundle.clear();
         (!direct.is_empty()).then_some(OutboundAvatarBatch {
             receiver: receiver_id,
             sends: direct,
@@ -2030,6 +2046,263 @@ fn advertised_interval_byte(
 mod tests {
     use super::*;
     use basis_protocol::avatar::{decode_avatar_bundle, encode_avatar_bundle, AvatarBundleItem};
+
+    fn receiver_build_test_config() -> AvatarSyncConfig {
+        AvatarSyncConfig {
+            default_interval_ms: 1,
+            base_multiplier: 1.0,
+            increase_rate: 0.005,
+            high_distance_sq: 1.0e6,
+            medium_distance_sq: 1.0e7,
+            low_distance_sq: 1.0e8,
+            enable_bundle_compression: true,
+            enable_bundle_zstd: false,
+            bundle_zstd_delta_bundles: false,
+            bundle_zstd_level: -2,
+            enable_delta_compression: false,
+            delta_keyframe_interval_ms: 500,
+            delta_keyframe_max_interval_ms: 2000,
+            strip_additional_data_at_low_quality: true,
+            bundle_min_messages: 4,
+            bundle_min_bytes: 128,
+            min_receiver_slices: 1,
+            max_receiver_slices: MAX_SLICE_COUNT,
+            tick_budget_ms: DEFAULT_AVATAR_TICK_BUDGET_MS,
+            receiver_cycle_budget_ms: DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
+            spatial_cull_enabled: false,
+            enable_bsr_profiling: true,
+        }
+    }
+
+    fn receiver_build_test_peers(
+        changed: &[(PeerId, u64)],
+    ) -> Vec<(PeerId, Arc<PlayerAvatarState>)> {
+        (1..=8)
+            .map(|id| id as PeerId)
+            .chain([300])
+            .map(|peer_id| {
+                let generation = changed
+                    .iter()
+                    .find_map(|(id, generation)| (*id == peer_id).then_some(*generation))
+                    .unwrap_or(1);
+                let qualities = std::array::from_fn(|index| {
+                    let quality = match index {
+                        0 => BitQuality::VeryLow,
+                        1 => BitQuality::Low,
+                        2 => BitQuality::Medium,
+                        _ => BitQuality::High,
+                    };
+                    let payload = (0..quality.payload_len())
+                        .map(|offset| (offset as u8).wrapping_mul(31).wrapping_add(peer_id as u8))
+                        .collect::<Vec<_>>();
+                    Some(pre_serialize(
+                        peer_id,
+                        generation as u8,
+                        quality,
+                        &payload,
+                        &[],
+                    ))
+                });
+                (
+                    peer_id,
+                    Arc::new(PlayerAvatarState {
+                        peer_id,
+                        small_id: peer_id <= u8::MAX as PeerId,
+                        position: [peer_id as f32, 0.0, 0.0],
+                        generation,
+                        last_inbound_sequence: generation as u8,
+                        outbound_sequence: generation as u8,
+                        has_received_first: true,
+                        qualities: qualities.clone(),
+                        keyframe_qualities: qualities,
+                        keyframe_payloads: [None, None, None, None],
+                        deltas: [None, None, None, None],
+                        keyframe_generation: generation,
+                        keyframe_sequence: generation as u8,
+                        last_keyframe: Instant::now(),
+                        keyframe_stretch_shift: 0,
+                        small_delta_streak: 0,
+                        current_is_keyframe: true,
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    type AvatarBatchSnapshot = (PeerId, Vec<(u8, Vec<u8>, Option<(usize, u8)>)>);
+
+    fn snapshot_avatar_batch(
+        batch: Option<&OutboundAvatarBatch<'_>>,
+    ) -> Option<AvatarBatchSnapshot> {
+        batch.map(|batch| {
+            (
+                batch.receiver,
+                batch
+                    .sends
+                    .iter()
+                    .map(|send| {
+                        (
+                            send.channel(),
+                            send.payload().to_vec(),
+                            send.interval_patch(),
+                        )
+                    })
+                    .collect(),
+            )
+        })
+    }
+
+    fn build_fresh_and_reused<'a>(
+        fresh_system: &AvatarSyncSystem,
+        reused_system: &AvatarSyncSystem,
+        scratch: &mut ReceiverBuildScratch,
+        config: &AvatarSyncConfig,
+        peers: &'a [(PeerId, Arc<PlayerAvatarState>)],
+        receiver: PeerId,
+        now_ms: u64,
+    ) -> (Option<AvatarBatchSnapshot>, Option<OutboundAvatarBatch<'a>>) {
+        let receiver_position = peers
+            .iter()
+            .find(|(id, _)| *id == receiver)
+            .unwrap()
+            .1
+            .position;
+        let build = |system: &AvatarSyncSystem, scratch: &mut ReceiverBuildScratch| {
+            system.build_sends_for_receiver(
+                receiver,
+                receiver_position,
+                peers,
+                None,
+                config,
+                now_ms,
+                8,
+                4,
+                false,
+                true,
+                true,
+                scratch,
+            )
+        };
+        let mut fresh_scratch = ReceiverBuildScratch::default();
+        let fresh = build(fresh_system, &mut fresh_scratch);
+        let reused = build(reused_system, scratch);
+        let expected = snapshot_avatar_batch(fresh.as_ref());
+        assert_eq!(expected, snapshot_avatar_batch(reused.as_ref()));
+        assert!(fresh_scratch.bundle.is_empty());
+        assert!(scratch.bundle.is_empty());
+        (expected, reused)
+    }
+
+    fn logical_channels(snapshot: &Option<AvatarBatchSnapshot>) -> Vec<u8> {
+        snapshot
+            .as_ref()
+            .into_iter()
+            .flat_map(|(_, sends)| sends)
+            .flat_map(|(channel, payload, _)| {
+                if *channel == channels::COMPRESSED_AVATAR_BUNDLE {
+                    decode_avatar_bundle(payload)
+                        .unwrap()
+                        .into_iter()
+                        .map(|item| item.original_channel)
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![*channel]
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn receiver_build_scratch_reuse_preserves_output_across_receivers_and_empty_builds() {
+        let config = receiver_build_test_config();
+        let fresh_system = AvatarSyncSystem::new(config.clone());
+        let reused_system = AvatarSyncSystem::new(config.clone());
+        let mut scratch = ReceiverBuildScratch::default();
+        let base = receiver_build_test_peers(&[]);
+
+        // Populate for one receiver, then another. Keep the first owned result alive while
+        // later calls clear and refill scratch; it must remain unchanged.
+        let (initial, held_batch) = build_fresh_and_reused(
+            &fresh_system,
+            &reused_system,
+            &mut scratch,
+            &config,
+            &base,
+            1,
+            1_000,
+        );
+        let held_batch = held_batch.expect("initial receiver sends keyframes");
+        assert_eq!(logical_channels(&initial).len(), 8);
+        assert!(initial
+            .as_ref()
+            .unwrap()
+            .1
+            .iter()
+            .any(|(channel, _, _)| { *channel == channels::COMPRESSED_AVATAR_BUNDLE }));
+        let scratch_ptr = scratch.bundle.as_ptr();
+
+        let (alternate, _) = build_fresh_and_reused(
+            &fresh_system,
+            &reused_system,
+            &mut scratch,
+            &config,
+            &base,
+            300,
+            1_001,
+        );
+        assert_eq!(logical_channels(&alternate).len(), 8);
+        assert_eq!(scratch_ptr, scratch.bundle.as_ptr());
+
+        // An unchanged receiver is empty; the next changed frame repopulates the same vector.
+        let (empty, _) = build_fresh_and_reused(
+            &fresh_system,
+            &reused_system,
+            &mut scratch,
+            &config,
+            &base,
+            1,
+            1_002,
+        );
+        assert!(empty.is_none());
+
+        let four_changed = receiver_build_test_peers(&[(2, 2), (3, 2), (4, 2), (5, 2)]);
+        let (boundary, _) = build_fresh_and_reused(
+            &fresh_system,
+            &reused_system,
+            &mut scratch,
+            &config,
+            &four_changed,
+            1,
+            1_003,
+        );
+        assert_eq!(logical_channels(&boundary).len(), 4);
+        assert!(boundary
+            .as_ref()
+            .unwrap()
+            .1
+            .iter()
+            .any(|(channel, _, _)| { *channel == channels::COMPRESSED_AVATAR_BUNDLE }));
+
+        let three_changed = receiver_build_test_peers(&[(2, 3), (3, 3), (4, 3), (5, 2)]);
+        let (fallback, _) = build_fresh_and_reused(
+            &fresh_system,
+            &reused_system,
+            &mut scratch,
+            &config,
+            &three_changed,
+            1,
+            1_004,
+        );
+        assert_eq!(logical_channels(&fallback).len(), 3);
+        assert!(fallback
+            .as_ref()
+            .unwrap()
+            .1
+            .iter()
+            .all(|(channel, _, _)| { *channel != channels::COMPRESSED_AVATAR_BUNDLE }));
+        assert_eq!(scratch_ptr, scratch.bundle.as_ptr());
+        assert_eq!(snapshot_avatar_batch(Some(&held_batch)), initial);
+    }
 
     #[test]
     fn packet_preserialization_uses_small_and_large_ids() {
