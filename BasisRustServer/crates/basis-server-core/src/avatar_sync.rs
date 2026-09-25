@@ -15,9 +15,10 @@ use std::{
     collections::HashMap,
     env,
     hash::{BuildHasherDefault, Hasher},
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -92,7 +93,7 @@ pub struct AvatarSyncConfig {
     pub enable_bsr_profiling: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PreSerializedQuality {
     channel_small: u8,
     channel_large: u8,
@@ -101,10 +102,259 @@ struct PreSerializedQuality {
     additional_data: Bytes,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PreSerializedDelta {
     bytes_small: Bytes,
     bytes_large: Bytes,
+}
+
+/// Immutable source data for quality packets from one sender generation.
+/// High is materialized eagerly; lower qualities are cached on their first
+/// receiver request. The captured fields keep lazy work independent of later
+/// config changes and pooled inbound buffers.
+#[derive(Debug)]
+struct LazyQualityFrame {
+    peer_id: PeerId,
+    outbound_sequence: u8,
+    source_quality: BitQuality,
+    source_payload: Bytes,
+    additional_data: Bytes,
+    strip_additional_data_at_low_quality: bool,
+    qualities: [OnceLock<Result<Option<PreSerializedQuality>, String>>; 4],
+    #[cfg(test)]
+    init_counts: [AtomicU64; 4],
+}
+
+impl LazyQualityFrame {
+    fn new(
+        profiler: &BsrProfiler,
+        peer_id: PeerId,
+        outbound_sequence: u8,
+        source_quality: BitQuality,
+        payload: &[u8],
+        additional_data: &[u8],
+        strip_additional_data_at_low_quality: bool,
+    ) -> Result<Arc<Self>> {
+        // Preserve the eager builder's validation timing. These are the only
+        // fallible preconditions in repack_high_to_lower_into; inbound High
+        // payloads have exactly the validated fixed length and outputs below
+        // are allocated at the target's fixed length.
+        if source_quality == BitQuality::High {
+            anyhow::ensure!(
+                payload.len() >= BitQuality::High.payload_len(),
+                "high payload too small"
+            );
+            for target in [BitQuality::Medium, BitQuality::Low, BitQuality::VeryLow] {
+                validate_repack_preconditions(payload.len(), target, target.payload_len())?;
+            }
+        }
+
+        let source_additional = if strip_additional_data_at_low_quality
+            && matches!(source_quality, BitQuality::Low | BitQuality::VeryLow)
+        {
+            &[][..]
+        } else {
+            additional_data
+        };
+        let source_packet = pre_serialize(
+            peer_id,
+            outbound_sequence,
+            source_quality,
+            payload,
+            source_additional,
+        );
+        profiler.add_pre_serializations(1);
+        let source_payload_len = source_quality.payload_len();
+        let source_payload = source_packet
+            .bytes_small
+            .get(3..3 + source_payload_len)
+            .map(|_| source_packet.bytes_small.slice(3..3 + source_payload_len))
+            .ok_or_else(|| anyhow::anyhow!("serialized avatar payload is truncated"))?;
+        let qualities: [OnceLock<Result<Option<PreSerializedQuality>, String>>; 4] =
+            std::array::from_fn(|_| OnceLock::new());
+        let source_index = source_quality as usize;
+        let _ = qualities[source_index].set(Ok(Some(source_packet.clone())));
+        Ok(Arc::new(Self {
+            peer_id,
+            outbound_sequence,
+            source_quality,
+            source_payload,
+            additional_data: source_packet.additional_data.clone(),
+            strip_additional_data_at_low_quality,
+            qualities,
+            #[cfg(test)]
+            init_counts: std::array::from_fn(|_| AtomicU64::new(0)),
+        }))
+    }
+
+    fn quality(
+        &self,
+        pool: &BytePool,
+        profiler: &BsrProfiler,
+        quality: BitQuality,
+    ) -> Result<Option<&PreSerializedQuality>> {
+        let slot = &self.qualities[quality as usize];
+        let result = slot.get_or_init(|| {
+            #[cfg(test)]
+            self.init_counts[quality as usize].fetch_add(1, Ordering::Relaxed);
+            let built = (|| -> Result<Option<PreSerializedQuality>> {
+                if self.source_quality != BitQuality::High || quality == BitQuality::High {
+                    return Ok(None);
+                }
+                let mut repacked = pool.take(quality.payload_len());
+                let repack_result =
+                    repack_high_to_lower_into(&self.source_payload, quality, &mut repacked);
+                if let Err(error) = repack_result {
+                    pool.put(repacked);
+                    return Err(error);
+                }
+                let additional_data = if self.strip_additional_data_at_low_quality
+                    && matches!(quality, BitQuality::Low | BitQuality::VeryLow)
+                {
+                    &[][..]
+                } else {
+                    self.additional_data.as_ref()
+                };
+                let packet = pre_serialize(
+                    self.peer_id,
+                    self.outbound_sequence,
+                    quality,
+                    &repacked,
+                    additional_data,
+                );
+                pool.put(repacked);
+                profiler.add_pre_serializations(1);
+                Ok(Some(packet))
+            })();
+            built.map_err(|error| format!("{error:#}"))
+        });
+        match result {
+            Ok(packet) => Ok(packet.as_ref()),
+            Err(error) => anyhow::bail!("{error}"),
+        }
+    }
+
+    fn payload(
+        &self,
+        pool: &BytePool,
+        profiler: &BsrProfiler,
+        quality: BitQuality,
+    ) -> Result<Option<Bytes>> {
+        let Some(packet) = self.quality(pool, profiler, quality)? else {
+            return Ok(None);
+        };
+        let end = 3 + quality.payload_len();
+        Ok(packet
+            .bytes_small
+            .get(3..end)
+            .map(|_| packet.bytes_small.slice(3..end)))
+    }
+}
+
+/// Per-current-generation lazy deltas against the frozen keyframe frame.
+/// Each quality is initialized at most once across parallel receiver builds.
+#[derive(Debug)]
+struct LazyDeltaFrame {
+    current: Arc<LazyQualityFrame>,
+    baseline: Arc<LazyQualityFrame>,
+    outbound_sequence: u8,
+    base_sequence: u8,
+    deltas: [OnceLock<Option<PreSerializedDelta>>; 4],
+    #[cfg(test)]
+    init_counts: [AtomicU64; 4],
+}
+
+impl LazyDeltaFrame {
+    fn new(
+        current: Arc<LazyQualityFrame>,
+        baseline: Arc<LazyQualityFrame>,
+        outbound_sequence: u8,
+        base_sequence: u8,
+        high_delta: &[u8],
+        pool: &BytePool,
+        profiler: &BsrProfiler,
+    ) -> Result<Arc<Self>> {
+        let frame = Self {
+            current,
+            baseline,
+            outbound_sequence,
+            base_sequence,
+            deltas: std::array::from_fn(|_| OnceLock::new()),
+            #[cfg(test)]
+            init_counts: std::array::from_fn(|_| AtomicU64::new(0)),
+        };
+        let high_additional = frame
+            .current
+            .quality(pool, profiler, BitQuality::High)?
+            .map(|packet| packet.additional_data.as_ref())
+            .unwrap_or(&[]);
+        let high = pre_serialize_delta(
+            frame.current.peer_id,
+            outbound_sequence,
+            base_sequence,
+            BitQuality::High,
+            high_delta,
+            high_additional,
+        );
+        let _ = frame.deltas[BitQuality::High as usize].set(Some(high));
+        Ok(Arc::new(frame))
+    }
+
+    fn quality(
+        &self,
+        pool: &BytePool,
+        profiler: &BsrProfiler,
+        quality: BitQuality,
+    ) -> Result<Option<&PreSerializedDelta>> {
+        let slot = &self.deltas[quality as usize];
+        let result = slot.get_or_init(|| {
+            #[cfg(test)]
+            self.init_counts[quality as usize].fetch_add(1, Ordering::Relaxed);
+            let built = (|| -> Result<Option<PreSerializedDelta>> {
+                let Some(baseline) = self.baseline.payload(pool, profiler, quality)? else {
+                    return Ok(None);
+                };
+                let Some(current) = self.current.payload(pool, profiler, quality)? else {
+                    return Ok(None);
+                };
+                let Ok(body) = build_delta(baseline.as_ref(), current.as_ref(), quality) else {
+                    return Ok(None);
+                };
+                let additional_data = self
+                    .current
+                    .quality(pool, profiler, quality)?
+                    .map(|packet| packet.additional_data.as_ref())
+                    .unwrap_or(&[]);
+                Ok(Some(pre_serialize_delta(
+                    self.current.peer_id,
+                    self.outbound_sequence,
+                    self.base_sequence,
+                    quality,
+                    &body,
+                    additional_data,
+                )))
+            })();
+            built.ok().flatten()
+        });
+        Ok(result.as_ref())
+    }
+}
+
+fn validate_repack_preconditions(
+    source_len: usize,
+    target: BitQuality,
+    output_len: usize,
+) -> Result<()> {
+    anyhow::ensure!(target != BitQuality::High, "target must be lower than High");
+    anyhow::ensure!(
+        source_len >= BitQuality::High.payload_len(),
+        "high payload too small"
+    );
+    anyhow::ensure!(
+        output_len >= target.payload_len(),
+        "target output buffer too small"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +376,9 @@ struct PlayerAvatarState {
     keyframe_stretch_shift: u8,
     small_delta_streak: u8,
     current_is_keyframe: bool,
+    lazy_current: Option<Arc<LazyQualityFrame>>,
+    lazy_keyframe: Option<Arc<LazyQualityFrame>>,
+    lazy_deltas: Option<Arc<LazyDeltaFrame>>,
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +517,7 @@ impl UnreliablePacket for OutboundAvatarSend<'_> {
 struct OutboundAvatarBatch<'a> {
     receiver: PeerId,
     sends: Vec<OutboundAvatarSend<'a>>,
+    diagnostic_items: Vec<(PeerId, u8, bool)>,
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +564,214 @@ struct AvatarSyncCounters {
     flush_micros: AtomicU64,
     tick_micros: AtomicU64,
     max_tick_micros: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AvatarDiagnosticPairCounts {
+    built_full: u64,
+    built_delta: u64,
+    queue_ok_full: u64,
+    queue_ok_delta: u64,
+    quality: [u64; 4],
+}
+
+#[derive(Debug, Default)]
+struct AvatarDiagnosticWindow {
+    started_at: Option<Instant>,
+    last_sample_elapsed_ms: u64,
+    pair_counts: HashMap<PeerId, AvatarDiagnosticPairCounts>,
+}
+
+/// Disabled unless an observer ID, start marker and output path are all set.
+/// When enabled, this writes one compact row per active sender at five-second
+/// boundaries for a single receiver; it never logs individual packets.
+#[derive(Debug)]
+struct AvatarSyncDiagnostics {
+    observer_id: PeerId,
+    start_marker: PathBuf,
+    output_path: PathBuf,
+    global_output_path: PathBuf,
+    window_duration: Duration,
+    counters: Arc<AvatarSyncCounters>,
+    state: parking_lot::Mutex<AvatarDiagnosticWindow>,
+}
+
+impl AvatarSyncDiagnostics {
+    fn from_env(counters: Arc<AvatarSyncCounters>) -> Option<Arc<Self>> {
+        let observer_id = env::var("BASIS_AVATAR_DIAGNOSTIC_OBSERVER_ID")
+            .ok()?
+            .parse::<PeerId>()
+            .ok()?;
+        let start_marker = PathBuf::from(env::var_os("BASIS_AVATAR_DIAGNOSTIC_START_FILE")?);
+        let output_path = PathBuf::from(env::var_os("BASIS_AVATAR_DIAGNOSTIC_CSV")?);
+        let window_secs = env::var("BASIS_AVATAR_DIAGNOSTIC_WINDOW_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(60)
+            .max(1);
+        Some(Arc::new(Self {
+            observer_id,
+            start_marker,
+            global_output_path: output_path.with_extension("global.csv"),
+            output_path,
+            window_duration: Duration::from_secs(window_secs),
+            counters,
+            state: parking_lot::Mutex::new(AvatarDiagnosticWindow::default()),
+        }))
+    }
+
+    fn write_global_sample(&self, elapsed_ms: u64) {
+        let line = format!(
+            "{elapsed_ms},{},{},{},{},{},{},{}\n",
+            self.counters.inbound_updates.load(Ordering::Relaxed),
+            self.counters
+                .outbound_logical_avatar_sends
+                .load(Ordering::Relaxed),
+            self.counters.tick_count.load(Ordering::Relaxed),
+            self.counters.tick_micros.load(Ordering::Relaxed),
+            self.counters.build_micros.load(Ordering::Relaxed),
+            self.counters.flush_micros.load(Ordering::Relaxed),
+            self.counters.outbound_messages.load(Ordering::Relaxed),
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.global_output_path)
+        {
+            use std::io::Write;
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+
+    fn record_batch(&self, receiver_id: PeerId, items: &[(PeerId, u8, bool)], queue_ok: bool) {
+        if receiver_id != self.observer_id || items.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock();
+        for (sender_id, quality, is_delta) in items {
+            let counts = state.pair_counts.entry(*sender_id).or_default();
+            if *is_delta {
+                if queue_ok {
+                    counts.queue_ok_delta = counts.queue_ok_delta.saturating_add(1);
+                } else {
+                    counts.built_delta = counts.built_delta.saturating_add(1);
+                }
+            } else {
+                if queue_ok {
+                    counts.queue_ok_full = counts.queue_ok_full.saturating_add(1);
+                } else {
+                    counts.built_full = counts.built_full.saturating_add(1);
+                }
+            }
+            if !queue_ok {
+                if let Some(quality_count) = counts.quality.get_mut(*quality as usize) {
+                    *quality_count = quality_count.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    fn maybe_emit(
+        &self,
+        states: &DashMap<PeerId, Arc<PlayerAvatarState>>,
+        tracking: &DashMap<PeerId, PeerIdMap<ReceiverTracking>>,
+    ) {
+        let now = Instant::now();
+        let mut window = self.state.lock();
+        if window.started_at.is_none() {
+            if !self.start_marker.exists() {
+                return;
+            }
+            if let Some(parent) = self.output_path.parent() {
+                if std::fs::create_dir_all(parent).is_err() {
+                    return;
+                }
+            }
+            if std::fs::write(
+                &self.output_path,
+                "elapsed_ms,observer_id,sender_id,generation,inbound_sequence,outbound_sequence,keyframe_generation,current_is_keyframe,pair_last_seen_generation,pair_last_sent_ms,pair_baseline_quality,built_full,built_delta,queue_ok_full,queue_ok_delta,built_quality_very_low,built_quality_low,built_quality_medium,built_quality_high\n",
+            )
+            .is_err()
+            {
+                return;
+            }
+            if std::fs::write(
+                &self.global_output_path,
+                "elapsed_ms,inbound_updates,outbound_logical_avatar_sends,tick_count,tick_micros,build_micros,flush_micros,outbound_messages\n",
+            )
+            .is_err()
+            {
+                return;
+            }
+            window.pair_counts.clear();
+            window.last_sample_elapsed_ms = 0;
+            window.started_at = Some(now);
+            self.write_global_sample(0);
+            return;
+        }
+        let started_at = window.started_at.expect("checked above");
+        let elapsed = now.saturating_duration_since(started_at);
+        let nominal_window_ms = self.window_duration.as_millis().min(u64::MAX as u128) as u64;
+        if elapsed > self.window_duration && window.last_sample_elapsed_ms >= nominal_window_ms {
+            return;
+        }
+        let elapsed_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        if elapsed < self.window_duration
+            && elapsed_ms.saturating_sub(window.last_sample_elapsed_ms) < 5_000
+        {
+            return;
+        }
+        window.last_sample_elapsed_ms = elapsed_ms;
+        self.write_global_sample(elapsed_ms);
+        let counts = std::mem::take(&mut window.pair_counts);
+        let receiver_tracking = tracking.get(&self.observer_id);
+        let mut rows = String::with_capacity(states.len().saturating_mul(160));
+        for entry in states.iter() {
+            let sender_id = *entry.key();
+            let sender = entry.value();
+            let pair = receiver_tracking
+                .as_ref()
+                .and_then(|map| map.get(&sender_id));
+            let count = counts.get(&sender_id).copied().unwrap_or_default();
+            let (last_seen, last_sent, baseline_quality) = pair
+                .map(|value| {
+                    (
+                        value.last_seen_generation,
+                        value.last_sent_ms,
+                        value.baseline_quality,
+                    )
+                })
+                .unwrap_or((0, 0, u8::MAX));
+            rows.push_str(&format!(
+                "{elapsed_ms},{},{},{},{},{},{},{},{last_seen},{last_sent},{baseline_quality},{},{},{},{},{},{},{},{}\n",
+                self.observer_id,
+                sender_id,
+                sender.generation,
+                sender.last_inbound_sequence,
+                sender.outbound_sequence,
+                sender.keyframe_generation,
+                sender.current_is_keyframe,
+                count.built_full,
+                count.built_delta,
+                count.queue_ok_full,
+                count.queue_ok_delta,
+                count.quality[0],
+                count.quality[1],
+                count.quality[2],
+                count.quality[3],
+            ));
+        }
+        if !rows.is_empty() {
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.output_path)
+            {
+                use std::io::Write;
+                let _ = file.write_all(rows.as_bytes());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -630,11 +1092,14 @@ pub struct AvatarSyncSystem {
     profiler: Arc<BsrProfiler>,
     offloaded_pairs: Arc<DashMap<u64, ()>>,
     bypass_reduction_ids: Arc<DashMap<PeerId, ()>>,
+    diagnostics: Option<Arc<AvatarSyncDiagnostics>>,
 }
 
 impl AvatarSyncSystem {
     pub fn new(config: AvatarSyncConfig) -> Self {
         let profiler_enabled = config.enable_bsr_profiling;
+        let counters = Arc::new(AvatarSyncCounters::default());
+        let diagnostics = AvatarSyncDiagnostics::from_env(Arc::clone(&counters));
         Self {
             config: Arc::new(parking_lot::RwLock::new(config)),
             states: Arc::new(DashMap::new()),
@@ -650,10 +1115,11 @@ impl AvatarSyncSystem {
                 smoothed_tick_micros: 0,
             })),
             payload_pool: Arc::new(BytePool::new()),
-            counters: Arc::new(AvatarSyncCounters::default()),
+            counters,
             profiler: Arc::new(BsrProfiler::new(profiler_enabled)),
             offloaded_pairs: Arc::new(DashMap::new()),
             bypass_reduction_ids: Arc::new(DashMap::new()),
+            diagnostics,
         }
     }
 
@@ -916,7 +1382,14 @@ impl AvatarSyncSystem {
                 .fetch_add(1, Ordering::Relaxed);
         }
         let flush_start = Instant::now();
-        flush_receiver_groups_parallel(transport.clone(), receiver_groups)?;
+        flush_receiver_groups_parallel(
+            transport.clone(),
+            receiver_groups,
+            self.diagnostics.as_deref(),
+        )?;
+        if let Some(diagnostics) = self.diagnostics.as_ref() {
+            diagnostics.maybe_emit(&self.states, &self.tracking);
+        }
         self.counters
             .flush_micros
             .fetch_add(flush_start.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -984,8 +1457,7 @@ impl AvatarSyncSystem {
                 current.has_received_first = true;
                 current.position = update.position;
                 current.generation = generation;
-                if let Ok(qualities) = build_quality_packets(
-                    &self.payload_pool,
+                if let Ok(frame) = LazyQualityFrame::new(
                     &self.profiler,
                     update.peer_id,
                     current.outbound_sequence,
@@ -994,20 +1466,21 @@ impl AvatarSyncSystem {
                     additional_data,
                     config.strip_additional_data_at_low_quality,
                 ) {
-                    update_outbound_delta_state(
+                    let _ = update_lazy_outbound_delta_state(
                         current,
-                        qualities,
+                        frame,
                         generation,
                         config,
                         Instant::now(),
+                        &self.payload_pool,
+                        &self.profiler,
                     );
                 }
                 self.payload_pool.put(update.payload);
                 continue;
             }
 
-            if let Ok(qualities) = build_quality_packets(
-                &self.payload_pool,
+            if let Ok(frame) = LazyQualityFrame::new(
                 &self.profiler,
                 update.peer_id,
                 0,
@@ -1017,6 +1490,7 @@ impl AvatarSyncSystem {
                 config.strip_additional_data_at_low_quality,
             ) {
                 let now = Instant::now();
+                let qualities = lazy_frame_eager_view(&frame);
                 let keyframe_payloads = quality_payloads(&qualities);
                 self.states.insert(
                     update.peer_id,
@@ -1038,6 +1512,9 @@ impl AvatarSyncSystem {
                         small_delta_streak: 0,
                         current_is_keyframe: true,
                         qualities,
+                        lazy_current: Some(Arc::clone(&frame)),
+                        lazy_keyframe: Some(frame),
+                        lazy_deltas: None,
                     }),
                 );
             }
@@ -1072,6 +1549,14 @@ impl AvatarSyncSystem {
             spatial_candidates = Some(grid.ordered_indices(receiver_position, peer_count));
         }
         let initial_send_capacity = peer_count.saturating_sub(1);
+        let diagnostic_active = self
+            .diagnostics
+            .as_ref()
+            .is_some_and(|diagnostics| diagnostics.observer_id == receiver_id);
+        let mut diagnostic_items = Vec::new();
+        if diagnostic_active {
+            diagnostic_items.reserve(initial_send_capacity);
+        }
         let mut direct = if config.enable_bundle_compression {
             Vec::new()
         } else {
@@ -1151,8 +1636,15 @@ impl AvatarSyncSystem {
             {
                 continue;
             }
-            let Some(current_packet) = sender_state.qualities[quality_index as usize].as_ref()
-            else {
+            let current_quality = bit_quality_from_index(quality_index);
+            let current_packet = match sender_state.lazy_current.as_ref() {
+                Some(frame) => frame
+                    .quality(&self.payload_pool, &self.profiler, current_quality)
+                    .ok()
+                    .flatten(),
+                None => sender_state.qualities[quality_index as usize].as_ref(),
+            };
+            let Some(current_packet) = current_packet else {
                 continue;
             };
             tracking.last_seen_generation = sender_state.generation;
@@ -1169,17 +1661,22 @@ impl AvatarSyncSystem {
                 )
             };
 
+            let delta_packet = match sender_state.lazy_deltas.as_ref() {
+                Some(deltas) => deltas
+                    .quality(&self.payload_pool, &self.profiler, current_quality)
+                    .ok()
+                    .flatten(),
+                None => sender_state.deltas[quality_index as usize].as_ref(),
+            };
             let send_delta = config.enable_delta_compression
                 && !bypass_reduction
                 && !sender_state.current_is_keyframe
                 && tracking.baseline_keyframe_generation == sender_state.keyframe_generation
                 && tracking.baseline_quality == quality_index
-                && sender_state.deltas[quality_index as usize].is_some();
+                && delta_packet.is_some();
 
             let (channel, packet_bytes, interval_offset) = if send_delta {
-                let delta = sender_state.deltas[quality_index as usize]
-                    .as_ref()
-                    .expect("checked above");
+                let delta = delta_packet.expect("checked above");
                 if sender_state.small_id {
                     (channels::DELTA_AVATAR, &delta.bytes_small, 2)
                 } else {
@@ -1199,9 +1696,16 @@ impl AvatarSyncSystem {
                     if current_is_newer_than_keyframe {
                         current_packet
                     } else {
-                        let Some(keyframe) =
-                            sender_state.keyframe_qualities[quality_index as usize].as_ref()
-                        else {
+                        let keyframe = match sender_state.lazy_keyframe.as_ref() {
+                            Some(frame) => frame
+                                .quality(&self.payload_pool, &self.profiler, current_quality)
+                                .ok()
+                                .flatten(),
+                            None => {
+                                sender_state.keyframe_qualities[quality_index as usize].as_ref()
+                            }
+                        };
+                        let Some(keyframe) = keyframe else {
                             continue;
                         };
                         keyframe
@@ -1224,6 +1728,9 @@ impl AvatarSyncSystem {
                 }
             };
             logical_sends += 1;
+            if diagnostic_active {
+                diagnostic_items.push((sender_id, quality_index, send_delta));
+            }
 
             if config.enable_bundle_compression {
                 bundle.push(BundleAvatarSend {
@@ -1261,6 +1768,7 @@ impl AvatarSyncSystem {
         (!direct.is_empty()).then_some(OutboundAvatarBatch {
             receiver: receiver_id,
             sends: direct,
+            diagnostic_items,
         })
     }
 
@@ -1392,14 +1900,22 @@ fn env_bool(name: &str) -> Option<bool> {
 fn flush_receiver_groups_parallel<'a>(
     transport: TransportHandle,
     receiver_groups: Vec<OutboundAvatarBatch<'a>>,
+    diagnostics: Option<&AvatarSyncDiagnostics>,
 ) -> Result<()> {
     receiver_groups
         .par_iter()
         .with_min_len(RECEIVER_FLUSH_MIN_BATCH)
         .try_for_each(|batch| {
+            if let Some(diagnostics) = diagnostics {
+                diagnostics.record_batch(batch.receiver, &batch.diagnostic_items, false);
+            }
             transport
                 .try_send_many_unreliable_packets(batch.receiver, &batch.sends)
-                .map(|_| ())
+                .map(|_| {
+                    if let Some(diagnostics) = diagnostics {
+                        diagnostics.record_batch(batch.receiver, &batch.diagnostic_items, true);
+                    }
+                })
         })?;
     Ok(())
 }
@@ -1710,6 +2226,23 @@ fn quality_payloads(qualities: &[Option<PreSerializedQuality>; 4]) -> [Option<By
     })
 }
 
+fn lazy_frame_eager_view(frame: &LazyQualityFrame) -> [Option<PreSerializedQuality>; 4] {
+    let mut qualities = [None, None, None, None];
+    if let Some(Ok(Some(packet))) = frame.qualities[frame.source_quality as usize].get() {
+        qualities[frame.source_quality as usize] = Some(packet.clone());
+    }
+    qualities
+}
+
+fn bit_quality_from_index(index: u8) -> BitQuality {
+    match index {
+        0 => BitQuality::VeryLow,
+        1 => BitQuality::Low,
+        2 => BitQuality::Medium,
+        _ => BitQuality::High,
+    }
+}
+
 fn effective_keyframe_interval_ms(config: &AvatarSyncConfig, stretch_shift: u8) -> u64 {
     let base_ms = config.delta_keyframe_interval_ms.max(1);
     let max_ms = config.delta_keyframe_max_interval_ms;
@@ -1742,6 +2275,7 @@ fn update_keyframe_stretch(
     }
 }
 
+#[cfg(test)]
 fn update_outbound_delta_state(
     state: &mut PlayerAvatarState,
     qualities: [Option<PreSerializedQuality>; 4],
@@ -1807,6 +2341,104 @@ fn update_outbound_delta_state(
     state.qualities = qualities;
 }
 
+fn update_lazy_outbound_delta_state(
+    state: &mut PlayerAvatarState,
+    current: Arc<LazyQualityFrame>,
+    generation: u64,
+    config: &AvatarSyncConfig,
+    now: Instant,
+    pool: &BytePool,
+    profiler: &BsrProfiler,
+) -> Result<()> {
+    let current_payload = current.payload(pool, profiler, BitQuality::High)?;
+    let keyframe_interval = effective_keyframe_interval_ms(config, state.keyframe_stretch_shift);
+    let mut is_keyframe = !config.enable_delta_compression
+        || state
+            .lazy_keyframe
+            .as_ref()
+            .and_then(|frame| {
+                frame
+                    .quality(pool, profiler, BitQuality::High)
+                    .ok()
+                    .flatten()
+            })
+            .is_none()
+        || now.duration_since(state.last_keyframe)
+            >= Duration::from_millis(keyframe_interval.max(1));
+
+    let high_delta = if !is_keyframe {
+        let baseline = state
+            .lazy_keyframe
+            .as_ref()
+            .map(|frame| frame.payload(pool, profiler, BitQuality::High))
+            .transpose()?
+            .flatten();
+        match (baseline, current_payload) {
+            (Some(baseline), Some(current_payload)) => {
+                match build_delta(
+                    baseline.as_ref(),
+                    current_payload.as_ref(),
+                    BitQuality::High,
+                ) {
+                    Ok(delta) if delta.len() < BitQuality::High.payload_len() => {
+                        update_keyframe_stretch(state, config, delta.len());
+                        Some(delta)
+                    }
+                    Ok(_) | Err(_) => {
+                        is_keyframe = true;
+                        state.keyframe_stretch_shift = 0;
+                        state.small_delta_streak = 0;
+                        None
+                    }
+                }
+            }
+            _ => {
+                is_keyframe = true;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let current_qualities = lazy_frame_eager_view(&current);
+    if is_keyframe {
+        state.keyframe_qualities = current_qualities.clone();
+        state.keyframe_payloads = quality_payloads(&current_qualities);
+        state.lazy_keyframe = Some(Arc::clone(&current));
+        state.deltas = [None, None, None, None];
+        state.lazy_deltas = None;
+        state.keyframe_generation = generation;
+        state.keyframe_sequence = state.outbound_sequence;
+        state.last_keyframe = now;
+        state.current_is_keyframe = true;
+    } else {
+        let baseline = state
+            .lazy_keyframe
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing lazy keyframe frame"))?;
+        let high_delta = high_delta
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("missing High delta for non-keyframe"))?;
+        state.lazy_deltas = Some(LazyDeltaFrame::new(
+            Arc::clone(&current),
+            baseline,
+            state.outbound_sequence,
+            state.keyframe_sequence,
+            high_delta,
+            pool,
+            profiler,
+        )?);
+        state.deltas = [None, None, None, None];
+        state.current_is_keyframe = false;
+    }
+    state.qualities = current_qualities;
+    state.lazy_current = Some(current);
+    Ok(())
+}
+
+#[cfg(test)]
 fn build_delta_packets(
     peer_id: PeerId,
     outbound_sequence: u8,
@@ -1891,6 +2523,7 @@ fn pre_serialize_delta(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn build_quality_packets(
     pool: &BytePool,
     profiler: &BsrProfiler,
@@ -2235,6 +2868,9 @@ mod tests {
                         keyframe_stretch_shift: 0,
                         small_delta_streak: 0,
                         current_is_keyframe: true,
+                        lazy_current: None,
+                        lazy_keyframe: None,
+                        lazy_deltas: None,
                     }),
                 )
             })
@@ -2507,6 +3143,594 @@ mod tests {
     }
 
     #[test]
+    fn lazy_quality_packets_match_eager_packets_for_all_inputs_and_policies() {
+        let pool = BytePool::new();
+        let profiler = BsrProfiler::new(false);
+        let additional = [1, 0, 1, 7, 42];
+        for peer_id in [42, 300] {
+            for source_quality in [
+                BitQuality::VeryLow,
+                BitQuality::Low,
+                BitQuality::Medium,
+                BitQuality::High,
+            ] {
+                for strip in [false, true] {
+                    let payload = (0..source_quality.payload_len())
+                        .map(|index| (index as u8).wrapping_mul(17).wrapping_add(31))
+                        .collect::<Vec<_>>();
+                    let eager = build_quality_packets(
+                        &pool,
+                        &profiler,
+                        peer_id,
+                        251,
+                        source_quality,
+                        &payload,
+                        &additional,
+                        strip,
+                    )
+                    .unwrap();
+                    let lazy = LazyQualityFrame::new(
+                        &profiler,
+                        peer_id,
+                        251,
+                        source_quality,
+                        &payload,
+                        &additional,
+                        strip,
+                    )
+                    .unwrap();
+                    for quality in [
+                        BitQuality::VeryLow,
+                        BitQuality::Low,
+                        BitQuality::Medium,
+                        BitQuality::High,
+                    ] {
+                        let actual = lazy.quality(&pool, &profiler, quality).unwrap().cloned();
+                        assert_eq!(actual, eager[quality as usize]);
+                        if source_quality == BitQuality::High && quality != BitQuality::High {
+                            assert_eq!(
+                                lazy.init_counts[quality as usize].load(Ordering::Relaxed),
+                                1
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let malformed = vec![0; BitQuality::High.payload_len() - 1];
+        assert!(
+            LazyQualityFrame::new(&profiler, 42, 0, BitQuality::High, &malformed, &[], false,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn lazy_deltas_match_eager_packets_and_keep_frozen_keyframe_across_generations() {
+        let pool = BytePool::new();
+        let profiler = BsrProfiler::new(false);
+        let additional = [1, 0, 1, 7, 42];
+        let baseline_payload = (0..BitQuality::High.payload_len())
+            .map(|index| (index as u8).wrapping_mul(13).wrapping_add(9))
+            .collect::<Vec<_>>();
+        let mut current_payload = baseline_payload.clone();
+        for index in [0usize, 12, 28, 55, 91, 127, 158] {
+            current_payload[index] = current_payload[index].wrapping_add(1);
+        }
+        let baseline = LazyQualityFrame::new(
+            &profiler,
+            300,
+            77,
+            BitQuality::High,
+            &baseline_payload,
+            &additional,
+            false,
+        )
+        .unwrap();
+        let current = LazyQualityFrame::new(
+            &profiler,
+            300,
+            78,
+            BitQuality::High,
+            &current_payload,
+            &additional,
+            false,
+        )
+        .unwrap();
+        let eager_baseline = build_quality_packets(
+            &pool,
+            &profiler,
+            300,
+            77,
+            BitQuality::High,
+            &baseline_payload,
+            &additional,
+            false,
+        )
+        .unwrap();
+        let eager_current = build_quality_packets(
+            &pool,
+            &profiler,
+            300,
+            78,
+            BitQuality::High,
+            &current_payload,
+            &additional,
+            false,
+        )
+        .unwrap();
+        let baseline_payloads = quality_payloads(&eager_baseline);
+        let current_payloads = quality_payloads(&eager_current);
+        let high = build_delta(
+            baseline_payloads[BitQuality::High as usize]
+                .as_ref()
+                .unwrap(),
+            current_payloads[BitQuality::High as usize]
+                .as_ref()
+                .unwrap(),
+            BitQuality::High,
+        )
+        .unwrap();
+        let expected = build_delta_packets(
+            300,
+            78,
+            77,
+            &baseline_payloads,
+            &current_payloads,
+            &eager_current,
+            Some(&high),
+        );
+        let lazy = LazyDeltaFrame::new(
+            Arc::clone(&current),
+            Arc::clone(&baseline),
+            78,
+            77,
+            &high,
+            &pool,
+            &profiler,
+        )
+        .unwrap();
+        for quality in [
+            BitQuality::VeryLow,
+            BitQuality::Low,
+            BitQuality::Medium,
+            BitQuality::High,
+        ] {
+            assert_eq!(
+                lazy.quality(&pool, &profiler, quality).unwrap().cloned(),
+                expected[quality as usize]
+            );
+        }
+        let old_low = lazy
+            .quality(&pool, &profiler, BitQuality::Low)
+            .unwrap()
+            .unwrap()
+            .clone();
+
+        let mut later_payload = current_payload;
+        later_payload[63] ^= 0x80;
+        let later = LazyQualityFrame::new(
+            &profiler,
+            300,
+            79,
+            BitQuality::High,
+            &later_payload,
+            &additional,
+            false,
+        )
+        .unwrap();
+        let later_high = build_delta(
+            baseline_payloads[BitQuality::High as usize]
+                .as_ref()
+                .unwrap(),
+            &later
+                .payload(&pool, &profiler, BitQuality::High)
+                .unwrap()
+                .unwrap(),
+            BitQuality::High,
+        )
+        .unwrap();
+        let later_deltas = LazyDeltaFrame::new(
+            Arc::clone(&later),
+            baseline,
+            79,
+            77,
+            &later_high,
+            &pool,
+            &profiler,
+        )
+        .unwrap();
+        assert_eq!(
+            lazy.quality(&pool, &profiler, BitQuality::Low)
+                .unwrap()
+                .unwrap(),
+            &old_low
+        );
+        assert!(later_deltas
+            .quality(&pool, &profiler, BitQuality::Low)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn cold_old_delta_demand_survives_keyframe_replacement_and_peer_id_reuse() {
+        let pool = BytePool::new();
+        let profiler = BsrProfiler::new(false);
+        let additional = [1, 0, 1, 3, 91];
+        let payload = |seed: u8| {
+            (0..BitQuality::High.payload_len())
+                .map(|index| (index as u8).wrapping_mul(23).wrapping_add(seed))
+                .collect::<Vec<_>>()
+        };
+
+        // Keep an old High keyframe and a later generation whose Low delta has
+        // never been requested. The same numeric peer ID is then reused after
+        // a new keyframe, with sequence numbers wrapping across the reuse.
+        let old_baseline_payload = payload(11);
+        let mut old_current_payload = old_baseline_payload.clone();
+        for index in [2usize, 17, 45, 90, 131] {
+            old_current_payload[index] ^= 0x40;
+        }
+        let old_baseline = LazyQualityFrame::new(
+            &profiler,
+            42,
+            254,
+            BitQuality::High,
+            &old_baseline_payload,
+            &additional,
+            false,
+        )
+        .unwrap();
+        let old_current = LazyQualityFrame::new(
+            &profiler,
+            42,
+            255,
+            BitQuality::High,
+            &old_current_payload,
+            &additional,
+            false,
+        )
+        .unwrap();
+        let old_high_delta = build_delta(
+            &old_baseline_payload,
+            &old_current_payload,
+            BitQuality::High,
+        )
+        .unwrap();
+        let old_delta = LazyDeltaFrame::new(
+            Arc::clone(&old_current),
+            Arc::clone(&old_baseline),
+            255,
+            254,
+            &old_high_delta,
+            &pool,
+            &profiler,
+        )
+        .unwrap();
+        assert!(old_delta.deltas[BitQuality::Low as usize].get().is_none());
+
+        // Replacement/keyframe materialization and reuse do not mutate old
+        // snapshots or change the source bytes they own.
+        let replacement_payload = payload(99);
+        let replacement_keyframe = LazyQualityFrame::new(
+            &profiler,
+            42,
+            0,
+            BitQuality::High,
+            &replacement_payload,
+            &additional,
+            true,
+        )
+        .unwrap();
+        let reused_id_payload = payload(177);
+        let reused_id_current = LazyQualityFrame::new(
+            &profiler,
+            42,
+            1,
+            BitQuality::High,
+            &reused_id_payload,
+            &additional,
+            true,
+        )
+        .unwrap();
+        let replacement_low = replacement_keyframe
+            .quality(&pool, &profiler, BitQuality::Low)
+            .unwrap()
+            .unwrap()
+            .clone();
+        let reused_low = reused_id_current
+            .quality(&pool, &profiler, BitQuality::Low)
+            .unwrap()
+            .unwrap()
+            .clone();
+
+        let eager_old_baseline = build_quality_packets(
+            &pool,
+            &profiler,
+            42,
+            254,
+            BitQuality::High,
+            &old_baseline_payload,
+            &additional,
+            false,
+        )
+        .unwrap();
+        let eager_old_current = build_quality_packets(
+            &pool,
+            &profiler,
+            42,
+            255,
+            BitQuality::High,
+            &old_current_payload,
+            &additional,
+            false,
+        )
+        .unwrap();
+        let baseline_payloads = quality_payloads(&eager_old_baseline);
+        let current_payloads = quality_payloads(&eager_old_current);
+        let expected_old = build_delta_packets(
+            42,
+            255,
+            254,
+            &baseline_payloads,
+            &current_payloads,
+            &eager_old_current,
+            Some(&old_high_delta),
+        );
+
+        // First demand is deliberately cold and happens after both replacement
+        // and ID reuse. It must still use the old sequence, additional data,
+        // current frame, and frozen keyframe bytes.
+        assert_eq!(
+            old_delta
+                .quality(&pool, &profiler, BitQuality::Low)
+                .unwrap()
+                .cloned(),
+            expected_old[BitQuality::Low as usize]
+        );
+        assert_eq!(
+            old_delta.init_counts[BitQuality::Low as usize].load(Ordering::Relaxed),
+            1
+        );
+        assert_ne!(
+            old_delta
+                .quality(&pool, &profiler, BitQuality::Low)
+                .unwrap()
+                .unwrap()
+                .bytes_small,
+            reused_low.bytes_small
+        );
+        assert_ne!(replacement_low.bytes_small, reused_low.bytes_small);
+        assert_eq!(old_delta.baseline.peer_id, 42);
+        assert_eq!(old_delta.baseline.outbound_sequence, 254);
+        assert_eq!(old_delta.current.outbound_sequence, 255);
+    }
+
+    #[test]
+    fn concurrent_first_quality_demand_publishes_one_immutable_cache_entry() {
+        let pool = BytePool::new();
+        let profiler = BsrProfiler::new(false);
+        let payload = vec![0x53; BitQuality::High.payload_len()];
+        let frame =
+            LazyQualityFrame::new(&profiler, 42, 10, BitQuality::High, &payload, &[], false)
+                .unwrap();
+        let results = (0..64usize)
+            .into_par_iter()
+            .map(|_| {
+                frame
+                    .quality(&pool, &profiler, BitQuality::Medium)
+                    .unwrap()
+                    .unwrap()
+                    .bytes_small
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert!(results.iter().all(|bytes| bytes == &results[0]));
+        assert_eq!(
+            frame.init_counts[BitQuality::Medium as usize].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            frame.init_counts[BitQuality::Low as usize].load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn lazy_state_trace_matches_eager_keyframe_and_delta_transitions() {
+        let pool = BytePool::new();
+        let profiler = BsrProfiler::new(false);
+        let mut config = receiver_build_test_config();
+        config.enable_delta_compression = true;
+        config.delta_keyframe_interval_ms = 500;
+        config.delta_keyframe_max_interval_ms = 500;
+        let start = Instant::now();
+        let additional = [1, 0, 1, 4, 22];
+        let make_payload = |seed: u8| {
+            (0..BitQuality::High.payload_len())
+                .map(|index| (index as u8).wrapping_mul(19).wrapping_add(seed))
+                .collect::<Vec<_>>()
+        };
+        let initial_payload = make_payload(8);
+        let initial_frame = LazyQualityFrame::new(
+            &profiler,
+            42,
+            20,
+            BitQuality::High,
+            &initial_payload,
+            &additional,
+            true,
+        )
+        .unwrap();
+        let initial_eager = build_quality_packets(
+            &pool,
+            &profiler,
+            42,
+            20,
+            BitQuality::High,
+            &initial_payload,
+            &additional,
+            true,
+        )
+        .unwrap();
+        let make_state = |qualities: [Option<PreSerializedQuality>; 4],
+                          current_frame: Option<Arc<LazyQualityFrame>>,
+                          keyframe_frame: Option<Arc<LazyQualityFrame>>| {
+            let payloads = quality_payloads(&qualities);
+            PlayerAvatarState {
+                peer_id: 42,
+                small_id: true,
+                position: [0.0; 3],
+                generation: 1,
+                last_inbound_sequence: 20,
+                outbound_sequence: 20,
+                has_received_first: true,
+                qualities: qualities.clone(),
+                keyframe_qualities: qualities,
+                keyframe_payloads: payloads,
+                deltas: [None, None, None, None],
+                keyframe_generation: 1,
+                keyframe_sequence: 20,
+                last_keyframe: start,
+                keyframe_stretch_shift: 0,
+                small_delta_streak: 0,
+                current_is_keyframe: true,
+                lazy_current: current_frame,
+                lazy_keyframe: keyframe_frame,
+                lazy_deltas: None,
+            }
+        };
+        let mut lazy_state = make_state(
+            lazy_frame_eager_view(&initial_frame),
+            Some(Arc::clone(&initial_frame)),
+            Some(Arc::clone(&initial_frame)),
+        );
+        let mut eager_state = make_state(initial_eager, None, None);
+
+        let mut second_payload = initial_payload.clone();
+        second_payload[12] ^= 0x01;
+        second_payload[85] ^= 0x02;
+        let second_frame = LazyQualityFrame::new(
+            &profiler,
+            42,
+            21,
+            BitQuality::High,
+            &second_payload,
+            &additional,
+            true,
+        )
+        .unwrap();
+        let second_eager = build_quality_packets(
+            &pool,
+            &profiler,
+            42,
+            21,
+            BitQuality::High,
+            &second_payload,
+            &additional,
+            true,
+        )
+        .unwrap();
+        // The later config change must not alter policy captured for this frame.
+        config.strip_additional_data_at_low_quality = false;
+        let second_time = start + Duration::from_millis(100);
+        update_lazy_outbound_delta_state(
+            &mut lazy_state,
+            second_frame,
+            2,
+            &config,
+            second_time,
+            &pool,
+            &profiler,
+        )
+        .unwrap();
+        update_outbound_delta_state(&mut eager_state, second_eager, 2, &config, second_time);
+        assert_eq!(
+            lazy_state.current_is_keyframe,
+            eager_state.current_is_keyframe
+        );
+        assert_eq!(
+            lazy_state.keyframe_generation,
+            eager_state.keyframe_generation
+        );
+        assert_eq!(lazy_state.keyframe_sequence, eager_state.keyframe_sequence);
+        assert_eq!(lazy_state.last_keyframe, eager_state.last_keyframe);
+        for quality in [
+            BitQuality::VeryLow,
+            BitQuality::Low,
+            BitQuality::Medium,
+            BitQuality::High,
+        ] {
+            assert_eq!(
+                lazy_state
+                    .lazy_current
+                    .as_ref()
+                    .unwrap()
+                    .quality(&pool, &profiler, quality)
+                    .unwrap(),
+                eager_state.qualities[quality as usize].as_ref()
+            );
+            assert_eq!(
+                lazy_state
+                    .lazy_deltas
+                    .as_ref()
+                    .unwrap()
+                    .quality(&pool, &profiler, quality)
+                    .unwrap(),
+                eager_state.deltas[quality as usize].as_ref()
+            );
+        }
+
+        let mut third_payload = second_payload.clone();
+        third_payload[63] ^= 0x04;
+        let third_frame = LazyQualityFrame::new(
+            &profiler,
+            42,
+            22,
+            BitQuality::High,
+            &third_payload,
+            &additional,
+            false,
+        )
+        .unwrap();
+        let third_eager = build_quality_packets(
+            &pool,
+            &profiler,
+            42,
+            22,
+            BitQuality::High,
+            &third_payload,
+            &additional,
+            false,
+        )
+        .unwrap();
+        let keyframe_time = start + Duration::from_millis(600);
+        update_lazy_outbound_delta_state(
+            &mut lazy_state,
+            third_frame,
+            3,
+            &config,
+            keyframe_time,
+            &pool,
+            &profiler,
+        )
+        .unwrap();
+        update_outbound_delta_state(&mut eager_state, third_eager, 3, &config, keyframe_time);
+        assert_eq!(
+            lazy_state.current_is_keyframe,
+            eager_state.current_is_keyframe
+        );
+        assert!(lazy_state.current_is_keyframe);
+        assert_eq!(
+            lazy_state.keyframe_generation,
+            eager_state.keyframe_generation
+        );
+        assert_eq!(lazy_state.keyframe_sequence, eager_state.keyframe_sequence);
+        assert_eq!(lazy_state.last_keyframe, eager_state.last_keyframe);
+        assert!(lazy_state.lazy_deltas.is_none());
+    }
+
+    #[test]
     fn interval_byte_matches_csharp_formula() {
         let config = AvatarSyncConfig {
             default_interval_ms: 50,
@@ -2709,6 +3933,9 @@ mod tests {
             keyframe_stretch_shift,
             small_delta_streak,
             current_is_keyframe: true,
+            lazy_current: None,
+            lazy_keyframe: None,
+            lazy_deltas: None,
         };
 
         let mut small_delta_state = make_state(baseline_payloads.clone(), now, 0, 3);
