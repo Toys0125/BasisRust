@@ -83,6 +83,39 @@ jobs:
           cp BasisRustServer/Config.xml package/server/Config.xml
           cp README.md package/README.md
 
+      - name: Pretty-print packaged configs
+        shell: bash
+        run: |
+          PYTHON=python3
+          command -v "$PYTHON" >/dev/null || PYTHON=python
+          "$PYTHON" - <<'PY'
+          from pathlib import Path
+          from xml.dom import minidom
+
+          def strip_whitespace(node):
+              for child in list(node.childNodes):
+                  if child.nodeType == child.TEXT_NODE and not child.data.strip():
+                      node.removeChild(child)
+                  elif child.hasChildNodes():
+                      strip_whitespace(child)
+
+          for path in (
+              Path("package/client/Config.xml"),
+              Path("package/server/Config.xml"),
+          ):
+              document = minidom.parse(str(path))
+              strip_whitespace(document)
+              pretty = document.documentElement.toprettyxml(indent="  ", newl="\n")
+              with path.open("w", encoding="utf-8", newline="\n") as output:
+                  output.write(pretty)
+                  if not pretty.endswith("\n"):
+                      output.write("\n")
+
+              formatted = path.read_text(encoding="utf-8")
+              if "\n  <" not in formatted or not formatted.endswith("\n"):
+                  raise SystemExit(f"{path} was not pretty-printed")
+          PY
+
       - name: Package Windows build
         if: runner.os == 'Windows'
         shell: pwsh
