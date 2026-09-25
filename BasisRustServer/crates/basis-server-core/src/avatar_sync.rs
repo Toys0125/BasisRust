@@ -217,7 +217,7 @@ impl SpatialGrid {
 #[derive(Debug, Clone, Copy)]
 struct SliceState {
     slice_count: usize,
-    slice_index: usize,
+    receiver_cursor: usize,
     last_distance_update: Instant,
     smoothed_tick_micros: u64,
 }
@@ -283,6 +283,7 @@ struct ReceiverBuildScratch {
 pub struct AvatarSyncStats {
     pub inbound_updates: u64,
     pub outbound_messages: u64,
+    pub outbound_logical_avatar_sends: u64,
     pub outbound_batches: u64,
     pub active_states: usize,
     pub pending_updates: usize,
@@ -302,6 +303,7 @@ pub struct AvatarSyncStats {
 struct AvatarSyncCounters {
     inbound_updates: AtomicU64,
     outbound_messages: AtomicU64,
+    outbound_logical_avatar_sends: AtomicU64,
     outbound_batches: AtomicU64,
     tick_count: AtomicU64,
     build_micros: AtomicU64,
@@ -643,7 +645,7 @@ impl AvatarSyncSystem {
             monotonic_origin: Instant::now(),
             slice_state: Arc::new(parking_lot::Mutex::new(SliceState {
                 slice_count: 1,
-                slice_index: 0,
+                receiver_cursor: 0,
                 last_distance_update: Instant::now(),
                 smoothed_tick_micros: 0,
             })),
@@ -665,7 +667,6 @@ impl AvatarSyncSystem {
             state.slice_count = state
                 .slice_count
                 .clamp(config.min_receiver_slices, config.max_receiver_slices);
-            state.slice_index %= state.slice_count.max(1);
         }
         self.profiler.set_enabled(config.enable_bsr_profiling);
         *self.config.write() = config;
@@ -782,6 +783,10 @@ impl AvatarSyncSystem {
         AvatarSyncStats {
             inbound_updates: self.counters.inbound_updates.load(Ordering::Relaxed),
             outbound_messages: self.counters.outbound_messages.load(Ordering::Relaxed),
+            outbound_logical_avatar_sends: self
+                .counters
+                .outbound_logical_avatar_sends
+                .load(Ordering::Relaxed),
             outbound_batches: self.counters.outbound_batches.load(Ordering::Relaxed),
             active_states: self.states.len(),
             pending_updates: self.pending.len(),
@@ -1247,6 +1252,9 @@ impl AvatarSyncSystem {
             self.bundle_ratios.insert(receiver_id, bundle_ratio);
         }
         self.profiler.add_sends(logical_sends);
+        self.counters
+            .outbound_logical_avatar_sends
+            .fetch_add(logical_sends as u64, Ordering::Relaxed);
         // Only the independently owned `direct` sends escape this receiver build. In
         // particular, release every Bytes clone held by scratch before it is reused.
         bundle.clear();
@@ -1260,11 +1268,9 @@ impl AvatarSyncSystem {
         let mut state = self.slice_state.lock();
         let now = Instant::now();
         let slice_count = state.slice_count.max(1);
-        let slice_index = state.slice_index % slice_count;
-        state.slice_index = (state.slice_index + 1) % slice_count;
-        let slice_size = receiver_count.div_ceil(slice_count);
-        let slice_start = slice_index.saturating_mul(slice_size).min(receiver_count);
-        let slice_end = slice_start.saturating_add(slice_size).min(receiver_count);
+        let (slice_start, slice_end, next_cursor) =
+            next_receiver_slice(receiver_count, slice_count, state.receiver_cursor);
+        state.receiver_cursor = next_cursor;
         let update_distances = now.duration_since(state.last_distance_update)
             >= Duration::from_millis(DISTANCE_UPDATE_INTERVAL_MS);
         if update_distances {
@@ -1306,8 +1312,10 @@ impl AvatarSyncSystem {
 
         let mut next_slice_count = state.slice_count;
         if estimated_cycle_micros > cycle_budget_micros {
-            if elapsed_micros > tick_budget_micros && state.slice_count < max_slices {
-                next_slice_count = state.slice_count + 1;
+            if elapsed_micros > tick_budget_micros {
+                if state.slice_count < max_slices {
+                    next_slice_count = state.slice_count + 1;
+                }
             } else if state.slice_count > min_slices {
                 next_slice_count = state.slice_count - 1;
             }
@@ -1324,9 +1332,24 @@ impl AvatarSyncSystem {
 
         if next_slice_count != state.slice_count {
             state.slice_count = next_slice_count;
-            state.slice_index %= state.slice_count.max(1);
         }
     }
+}
+
+fn next_receiver_slice(
+    receiver_count: usize,
+    slice_count: usize,
+    cursor: usize,
+) -> (usize, usize, usize) {
+    if receiver_count == 0 {
+        return (0, 0, 0);
+    }
+
+    let start = if cursor >= receiver_count { 0 } else { cursor };
+    let slice_size = receiver_count.div_ceil(slice_count.max(1));
+    let end = start.saturating_add(slice_size).min(receiver_count);
+    let next_cursor = if end == receiver_count { 0 } else { end };
+    (start, end, next_cursor)
 }
 
 impl AvatarSyncConfig {
@@ -2493,6 +2516,56 @@ mod tests {
 
         system.adapt_slice_count(4_000, &config);
         assert_eq!(system.slice_state.lock().slice_count, 2);
+    }
+
+    #[test]
+    fn overloaded_slice_count_saturates_at_maximum() {
+        let mut config = receiver_build_test_config();
+        config.min_receiver_slices = 1;
+        config.max_receiver_slices = 32;
+        config.tick_budget_ms = 1.0;
+        config.receiver_cycle_budget_ms = 1.0;
+        let system = AvatarSyncSystem::new(config.clone());
+        system.slice_state.lock().slice_count = 32;
+
+        for _ in 0..8 {
+            system.adapt_slice_count(10_000, &config);
+            assert_eq!(system.slice_state.lock().slice_count, 32);
+        }
+    }
+
+    #[test]
+    fn absolute_receiver_cursor_covers_each_receiver_once_as_slice_count_changes() {
+        for receiver_count in [1, 17, 1_500] {
+            let mut cursor = 0;
+            let mut visits = vec![0_u8; receiver_count];
+            let mut complete_cycles = 0;
+            for tick in 0..500 {
+                let slices = [32, 31, 1, 30, 2, 31, 7, 32, 3, 17];
+                let (start, end, next_cursor) =
+                    next_receiver_slice(receiver_count, slices[tick % slices.len()], cursor);
+                assert!(start <= end && end <= receiver_count);
+                for visit in &mut visits[start..end] {
+                    *visit += 1;
+                }
+                cursor = next_cursor;
+                if cursor == 0 {
+                    assert!(visits.iter().all(|count| *count == 1));
+                    visits.fill(0);
+                    complete_cycles += 1;
+                }
+            }
+            assert!(complete_cycles >= 2);
+        }
+    }
+
+    #[test]
+    fn receiver_cursor_handles_empty_and_changing_populations() {
+        assert_eq!(next_receiver_slice(0, 32, 120), (0, 0, 0));
+        assert_eq!(next_receiver_slice(17, 32, 120), (0, 1, 1));
+        assert_eq!(next_receiver_slice(4, 2, 3), (3, 4, 0));
+        assert_eq!(next_receiver_slice(9, 3, 2), (2, 5, 5));
+        assert_eq!(next_receiver_slice(9, 3, 9), (0, 3, 3));
     }
 
     #[test]
