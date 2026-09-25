@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex as StdMutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -142,6 +142,9 @@ struct Args {
     spawn_group_size: usize,
     #[arg(long, default_value_t = 1000.0)]
     spawn_group_spacing: f32,
+    /// Use exact group centers instead of random ±0.25-unit spawn offsets.
+    #[arg(long)]
+    fixed_spawn_positions: bool,
     /// Place every client at the origin and hold its position there for the full run.
     /// This is a dense colocated workload; it disables the per-send random positional walk.
     #[arg(long)]
@@ -1218,6 +1221,9 @@ struct AvatarObserver {
     unapplied_deltas: u64,
     observed_channels: HashMap<u8, u64>,
     accepted_avatar_items: u64,
+    applied_full_items: u64,
+    applied_delta_items: u64,
+    malformed_items: u64,
     ignored_channels: u64,
     non_newer_sequences: u64,
     decoded_delta_items: u64,
@@ -1247,6 +1253,9 @@ impl AvatarObserver {
             unapplied_deltas: 0,
             observed_channels: HashMap::new(),
             accepted_avatar_items: 0,
+            applied_full_items: 0,
+            applied_delta_items: 0,
+            malformed_items: 0,
             ignored_channels: 0,
             non_newer_sequences: 0,
             decoded_delta_items: 0,
@@ -1258,6 +1267,16 @@ impl AvatarObserver {
 
     fn begin_window(&mut self, observer_position: [f32; 3], now: std::time::Instant) {
         self.window_started_at = Some(now);
+        self.decode_errors = 0;
+        self.unapplied_deltas = 0;
+        self.accepted_avatar_items = 0;
+        self.applied_full_items = 0;
+        self.applied_delta_items = 0;
+        self.malformed_items = 0;
+        self.ignored_channels = 0;
+        self.non_newer_sequences = 0;
+        self.decoded_delta_items = 0;
+        self.observed_channels.clear();
         for peer in self.peers.values_mut() {
             peer.near_gaps_micros.clear();
             peer.near_update_count = 0;
@@ -1307,14 +1326,24 @@ impl AvatarObserver {
                             now,
                             tracking,
                         ) {
-                            self.decode_errors = self.decode_errors.saturating_add(1);
+                            if tracking {
+                                self.decode_errors = self.decode_errors.saturating_add(1);
+                                self.malformed_items = self.malformed_items.saturating_add(1);
+                            }
                         }
                     }
                 }
-                Err(_) => self.decode_errors = self.decode_errors.saturating_add(1),
+                Err(_) if tracking => {
+                    self.decode_errors = self.decode_errors.saturating_add(1);
+                    self.malformed_items = self.malformed_items.saturating_add(1);
+                }
+                Err(_) => {}
             }
         } else if !self.observe_item(channel, payload, observer_position, now, tracking) {
-            self.decode_errors = self.decode_errors.saturating_add(1);
+            if tracking {
+                self.decode_errors = self.decode_errors.saturating_add(1);
+                self.malformed_items = self.malformed_items.saturating_add(1);
+            }
         }
     }
 
@@ -1388,6 +1417,7 @@ impl AvatarObserver {
         state.last_position = Some(position);
         if tracking {
             self.accepted_avatar_items = self.accepted_avatar_items.saturating_add(1);
+            self.applied_full_items = self.applied_full_items.saturating_add(1);
         }
         if tracking {
             record_observer_near_update(self.radius, position, observer_position, state, now);
@@ -1457,6 +1487,7 @@ impl AvatarObserver {
         state.last_position = Some(position);
         if tracking {
             self.accepted_avatar_items = self.accepted_avatar_items.saturating_add(1);
+            self.applied_delta_items = self.applied_delta_items.saturating_add(1);
         }
         if tracking {
             record_observer_near_update(self.radius, position, observer_position, state, now);
@@ -1494,7 +1525,7 @@ impl AvatarObserver {
             .count();
         let missing = self.expected_near_peers.saturating_sub(near.len());
         let summary = format!(
-            "avatar observer: window_started={} window_ms={} near_peers={} expected={} missing={} stale_500ms={} applied_gaps={} p50_ms={:.2} p95_ms={:.2} decode_errors={} unapplied_deltas={}",
+            "avatar observer: window_started={} window_ms={} near_peers={} expected={} missing={} stale_500ms={} applied_gaps={} p50_ms={:.2} p95_ms={:.2} applied_full={} applied_delta={} malformed={} decode_errors={} unapplied_deltas={} non_newer_sequences={} ignored_channels={}",
             self.window_started_at.is_some(),
             observed_ms,
             near.len(),
@@ -1504,12 +1535,17 @@ impl AvatarObserver {
             gaps.len(),
             p50 as f64 / 1000.0,
             p95 as f64 / 1000.0,
+            self.applied_full_items,
+            self.applied_delta_items,
+            self.malformed_items,
             self.decode_errors,
             self.unapplied_deltas,
+            self.non_newer_sequences,
+            self.ignored_channels,
         );
         let mut csv = String::from("metric,value\n");
         let summary_values = format!(
-            "{},{},{},{},{},{},{},{:.2},{:.2},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{:.2},{:.2},{},{},{},{},{},{},{},{},{},{}",
             self.window_started_at.is_some(),
             observed_ms,
             near.len(),
@@ -1522,6 +1558,9 @@ impl AvatarObserver {
             self.decode_errors,
             self.unapplied_deltas,
             self.accepted_avatar_items,
+            self.applied_full_items,
+            self.applied_delta_items,
+            self.malformed_items,
             self.ignored_channels,
             self.non_newer_sequences,
             self.decoded_delta_items,
@@ -1540,6 +1579,9 @@ impl AvatarObserver {
             "decode_errors",
             "unapplied_deltas",
             "accepted_avatar_items",
+            "applied_full_items",
+            "applied_delta_items",
+            "malformed_items",
             "ignored_channels",
             "non_newer_sequences",
             "decoded_delta_items",
@@ -1661,7 +1703,214 @@ struct BasisClient {
     force_avatar_keyframe: AtomicBool,
     pose: Mutex<PoseState>,
     avatar_observer: Option<StdMutex<AvatarObserver>>,
+    avatar_diagnostics: Option<Arc<ClientAvatarDiagnostics>>,
     identity: Identity,
+}
+
+#[derive(Debug, Default)]
+struct ClientAvatarDiagnostics {
+    movement_frame_visits: AtomicU64,
+    generated_full: AtomicU64,
+    generated_delta: AtomicU64,
+    socket_sent_full: AtomicU64,
+    socket_sent_delta: AtomicU64,
+    send_errors: AtomicU64,
+    last_sequence: AtomicU8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClientAvatarDiagnosticSnapshot {
+    index: usize,
+    remote_peer_id: Option<i32>,
+    local_port: Option<u16>,
+    connected: bool,
+    frame_visits: u64,
+    generated_full: u64,
+    generated_delta: u64,
+    socket_sent_full: u64,
+    socket_sent_delta: u64,
+    send_errors: u64,
+    last_sequence: u8,
+}
+
+async fn client_avatar_diagnostic_snapshot(
+    clients: &Arc<Mutex<Vec<Arc<BasisClient>>>>,
+) -> Vec<ClientAvatarDiagnosticSnapshot> {
+    let clients = clients.lock().await.clone();
+    let mut snapshots = Vec::with_capacity(clients.len());
+    for client in clients {
+        let Some(diagnostics) = &client.avatar_diagnostics else {
+            continue;
+        };
+        let remote_peer_id = *client.remote_peer_id.lock().await;
+        let local_port = client
+            .socket
+            .local_addr()
+            .ok()
+            .map(|address| address.port());
+        snapshots.push(ClientAvatarDiagnosticSnapshot {
+            index: client.index,
+            remote_peer_id,
+            local_port,
+            connected: client.connected.load(Ordering::Relaxed),
+            frame_visits: diagnostics.movement_frame_visits.load(Ordering::Relaxed),
+            generated_full: diagnostics.generated_full.load(Ordering::Relaxed),
+            generated_delta: diagnostics.generated_delta.load(Ordering::Relaxed),
+            socket_sent_full: diagnostics.socket_sent_full.load(Ordering::Relaxed),
+            socket_sent_delta: diagnostics.socket_sent_delta.load(Ordering::Relaxed),
+            send_errors: diagnostics.send_errors.load(Ordering::Relaxed),
+            last_sequence: diagnostics.last_sequence.load(Ordering::Relaxed),
+        });
+    }
+    snapshots.sort_unstable_by_key(|snapshot| snapshot.index);
+    snapshots
+}
+
+async fn client_avatar_diagnostic_window(
+    clients: Arc<Mutex<Vec<Arc<BasisClient>>>>,
+    marker_path: PathBuf,
+    output_path: PathBuf,
+    window_duration: Duration,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
+    loop {
+        if marker_path.exists() {
+            break;
+        }
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        time::sleep(Duration::from_millis(50)).await;
+    }
+    let started = time::Instant::now();
+    let start = client_avatar_diagnostic_snapshot(&clients).await;
+    let socket_ports_path = output_path.with_extension("socket-ports.csv");
+    let mut socket_ports_csv =
+        String::from("boundary,logical_client_index,remote_peer_id,local_port\n");
+    for snapshot in &start {
+        socket_ports_csv.push_str(&format!(
+            "start,{},{},{}\n",
+            snapshot.index,
+            snapshot
+                .remote_peer_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            snapshot
+                .local_port
+                .map(|port| port.to_string())
+                .unwrap_or_default(),
+        ));
+    }
+    if let Some(parent) = socket_ports_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&socket_ports_path, &socket_ports_csv).with_context(|| {
+        format!(
+            "writing avatar sender socket ports {}",
+            socket_ports_path.display()
+        )
+    })?;
+    tokio::select! {
+        _ = time::sleep(window_duration) => {},
+        _ = async {
+            while !shutdown.load(Ordering::Relaxed) {
+                time::sleep(Duration::from_millis(100)).await;
+            }
+        } => {},
+    }
+    let elapsed_ms = started.elapsed().as_millis();
+    let end = client_avatar_diagnostic_snapshot(&clients).await;
+    for snapshot in &end {
+        socket_ports_csv.push_str(&format!(
+            "end,{},{},{}\n",
+            snapshot.index,
+            snapshot
+                .remote_peer_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            snapshot
+                .local_port
+                .map(|port| port.to_string())
+                .unwrap_or_default(),
+        ));
+    }
+    std::fs::write(&socket_ports_path, &socket_ports_csv).with_context(|| {
+        format!(
+            "writing avatar sender socket ports {}",
+            socket_ports_path.display()
+        )
+    })?;
+    let by_index = start
+        .into_iter()
+        .map(|snapshot| (snapshot.index, snapshot))
+        .collect::<HashMap<_, _>>();
+    let mut csv = String::from(
+        "logical_client_index,remote_peer_id_start,remote_peer_id_end,local_port_start,local_port_end,connected_at_end,window_ms,movement_frame_visits,generated_full,generated_delta,socket_sent_full,socket_sent_delta,send_errors,start_sequence,end_sequence\n",
+    );
+    let peer_count = end.len();
+    for current in end {
+        let previous = by_index.get(&current.index).copied().unwrap_or(current);
+        let difference = |end: u64, start: u64| end.saturating_sub(start);
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            current.index,
+            previous
+                .remote_peer_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            current
+                .remote_peer_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            previous
+                .local_port
+                .map(|port| port.to_string())
+                .unwrap_or_default(),
+            current
+                .local_port
+                .map(|port| port.to_string())
+                .unwrap_or_default(),
+            current.connected,
+            elapsed_ms,
+            difference(current.frame_visits, previous.frame_visits),
+            difference(current.generated_full, previous.generated_full),
+            difference(current.generated_delta, previous.generated_delta),
+            difference(current.socket_sent_full, previous.socket_sent_full),
+            difference(current.socket_sent_delta, previous.socket_sent_delta),
+            difference(current.send_errors, previous.send_errors),
+            previous.last_sequence,
+            current.last_sequence,
+        ));
+    }
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&output_path, csv).with_context(|| {
+        format!(
+            "writing avatar sender diagnostics {}",
+            output_path.display()
+        )
+    })?;
+    info!(
+        "avatar sender diagnostics: window_ms={} peers={} csv={}",
+        elapsed_ms,
+        peer_count,
+        output_path.display()
+    );
+    Ok(())
+}
+
+impl ClientAvatarDiagnostics {
+    fn enabled_from_env() -> bool {
+        std::env::var("BASIS_AVATAR_DIAGNOSTICS")
+            .map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    }
 }
 
 impl BasisClient {
@@ -1713,6 +1962,8 @@ impl BasisClient {
                     config.observe_avatar_window,
                 ))
             }),
+            avatar_diagnostics: ClientAvatarDiagnostics::enabled_from_env()
+                .then(|| Arc::new(ClientAvatarDiagnostics::default())),
             identity,
         });
 
@@ -2880,6 +3131,7 @@ struct SpawnLayout {
     group_size: usize,
     group_spacing: f32,
     no_spread: bool,
+    fixed_positions: bool,
 }
 
 impl SpawnLayout {
@@ -2888,6 +3140,7 @@ impl SpawnLayout {
             group_size: 0,
             group_spacing: 0.0,
             no_spread: false,
+            fixed_positions: false,
         }
     }
 
@@ -2899,6 +3152,7 @@ impl SpawnLayout {
                 group_size,
                 group_spacing,
                 no_spread: false,
+                fixed_positions: false,
             }
         }
     }
@@ -2908,15 +3162,23 @@ impl SpawnLayout {
         self
     }
 
+    fn with_fixed_positions(mut self, fixed_positions: bool) -> Self {
+        self.fixed_positions = fixed_positions;
+        self
+    }
+
     fn base_for_client(self, index: usize) -> [f32; 3] {
         if self.no_spread {
             return [0.0; 3];
         }
-        let mut rng = rand::thread_rng();
         let group_offset = index
             .checked_div(self.group_size)
             .map(|group| group as f32 * self.group_spacing)
             .unwrap_or(0.0);
+        if self.fixed_positions {
+            return [group_offset, 0.0, 0.0];
+        }
+        let mut rng = rand::thread_rng();
         [
             group_offset + rng.gen_range(-0.25..=0.25),
             rng.gen_range(-0.25..=0.25),
@@ -3020,6 +3282,11 @@ async fn movement_workers(
                     while idx < snapshot.len() {
                         let client = &snapshot[idx];
                         if client.connected.load(Ordering::Relaxed) {
+                            if let Some(diagnostics) = &client.avatar_diagnostics {
+                                diagnostics
+                                    .movement_frame_visits
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                             let metadata = *client
                                 .server_avatar_metadata
                                 .lock()
@@ -3034,6 +3301,28 @@ async fn movement_workers(
                                     force,
                                     cadence.unity_pose_amplitude_radians,
                                 ) {
+                                    let channel = datagram.get(1).copied().unwrap_or_default();
+                                    let sequence = match channel {
+                                        channels::PLAYER_AVATAR_HIGH => datagram.get(2).copied(),
+                                        channels::DELTA_AVATAR => datagram.get(3).copied(),
+                                        _ => None,
+                                    };
+                                    if let (Some(diagnostics), Some(sequence)) =
+                                        (&client.avatar_diagnostics, sequence)
+                                    {
+                                        diagnostics
+                                            .last_sequence
+                                            .store(sequence, Ordering::Relaxed);
+                                        if channel == channels::DELTA_AVATAR {
+                                            diagnostics
+                                                .generated_delta
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        } else {
+                                            diagnostics
+                                                .generated_full
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
                                     if force
                                         && datagram.get(1) == Some(&channels::PLAYER_AVATAR_HIGH)
                                     {
@@ -3041,11 +3330,31 @@ async fn movement_workers(
                                             .force_avatar_keyframe
                                             .store(false, Ordering::Release);
                                     }
-                                    if let Err(err) = client.send_connected(datagram).await {
-                                        trace!(
-                                            "Unity-policy avatar send failed for {}: {err}",
-                                            client.index
-                                        );
+                                    match client.send_connected(datagram).await {
+                                        Ok(()) => {
+                                            if let Some(diagnostics) = &client.avatar_diagnostics {
+                                                if channel == channels::DELTA_AVATAR {
+                                                    diagnostics
+                                                        .socket_sent_delta
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                } else {
+                                                    diagnostics
+                                                        .socket_sent_full
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            if let Some(diagnostics) = &client.avatar_diagnostics {
+                                                diagnostics
+                                                    .send_errors
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            trace!(
+                                                "Unity-policy avatar send failed for {}: {err}",
+                                                client.index
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -4359,9 +4668,9 @@ async fn async_main(worker_threads: usize) -> Result<()> {
     config.avatar_observe_expected_peers = args.avatar_observe_expected_peers;
     config.observe_avatar_start_file = args.observe_avatar_start_file.clone();
     config.observe_avatar_window = Duration::from_secs(args.observe_avatar_window_secs.max(1));
-    if args.unity_avatar_policy && !args.no_spread {
+    if args.unity_avatar_policy && !args.no_spread && !args.fixed_spawn_positions {
         return Err(anyhow!(
-            "--unity-avatar-policy requires --no-spread so the workload remains colocated"
+            "--unity-avatar-policy requires --no-spread or --fixed-spawn-positions"
         ));
     }
     let voice_reencode = !args.no_voice_reencode;
@@ -4427,14 +4736,15 @@ async fn async_main(worker_threads: usize) -> Result<()> {
         config.client_count, config.ip, config.port
     );
     let spawn_layout = SpawnLayout::new(args.spawn_group_size, args.spawn_group_spacing)
-        .with_no_spread(args.no_spread);
+        .with_no_spread(args.no_spread)
+        .with_fixed_positions(args.fixed_spawn_positions);
     if args.no_spread {
         info!("no-spread mode enabled: all client positions remain at the origin");
     }
     if args.spawn_group_size > 0 {
         info!(
-            "spawning clients in groups of {} spaced {:.1} units apart",
-            args.spawn_group_size, args.spawn_group_spacing
+            "spawning clients in groups of {} spaced {:.1} units apart; fixed centers={}",
+            args.spawn_group_size, args.spawn_group_spacing, args.fixed_spawn_positions
         );
     }
 
@@ -4543,6 +4853,29 @@ async fn async_main(worker_threads: usize) -> Result<()> {
     if !args.no_movement && !shutdown.load(Ordering::Relaxed) {
         movement_workers(managed_clients.clone(), shutdown.clone(), cadence).await;
     }
+    let avatar_diagnostic_task = if ClientAvatarDiagnostics::enabled_from_env() {
+        match (
+            config.observe_avatar_start_file.clone(),
+            config.observe_avatar_csv.as_ref(),
+        ) {
+            (Some(marker), Some(observer_csv)) => {
+                let output = observer_csv.with_extension("sender.csv");
+                Some(tokio::spawn(client_avatar_diagnostic_window(
+                    managed_clients.clone(),
+                    marker,
+                    output,
+                    config.observe_avatar_window,
+                    shutdown.clone(),
+                )))
+            }
+            _ => {
+                warn!("avatar diagnostics enabled without observer marker/output; sender CSV disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut voice_running = false;
     if let Some(voice_library) = voice_library.take() {
         if !shutdown.load(Ordering::Relaxed) {
@@ -4670,6 +5003,13 @@ async fn async_main(worker_threads: usize) -> Result<()> {
         }
     }
     shutdown.store(true, Ordering::SeqCst);
+    if let Some(task) = avatar_diagnostic_task {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!("avatar sender diagnostic window failed: {error:#}"),
+            Err(error) => warn!("avatar sender diagnostic task failed: {error}"),
+        }
+    }
     if let Some(path) = &config.observe_avatar_csv {
         let observer_client = managed_clients.lock().await.first().cloned();
         if let Some(observer_client) = observer_client {
@@ -5018,12 +5358,13 @@ mod tests {
             "{summary}"
         );
         assert!(
-            summary.contains("decode_errors=0 unapplied_deltas=2"),
+            summary.contains("applied_full=1 applied_delta=2 malformed=0 decode_errors=0 unapplied_deltas=1 non_newer_sequences=0"),
             "{summary}"
         );
-        assert!(csv.contains("non_newer_sequences,1"), "{csv}");
+        assert!(csv.contains("non_newer_sequences,0"), "{csv}");
         assert!(csv.contains("1481,3,"), "{csv}");
-        assert!(csv.contains("accepted_avatar_items,5"), "{csv}");
+        assert!(csv.contains("accepted_avatar_items,3"), "{csv}");
+        assert_eq!(observer.peers.get(&1481).unwrap().last_sequence, Some(3));
     }
 
     #[test]
@@ -5091,6 +5432,7 @@ mod tests {
             force_avatar_keyframe: AtomicBool::new(false),
             pose: Mutex::new(PoseState::new_at([0.0; 3])),
             avatar_observer: None,
+            avatar_diagnostics: None,
             identity: Identity::random(),
         })
     }
@@ -5663,6 +6005,22 @@ mod tests {
         assert!(same_group[0].abs() <= 0.25);
         assert!((999.75..=1000.25).contains(&next_group[0]));
         assert!((1999.75..=2000.25).contains(&later_group[0]));
+    }
+
+    #[test]
+    fn fixed_spawn_layout_places_exact_groups_in_distance_bands() {
+        let layout = SpawnLayout::new(150, 15.0).with_fixed_positions(true);
+        for group in 0..4 {
+            let first = group * 150;
+            assert_eq!(
+                layout.base_for_client(first),
+                [group as f32 * 15.0, 0.0, 0.0]
+            );
+            assert_eq!(
+                layout.base_for_client(first + 149),
+                [group as f32 * 15.0, 0.0, 0.0]
+            );
+        }
     }
 
     #[test]
