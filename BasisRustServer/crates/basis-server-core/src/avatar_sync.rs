@@ -359,7 +359,9 @@ fn validate_repack_preconditions(
 
 #[derive(Debug, Clone)]
 struct PlayerAvatarState {
+    #[cfg(test)]
     peer_id: PeerId,
+    incarnation: u64,
     small_id: bool,
     position: [f32; 3],
     generation: u64,
@@ -467,10 +469,24 @@ impl SpatialGrid {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
+struct ReceiverCycle {
+    roster: Vec<(PeerId, u64)>,
+    cursor: usize,
+    slice_count: usize,
+}
+
+struct ReceiverSlicePlan {
+    receiver_cycle: usize,
+    receivers: Vec<(PeerId, Arc<PlayerAvatarState>)>,
+    update_distances: bool,
+    effective_tick_interval_ms: u64,
+}
+
+#[derive(Debug, Clone)]
 struct SliceState {
     slice_count: usize,
-    receiver_cursor: usize,
+    cycle: Option<ReceiverCycle>,
     last_distance_update: Instant,
     smoothed_tick_micros: u64,
 }
@@ -1110,7 +1126,7 @@ impl AvatarSyncSystem {
             monotonic_origin: Instant::now(),
             slice_state: Arc::new(parking_lot::Mutex::new(SliceState {
                 slice_count: 1,
-                receiver_cursor: 0,
+                cycle: None,
                 last_distance_update: Instant::now(),
                 smoothed_tick_micros: 0,
             })),
@@ -1256,16 +1272,21 @@ impl AvatarSyncSystem {
             outbound_batches: self.counters.outbound_batches.load(Ordering::Relaxed),
             active_states: self.states.len(),
             pending_updates: self.pending.len(),
-            slice_count: state.slice_count,
+            slice_count: state
+                .cycle
+                .as_ref()
+                .map_or(state.slice_count, |cycle| cycle.slice_count),
             tick_count,
             build_micros: self.counters.build_micros.load(Ordering::Relaxed),
             flush_micros: self.counters.flush_micros.load(Ordering::Relaxed),
             max_tick_micros: self.counters.max_tick_micros.load(Ordering::Relaxed),
             avg_tick_micros,
             smoothed_tick_micros: state.smoothed_tick_micros,
-            receiver_cycle_micros: state
-                .smoothed_tick_micros
-                .saturating_mul(state.slice_count as u64),
+            receiver_cycle_micros: state.smoothed_tick_micros.saturating_mul(
+                state.cycle.as_ref().map_or(0, |cycle| {
+                    receiver_cycle_length(cycle.roster.len(), cycle.slice_count)
+                }) as u64,
+            ),
             tick_budget_micros: (config.tick_budget_ms.max(1.0) * 1000.0) as u64,
             receiver_cycle_budget_micros: (config.receiver_cycle_budget_ms.max(1.0) * 1000.0)
                 as u64,
@@ -1318,17 +1339,23 @@ impl AvatarSyncSystem {
         let now_ms = self.monotonic_millis();
         let messages_processed = self.process_pending_updates(&config);
         let peers = peer_snapshot();
-        if peers.len() <= 1 {
-            return Ok(());
-        }
         let mut peer_states = Vec::with_capacity(peers.len());
         for peer in &peers {
             if let Some(state) = self.states.get(peer) {
                 peer_states.push((*peer, Arc::clone(state.value())));
             }
         }
-        let (slice_count, slice_start, slice_end, update_distances, effective_tick_interval_ms) =
-            self.advance_slice_state(peer_states.len());
+        let receiver_plan = self.advance_slice_state(&peer_states, &config);
+        if receiver_plan.receivers.is_empty() {
+            let tick_micros = tick_start.elapsed().as_micros() as u64;
+            self.counters
+                .tick_micros
+                .fetch_add(tick_micros, Ordering::Relaxed);
+            self.counters.tick_count.fetch_add(1, Ordering::Relaxed);
+            update_max_atomic(&self.counters.max_tick_micros, tick_micros);
+            self.adapt_slice_count(tick_micros, &config);
+            return Ok(());
+        }
         let spatial_grid = if config.spatial_cull_enabled {
             SpatialGrid::build(&peer_states, config.low_distance_sq)
         } else {
@@ -1339,11 +1366,10 @@ impl AvatarSyncSystem {
         let build_start = Instant::now();
         // Avoid cloning states for receiver_states: par_iter over slice directly.
         // build_sends_for_receiver only needs position from receiver state.
-        let receiver_slice =
-            &peer_states[slice_start.min(peer_states.len())..slice_end.min(peer_states.len())];
         let offloaded_empty = self.offloaded_pairs.is_empty();
         let bypass_empty = self.bypass_reduction_ids.is_empty();
-        let receiver_groups = receiver_slice
+        let receiver_groups = receiver_plan
+            .receivers
             .par_iter()
             .with_min_len(RECEIVER_BUILD_MIN_BATCH)
             .map_init(
@@ -1356,9 +1382,9 @@ impl AvatarSyncSystem {
                         spatial_grid.as_ref(),
                         &config,
                         now_ms,
-                        slice_count,
-                        effective_tick_interval_ms,
-                        update_distances,
+                        receiver_plan.receiver_cycle,
+                        receiver_plan.effective_tick_interval_ms,
+                        receiver_plan.update_distances,
                         offloaded_empty,
                         bypass_empty,
                         scratch,
@@ -1495,7 +1521,9 @@ impl AvatarSyncSystem {
                 self.states.insert(
                     update.peer_id,
                     Arc::new(PlayerAvatarState {
+                        #[cfg(test)]
                         peer_id: update.peer_id,
+                        incarnation: generation,
                         small_id: update.peer_id <= u8::MAX as u16,
                         position: update.position,
                         generation,
@@ -1536,7 +1564,7 @@ impl AvatarSyncSystem {
         spatial_grid: Option<&SpatialGrid>,
         config: &AvatarSyncConfig,
         now_ms: u64,
-        slice_count: usize,
+        receiver_cycle: usize,
         effective_tick_interval_ms: u64,
         update_distances: bool,
         offloaded_empty: bool,
@@ -1655,7 +1683,7 @@ impl AvatarSyncSystem {
                 advertised_interval_byte(
                     tracking.cached_interval_byte,
                     tracking.cached_interval_ms,
-                    slice_count,
+                    receiver_cycle,
                     effective_tick_interval_ms,
                     config.default_interval_ms,
                 )
@@ -1761,7 +1789,7 @@ impl AvatarSyncSystem {
         self.profiler.add_sends(logical_sends);
         self.counters
             .outbound_logical_avatar_sends
-            .fetch_add(logical_sends as u64, Ordering::Relaxed);
+            .fetch_add(logical_sends, Ordering::Relaxed);
         // Only the independently owned `direct` sends escape this receiver build. In
         // particular, release every Bytes clone held by scratch before it is reused.
         bundle.clear();
@@ -1772,13 +1800,56 @@ impl AvatarSyncSystem {
         })
     }
 
-    fn advance_slice_state(&self, receiver_count: usize) -> (usize, usize, usize, bool, u64) {
+    fn advance_slice_state(
+        &self,
+        peer_states: &[(PeerId, Arc<PlayerAvatarState>)],
+        config: &AvatarSyncConfig,
+    ) -> ReceiverSlicePlan {
         let mut state = self.slice_state.lock();
         let now = Instant::now();
-        let slice_count = state.slice_count.max(1);
-        let (slice_start, slice_end, next_cursor) =
-            next_receiver_slice(receiver_count, slice_count, state.receiver_cursor);
-        state.receiver_cursor = next_cursor;
+
+        if peer_states.len() <= 1 {
+            // There is no recipient work with zero or one authenticated active avatar.
+            // Terminate the old roster instead of letting departed peers linger in it.
+            state.cycle = None;
+        } else if state
+            .cycle
+            .as_ref()
+            .is_none_or(|cycle| cycle.cursor >= cycle.roster.len())
+        {
+            // Membership is frozen for one bounded cycle. New arrivals join at the next
+            // boundary; departures are skipped as their IDs are resolved below.
+            let roster = peer_states
+                .iter()
+                .map(|(peer_id, avatar)| (*peer_id, avatar.incarnation))
+                .collect::<Vec<_>>();
+            let minimum = config.min_receiver_slices.max(1);
+            let maximum = config.max_receiver_slices.max(minimum).min(MAX_SLICE_COUNT);
+            state.slice_count = state.slice_count.clamp(minimum, maximum);
+            state.cycle = Some(ReceiverCycle {
+                roster,
+                cursor: 0,
+                slice_count: state.slice_count,
+            });
+        }
+
+        let mut selected = Vec::new();
+        let receiver_cycle = if let Some(cycle) = state.cycle.as_mut() {
+            let mut current =
+                PeerIdMap::with_capacity_and_hasher(peer_states.len(), Default::default());
+            for (index, (peer_id, avatar)) in peer_states.iter().enumerate() {
+                current.insert(*peer_id, (index, avatar.incarnation));
+            }
+            let selected_indices = select_receiver_cycle_indices(cycle, &current);
+            selected.reserve(selected_indices.len());
+            for index in selected_indices {
+                selected.push((peer_states[index].0, Arc::clone(&peer_states[index].1)));
+            }
+            receiver_cycle_length(cycle.roster.len(), cycle.slice_count)
+        } else {
+            0
+        };
+
         let update_distances = now.duration_since(state.last_distance_update)
             >= Duration::from_millis(DISTANCE_UPDATE_INTERVAL_MS);
         if update_distances {
@@ -1786,13 +1857,12 @@ impl AvatarSyncSystem {
         }
         let effective_tick_interval_ms =
             AVATAR_TICK_INTERVAL_MS.max(state.smoothed_tick_micros.div_ceil(1_000));
-        (
-            slice_count,
-            slice_start,
-            slice_end,
+        ReceiverSlicePlan {
+            receiver_cycle,
+            receivers: selected,
             update_distances,
             effective_tick_interval_ms,
-        )
+        }
     }
 
     fn adapt_slice_count(&self, elapsed_micros: u64, config: &AvatarSyncConfig) {
@@ -1803,61 +1873,90 @@ impl AvatarSyncSystem {
             ((state.smoothed_tick_micros as f64 * 0.85) + (elapsed_micros as f64 * 0.15)) as u64
         };
 
+        let Some(cycle) = state.cycle.as_ref() else {
+            return;
+        };
+        if cycle.cursor < cycle.roster.len() {
+            return;
+        }
+
+        // Choose the next geometry only once per completed cycle. This keeps the
+        // in-flight roster and its slice width stable while adapting from effective
+        // receiver-cycle lengths rather than requested slice counts.
+        let active_count = cycle.roster.len();
+        let active_slices = cycle.slice_count;
         let min_slices = config.min_receiver_slices.max(1);
         let max_slices = config
             .max_receiver_slices
             .max(min_slices)
             .min(MAX_SLICE_COUNT);
-        state.slice_count = state.slice_count.clamp(min_slices, max_slices);
+        let current_target = state.slice_count.clamp(min_slices, max_slices);
         let tick_budget_micros = (config.tick_budget_ms.max(1.0) * 1000.0) as u64;
         let cycle_budget_micros = (config.receiver_cycle_budget_ms.max(1.0) * 1000.0) as u64;
         let estimated_cycle_micros = state
             .smoothed_tick_micros
-            .saturating_mul(state.slice_count as u64);
+            .saturating_mul(receiver_cycle_length(active_count, active_slices) as u64);
         let projected_larger_cycle_micros = state
             .smoothed_tick_micros
-            .saturating_mul((state.slice_count + 1) as u64);
+            .saturating_mul(receiver_cycle_length(active_count, current_target + 1) as u64);
 
-        let mut next_slice_count = state.slice_count;
+        let mut next_slice_count = current_target;
         if estimated_cycle_micros > cycle_budget_micros {
             if elapsed_micros > tick_budget_micros {
-                if state.slice_count < max_slices {
-                    next_slice_count = state.slice_count + 1;
+                if current_target < max_slices {
+                    next_slice_count = current_target + 1;
                 }
-            } else if state.slice_count > min_slices {
-                next_slice_count = state.slice_count - 1;
+            } else if current_target > min_slices {
+                next_slice_count = current_target - 1;
             }
         } else if elapsed_micros < tick_budget_micros.saturating_mul(3) / 4
-            && state.slice_count > min_slices
+            && current_target > min_slices
         {
-            next_slice_count = state.slice_count - 1;
+            next_slice_count = current_target - 1;
         } else if elapsed_micros > tick_budget_micros
             && projected_larger_cycle_micros <= cycle_budget_micros
-            && state.slice_count < max_slices
+            && current_target < max_slices
         {
-            next_slice_count = state.slice_count + 1;
+            next_slice_count = current_target + 1;
         }
-
-        if next_slice_count != state.slice_count {
-            state.slice_count = next_slice_count;
-        }
+        state.slice_count = next_slice_count;
     }
 }
 
-fn next_receiver_slice(
+fn receiver_cycle_bounds(
     receiver_count: usize,
     slice_count: usize,
     cursor: usize,
-) -> (usize, usize, usize) {
-    if receiver_count == 0 {
-        return (0, 0, 0);
-    }
+) -> (usize, usize) {
+    let start = cursor.min(receiver_count);
+    let width = receiver_count.div_ceil(slice_count.max(1));
+    (start, start.saturating_add(width).min(receiver_count))
+}
 
-    let start = if cursor >= receiver_count { 0 } else { cursor };
-    let slice_size = receiver_count.div_ceil(slice_count.max(1));
-    let end = start.saturating_add(slice_size).min(receiver_count);
-    let next_cursor = if end == receiver_count { 0 } else { end };
-    (start, end, next_cursor)
+fn receiver_cycle_length(receiver_count: usize, slice_count: usize) -> usize {
+    if receiver_count == 0 {
+        0
+    } else {
+        receiver_count.div_ceil(receiver_count.div_ceil(slice_count.max(1)))
+    }
+}
+
+fn select_receiver_cycle_indices(
+    cycle: &mut ReceiverCycle,
+    current: &PeerIdMap<(usize, u64)>,
+) -> Vec<usize> {
+    let (start, end) = receiver_cycle_bounds(cycle.roster.len(), cycle.slice_count, cycle.cursor);
+    cycle.cursor = end;
+    cycle.roster[start..end]
+        .iter()
+        .filter_map(|(peer_id, incarnation)| {
+            current
+                .get(peer_id)
+                .and_then(|(index, current_incarnation)| {
+                    (current_incarnation == incarnation).then_some(*index)
+                })
+        })
+        .collect()
 }
 
 impl AvatarSyncConfig {
@@ -2700,13 +2799,13 @@ fn calculate_interval_from_distance_sq(distance_sq: f32, config: &AvatarSyncConf
 fn advertised_interval_byte(
     cached_interval_byte: u8,
     cached_interval_ms: u64,
-    slice_count: usize,
+    receiver_cycle: usize,
     effective_tick_interval_ms: u64,
     base_interval_ms: u64,
 ) -> u8 {
     let deliverable_interval_ms = effective_tick_interval_ms
         .max(AVATAR_TICK_INTERVAL_MS)
-        .saturating_mul(slice_count.max(1) as u64);
+        .saturating_mul(receiver_cycle.max(1) as u64);
     if deliverable_interval_ms <= cached_interval_ms {
         return cached_interval_byte;
     }
@@ -2747,6 +2846,14 @@ mod tests {
             spatial_cull_enabled: false,
             enable_bsr_profiling: true,
         }
+    }
+
+    fn generation_map(states: &[(PeerId, u64)]) -> PeerIdMap<(usize, u64)> {
+        let mut map = PeerIdMap::with_capacity_and_hasher(states.len(), Default::default());
+        for (index, (peer_id, incarnation)) in states.iter().enumerate() {
+            map.insert(*peer_id, (index, *incarnation));
+        }
+        map
     }
 
     fn reference_build_delta_packets(
@@ -2852,6 +2959,7 @@ mod tests {
                     peer_id,
                     Arc::new(PlayerAvatarState {
                         peer_id,
+                        incarnation: generation,
                         small_id: peer_id <= u8::MAX as PeerId,
                         position: [peer_id as f32, 0.0, 0.0],
                         generation,
@@ -3579,6 +3687,7 @@ mod tests {
             let payloads = quality_payloads(&qualities);
             PlayerAvatarState {
                 peer_id: 42,
+                incarnation: 1,
                 small_id: true,
                 position: [0.0; 3],
                 generation: 1,
@@ -3917,6 +4026,7 @@ mod tests {
                           keyframe_stretch_shift,
                           small_delta_streak| PlayerAvatarState {
             peer_id: 42,
+            incarnation: 1,
             small_id: true,
             position: [0.0; 3],
             generation: 1,
@@ -4044,9 +4154,19 @@ mod tests {
         };
         let system = AvatarSyncSystem::new(config.clone());
 
+        system.slice_state.lock().cycle = Some(ReceiverCycle {
+            roster: (0..4).map(|id| (id, id as u64)).collect(),
+            cursor: 4,
+            slice_count: 1,
+        });
         system.adapt_slice_count(1_000, &config);
         assert_eq!(system.slice_state.lock().slice_count, 1);
 
+        system.slice_state.lock().cycle = Some(ReceiverCycle {
+            roster: (0..4).map(|id| (id, id as u64)).collect(),
+            cursor: 4,
+            slice_count: 1,
+        });
         system.adapt_slice_count(4_000, &config);
         assert_eq!(system.slice_state.lock().slice_count, 2);
     }
@@ -4062,43 +4182,184 @@ mod tests {
         system.slice_state.lock().slice_count = 32;
 
         for _ in 0..8 {
+            system.slice_state.lock().cycle = Some(ReceiverCycle {
+                roster: (0..1_500).map(|id| (id, id as u64)).collect(),
+                cursor: 1_500,
+                slice_count: 32,
+            });
             system.adapt_slice_count(10_000, &config);
             assert_eq!(system.slice_state.lock().slice_count, 32);
         }
     }
 
     #[test]
-    fn absolute_receiver_cursor_covers_each_receiver_once_as_slice_count_changes() {
-        for receiver_count in [1, 17, 1_500] {
-            let mut cursor = 0;
+    fn slice_target_changes_only_after_active_cycle_completes() {
+        let mut config = receiver_build_test_config();
+        config.min_receiver_slices = 1;
+        config.max_receiver_slices = 32;
+        config.tick_budget_ms = 3.0;
+        config.receiver_cycle_budget_ms = 180.0;
+        let system = AvatarSyncSystem::new(config.clone());
+        system.slice_state.lock().cycle = Some(ReceiverCycle {
+            roster: (0..17).map(|id| (id, id as u64 + 1)).collect(),
+            cursor: 1,
+            slice_count: 1,
+        });
+
+        for _ in 0..10 {
+            system.adapt_slice_count(1_000, &config);
+        }
+        {
+            let state = system.slice_state.lock();
+            assert_eq!(state.slice_count, 1);
+            assert_eq!(state.cycle.as_ref().unwrap().slice_count, 1);
+        }
+
+        system.slice_state.lock().cycle.as_mut().unwrap().cursor = 17;
+        system.adapt_slice_count(4_000, &config);
+        let state = system.slice_state.lock();
+        assert_eq!(state.slice_count, 2);
+        assert_eq!(state.cycle.as_ref().unwrap().slice_count, 1);
+    }
+
+    #[test]
+    fn identity_cycle_visits_stable_roster_once_across_slice_changes() {
+        for receiver_count in [2, 17, 100, 1_500] {
             let mut visits = vec![0_u8; receiver_count];
-            let mut complete_cycles = 0;
-            for tick in 0..500 {
-                let slices = [32, 31, 1, 30, 2, 31, 7, 32, 3, 17];
-                let (start, end, next_cursor) =
-                    next_receiver_slice(receiver_count, slices[tick % slices.len()], cursor);
-                assert!(start <= end && end <= receiver_count);
-                for visit in &mut visits[start..end] {
-                    *visit += 1;
+            for slices in [32, 31, 7, 1, 32, 2] {
+                let roster = (0..receiver_count)
+                    .map(|id| (id as PeerId, id as u64 + 1))
+                    .collect::<Vec<_>>();
+                let mut cycle = ReceiverCycle {
+                    roster,
+                    cursor: 0,
+                    slice_count: slices,
+                };
+                let current = generation_map(
+                    &(0..receiver_count)
+                        .map(|id| (id as PeerId, id as u64 + 1))
+                        .collect::<Vec<_>>(),
+                );
+                while cycle.cursor < cycle.roster.len() {
+                    for index in select_receiver_cycle_indices(&mut cycle, &current) {
+                        visits[index] += 1;
+                    }
                 }
-                cursor = next_cursor;
-                if cursor == 0 {
-                    assert!(visits.iter().all(|count| *count == 1));
-                    visits.fill(0);
-                    complete_cycles += 1;
-                }
+                assert!(visits.iter().all(|count| *count == 1));
+                visits.fill(0);
             }
-            assert!(complete_cycles >= 2);
         }
     }
 
     #[test]
-    fn receiver_cursor_handles_empty_and_changing_populations() {
-        assert_eq!(next_receiver_slice(0, 32, 120), (0, 0, 0));
-        assert_eq!(next_receiver_slice(17, 32, 120), (0, 1, 1));
-        assert_eq!(next_receiver_slice(4, 2, 3), (3, 4, 0));
-        assert_eq!(next_receiver_slice(9, 3, 2), (2, 5, 5));
-        assert_eq!(next_receiver_slice(9, 3, 9), (0, 3, 3));
+    fn identity_cycle_skips_departures_and_reused_ids_then_admits_joins_next_cycle() {
+        let mut cycle = ReceiverCycle {
+            roster: vec![(10, 1), (20, 2), (30, 3), (40, 4)],
+            cursor: 0,
+            slice_count: 2,
+        };
+        let first = generation_map(&[(30, 3), (10, 1), (20, 99), (50, 5)]);
+        assert_eq!(select_receiver_cycle_indices(&mut cycle, &first), vec![1]);
+        assert_eq!(cycle.cursor, 2);
+        // The same ID with a new incarnation is a replacement; new ID 50 waits for
+        // the next cycle, and remaining old-roster peers are still progressed.
+        let reordered = generation_map(&[(40, 4), (20, 99), (30, 3), (50, 5)]);
+        assert_eq!(
+            select_receiver_cycle_indices(&mut cycle, &reordered),
+            vec![2, 0]
+        );
+        assert_eq!(cycle.cursor, 4);
+        assert_eq!(cycle.slice_count, 2);
+
+        let next = ReceiverCycle {
+            roster: vec![(40, 4), (20, 99), (30, 3), (50, 5)],
+            cursor: 0,
+            slice_count: 3,
+        };
+        assert_eq!(
+            receiver_cycle_length(next.roster.len(), next.slice_count),
+            2
+        );
+        assert_eq!(receiver_cycle_bounds(0, 32, 0), (0, 0));
+        assert_eq!(receiver_cycle_bounds(1, 32, 0), (0, 1));
+    }
+
+    #[test]
+    fn current_snapshot_order_resolves_latest_pose_for_same_incarnation() {
+        let mut cycle = ReceiverCycle {
+            roster: vec![(10, 1), (20, 2)],
+            cursor: 0,
+            slice_count: 1,
+        };
+        // The map index addresses this tick's current snapshot, whose position data
+        // changed since roster creation; cycle entries retain identity, never poses.
+        let current_positions = [[20.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
+        let reordered = generation_map(&[(20, 2), (10, 1)]);
+        let selected = select_receiver_cycle_indices(&mut cycle, &reordered);
+        assert_eq!(selected, vec![1, 0]);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|index| current_positions[*index])
+                .collect::<Vec<_>>(),
+            vec![[10.0, 0.0, 0.0], [20.0, 0.0, 0.0]]
+        );
+    }
+
+    #[test]
+    fn sustained_churn_does_not_reset_a_surviving_tail_peer() {
+        let tail = 1499;
+        let mut cycle = ReceiverCycle {
+            roster: (0..=tail).map(|id| (id as PeerId, id as u64 + 1)).collect(),
+            cursor: 0,
+            slice_count: 32,
+        };
+        let mut selected_tail = false;
+        let mut joins = 0_u16;
+        while cycle.cursor < cycle.roster.len() {
+            let tick = cycle.cursor;
+            let mut current = vec![(tail as PeerId, (0, tail as u64 + 1))];
+            // Vary the lookup order and add IDs every selection window while keeping
+            // the old-roster tail continuously authenticated.
+            for id in tick..tick + 8 {
+                if id < tail {
+                    current.push((id as PeerId, (current.len(), id as u64 + 1)));
+                }
+            }
+            joins = joins.wrapping_add(1);
+            current.push((joins.wrapping_add(2_000), (current.len(), u64::from(joins))));
+            let map = current.into_iter().collect::<PeerIdMap<_>>();
+            let selected = select_receiver_cycle_indices(&mut cycle, &map);
+            if selected.contains(&0) {
+                selected_tail = true;
+            }
+        }
+        assert!(
+            selected_tail,
+            "the roster tail must receive its turn within one cycle"
+        );
+    }
+
+    #[test]
+    fn effective_receiver_cycle_length_uses_ceil_geometry() {
+        assert_eq!(receiver_cycle_length(0, 32), 0);
+        assert_eq!(receiver_cycle_length(1, 32), 1);
+        assert_eq!(receiver_cycle_length(17, 32), 17);
+        assert_eq!(receiver_cycle_length(100, 32), 25);
+        assert_eq!(receiver_cycle_length(1_500, 31), 31);
+        assert_eq!(receiver_cycle_length(1_500, 32), 32);
+        assert_eq!(receiver_cycle_length(1_500, 33), 33);
+
+        for (count, slices, cycle_ms) in [
+            (17, 32, 68),
+            (100, 32, 100),
+            (1_500, 31, 124),
+            (1_500, 32, 128),
+        ] {
+            let cycle = receiver_cycle_length(count, slices);
+            let encoded = advertised_interval_byte(0, 0, cycle, 4, 50);
+            assert_eq!(channels::decode_avatar_interval_ms(encoded, 50), cycle_ms);
+        }
     }
 
     #[test]

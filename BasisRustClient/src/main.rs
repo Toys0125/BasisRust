@@ -67,7 +67,6 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
 const PING_INTERVAL_TICKS: usize = 15;
 const SNAPSHOT_REFRESH_TICKS: usize = 10;
 const INITIAL_START_ATTEMPTS: usize = 3;
-const DEFAULT_MOVEMENT_INTERVAL: Duration = Duration::from_millis(90);
 const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 const SOCKET_TTL: u32 = 255;
 const DEFAULT_VOICE_AUDIO_FOLDER: &str = "audio";
@@ -1325,11 +1324,10 @@ impl AvatarObserver {
                             observer_position,
                             now,
                             tracking,
-                        ) {
-                            if tracking {
-                                self.decode_errors = self.decode_errors.saturating_add(1);
-                                self.malformed_items = self.malformed_items.saturating_add(1);
-                            }
+                        ) && tracking
+                        {
+                            self.decode_errors = self.decode_errors.saturating_add(1);
+                            self.malformed_items = self.malformed_items.saturating_add(1);
                         }
                     }
                 }
@@ -1339,11 +1337,10 @@ impl AvatarObserver {
                 }
                 Err(_) => {}
             }
-        } else if !self.observe_item(channel, payload, observer_position, now, tracking) {
-            if tracking {
-                self.decode_errors = self.decode_errors.saturating_add(1);
-                self.malformed_items = self.malformed_items.saturating_add(1);
-            }
+        } else if !self.observe_item(channel, payload, observer_position, now, tracking) && tracking
+        {
+            self.decode_errors = self.decode_errors.saturating_add(1);
+            self.malformed_items = self.malformed_items.saturating_add(1);
         }
     }
 
@@ -1358,12 +1355,9 @@ impl AvatarObserver {
         let (quality_index, quality) = if (channels::PLAYER_AVATAR_VERY_LOW
             ..=channels::PLAYER_AVATAR_HIGH_ADDITIONAL)
             .contains(&channel)
-        {
-            let quality_index = channels::quality_from_channel(channel);
-            (quality_index, observer_quality(quality_index))
-        } else if (channels::PLAYER_AVATAR_VERY_LOW_LARGE
-            ..=channels::PLAYER_AVATAR_HIGH_ADDITIONAL_LARGE)
-            .contains(&channel)
+            || (channels::PLAYER_AVATAR_VERY_LOW_LARGE
+                ..=channels::PLAYER_AVATAR_HIGH_ADDITIONAL_LARGE)
+                .contains(&channel)
         {
             let quality_index = channels::quality_from_channel(channel);
             (quality_index, observer_quality(quality_index))
@@ -1665,7 +1659,7 @@ fn observer_sequence_is_newer(sequence: u8, last: Option<u8>) -> bool {
     .unwrap_or(true)
 }
 
-fn avatar_gap_percentile(gaps_micros: &mut Vec<u64>, percentile: f64) -> u64 {
+fn avatar_gap_percentile(gaps_micros: &mut [u64], percentile: f64) -> u64 {
     if gaps_micros.is_empty() {
         return 0;
     }
@@ -2418,11 +2412,12 @@ impl BasisClient {
                     self.index
                 ),
             },
-            channels::DELTA_AVATAR => {
-                if payload.first() == Some(&channels::DELTA_CONTROL_UPLINK_KEYFRAME_REQUEST) {
-                    self.force_avatar_keyframe.store(true, Ordering::Release);
-                }
+            channels::DELTA_AVATAR
+                if payload.first() == Some(&channels::DELTA_CONTROL_UPLINK_KEYFRAME_REQUEST) =>
+            {
+                self.force_avatar_keyframe.store(true, Ordering::Release);
             }
+            channels::DELTA_AVATAR => {}
             channels::CREATE_REMOTE_PLAYER
             | channels::CREATE_REMOTE_PLAYERS_FOR_NEW_PEER
             | channels::DISCONNECTION

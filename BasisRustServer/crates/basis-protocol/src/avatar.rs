@@ -1039,7 +1039,7 @@ mod tests {
             let max_bit = len * 8;
             for width in 1..=38 {
                 for bit_pos in 0..=max_bit - width {
-                    for base_byte_offset in [0, (len > 9).then_some(9).unwrap_or(0)] {
+                    for base_byte_offset in [0, if len > 9 { 9 } else { 0 }] {
                         if base_byte_offset * 8 + bit_pos + width > max_bit {
                             continue;
                         }
@@ -1099,7 +1099,7 @@ mod tests {
     #[test]
     fn word_bit_writes_match_reference_when_packed_ranges_overlap() {
         let operations = [
-            (3, 0x2a_5a_35_5aa5_u64, 38),
+            (3, 0x002a_5a35_5aa5_u64, 38),
             (32, 0xdead_beef, 32),
             (61, 0x7fff_ffff, 31),
         ];
