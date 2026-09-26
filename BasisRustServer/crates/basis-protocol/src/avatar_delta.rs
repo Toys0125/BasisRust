@@ -372,6 +372,22 @@ fn read_channel(payload: &[u8], channel: AvatarChannel) -> u32 {
     debug_assert!((1..=32).contains(&channel.width));
     let first_byte = channel.bit_offset >> 3;
     let bit_shift = channel.bit_offset & 7;
+
+    // Avatar payloads usually have at least eight bytes available from this
+    // channel's first byte. Read a single bounded word in that case; near the
+    // fixed payload tail, gather only the bytes the channel actually spans.
+    if let Some(end) = first_byte.checked_add(8) {
+        if let Some(bytes) = payload.get(first_byte..end) {
+            let window = u64::from_le_bytes(bytes.try_into().expect("eight-byte window"));
+            let mask = if channel.width == 32 {
+                u64::from(u32::MAX)
+            } else {
+                (1u64 << channel.width) - 1
+            };
+            return ((window >> bit_shift) & mask) as u32;
+        }
+    }
+
     let byte_count = (bit_shift + channel.width + 7) >> 3;
     let bytes = &payload[first_byte..first_byte + byte_count];
 
