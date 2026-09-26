@@ -1,0 +1,454 @@
+{
+  "method": "Profiler-off matched timing; global counter endpoint nearest each 0/30/60s target, exact sample times retained. Counter time starts when server diagnostic first sees the observer marker; endpoints can be offset by up to half the 5s sampling interval. Per-peer gap quantiles summarize each peer row; 500ms stale is end-of-window age only.",
+  "runs": [
+    {
+      "run": "i12-control-forward",
+      "candidate": "I10 control",
+      "source_hashes": {
+        "server_binary_sha256": "bb6b4ceb64ab146734a3e008bfe58272c565aca438402b50e80b55e896201366",
+        "client_binary_sha256": "896734c39a8d8d27aae917d2907e73e9ca33708a3a00925b3ff14670981af752",
+        "server_config_sha256": "35c48042a9208bffdd15923dab7d3cb3a273d6358cf20caeeb7b3345eb3c8e4e",
+        "client_config_sha256": "043b8b7f451368326e9a6a73d00e462b4d26adbfccca1034d178eb71cb2f4f9a"
+      },
+      "active_peer_count_min": 1500,
+      "active_state_count_min": 1500,
+      "sender_count": 1500,
+      "sender_min_frame_visits_per_s": 59.998000066664446,
+      "sender_min_socket_sent_per_s": 49.99833338888704,
+      "sender_errors_total": 0,
+      "observer": {
+        "near_peers": "1499",
+        "expected_near_peers": "1499",
+        "missing_expected_peers": "0",
+        "stale_peers_500ms": "0",
+        "applied_gaps": "152898",
+        "gap_p50_ms": "590.29",
+        "gap_p95_ms": "623.69",
+        "accepted_avatar_items": "154397",
+        "applied_full_items": "150227",
+        "applied_delta_items": "4170",
+        "malformed_items": "0",
+        "decode_errors": "0",
+        "unapplied_deltas": "0",
+        "non_newer_sequences": "0"
+      },
+      "per_peer": {
+        "count": 1499,
+        "updates_min": 103,
+        "updates_median": 103,
+        "updates_max": 103,
+        "p50_of_peer_p50_ms": 590.16,
+        "p95_of_peer_p50_ms": 590.23,
+        "p50_of_peer_p95_ms": 623.66,
+        "p95_of_peer_p95_ms": 623.69,
+        "end_age_p50_ms": 64.0,
+        "end_age_p95_ms": 65.0,
+        "end_age_max_ms": 65.0
+      },
+      "server_cpu_windows_percent": [
+        278.94191113349996,
+        282.0077336521759
+      ],
+      "server_cpu_mean_percent": 280.47482239283795,
+      "client_cpu_windows_percent": [
+        101.62715921922428,
+        104.6915001301737
+      ],
+      "client_cpu_mean_percent": 103.159329674699,
+      "global_counter_endpoints_ms": [
+        0,
+        30057,
+        60016
+      ],
+      "counter_windows": [
+        {
+          "start_ms": 0,
+          "end_ms": 30057,
+          "elapsed_s": 30.057,
+          "inbound_per_s": 74980.17100841734,
+          "built_logical_per_s": 3878289.084073594,
+          "encoded_entries_per_s": 211241.37472136275,
+          "tick_ms_per_tick": 18.100619650391803,
+          "build_ms_per_tick": 10.134694394213382,
+          "flush_ms_per_tick": 2.4300542495479203,
+          "counter_delta": {
+            "inbound_updates": 2253679,
+            "outbound_logical_avatar_sends": 116569735,
+            "tick_count": 1659,
+            "tick_micros": 30028928,
+            "build_micros": 16813458,
+            "flush_micros": 4031460,
+            "outbound_messages": 6349282
+          }
+        },
+        {
+          "start_ms": 30057,
+          "end_ms": 60016,
+          "elapsed_s": 29.959,
+          "inbound_per_s": 75002.90396875731,
+          "built_logical_per_s": 3775944.924730465,
+          "encoded_entries_per_s": 233395.8076037251,
+          "tick_ms_per_tick": 18.587137267080745,
+          "build_ms_per_tick": 10.195388819875776,
+          "flush_ms_per_tick": 2.687960248447205,
+          "counter_delta": {
+            "inbound_updates": 2247012,
+            "outbound_logical_avatar_sends": 113123534,
+            "tick_count": 1610,
+            "tick_micros": 29925291,
+            "build_micros": 16414576,
+            "flush_micros": 4327616,
+            "outbound_messages": 6992305
+          }
+        }
+      ],
+      "mean_built_logical_per_s": 3827117.0044020293,
+      "server_cpu_percent_per_million_logical_sends": 73.28618959656316,
+      "observer_socket_drops_start_end": [
+        0,
+        0
+      ],
+      "cpu_sample_offsets_from_marker_s": [
+        30.031342245987616,
+        30.03109131200472
+      ]
+    },
+    {
+      "run": "i12-candidate-forward",
+      "candidate": "I12",
+      "source_hashes": {
+        "server_binary_sha256": "a3dd4f95e7c56408ef037bd70d52a77a636327a128db09b7c769956a6878526a",
+        "client_binary_sha256": "896734c39a8d8d27aae917d2907e73e9ca33708a3a00925b3ff14670981af752",
+        "server_config_sha256": "35c48042a9208bffdd15923dab7d3cb3a273d6358cf20caeeb7b3345eb3c8e4e",
+        "client_config_sha256": "043b8b7f451368326e9a6a73d00e462b4d26adbfccca1034d178eb71cb2f4f9a"
+      },
+      "active_peer_count_min": 1500,
+      "active_state_count_min": 1500,
+      "sender_count": 1500,
+      "sender_min_frame_visits_per_s": 59.998000066664446,
+      "sender_min_socket_sent_per_s": 49.99833338888704,
+      "sender_errors_total": 0,
+      "observer": {
+        "near_peers": "1499",
+        "expected_near_peers": "1499",
+        "missing_expected_peers": "0",
+        "stale_peers_500ms": "0",
+        "applied_gaps": "163391",
+        "gap_p50_ms": "549.64",
+        "gap_p95_ms": "589.72",
+        "accepted_avatar_items": "164890",
+        "applied_full_items": "164419",
+        "applied_delta_items": "471",
+        "malformed_items": "0",
+        "decode_errors": "0",
+        "unapplied_deltas": "0",
+        "non_newer_sequences": "0"
+      },
+      "per_peer": {
+        "count": 1499,
+        "updates_min": 110,
+        "updates_median": 110,
+        "updates_max": 110,
+        "p50_of_peer_p50_ms": 549.64,
+        "p95_of_peer_p50_ms": 549.99,
+        "p50_of_peer_p95_ms": 589.71,
+        "p95_of_peer_p95_ms": 589.79,
+        "end_age_p50_ms": 73.0,
+        "end_age_p95_ms": 74.0,
+        "end_age_max_ms": 74.0
+      },
+      "server_cpu_windows_percent": [
+        282.1134792306972,
+        285.1849444328284
+      ],
+      "server_cpu_mean_percent": 283.6492118317628,
+      "client_cpu_windows_percent": [
+        103.2617916778083,
+        105.35028186637118
+      ],
+      "client_cpu_mean_percent": 104.30603677208974,
+      "global_counter_endpoints_ms": [
+        0,
+        30049,
+        60005
+      ],
+      "counter_windows": [
+        {
+          "start_ms": 0,
+          "end_ms": 30049,
+          "elapsed_s": 30.049,
+          "inbound_per_s": 75026.98925089021,
+          "built_logical_per_s": 4157531.2988784984,
+          "encoded_entries_per_s": 209615.42813404772,
+          "tick_ms_per_tick": 16.882767716535433,
+          "build_ms_per_tick": 9.96333802024747,
+          "flush_ms_per_tick": 2.2384347581552304,
+          "counter_delta": {
+            "inbound_updates": 2254486,
+            "outbound_logical_avatar_sends": 124929658,
+            "tick_count": 1778,
+            "tick_micros": 30017561,
+            "build_micros": 17714815,
+            "flush_micros": 3979937,
+            "outbound_messages": 6298734
+          }
+        },
+        {
+          "start_ms": 30049,
+          "end_ms": 60005,
+          "elapsed_s": 29.956,
+          "inbound_per_s": 74976.93283482442,
+          "built_logical_per_s": 4022670.2830818533,
+          "encoded_entries_per_s": 262998.898384297,
+          "tick_ms_per_tick": 17.44314635568513,
+          "build_ms_per_tick": 10.018173760932944,
+          "flush_ms_per_tick": 2.6061160349854227,
+          "counter_delta": {
+            "inbound_updates": 2246009,
+            "outbound_logical_avatar_sends": 120503111,
+            "tick_count": 1715,
+            "tick_micros": 29914996,
+            "build_micros": 17181168,
+            "flush_micros": 4469489,
+            "outbound_messages": 7878395
+          }
+        }
+      ],
+      "mean_built_logical_per_s": 4090100.790980176,
+      "server_cpu_percent_per_million_logical_sends": 69.35017651821421,
+      "observer_socket_drops_start_end": [
+        0,
+        0
+      ],
+      "cpu_sample_offsets_from_marker_s": [
+        30.0304686720483,
+        30.033142236992717
+      ]
+    },
+    {
+      "run": "i12-candidate-reverse",
+      "candidate": "I12",
+      "source_hashes": {
+        "server_binary_sha256": "a3dd4f95e7c56408ef037bd70d52a77a636327a128db09b7c769956a6878526a",
+        "client_binary_sha256": "896734c39a8d8d27aae917d2907e73e9ca33708a3a00925b3ff14670981af752",
+        "server_config_sha256": "35c48042a9208bffdd15923dab7d3cb3a273d6358cf20caeeb7b3345eb3c8e4e",
+        "client_config_sha256": "043b8b7f451368326e9a6a73d00e462b4d26adbfccca1034d178eb71cb2f4f9a"
+      },
+      "active_peer_count_min": 1500,
+      "active_state_count_min": 1500,
+      "sender_count": 1500,
+      "sender_min_frame_visits_per_s": 59.998000066664446,
+      "sender_min_socket_sent_per_s": 49.99833338888704,
+      "sender_errors_total": 0,
+      "observer": {
+        "near_peers": "1499",
+        "expected_near_peers": "1499",
+        "missing_expected_peers": "0",
+        "stale_peers_500ms": "0",
+        "applied_gaps": "166389",
+        "gap_p50_ms": "538.23",
+        "gap_p95_ms": "565.40",
+        "accepted_avatar_items": "167888",
+        "applied_full_items": "167438",
+        "applied_delta_items": "450",
+        "malformed_items": "0",
+        "decode_errors": "0",
+        "unapplied_deltas": "0",
+        "non_newer_sequences": "0"
+      },
+      "per_peer": {
+        "count": 1499,
+        "updates_min": 112,
+        "updates_median": 112,
+        "updates_max": 112,
+        "p50_of_peer_p50_ms": 538.23,
+        "p95_of_peer_p50_ms": 538.27,
+        "p50_of_peer_p95_ms": 565.4,
+        "p95_of_peer_p95_ms": 565.44,
+        "end_age_p50_ms": 67.0,
+        "end_age_p95_ms": 67.0,
+        "end_age_max_ms": 68.0
+      },
+      "server_cpu_windows_percent": [
+        281.05463896302325,
+        281.3764617091348
+      ],
+      "server_cpu_mean_percent": 281.215550336079,
+      "client_cpu_windows_percent": [
+        98.80202770181162,
+        102.22789792272708
+      ],
+      "client_cpu_mean_percent": 100.51496281226935,
+      "global_counter_endpoints_ms": [
+        0,
+        30032,
+        60009
+      ],
+      "counter_windows": [
+        {
+          "start_ms": 0,
+          "end_ms": 30032,
+          "elapsed_s": 30.032,
+          "inbound_per_s": 75019.44592434737,
+          "built_logical_per_s": 4192727.757059137,
+          "encoded_entries_per_s": 192687.40010655302,
+          "tick_ms_per_tick": 16.738317522321427,
+          "build_ms_per_tick": 9.920461495535713,
+          "flush_ms_per_tick": 2.1063694196428573,
+          "counter_delta": {
+            "inbound_updates": 2252984,
+            "outbound_logical_avatar_sends": 125916000,
+            "tick_count": 1792,
+            "tick_micros": 29995065,
+            "build_micros": 17777467,
+            "flush_micros": 3774614,
+            "outbound_messages": 5786788
+          }
+        },
+        {
+          "start_ms": 30032,
+          "end_ms": 60009,
+          "elapsed_s": 29.977,
+          "inbound_per_s": 74997.73159422223,
+          "built_logical_per_s": 4141864.4627547786,
+          "encoded_entries_per_s": 199236.24778997232,
+          "tick_ms_per_tick": 16.945421618562534,
+          "build_ms_per_tick": 10.012284097340125,
+          "flush_ms_per_tick": 2.1469354838709678,
+          "counter_delta": {
+            "inbound_updates": 2248207,
+            "outbound_logical_avatar_sends": 124160671,
+            "tick_count": 1767,
+            "tick_micros": 29942560,
+            "build_micros": 17691706,
+            "flush_micros": 3793635,
+            "outbound_messages": 5972505
+          }
+        }
+      ],
+      "mean_built_logical_per_s": 4167296.1099069575,
+      "server_cpu_percent_per_million_logical_sends": 67.48153788917045,
+      "observer_socket_drops_start_end": [
+        0,
+        0
+      ],
+      "cpu_sample_offsets_from_marker_s": [
+        30.02974806301063,
+        30.030941282981075
+      ]
+    },
+    {
+      "run": "i12-control-reverse",
+      "candidate": "I10 control",
+      "source_hashes": {
+        "server_binary_sha256": "bb6b4ceb64ab146734a3e008bfe58272c565aca438402b50e80b55e896201366",
+        "client_binary_sha256": "896734c39a8d8d27aae917d2907e73e9ca33708a3a00925b3ff14670981af752",
+        "server_config_sha256": "35c48042a9208bffdd15923dab7d3cb3a273d6358cf20caeeb7b3345eb3c8e4e",
+        "client_config_sha256": "043b8b7f451368326e9a6a73d00e462b4d26adbfccca1034d178eb71cb2f4f9a"
+      },
+      "active_peer_count_min": 1500,
+      "active_state_count_min": 1500,
+      "sender_count": 1500,
+      "sender_min_frame_visits_per_s": 59.995000416631946,
+      "sender_min_socket_sent_per_s": 49.979168402633114,
+      "sender_errors_total": 0,
+      "observer": {
+        "near_peers": "1499",
+        "expected_near_peers": "1499",
+        "missing_expected_peers": "0",
+        "stale_peers_500ms": "1499",
+        "applied_gaps": "157395",
+        "gap_p50_ms": "567.52",
+        "gap_p95_ms": "598.41",
+        "accepted_avatar_items": "158894",
+        "applied_full_items": "154865",
+        "applied_delta_items": "4029",
+        "malformed_items": "0",
+        "decode_errors": "0",
+        "unapplied_deltas": "0",
+        "non_newer_sequences": "0"
+      },
+      "per_peer": {
+        "count": 1499,
+        "updates_min": 106,
+        "updates_median": 106,
+        "updates_max": 106,
+        "p50_of_peer_p50_ms": 567.52,
+        "p95_of_peer_p50_ms": 567.56,
+        "p50_of_peer_p95_ms": 598.38,
+        "p95_of_peer_p95_ms": 598.44,
+        "end_age_p50_ms": 505.0,
+        "end_age_p95_ms": 505.0,
+        "end_age_max_ms": 506.0
+      },
+      "server_cpu_windows_percent": [
+        276.2296740724506,
+        277.2723888406479
+      ],
+      "server_cpu_mean_percent": 276.7510314565493,
+      "client_cpu_windows_percent": [
+        100.80135303403351,
+        100.771829045376
+      ],
+      "client_cpu_mean_percent": 100.78659103970475,
+      "global_counter_endpoints_ms": [
+        0,
+        30038,
+        60010
+      ],
+      "counter_windows": [
+        {
+          "start_ms": 0,
+          "end_ms": 30038,
+          "elapsed_s": 30.038,
+          "inbound_per_s": 74955.85591583993,
+          "built_logical_per_s": 4002506.658232905,
+          "encoded_entries_per_s": 160363.0068579799,
+          "tick_ms_per_tick": 17.536447691408533,
+          "build_ms_per_tick": 9.989239625949736,
+          "flush_ms_per_tick": 2.1259310344827584,
+          "counter_delta": {
+            "inbound_updates": 2251524,
+            "outbound_logical_avatar_sends": 120227295,
+            "tick_count": 1711,
+            "tick_micros": 30004862,
+            "build_micros": 17091589,
+            "flush_micros": 3637468,
+            "outbound_messages": 4816984
+          }
+        },
+        {
+          "start_ms": 30038,
+          "end_ms": 60010,
+          "elapsed_s": 29.972,
+          "inbound_per_s": 75069.23128253035,
+          "built_logical_per_s": 3931399.0724676363,
+          "encoded_entries_per_s": 173750.0,
+          "tick_ms_per_tick": 17.850392963625524,
+          "build_ms_per_tick": 10.103327966607036,
+          "flush_ms_per_tick": 2.296901013714967,
+          "counter_delta": {
+            "inbound_updates": 2249975,
+            "outbound_logical_avatar_sends": 117831893,
+            "tick_count": 1677,
+            "tick_micros": 29935109,
+            "build_micros": 16943281,
+            "flush_micros": 3851903,
+            "outbound_messages": 5207635
+          }
+        }
+      ],
+      "mean_built_logical_per_s": 3966952.8653502706,
+      "server_cpu_percent_per_million_logical_sends": 69.76413404703082,
+      "observer_socket_drops_start_end": [
+        0,
+        0
+      ],
+      "cpu_sample_offsets_from_marker_s": [
+        30.029358821979258,
+        30.02823337301379
+      ]
+    }
+  ],
+  "mixed_600_runs": []
+}

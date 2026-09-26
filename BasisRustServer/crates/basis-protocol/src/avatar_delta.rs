@@ -369,17 +369,75 @@ pub fn apply_delta(
 }
 
 fn read_channel(payload: &[u8], channel: AvatarChannel) -> u32 {
-    let mut value = 0u32;
-    for i in 0..channel.width {
-        let bit = channel.bit_offset + i;
-        if ((payload[bit >> 3] >> (bit & 7)) & 1) != 0 {
-            value |= 1u32 << i;
+    debug_assert!((1..=32).contains(&channel.width));
+    let first_byte = channel.bit_offset >> 3;
+    let bit_shift = channel.bit_offset & 7;
+
+    // Avatar payloads usually have at least eight bytes available from this
+    // channel's first byte. Read a single bounded word in that case; near the
+    // fixed payload tail, gather only the bytes the channel actually spans.
+    if let Some(end) = first_byte.checked_add(8) {
+        if let Some(bytes) = payload.get(first_byte..end) {
+            let window = u64::from_le_bytes(bytes.try_into().expect("eight-byte window"));
+            let mask = if channel.width == 32 {
+                u64::from(u32::MAX)
+            } else {
+                (1u64 << channel.width) - 1
+            };
+            return ((window >> bit_shift) & mask) as u32;
         }
     }
-    value
+
+    let byte_count = (bit_shift + channel.width + 7) >> 3;
+    let bytes = &payload[first_byte..first_byte + byte_count];
+
+    // A 32-bit channel can begin seven bits into a byte, so at most five bytes are
+    // gathered. The layout guarantees these bytes are within the fixed avatar payload.
+    let mut window = 0u64;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        window |= u64::from(byte) << (index * 8);
+    }
+
+    let mask = if channel.width == 32 {
+        u64::from(u32::MAX)
+    } else {
+        (1u64 << channel.width) - 1
+    };
+    ((window >> bit_shift) & mask) as u32
 }
 
 fn replace_channel(payload: &mut [u8], channel: AvatarChannel, value: u32) {
+    if channel.width == 0 {
+        return;
+    }
+
+    let first_byte = channel.bit_offset >> 3;
+    let bit_shift = channel.bit_offset & 7;
+    let span_bits = bit_shift + channel.width;
+    if span_bits <= 64 {
+        let byte_count = (span_bits + 7) >> 3;
+        // Avatar layouts are bounded by their fixed payload lengths. Keep the old
+        // bit writer as a fallback if a future layout violates that invariant.
+        if let Some(bytes) = payload.get_mut(first_byte..first_byte + byte_count) {
+            let mut window = 0u64;
+            for (index, byte) in bytes.iter().copied().enumerate() {
+                window |= u64::from(byte) << (index * 8);
+            }
+
+            let channel_mask = if channel.width >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << channel.width) - 1
+            };
+            let shifted_mask = channel_mask << bit_shift;
+            window = (window & !shifted_mask) | ((u64::from(value) & channel_mask) << bit_shift);
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = (window >> (index * 8)) as u8;
+            }
+            return;
+        }
+    }
+
     for i in 0..channel.width {
         let bit = channel.bit_offset + i;
         let mask = 1u8 << (bit & 7);
@@ -472,6 +530,35 @@ impl<'a> ResidualBitReader<'a> {
         if self.bit_position.saturating_add(count) > self.end_bit {
             bail!("truncated avatar delta bitstream");
         }
+
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let bit_shift = self.bit_position & 7;
+        let span_bits = bit_shift + count;
+        if span_bits <= 64 {
+            let first_byte = self.bit_position >> 3;
+            let byte_count = (span_bits + 7) >> 3;
+            let Some(bytes) = self.bytes.get(first_byte..first_byte + byte_count) else {
+                bail!("truncated avatar delta bitstream");
+            };
+            let mut window = 0u64;
+            for (index, byte) in bytes.iter().copied().enumerate() {
+                window |= u64::from(byte) << (index * 8);
+            }
+            let mask = if count == 64 {
+                u64::MAX
+            } else {
+                (1u64 << count) - 1
+            };
+            let value = (window >> bit_shift) & mask;
+            self.bit_position += count;
+            return Ok(value);
+        }
+
+        // Current channel widths fit in a single aligned u64 window. Retain the
+        // original bounded behavior for any future wider private caller.
         let mut value = 0u64;
         for i in 0..count {
             let bit = self.bit_position + i;
@@ -512,6 +599,269 @@ mod tests {
     use super::*;
     use crate::avatar::read_position;
 
+    fn bit_loop_reference(payload: &[u8], channel: AvatarChannel) -> u32 {
+        let mut value = 0u32;
+        for bit_index in 0..channel.width {
+            let bit = channel.bit_offset + bit_index;
+            if ((payload[bit >> 3] >> (bit & 7)) & 1) != 0 {
+                value |= 1u32 << bit_index;
+            }
+        }
+        value
+    }
+
+    fn read_bits_reference(bytes: &[u8], start: usize, count: usize) -> u64 {
+        let mut value = 0u64;
+        for index in 0..count {
+            let bit = start + index;
+            if ((bytes[bit >> 3] >> (bit & 7)) & 1) != 0 {
+                value |= 1u64 << index;
+            }
+        }
+        value
+    }
+
+    fn replace_channel_reference(payload: &mut [u8], channel: AvatarChannel, value: u32) {
+        for index in 0..channel.width {
+            let bit = channel.bit_offset + index;
+            let mask = 1u8 << (bit & 7);
+            if ((value >> index) & 1) != 0 {
+                payload[bit >> 3] |= mask;
+            } else {
+                payload[bit >> 3] &= !mask;
+            }
+        }
+    }
+
+    fn read_bits_reference_checked(
+        bytes: &[u8],
+        bit_position: &mut usize,
+        end_bit: usize,
+        count: usize,
+    ) -> Result<u64> {
+        if bit_position.saturating_add(count) > end_bit {
+            bail!("truncated avatar delta bitstream");
+        }
+        let value = read_bits_reference(bytes, *bit_position, count);
+        *bit_position += count;
+        Ok(value)
+    }
+
+    fn read_signed_eg_reference(
+        bytes: &[u8],
+        bit_position: &mut usize,
+        end_bit: usize,
+    ) -> Result<i32> {
+        let mut zeros = 0usize;
+        loop {
+            if *bit_position >= end_bit {
+                bail!("truncated avatar delta Exp-Golomb code");
+            }
+            if read_bits_reference_checked(bytes, bit_position, end_bit, 1)? != 0 {
+                break;
+            }
+            zeros += 1;
+            if zeros > 32 {
+                bail!("invalid avatar delta Exp-Golomb prefix");
+            }
+        }
+        let mut m = 1u32;
+        for _ in 0..zeros {
+            m = (m << 1) | read_bits_reference_checked(bytes, bit_position, end_bit, 1)? as u32;
+        }
+        let zz = m.wrapping_sub(1);
+        Ok(((zz >> 1) as i32) ^ -((zz & 1) as i32))
+    }
+
+    fn apply_delta_reference(
+        baseline: &[u8],
+        delta_and_trailing: &[u8],
+        quality: BitQuality,
+    ) -> Result<(Vec<u8>, usize)> {
+        let layout = layout(quality);
+        ensure!(
+            baseline.len() >= layout.payload_bytes,
+            "avatar delta baseline too small"
+        );
+        ensure!(
+            delta_and_trailing.len() >= DIRTY_MASK_BYTES,
+            "avatar delta missing dirty mask"
+        );
+        let mask = &delta_and_trailing[..DIRTY_MASK_BYTES];
+        let mut output = baseline[..layout.payload_bytes].to_vec();
+        let body_start_bit = DIRTY_MASK_BYTES * 8;
+        let end_bit = delta_and_trailing.len() * 8;
+        let mut bit_position = body_start_bit;
+        for field in 0..FIELD_COUNT {
+            if mask[field >> 3] & (1 << (field & 7)) == 0 {
+                continue;
+            }
+            let raw_mode =
+                read_bits_reference_checked(delta_and_trailing, &mut bit_position, end_bit, 1)?
+                    != 0;
+            for channel in &layout.fields[field] {
+                let value = if raw_mode || channel.kind == ChannelKind::Raw {
+                    read_bits_reference_checked(
+                        delta_and_trailing,
+                        &mut bit_position,
+                        end_bit,
+                        channel.width,
+                    )? as u32
+                } else {
+                    let diff =
+                        read_signed_eg_reference(delta_and_trailing, &mut bit_position, end_bit)?;
+                    let base = bit_loop_reference(baseline, *channel) as i32;
+                    ((base.wrapping_add(diff)) as u32) & channel.mask()
+                };
+                replace_channel_reference(&mut output, *channel, value);
+            }
+        }
+        let consumed_bits = bit_position - body_start_bit;
+        let body_len = DIRTY_MASK_BYTES + ((consumed_bits + 7) >> 3);
+        ensure!(
+            body_len <= delta_and_trailing.len(),
+            "avatar delta body overrun"
+        );
+        Ok((output, body_len))
+    }
+
+    fn deterministic_payload(len: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn residual_word_reads_match_bit_loop_at_all_widths_and_boundaries() {
+        let seeds = [0, 1, 0x1234_5678, 0xdead_beef, u32::MAX];
+        for byte_len in [1usize, 8, 19] {
+            let bit_len = byte_len * 8;
+            let payloads = seeds.map(|seed| deterministic_payload(byte_len, seed));
+            for count in 0..=64 {
+                if count > bit_len {
+                    continue;
+                }
+                for start in 0..=bit_len - count {
+                    for bytes in &payloads {
+                        let mut reader = ResidualBitReader::new(bytes, start, bit_len);
+                        assert_eq!(
+                            reader.read_bits(count).unwrap(),
+                            read_bits_reference(bytes, start, count),
+                            "start={start} count={count} bytes={byte_len}",
+                        );
+                        assert_eq!(reader.bit_position, start + count);
+                    }
+                }
+            }
+        }
+
+        // A short logical end and a short backing slice both fail without advancing;
+        // zero-width reads preserve their old no-op behavior at the end boundary.
+        let bytes = [0xff, 0x5a];
+        let mut reader = ResidualBitReader::new(&bytes, 7, 8);
+        assert!(reader.read_bits(2).is_err());
+        assert_eq!(reader.bit_position, 7);
+        assert_eq!(reader.read_bits(0).unwrap(), 0);
+        assert_eq!(reader.bit_position, 7);
+        let mut reader = ResidualBitReader::new(&bytes[..1], 7, 16);
+        assert!(reader.read_bits(2).is_err());
+        assert_eq!(reader.bit_position, 7);
+    }
+
+    #[test]
+    fn channel_window_writes_match_bit_loop_and_preserve_neighbors() {
+        let seeds = [0, 1, 0x1234_5678, 0xdead_beef, u32::MAX];
+        for byte_len in [1usize, 8, 19] {
+            let bit_len = byte_len * 8;
+            let payloads = seeds.map(|seed| deterministic_payload(byte_len, seed));
+            for width in 0..=32 {
+                if width > bit_len {
+                    continue;
+                }
+                for bit_offset in 0..=bit_len - width {
+                    let channel = AvatarChannel {
+                        bit_offset,
+                        width,
+                        kind: ChannelKind::Raw,
+                    };
+                    for (seed_index, payload) in payloads.iter().enumerate() {
+                        for value in [
+                            0,
+                            u32::MAX,
+                            0xaaaa_5555,
+                            (seed_index as u32).wrapping_mul(7919),
+                        ] {
+                            let mut expected = payload.clone();
+                            let mut actual = payload.clone();
+                            replace_channel_reference(&mut expected, channel, value);
+                            replace_channel(&mut actual, channel, value);
+                            assert_eq!(actual, expected, "offset={bit_offset} width={width}");
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut payload = [0x5a];
+        replace_channel(
+            &mut payload,
+            AvatarChannel {
+                bit_offset: usize::MAX,
+                width: 0,
+                kind: ChannelKind::Raw,
+            },
+            u32::MAX,
+        );
+        assert_eq!(payload, [0x5a]);
+    }
+
+    #[test]
+    fn public_decoder_matches_bit_loop_reference_for_all_qualities_and_truncations() {
+        let seeds = [1, 0x1234_5678, 0xdead_beef];
+        for quality in [
+            BitQuality::VeryLow,
+            BitQuality::Low,
+            BitQuality::Medium,
+            BitQuality::High,
+        ] {
+            for seed in seeds {
+                let baseline = deterministic_payload(quality.payload_len(), seed);
+                let mut current = baseline.clone();
+                for (index, byte) in current.iter_mut().enumerate() {
+                    if (index.wrapping_mul(31).wrapping_add(seed as usize)) % 7 == 0 {
+                        *byte ^= (seed.rotate_left((index & 31) as u32) as u8) | 1;
+                    }
+                }
+                let delta = build_delta(&baseline, &current, quality).unwrap();
+                let mut with_trailing = delta.clone();
+                with_trailing.extend_from_slice(&[0xa5, 0x5a, 0xc3]);
+                assert_eq!(
+                    apply_delta(&baseline, &with_trailing, quality).unwrap(),
+                    apply_delta_reference(&baseline, &with_trailing, quality).unwrap(),
+                    "quality={quality:?} seed={seed:#x}",
+                );
+
+                // Every truncated prefix must preserve the same public failure result.
+                for end in 0..delta.len() {
+                    let optimized = apply_delta(&baseline, &delta[..end], quality)
+                        .unwrap_err()
+                        .to_string();
+                    let reference = apply_delta_reference(&baseline, &delta[..end], quality)
+                        .unwrap_err()
+                        .to_string();
+                    assert_eq!(
+                        optimized, reference,
+                        "quality={quality:?} seed={seed:#x} end={end}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn layouts_partition_current_payloads() {
         for quality in [
@@ -524,6 +874,124 @@ mod tests {
             assert_eq!(layout.fields.len(), FIELD_COUNT);
             assert_eq!(layout.payload_bytes, quality.payload_len());
         }
+    }
+
+    #[test]
+    fn word_channel_read_matches_bit_loop_for_layouts_and_all_widths() {
+        let qualities = [
+            BitQuality::VeryLow,
+            BitQuality::Low,
+            BitQuality::Medium,
+            BitQuality::High,
+        ];
+        let seeds = [0, 1, 0x1234_5678, 0xdead_beef, u32::MAX];
+
+        // Exercise every channel in every protocol layout using different deterministic bytes.
+        for quality in qualities {
+            let layout = layout(quality);
+            let payloads = seeds.map(|seed| deterministic_payload(layout.payload_bytes, seed));
+            for (field_index, field) in layout.fields.iter().enumerate() {
+                for (channel_index, channel) in field.iter().copied().enumerate() {
+                    assert!((1..=32).contains(&channel.width));
+                    assert!(channel.bit_offset + channel.width <= layout.payload_bytes * 8);
+                    for payload in &payloads {
+                        assert_eq!(
+                            read_channel(payload, channel),
+                            bit_loop_reference(payload, channel),
+                            "quality={quality:?} field={field_index} channel={channel_index} offset={} width={}",
+                            channel.bit_offset,
+                            channel.width,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Cover each supported width at every possible offset in differently sized buffers,
+        // including ranges that end at the final bit and ranges crossing up to five bytes.
+        for width in 1usize..=32 {
+            for byte_len in [width.div_ceil(8), 8, 19] {
+                let bit_len = byte_len * 8;
+                if width > bit_len {
+                    continue;
+                }
+                let payloads = seeds.map(|seed| deterministic_payload(byte_len, seed));
+                for bit_offset in 0..=(bit_len - width) {
+                    let channel = AvatarChannel {
+                        bit_offset,
+                        width,
+                        kind: ChannelKind::Raw,
+                    };
+                    for payload in &payloads {
+                        assert_eq!(
+                            read_channel(payload, channel),
+                            bit_loop_reference(payload, channel),
+                            "offset={bit_offset} width={width} bytes={byte_len}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn build_delta_rejects_truncated_payloads_before_channel_reads() {
+        for quality in [
+            BitQuality::VeryLow,
+            BitQuality::Low,
+            BitQuality::Medium,
+            BitQuality::High,
+        ] {
+            let payload = deterministic_payload(quality.payload_len(), 0x1234_5678);
+            assert!(build_delta(&payload[..payload.len() - 1], &payload, quality).is_err());
+            assert!(build_delta(&payload, &payload[..payload.len() - 1], quality).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-only comparison of word extraction against the former bit loop"]
+    fn bench_word_channel_read_against_bit_loop_reference() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let layout = layout(BitQuality::High);
+        let channels = layout.fields.iter().flatten().copied().collect::<Vec<_>>();
+        let payloads = [
+            deterministic_payload(layout.payload_bytes, 0x1234_5678),
+            deterministic_payload(layout.payload_bytes, 0xdead_beef),
+            deterministic_payload(layout.payload_bytes, 0x7f4a_7c15),
+            deterministic_payload(layout.payload_bytes, 0x9e37_79b9),
+        ];
+        let iterations = 50_000;
+
+        let start = Instant::now();
+        let mut word_checksum = 0u64;
+        for iteration in 0..iterations {
+            for (index, channel) in channels.iter().copied().enumerate() {
+                let payload = black_box(&payloads[(iteration + index) & 3]);
+                word_checksum = word_checksum
+                    .wrapping_add(u64::from(black_box(read_channel(payload, channel))));
+            }
+        }
+        let word_elapsed = start.elapsed();
+
+        let start = Instant::now();
+        let mut reference_checksum = 0u64;
+        for iteration in 0..iterations {
+            for (index, channel) in channels.iter().copied().enumerate() {
+                let payload = black_box(&payloads[(iteration + index) & 3]);
+                reference_checksum = reference_checksum
+                    .wrapping_add(u64::from(black_box(bit_loop_reference(payload, channel))));
+            }
+        }
+        let reference_elapsed = start.elapsed();
+
+        assert_eq!(word_checksum, reference_checksum);
+        eprintln!(
+            "high-quality layout: {} channels x {iterations} passes; word={word_elapsed:?}, bit_loop={reference_elapsed:?}, speedup={:.2}x, checksum={word_checksum}",
+            channels.len(),
+            reference_elapsed.as_secs_f64() / word_elapsed.as_secs_f64(),
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use flate2::{write::DeflateEncoder, Compression};
 use lz4_flex::{compress, decompress};
-use std::io::Write;
+use std::{cell::RefCell, io::Write};
 
 use crate::{
     avatar_bundle_dictionary,
@@ -439,6 +439,28 @@ fn rescale_quant(value: u64, src_bits: usize, dst_bits: usize) -> u64 {
 
 fn read_bits(src: &[u8], base_byte_offset: usize, bit_pos: usize, bit_count: usize) -> u64 {
     let absolute = (base_byte_offset << 3) + bit_pos;
+    let first_byte = absolute >> 3;
+    let bit_shift = absolute & 7;
+    if bit_count <= 64 - bit_shift {
+        let byte_count = (bit_shift + bit_count + 7) >> 3;
+        if let Some(end) = first_byte.checked_add(byte_count) {
+            if let Some(bytes) = src.get(first_byte..end) {
+                let mut window = 0u64;
+                for (index, byte) in bytes.iter().copied().enumerate() {
+                    window |= u64::from(byte) << (index * 8);
+                }
+                let mask = if bit_count == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << bit_count) - 1
+                };
+                return (window >> bit_shift) & mask;
+            }
+        }
+    }
+
+    // Keep the former path for future callers whose range cannot fit in the
+    // bounded u64 window, and preserve its indexing behavior for invalid ranges.
     let mut result = 0u64;
     for i in 0..bit_count {
         let bit = absolute + i;
@@ -457,6 +479,31 @@ fn write_bits(
     bit_count: usize,
 ) {
     let absolute = (base_byte_offset << 3) + bit_pos;
+    let first_byte = absolute >> 3;
+    let bit_shift = absolute & 7;
+    if bit_count <= 64 - bit_shift {
+        let byte_count = (bit_shift + bit_count + 7) >> 3;
+        if let Some(end) = first_byte.checked_add(byte_count) {
+            if let Some(bytes) = dst.get_mut(first_byte..end) {
+                let mut window = 0u64;
+                for (index, byte) in bytes.iter().copied().enumerate() {
+                    window |= u64::from(byte) << (index * 8);
+                }
+                let mask = if bit_count == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << bit_count) - 1
+                };
+                window |= (value & mask) << bit_shift;
+                for (index, byte) in bytes.iter_mut().enumerate() {
+                    *byte = (window >> (index * 8)) as u8;
+                }
+                return;
+            }
+        }
+    }
+
+    // This is also the conservative fallback for widths that exceed one u64 window.
     for i in 0..bit_count {
         if (value >> i) & 1 != 0 {
             let bit = absolute + i;
@@ -605,76 +652,113 @@ pub fn try_encode_avatar_bundle_slices_with_compression(
     })
 }
 
+struct AvatarBundleZstdContext {
+    level: i32,
+    context: zstd_safe::CCtx<'static>,
+}
+
+impl AvatarBundleZstdContext {
+    fn new(level: i32) -> Result<Self> {
+        use zstd_safe::{CParameter, FrameFormat};
+
+        let mut context = zstd_safe::CCtx::try_create()
+            .ok_or_else(|| anyhow::anyhow!("creating avatar bundle zstd context failed"))?;
+        context
+            .set_parameter(CParameter::CompressionLevel(level))
+            .map_err(|code| zstd_error("setting zstd compression level", code))?;
+        context
+            .set_parameter(CParameter::ContentSizeFlag(false))
+            .map_err(|code| zstd_error("disabling zstd content-size flag", code))?;
+        context
+            .set_parameter(CParameter::ChecksumFlag(false))
+            .map_err(|code| zstd_error("disabling zstd checksum", code))?;
+        context
+            .set_parameter(CParameter::DictIdFlag(false))
+            .map_err(|code| zstd_error("disabling zstd dictionary id", code))?;
+        context
+            .set_parameter(CParameter::WindowLog(BUNDLE_ZSTD_WINDOW_LOG))
+            .map_err(|code| zstd_error("setting zstd window log", code))?;
+        context
+            .set_parameter(CParameter::Format(FrameFormat::Magicless))
+            .map_err(|code| zstd_error("setting magicless zstd format", code))?;
+        context
+            .load_dictionary(avatar_bundle_dictionary::bytes())
+            .map_err(|code| zstd_error("loading avatar bundle zstd dictionary", code))?;
+
+        Ok(Self { level, context })
+    }
+
+    fn compress(&mut self, raw: &[u8]) -> Result<Vec<u8>> {
+        use zstd_safe::ResetDirective;
+
+        // Reset only the frame session. zstd-safe guarantees that this preserves both the
+        // parameters and the loaded dictionary for the next independent frame.
+        self.context
+            .reset(ResetDirective::SessionOnly)
+            .map_err(|code| zstd_error("resetting avatar bundle zstd session", code))?;
+        let mut compressed = vec![0u8; zstd_safe::compress_bound(raw.len())];
+        let written = self
+            .context
+            .compress2(&mut compressed[..], raw)
+            .map_err(|code| zstd_error("compressing avatar bundle with zstd", code))?;
+        compressed.truncate(written);
+        Ok(compressed)
+    }
+}
+
+thread_local! {
+    // Rayon may call this compressor on multiple workers. Each worker owns one context, so
+    // compression stays lock-free and retained native workspace is bounded by worker count.
+    static AVATAR_BUNDLE_ZSTD_CONTEXT: RefCell<Option<AvatarBundleZstdContext>> = const { RefCell::new(None) };
+}
+
 fn compress_avatar_bundle_zstd(raw: &[u8], level: i32) -> Result<Vec<u8>> {
+    AVATAR_BUNDLE_ZSTD_CONTEXT.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.as_ref().is_none_or(|context| context.level != level) {
+            *cached = Some(AvatarBundleZstdContext::new(level)?);
+        }
+        cached
+            .as_mut()
+            .expect("avatar bundle zstd context initialized")
+            .compress(raw)
+    })
+}
+
+fn zstd_error(operation: &str, code: usize) -> anyhow::Error {
+    anyhow::anyhow!("{operation}: {}", zstd_safe::get_error_name(code))
+}
+
+#[cfg(test)]
+fn compress_avatar_bundle_zstd_fresh(raw: &[u8], level: i32) -> Result<Vec<u8>> {
     use zstd_safe::{CCtx, CParameter, FrameFormat};
 
     let mut context = CCtx::default();
     context
         .set_parameter(CParameter::CompressionLevel(level))
-        .map_err(|code| {
-            anyhow::anyhow!(
-                "setting zstd compression level: {}",
-                zstd_safe::get_error_name(code)
-            )
-        })?;
+        .map_err(|code| zstd_error("setting zstd compression level", code))?;
     context
         .set_parameter(CParameter::ContentSizeFlag(false))
-        .map_err(|code| {
-            anyhow::anyhow!(
-                "disabling zstd content-size flag: {}",
-                zstd_safe::get_error_name(code)
-            )
-        })?;
+        .map_err(|code| zstd_error("disabling zstd content-size flag", code))?;
     context
         .set_parameter(CParameter::ChecksumFlag(false))
-        .map_err(|code| {
-            anyhow::anyhow!(
-                "disabling zstd checksum: {}",
-                zstd_safe::get_error_name(code)
-            )
-        })?;
+        .map_err(|code| zstd_error("disabling zstd checksum", code))?;
     context
         .set_parameter(CParameter::DictIdFlag(false))
-        .map_err(|code| {
-            anyhow::anyhow!(
-                "disabling zstd dictionary id: {}",
-                zstd_safe::get_error_name(code)
-            )
-        })?;
+        .map_err(|code| zstd_error("disabling zstd dictionary id", code))?;
     context
         .set_parameter(CParameter::WindowLog(BUNDLE_ZSTD_WINDOW_LOG))
-        .map_err(|code| {
-            anyhow::anyhow!(
-                "setting zstd window log: {}",
-                zstd_safe::get_error_name(code)
-            )
-        })?;
+        .map_err(|code| zstd_error("setting zstd window log", code))?;
     context
         .set_parameter(CParameter::Format(FrameFormat::Magicless))
-        .map_err(|code| {
-            anyhow::anyhow!(
-                "setting magicless zstd format: {}",
-                zstd_safe::get_error_name(code)
-            )
-        })?;
+        .map_err(|code| zstd_error("setting magicless zstd format", code))?;
     context
         .load_dictionary(avatar_bundle_dictionary::bytes())
-        .map_err(|code| {
-            anyhow::anyhow!(
-                "loading avatar bundle zstd dictionary: {}",
-                zstd_safe::get_error_name(code)
-            )
-        })?;
-
+        .map_err(|code| zstd_error("loading avatar bundle zstd dictionary", code))?;
     let mut compressed = vec![0u8; zstd_safe::compress_bound(raw.len())];
     let written = context
         .compress2(&mut compressed[..], raw)
-        .map_err(|code| {
-            anyhow::anyhow!(
-                "compressing avatar bundle with zstd: {}",
-                zstd_safe::get_error_name(code)
-            )
-        })?;
+        .map_err(|code| zstd_error("compressing avatar bundle with zstd", code))?;
     compressed.truncate(written);
     Ok(compressed)
 }
@@ -805,6 +889,285 @@ mod tests {
     use flate2::read::DeflateDecoder;
     use std::io::Read;
 
+    fn reference_read_bits(
+        source: &[u8],
+        base_byte_offset: usize,
+        bit_pos: usize,
+        bit_count: usize,
+    ) -> u64 {
+        let absolute = (base_byte_offset << 3) + bit_pos;
+        let mut result = 0u64;
+        for index in 0..bit_count {
+            let bit = absolute + index;
+            if source[bit >> 3] & (1 << (bit & 7)) != 0 {
+                result |= 1u64 << index;
+            }
+        }
+        result
+    }
+
+    fn reference_write_bits(
+        destination: &mut [u8],
+        base_byte_offset: usize,
+        bit_pos: usize,
+        value: u64,
+        bit_count: usize,
+    ) {
+        let absolute = (base_byte_offset << 3) + bit_pos;
+        for index in 0..bit_count {
+            if value & (1u64 << index) != 0 {
+                let bit = absolute + index;
+                destination[bit >> 3] |= 1 << (bit & 7);
+            }
+        }
+    }
+
+    fn deterministic_bytes(len: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn reference_repack_high_to_lower(high: &[u8], target: BitQuality) -> Vec<u8> {
+        let mut output = vec![0; target.payload_len()];
+        output[..WRITE_POSITION].copy_from_slice(&high[..WRITE_POSITION]);
+        let high_offsets = rotation_field_offsets(BitQuality::High);
+        let target_offsets = rotation_field_offsets(target);
+        let target_bpc = bpc_table(target);
+
+        for slot in 0..WIRE_BONE_SLOT_COUNT {
+            let src_bit = high_offsets[slot];
+            let dst_bit = target_offsets[slot];
+            match BONE_DOF[slot] {
+                3 => {
+                    let src_bpc = BPC_HIGH[slot] as usize;
+                    let dst_bpc = target_bpc[slot] as usize;
+                    let raw = reference_read_bits(high, WRITE_POSITION, src_bit, 2 + 3 * src_bpc);
+                    let index = raw & 3;
+                    let src_mask = (1u64 << src_bpc) - 1;
+                    let qa = (raw >> 2) & src_mask;
+                    let qb = (raw >> (2 + src_bpc)) & src_mask;
+                    let qc = (raw >> (2 + 2 * src_bpc)) & src_mask;
+                    let packed = index
+                        | (rescale_quant(qa, src_bpc, dst_bpc) << 2)
+                        | (rescale_quant(qb, src_bpc, dst_bpc) << (2 + dst_bpc))
+                        | (rescale_quant(qc, src_bpc, dst_bpc) << (2 + 2 * dst_bpc));
+                    reference_write_bits(
+                        &mut output,
+                        WRITE_POSITION,
+                        dst_bit,
+                        packed,
+                        2 + 3 * dst_bpc,
+                    );
+                }
+                2 => {
+                    let src_hinge = HINGE_BITS[BitQuality::High.index()] as usize;
+                    let src_twist = TWIST_BITS[BitQuality::High.index()] as usize;
+                    let dst_hinge = HINGE_BITS[target.index()] as usize;
+                    let dst_twist = TWIST_BITS[target.index()] as usize;
+                    let hinge = reference_read_bits(high, WRITE_POSITION, src_bit, src_hinge);
+                    let twist =
+                        reference_read_bits(high, WRITE_POSITION, src_bit + src_hinge, src_twist);
+                    let packed = rescale_quant(hinge, src_hinge, dst_hinge)
+                        | (rescale_quant(twist, src_twist, dst_twist) << dst_hinge);
+                    reference_write_bits(
+                        &mut output,
+                        WRITE_POSITION,
+                        dst_bit,
+                        packed,
+                        dst_hinge + dst_twist,
+                    );
+                }
+                _ => {
+                    let src_bits = SINGLE_BITS[BitQuality::High.index()] as usize;
+                    let dst_bits = SINGLE_BITS[target.index()] as usize;
+                    let value = reference_read_bits(high, WRITE_POSITION, src_bit, src_bits);
+                    reference_write_bits(
+                        &mut output,
+                        WRITE_POSITION,
+                        dst_bit,
+                        rescale_quant(value, src_bits, dst_bits),
+                        dst_bits,
+                    );
+                }
+            }
+        }
+
+        let src_curl = CURL_BITS[BitQuality::High.index()] as usize;
+        let src_splay = SPLAY_BITS[BitQuality::High.index()] as usize;
+        let dst_curl = CURL_BITS[target.index()] as usize;
+        let dst_splay = SPLAY_BITS[target.index()] as usize;
+        for finger in 0..FINGER_CHANNEL_COUNT {
+            let field = WIRE_BONE_SLOT_COUNT + finger;
+            let src_bit = high_offsets[field];
+            let curl = reference_read_bits(high, WRITE_POSITION, src_bit, src_curl);
+            let splay = reference_read_bits(high, WRITE_POSITION, src_bit + src_curl, src_splay);
+            let packed = rescale_quant(curl, src_curl, dst_curl)
+                | (rescale_quant(splay, src_splay, dst_splay) << dst_curl);
+            reference_write_bits(
+                &mut output,
+                WRITE_POSITION,
+                target_offsets[field],
+                packed,
+                dst_curl + dst_splay,
+            );
+        }
+
+        let src_tail = WRITE_POSITION + BitQuality::High.rotation_len();
+        let dst_tail = WRITE_POSITION + target.rotation_len();
+        output[dst_tail..dst_tail + TAIL_BYTES]
+            .copy_from_slice(&high[src_tail..src_tail + TAIL_BYTES]);
+        output
+    }
+
+    #[test]
+    fn word_bit_accessors_match_reference_for_supported_widths_and_offsets() {
+        let seeds = [0, 0x1234_5678, 0xdead_beef, u32::MAX];
+        for len in [6, 8, 19, BitQuality::High.payload_len()] {
+            let patterns = [
+                vec![0; len],
+                vec![u8::MAX; len],
+                (0..len)
+                    .map(|i| if i % 2 == 0 { 0x55 } else { 0xaa })
+                    .collect(),
+                deterministic_bytes(len, seeds[len % seeds.len()]),
+            ];
+            let max_bit = len * 8;
+            for width in 1..=38 {
+                for bit_pos in 0..=max_bit - width {
+                    for base_byte_offset in [0, if len > 9 { 9 } else { 0 }] {
+                        if base_byte_offset * 8 + bit_pos + width > max_bit {
+                            continue;
+                        }
+                        for source in &patterns {
+                            assert_eq!(
+                                read_bits(source, base_byte_offset, bit_pos, width),
+                                reference_read_bits(source, base_byte_offset, bit_pos, width),
+                                "read offset={bit_pos} base={base_byte_offset} width={width} len={len}",
+                            );
+                        }
+
+                        let width_mask = (1u64 << width) - 1;
+                        for value in [0, width_mask, u64::MAX, 0xaaaa_aaaa_aaaa_aaaa & width_mask] {
+                            for initial in &patterns {
+                                let mut actual = initial.clone();
+                                let mut expected = initial.clone();
+                                write_bits(&mut actual, base_byte_offset, bit_pos, value, width);
+                                reference_write_bits(
+                                    &mut expected,
+                                    base_byte_offset,
+                                    bit_pos,
+                                    value,
+                                    width,
+                                );
+                                assert_eq!(actual, expected);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repack_high_to_lower_matches_bit_loop_for_extreme_and_random_payloads() {
+        let len = BitQuality::High.payload_len();
+        let patterns = [
+            vec![0; len],
+            vec![u8::MAX; len],
+            (0..len)
+                .map(|i| if i % 2 == 0 { 0x55 } else { 0xaa })
+                .collect(),
+            deterministic_bytes(len, 0x1234_5678),
+            deterministic_bytes(len, 0xdead_beef),
+        ];
+        for target in [BitQuality::Medium, BitQuality::Low, BitQuality::VeryLow] {
+            for high in &patterns {
+                assert_eq!(
+                    repack_high_to_lower(high, target).unwrap(),
+                    reference_repack_high_to_lower(high, target),
+                    "target={target:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn word_bit_writes_match_reference_when_packed_ranges_overlap() {
+        let operations = [
+            (3, 0x002a_5a35_5aa5_u64, 38),
+            (32, 0xdead_beef, 32),
+            (61, 0x7fff_ffff, 31),
+        ];
+        for initial in [
+            vec![0; BitQuality::High.payload_len()],
+            vec![u8::MAX; BitQuality::High.payload_len()],
+            deterministic_bytes(BitQuality::High.payload_len(), 0x1357_9bdf),
+        ] {
+            let mut actual = initial.clone();
+            let mut expected = initial;
+            for (offset, value, width) in operations {
+                write_bits(&mut actual, 0, offset, value, width);
+                reference_write_bits(&mut expected, 0, offset, value, width);
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn word_bit_accessors_fall_back_when_an_unaligned_window_exceeds_u64() {
+        let source = deterministic_bytes(16, 0x2468_ace0);
+        for (bit_pos, width) in [(0, 64), (1, 64), (7, 58)] {
+            assert_eq!(
+                read_bits(&source, 0, bit_pos, width),
+                reference_read_bits(&source, 0, bit_pos, width),
+            );
+            let mut actual = source.clone();
+            let mut expected = source.clone();
+            let value = 0xdead_beef_cafe_babe;
+            write_bits(&mut actual, 0, bit_pos, value, width);
+            reference_write_bits(&mut expected, 0, bit_pos, value, width);
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn zero_width_bit_accessors_preserve_end_of_buffer_behavior() {
+        let source = deterministic_bytes(4, 0x1020_3040);
+        assert_eq!(read_bits(&source, 0, source.len() * 8, 0), 0);
+        assert_eq!(read_bits(&source, 0, source.len() * 8 - 1, 0), 0);
+
+        let mut actual = source.clone();
+        write_bits(&mut actual, 0, source.len() * 8, u64::MAX, 0);
+        assert_eq!(actual, source);
+        write_bits(&mut actual, 0, source.len() * 8 - 1, u64::MAX, 0);
+        assert_eq!(actual, source);
+    }
+
+    #[test]
+    fn repack_input_and_output_errors_are_unchanged() {
+        let high = vec![0; BitQuality::High.payload_len()];
+        let mut too_small = vec![0; BitQuality::Low.payload_len() - 1];
+        assert!(repack_high_to_lower(&high, BitQuality::High).is_err());
+        assert!(repack_high_to_lower_into(
+            &high[..high.len() - 1],
+            BitQuality::Low,
+            &mut too_small
+        )
+        .is_err());
+        let short_output_len = too_small.len() - 1;
+        assert!(repack_high_to_lower_into(
+            &high,
+            BitQuality::Low,
+            &mut too_small[..short_output_len],
+        )
+        .is_err());
+    }
+
     #[test]
     fn quality_sizes_match_basis_v54_constants() {
         assert_eq!(BitQuality::VeryLow.payload_len(), 74);
@@ -931,6 +1294,77 @@ mod tests {
         let decoded = decode_avatar_bundle(&encoded.bytes).unwrap();
         assert_eq!(decoded[0].payload, payload_a);
         assert_eq!(decoded[1].payload, payload_b);
+    }
+
+    #[test]
+    fn avatar_bundle_zstd_cached_context_matches_fresh_frames_across_levels() {
+        let payloads = [
+            vec![7u8; 159],
+            (0..251).map(|index| (index * 37) as u8).collect(),
+            vec![0x5a; 4096],
+        ];
+        let mut raw = NetWriter::new();
+        raw.put_u8(12);
+        raw.put_u8(payloads.len() as u8);
+        for payload in &payloads {
+            raw.put_u16(payload.len() as u16);
+        }
+        for payload in &payloads {
+            raw.put_bytes(payload);
+        }
+        let raw = raw.into_vec();
+
+        // Reusing the context must produce independent frames identical to the former fresh
+        // context path, even after changing levels and returning to the previous level.
+        for level in [-2, 3, -2] {
+            let cached = compress_avatar_bundle_zstd(&raw, level).unwrap();
+            let fresh = compress_avatar_bundle_zstd_fresh(&raw, level).unwrap();
+            assert_eq!(cached, fresh, "compressed frame differs at level {level}");
+
+            let mut frame = Vec::with_capacity(cached.len() + 3);
+            frame.push(
+                BUNDLE_CODEC_ZSTD_DICTIONARY
+                    | (avatar_bundle_dictionary::GENERATION << BUNDLE_DICTIONARY_SHIFT),
+            );
+            frame.extend_from_slice(&(raw.len() as u16).to_le_bytes());
+            frame.extend_from_slice(&cached);
+            let decoded = decode_avatar_bundle(&frame).unwrap();
+            assert_eq!(decoded.len(), payloads.len());
+            for (item, expected) in decoded.iter().zip(&payloads) {
+                assert_eq!(&item.payload, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn avatar_bundle_zstd_cached_contexts_are_thread_local_and_concurrent() {
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                scope.spawn(move || {
+                    for iteration in 0..40 {
+                        let level = if iteration % 2 == 0 { -2 } else { 1 };
+                        let payload = (0..(128 + worker * 17 + iteration * 3))
+                            .map(|index| (index * 31 + worker) as u8)
+                            .collect::<Vec<_>>();
+                        let items = [AvatarBundleItem {
+                            original_channel: 12,
+                            payload: payload.clone(),
+                        }];
+                        let slices = [AvatarBundleSlice {
+                            original_channel: 12,
+                            payload: &payload,
+                            interval_patch: None,
+                        }];
+                        let encoded = try_encode_avatar_bundle_slices_with_compression(
+                            &slices,
+                            AvatarBundleCompression::ZstdDictionary { level },
+                        )
+                        .unwrap();
+                        assert_eq!(decode_avatar_bundle(&encoded.bytes).unwrap(), items);
+                    }
+                });
+            }
+        });
     }
 
     #[test]
