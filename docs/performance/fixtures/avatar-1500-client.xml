@@ -1,0 +1,16 @@
+<Configuration>
+  <Password>avatar-bench-only</Password>
+  <Ip>127.0.0.1</Ip>
+  <Port>4296</Port>
+  <ClientCount>1500</ClientCount>
+  <CompanyName>Basis Unity</CompanyName>
+  <ProductName>Basis Unity</ProductName>
+  <AvatarPassword>N/A</AvatarPassword>
+  <AvatarUrl>LoadingAvatar</AvatarUrl>
+  <AvatarLoadMode>1</AvatarLoadMode>
+  <VoiceEnabled>false</VoiceEnabled>
+  <VoiceAudioFolder>audio</VoiceAudioFolder>
+  <VoiceSpeakerPercent>10</VoiceSpeakerPercent>
+  <VoiceHearingDistance>25</VoiceHearingDistance>
+  <VoiceFrameDurationMs>20</VoiceFrameDurationMs>
+</Configuration>
