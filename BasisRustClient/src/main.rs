@@ -7,7 +7,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering},
-        Arc, Mutex as StdMutex,
+        Arc, Mutex as StdMutex, Weak,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -1147,7 +1147,8 @@ struct ConnectOptions {
 #[derive(Debug, Clone)]
 struct ReliableSend {
     channel_id: u8,
-    sequence: u16,
+    /// `None` means queued but not yet admitted to LiteNetLib's 128-sequence send window.
+    sequence: Option<u16>,
     bytes: Vec<u8>,
     last_sent: Option<SystemTime>,
 }
@@ -1203,22 +1204,6 @@ impl ReliableReceiveState {
         if sequence >= MAX_SEQUENCE {
             return false; // bad sequence
         }
-        if !self.started[index] {
-            // The C# has no first-packet case: it starts `_remoteWindowStart` at 0 and sends 0
-            // in the header. Per-channel sequences start at 0, so the first packet to arrive on
-            // a channel is sequence 0 and this is a no-op -- the bytes are identical.
-            //
-            // It is kept because it is the only thing that keeps a first arrival far from 0
-            // working, and LiteNetLib drops such a packet outright ("Some very new packet")
-            // *without acknowledging it*, which would wedge the channel permanently. So the
-            // divergence only ever occurs in a state the C# cannot survive anyway.
-            self.started[index] = true;
-            self.window_start[index] = sequence;
-            self.received[index] = 1u128 << (sequence as usize % DEFAULT_WINDOW_SIZE);
-            self.ack_dirty[index] = true;
-            return true;
-        }
-
         let relate = relative_sequence(sequence, self.window_start[index]);
         if relate < 0 {
             // Too old to still be in the window. Believing it would set a bit that aliases an
@@ -1228,6 +1213,9 @@ impl ReliableReceiveState {
         if relate >= (DEFAULT_WINDOW_SIZE * 2) as i32 {
             return false; // implausibly far ahead of the window
         }
+        // Keep the C#'s initial window at zero even when packet zero is lost. A first arrival
+        // at sequence 1 must produce an ACK with header window zero so the sender accepts it.
+        self.started[index] = true;
         // `_mustSendAcks = true` in the C#, set after every rejection and *before* the duplicate
         // check. A retransmit therefore still schedules an ACK, which is what lets a lost ACK
         // recover -- the sender would otherwise never hear about that packet again.
@@ -1238,8 +1226,7 @@ impl ReliableReceiveState {
             for _ in 0..shift {
                 let leaving = self.window_start[index] as usize % DEFAULT_WINDOW_SIZE;
                 self.received[index] &= !(1u128 << leaving);
-                self.window_start[index] =
-                    self.window_start[index].wrapping_add(1) % MAX_SEQUENCE;
+                self.window_start[index] = self.window_start[index].wrapping_add(1) % MAX_SEQUENCE;
             }
         }
 
@@ -2179,10 +2166,6 @@ impl BasisClient {
         })
     }
 
-    fn next_reliable_sequence(&self, channel_id: u8) -> u16 {
-        self.reliable_sequences[channel_id as usize].fetch_add(1, Ordering::SeqCst) % MAX_SEQUENCE
-    }
-
     async fn mark_reliable_sent(&self, sent: &ReliableSend, sent_at: SystemTime) {
         let mut pending = self.pending_reliable.lock().await;
         if let Some(item) = pending.iter_mut().find(|item| {
@@ -2194,6 +2177,97 @@ impl BasisClient {
         }
     }
 
+    /// Promote unsent queue records into each channel's 128-sequence window. Sequence numbers
+    /// are assigned only here, so a large queued payload cannot wrap and alias before it is
+    /// admitted to the protocol window. This function is synchronous and is called under the
+    /// pending queue mutex; callers perform socket writes only after it returns.
+    fn promote_reliable_window(&self, pending: &mut VecDeque<ReliableSend>) -> Vec<ReliableSend> {
+        let mut queued = [false; 256];
+        let mut oldest = [None; 256];
+        for item in pending.iter() {
+            let index = item.channel_id as usize;
+            if let Some(sequence) = item.sequence {
+                oldest[index].get_or_insert(sequence);
+            } else {
+                queued[index] = true;
+            }
+        }
+
+        let mut next = [0u16; 256];
+        let mut capacity = [0usize; 256];
+        for channel in 0..256 {
+            if !queued[channel] {
+                continue;
+            }
+            let sequence = self.reliable_sequences[channel].load(Ordering::Relaxed) % MAX_SEQUENCE;
+            next[channel] = sequence;
+            let start = oldest[channel].unwrap_or(sequence);
+            let span = relative_sequence(sequence, start);
+            if (0..=DEFAULT_WINDOW_SIZE as i32).contains(&span) {
+                capacity[channel] = DEFAULT_WINDOW_SIZE - span as usize;
+            }
+        }
+
+        let now = SystemTime::now();
+        let mut promoted = Vec::new();
+        let mut changed = [false; 256];
+        for item in pending.iter_mut() {
+            if item.sequence.is_some() {
+                continue;
+            }
+            let index = item.channel_id as usize;
+            if capacity[index] == 0 {
+                continue;
+            }
+            let sequence = next[index];
+            next[index] = sequence.wrapping_add(1) % MAX_SEQUENCE;
+            capacity[index] -= 1;
+            changed[index] = true;
+            item.sequence = Some(sequence);
+            item.bytes[1..3].copy_from_slice(&sequence.to_le_bytes());
+            // Reserve the record before releasing the lock, preventing another maintenance
+            // pass from selecting it while this batch awaits socket writes.
+            item.last_sent = Some(now);
+            promoted.push(item.clone());
+        }
+        for channel in 0..256 {
+            if changed[channel] {
+                self.reliable_sequences[channel].store(next[channel], Ordering::Relaxed);
+            }
+        }
+        promoted
+    }
+
+    async fn pump_reliable_window(&self) -> Result<()> {
+        if !self.connected.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let promoted = {
+            let mut pending = self.pending_reliable.lock().await;
+            let promoted = self.promote_reliable_window(&mut pending);
+            self.pending_reliable_active
+                .store(!pending.is_empty(), Ordering::Relaxed);
+            promoted
+        };
+        for (index, packet) in promoted.iter().enumerate() {
+            if let Err(err) = self.send_connected(&packet.bytes).await {
+                let mut pending = self.pending_reliable.lock().await;
+                for unsent in &promoted[index..] {
+                    if let Some(current) = pending.iter_mut().find(|current| {
+                        current.channel_id == unsent.channel_id
+                            && current.sequence == unsent.sequence
+                            && current.bytes == unsent.bytes
+                    }) {
+                        current.last_sent = None;
+                    }
+                }
+                return Err(err);
+            }
+            self.mark_reliable_sent(packet, SystemTime::now()).await;
+        }
+        Ok(())
+    }
+
     async fn send_reliable_ordered(&self, channel: u8, payload: &[u8]) -> Result<()> {
         if !self.connected.load(Ordering::Relaxed) {
             return Ok(());
@@ -2202,15 +2276,14 @@ impl BasisClient {
         let channel_id = DeliveryMethod::channel_id(channel, DeliveryMethod::ReliableOrdered);
         let mut packets = Vec::new();
         if payload.len() + LITENETLIB_CHANNELED_HEADER_SIZE <= LITENETLIB_INITIAL_MTU {
-            let sequence = self.next_reliable_sequence(channel_id);
             let mut packet = Vec::with_capacity(LITENETLIB_CHANNELED_HEADER_SIZE + payload.len());
             packet.push(PacketProperty::Channeled as u8 | (self.connection_number << 5));
-            packet.extend_from_slice(&sequence.to_le_bytes());
+            packet.extend_from_slice(&0u16.to_le_bytes());
             packet.push(channel_id);
             packet.extend_from_slice(payload);
             packets.push(ReliableSend {
                 channel_id,
-                sequence,
+                sequence: None,
                 bytes: packet,
                 last_sent: None,
             });
@@ -2229,11 +2302,10 @@ impl BasisClient {
                 .wrapping_add(1);
             packets.reserve(total_fragments);
             for (part, chunk) in payload.chunks(RELIABLE_FRAGMENT_PAYLOAD_SIZE).enumerate() {
-                let sequence = self.next_reliable_sequence(channel_id);
                 let mut packet =
                     Vec::with_capacity(LITENETLIB_FRAGMENTED_HEADER_SIZE + chunk.len());
                 packet.push(PacketProperty::Channeled as u8 | (self.connection_number << 5) | 0x80);
-                packet.extend_from_slice(&sequence.to_le_bytes());
+                packet.extend_from_slice(&0u16.to_le_bytes());
                 packet.push(channel_id);
                 packet.extend_from_slice(&fragment_id.to_le_bytes());
                 packet.extend_from_slice(&(part as u16).to_le_bytes());
@@ -2241,7 +2313,7 @@ impl BasisClient {
                 packet.extend_from_slice(chunk);
                 packets.push(ReliableSend {
                     channel_id,
-                    sequence,
+                    sequence: None,
                     bytes: packet,
                     last_sent: None,
                 });
@@ -2255,12 +2327,7 @@ impl BasisClient {
             pending.extend(packets.iter().cloned());
             self.pending_reliable_active.store(true, Ordering::Relaxed);
         }
-
-        for packet in &packets {
-            self.send_connected(&packet.bytes).await?;
-            self.mark_reliable_sent(packet, SystemTime::now()).await;
-        }
-        Ok(())
+        self.pump_reliable_window().await
     }
 
     async fn receive_loop(self: Arc<Self>) -> Result<()> {
@@ -2337,7 +2404,8 @@ impl BasisClient {
             PacketProperty::Ack => {
                 if let Some(sequence) = packet.sequence {
                     if let Some(channel_id) = packet.channel_id {
-                        self.process_ack(channel_id, sequence, packet.payload).await;
+                        self.process_ack(channel_id, sequence, packet.payload)
+                            .await?;
                     }
                 }
             }
@@ -2604,40 +2672,58 @@ impl BasisClient {
         Ok(())
     }
 
-    async fn process_ack(&self, channel_id: u8, ack_window_start: u16, ack_bits: &[u8]) {
-        let mut pending = self.pending_reliable.lock().await;
-        if pending.iter().all(|item| item.channel_id != channel_id) {
-            return;
+    async fn process_ack(
+        &self,
+        channel_id: u8,
+        ack_window_start: u16,
+        ack_bits: &[u8],
+    ) -> Result<()> {
+        if ack_bits.len() != (DEFAULT_WINDOW_SIZE - 1) / 8 + 2 {
+            return Ok(());
         }
+        let mut pending = self.pending_reliable.lock().await;
+        let Some(local_window_start) = pending
+            .iter()
+            .filter(|item| item.channel_id == channel_id)
+            .find_map(|item| item.sequence)
+        else {
+            drop(pending);
+            return self.pump_reliable_window().await;
+        };
         // LiteNetLib `ReliableChannel.ProcessAck` bounds check: the window start must be a legal
         // sequence and within one window ahead of our own oldest unacknowledged packet.
-        let local_window_start = pending
-            .iter()
-            .find(|item| item.channel_id == channel_id)
-            .map(|item| item.sequence)
-            .unwrap_or(0);
         if ack_window_start >= MAX_SEQUENCE {
-            return;
+            return Ok(());
         }
         let window_rel = relative_sequence(local_window_start, ack_window_start);
         if window_rel < 0 || window_rel as usize >= DEFAULT_WINDOW_SIZE {
-            return;
+            return Ok(());
         }
         pending.retain(|item| {
             if item.channel_id != channel_id {
                 return true;
             }
+            let Some(sequence) = item.sequence else {
+                return true;
+            };
+            // LiteNetLib stops scanning once a pending sequence is 128 or more ahead of this
+            // ACK window. The bitmap repeats every 128 sequences, so omitting this bound lets
+            // a delayed old ACK alias and release newer packets.
+            let relative = relative_sequence(sequence, ack_window_start);
             // ACK bits are absolute -- `sequence % DEFAULT_WINDOW_SIZE` -- not offsets from the
             // window start. That is what the server sends, matching LiteNetLib.
-            let pos = item.sequence as usize % DEFAULT_WINDOW_SIZE;
-            let acked = ack_bits
-                .get(pos / 8)
-                .map(|b| (b & (1 << (pos % 8))) != 0)
-                .unwrap_or(false);
+            let pos = sequence as usize % DEFAULT_WINDOW_SIZE;
+            let acked = relative < DEFAULT_WINDOW_SIZE as i32
+                && ack_bits
+                    .get(pos / 8)
+                    .map(|b| (b & (1 << (pos % 8))) != 0)
+                    .unwrap_or(false);
             !acked
         });
         self.pending_reliable_active
             .store(!pending.is_empty(), Ordering::Relaxed);
+        drop(pending);
+        self.pump_reliable_window().await
     }
 
     async fn maintenance_loop(self: Arc<Self>) {
@@ -2663,12 +2749,13 @@ impl BasisClient {
                 let _ = self.flush_acks().await;
             }
 
-            if ticks % RESEND_INTERVAL_TICKS == 0 && self.pending_reliable_active.load(Ordering::Relaxed)
+            if ticks.is_multiple_of(RESEND_INTERVAL_TICKS)
+                && self.pending_reliable_active.load(Ordering::Relaxed)
             {
                 let _ = self.resend_reliable().await;
             }
 
-            if ticks % PING_INTERVAL_TICKS == 0 {
+            if ticks.is_multiple_of(PING_INTERVAL_TICKS) {
                 let _ = self.send_ping().await;
             }
         }
@@ -2691,11 +2778,12 @@ impl BasisClient {
 
             let mut due = Vec::new();
             for item in pending.iter_mut() {
-                let should_send = item
-                    .last_sent
-                    .and_then(|sent| now.duration_since(sent).ok())
-                    .map(|elapsed| elapsed >= Duration::from_millis(150))
-                    .unwrap_or(true);
+                let should_send = item.sequence.is_some()
+                    && item
+                        .last_sent
+                        .and_then(|sent| now.duration_since(sent).ok())
+                        .map(|elapsed| elapsed >= Duration::from_millis(150))
+                        .unwrap_or(true);
                 if should_send {
                     // Mark before sending so another maintenance pass cannot select the same
                     // packet while this pass is awaiting the UDP write.
@@ -4063,6 +4151,7 @@ async fn failure_reconnect_loop(
 struct SharedReceivePacket {
     index: usize,
     fd: RawFd,
+    client: Weak<BasisClient>,
     offset: usize,
     len: usize,
 }
@@ -4075,16 +4164,43 @@ struct SharedReceiveBatch {
 }
 
 #[cfg(target_os = "linux")]
-fn shared_receiver_send_ack(fd: RawFd, first_byte: u8, channel_id: u8, sequence: u16) {
-    let mut packet = [0u8; 4 + ((DEFAULT_WINDOW_SIZE - 1) / 8 + 2)];
-    packet[0] = PacketProperty::Ack as u8 | (first_byte & 0x60);
-    packet[1..3].copy_from_slice(&sequence.to_le_bytes());
-    packet[3] = channel_id;
-    let bit_index = sequence as usize % DEFAULT_WINDOW_SIZE;
-    packet[4 + bit_index / 8] |= 1 << (bit_index % 8);
-    unsafe {
-        libc::send(fd, packet.as_ptr().cast(), packet.len(), libc::MSG_DONTWAIT);
+#[derive(Debug)]
+struct SharedReceiveRegistration {
+    index: usize,
+    fd: RawFd,
+    client: Weak<BasisClient>,
+}
+
+#[cfg(target_os = "linux")]
+fn shared_receive_registration_matches(
+    registered_fd: RawFd,
+    fd: RawFd,
+    registered_client: &Weak<BasisClient>,
+    client: &Arc<BasisClient>,
+) -> bool {
+    registered_fd == fd && Weak::ptr_eq(registered_client, &Arc::downgrade(client))
+}
+
+#[cfg(target_os = "linux")]
+fn shared_receiver_mark_reliable(client: &BasisClient, bytes: &[u8]) {
+    if bytes.len() < LITENETLIB_CHANNELED_HEADER_SIZE
+        || bytes[0] & 0x1f != PacketProperty::Channeled as u8
+    {
+        return;
     }
+    let sequence = u16::from_le_bytes([bytes[1], bytes[2]]);
+    let channel_id = bytes[3];
+    if !matches!(channel_id % 4, 0 | 2) {
+        return;
+    }
+    let _ = client
+        .received_reliable
+        .lock()
+        .expect("reliable receive state mutex poisoned")
+        .mark_new(channel_id, sequence);
+    // Duplicates re-arm the same persistent ACK window. Invalid/too-old packets leave no dirty
+    // channel, so the maintenance flush remains a cheap no-op for them.
+    client.ack_pending.store(true, Ordering::Relaxed);
 }
 
 #[cfg(target_os = "linux")]
@@ -4099,7 +4215,7 @@ fn shared_receiver_send_pong(fd: RawFd, first_byte: u8, sequence: u16) {
 }
 
 #[cfg(target_os = "linux")]
-fn shared_receiver_process_merged(fd: RawFd, bytes: &[u8]) {
+fn shared_receiver_process_merged(client: &BasisClient, fd: RawFd, bytes: &[u8]) {
     let mut pos = 1usize;
     while pos + 2 <= bytes.len() {
         let size = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
@@ -4111,11 +4227,7 @@ fn shared_receiver_process_merged(fd: RawFd, bytes: &[u8]) {
         let property = packet.first().copied().unwrap_or_default() & 0x1f;
         match property {
             p if p == PacketProperty::Channeled as u8 && packet.len() >= 4 => {
-                let sequence = u16::from_le_bytes([packet[1], packet[2]]);
-                let channel_id = packet[3];
-                if matches!(channel_id % 4, 0 | 2) {
-                    shared_receiver_send_ack(fd, packet[0], channel_id, sequence);
-                }
+                shared_receiver_mark_reliable(client, packet);
             }
             p if p == PacketProperty::Ping as u8 && packet.len() >= 3 => {
                 let sequence = u16::from_le_bytes([packet[1], packet[2]]);
@@ -4129,7 +4241,7 @@ fn shared_receiver_process_merged(fd: RawFd, bytes: &[u8]) {
 
 #[cfg(target_os = "linux")]
 fn run_shared_epoll_receiver(
-    registrations: std_mpsc::Receiver<(usize, RawFd)>,
+    registrations: std_mpsc::Receiver<SharedReceiveRegistration>,
     batches: mpsc::UnboundedSender<SharedReceiveBatch>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -4148,8 +4260,22 @@ fn run_shared_epoll_receiver(
 
     let mut events = vec![unsafe { std::mem::zeroed::<libc::epoll_event>() }; 128];
     let mut buffer = vec![0u8; 65535];
+    let mut registered = HashMap::<usize, (RawFd, Weak<BasisClient>)>::new();
     while !shutdown.load(Ordering::Relaxed) {
-        while let Ok((index, fd)) = registrations.try_recv() {
+        while let Ok(registration) = registrations.try_recv() {
+            let SharedReceiveRegistration { index, fd, client } = registration;
+            if let Some((old_fd, old_client)) = registered.get(&index) {
+                if *old_fd == fd && Weak::ptr_eq(old_client, &client) {
+                    continue;
+                }
+                let mut old_event = libc::epoll_event {
+                    events: libc::EPOLLIN as u32,
+                    u64: ((index as u64) << 32) | (*old_fd as u32 as u64),
+                };
+                unsafe {
+                    libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, *old_fd, &mut old_event);
+                }
+            }
             let mut event = libc::epoll_event {
                 events: libc::EPOLLIN as u32,
                 u64: ((index as u64) << 32) | (fd as u32 as u64),
@@ -4157,10 +4283,19 @@ fn run_shared_epoll_receiver(
             let rc = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) };
             if rc != 0 {
                 let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EEXIST) {
+                if err.raw_os_error() == Some(libc::EEXIST) {
+                    let rc =
+                        unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_MOD, fd, &mut event) };
+                    if rc != 0 {
+                        warn!("failed to update client {index} fd {fd} with shared epoll receiver: {}", std::io::Error::last_os_error());
+                        continue;
+                    }
+                } else {
                     warn!("failed to register client {index} fd {fd} with shared epoll receiver: {err}");
+                    continue;
                 }
             }
+            registered.insert(index, (fd, client));
         }
 
         let ready =
@@ -4179,6 +4314,18 @@ fn run_shared_epoll_receiver(
         for event in events.iter().take(ready as usize) {
             let index = (event.u64 >> 32) as usize;
             let fd = event.u64 as u32 as RawFd;
+            let Some((registered_fd, registered_client)) = registered.get(&index) else {
+                continue;
+            };
+            if *registered_fd != fd {
+                continue;
+            }
+            let Some(client) = registered_client.upgrade() else {
+                continue;
+            };
+            if !client.in_use.load(Ordering::Relaxed) || client.socket.as_raw_fd() != fd {
+                continue;
+            }
             loop {
                 let len = unsafe {
                     libc::recv(
@@ -4201,17 +4348,11 @@ fn run_shared_epoll_receiver(
                     // but their application data is intentionally discarded for synthetic peers.
                     match property {
                         p if p == PacketProperty::Merged as u8 => {
-                            shared_receiver_process_merged(fd, &buffer[..len]);
+                            shared_receiver_process_merged(&client, fd, &buffer[..len]);
                             continue;
                         }
                         p if p == PacketProperty::Channeled as u8 => {
-                            if len >= 4 {
-                                let sequence = u16::from_le_bytes([buffer[1], buffer[2]]);
-                                let channel_id = buffer[3];
-                                if matches!(channel_id % 4, 0 | 2) {
-                                    shared_receiver_send_ack(fd, buffer[0], channel_id, sequence);
-                                }
-                            }
+                            shared_receiver_mark_reliable(&client, &buffer[..len]);
                             continue;
                         }
                         p if p == PacketProperty::Ping as u8 => {
@@ -4235,6 +4376,7 @@ fn run_shared_epoll_receiver(
                     batch.push(SharedReceivePacket {
                         index,
                         fd,
+                        client: Arc::downgrade(&client),
                         offset,
                         len,
                     });
@@ -4306,7 +4448,7 @@ async fn shared_receive_loop(
     clients: Arc<Mutex<Vec<Arc<BasisClient>>>>,
     shutdown: Arc<AtomicBool>,
 ) {
-    let (registration_tx, registration_rx) = std_mpsc::channel::<(usize, RawFd)>();
+    let (registration_tx, registration_rx) = std_mpsc::channel::<SharedReceiveRegistration>();
     let (batch_tx, mut batch_rx) = mpsc::unbounded_channel::<SharedReceiveBatch>();
     let thread_shutdown = shutdown.clone();
     if let Err(err) = std::thread::Builder::new()
@@ -4322,6 +4464,7 @@ async fn shared_receive_loop(
     refresh.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut snapshot = clients.lock().await.clone();
     let mut registered_fds = vec![-1; snapshot.len()];
+    let mut registered_clients = (0..snapshot.len()).map(|_| Weak::new()).collect::<Vec<_>>();
 
     loop {
         tokio::select! {
@@ -4332,6 +4475,7 @@ async fn shared_receive_loop(
                 snapshot = clients.lock().await.clone();
                 if registered_fds.len() < snapshot.len() {
                     registered_fds.resize(snapshot.len(), -1);
+                    registered_clients.resize(snapshot.len(), Weak::new());
                 }
                 for (index, client) in snapshot.iter().enumerate().skip(1) {
                     if !client.in_use.load(Ordering::Relaxed)
@@ -4340,15 +4484,29 @@ async fn shared_receive_loop(
                         continue;
                     }
                     let fd = client.socket.as_raw_fd();
-                    if registered_fds[index] == fd {
+                    let client_weak = Arc::downgrade(client);
+                    if shared_receive_registration_matches(
+                        registered_fds[index],
+                        fd,
+                        &registered_clients[index],
+                        client,
+                    ) {
                         continue;
                     }
                     client.shared_receive.store(true, Ordering::Release);
                     client.stop_receive_loop();
-                    if registration_tx.send((index, fd)).is_err() {
+                    if registration_tx
+                        .send(SharedReceiveRegistration {
+                            index,
+                            fd,
+                            client: client_weak.clone(),
+                        })
+                        .is_err()
+                    {
                         return;
                     }
                     registered_fds[index] = fd;
+                    registered_clients[index] = client_weak;
                 }
             }
             maybe_batch = batch_rx.recv() => {
@@ -4356,6 +4514,7 @@ async fn shared_receive_loop(
                 for packet in batch.packets {
                     let Some(client) = snapshot.get(packet.index) else { continue; };
                     if client.socket.as_raw_fd() != packet.fd
+                        || !Weak::ptr_eq(&packet.client, &Arc::downgrade(client))
                         || !client.in_use.load(Ordering::Relaxed)
                     {
                         continue;
@@ -6235,6 +6394,9 @@ mod tests {
     #[test]
     fn reliable_receive_suppresses_duplicate_sequences() {
         let mut state = ReliableReceiveState::default();
+        assert!(!state.mark_new(7, MAX_SEQUENCE));
+        assert!(state.take_dirty_channels().is_empty());
+        assert!(state.ack_window(7).is_none());
         assert!(state.mark_new(7, 10));
         assert!(!state.mark_new(7, 10));
         assert!(state.mark_new(7, 11));
@@ -6242,11 +6404,62 @@ mod tests {
     }
 
     #[test]
+    fn reliable_receive_first_packet_after_lost_zero_matches_csharp_window() {
+        const CHANNEL: u8 = 74;
+        let hex_bytes = |text: &str| {
+            (0..text.len())
+                .step_by(2)
+                .map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let mut state = ReliableReceiveState::default();
+
+        // The Basis C# channel begins with `_remoteWindowStart = 0`. If sequence 0 is lost,
+        // the first packet at sequence 1 is still accepted and ACKed with header window 0 and
+        // absolute bit 1 set. A sender whose oldest unacknowledged sequence is 0 accepts it.
+        assert!(state.mark_new(CHANNEL, 1));
+        let (window_start, bits) = state.ack_window(CHANNEL).unwrap();
+        assert_eq!(window_start, 0);
+        assert_eq!(bits[0] & 0b10, 0b10);
+        let mut first_ack = vec![PacketProperty::Ack as u8, 0, 0, CHANNEL, 2];
+        first_ack.resize(21, 0);
+        assert_eq!(
+            first_ack,
+            hex_bytes("0200004a0200000000000000000000000000000000")
+        );
+
+        // Receiving the retransmission of the missing packet must preserve the same window and
+        // report both sequences, so both ACK loss and data loss can recover normally.
+        assert!(state.mark_new(CHANNEL, 0));
+        let (window_start, bits) = state.ack_window(CHANNEL).unwrap();
+        assert_eq!(window_start, 0);
+        assert_eq!(bits[0] & 0b11, 0b11);
+        let mut recovered_ack = vec![PacketProperty::Ack as u8, 0, 0, CHANNEL, 3];
+        recovered_ack.resize(21, 0);
+        assert_eq!(
+            recovered_ack,
+            hex_bytes("0200004a0300000000000000000000000000000000")
+        );
+
+        // A far packet advances the window by one. Sequence 128 aliases bit zero, which is
+        // cleared as sequence zero leaves the window and then set again for the newcomer.
+        assert!(state.mark_new(CHANNEL, 128));
+        let (window_start, bits) = state.ack_window(CHANNEL).unwrap();
+        assert_eq!(window_start, 1);
+        assert_eq!(bits[0] & 0b11, 0b11);
+    }
+
+    #[test]
     fn reliable_receive_accepts_32767_to_0_wrap() {
         let mut state = ReliableReceiveState::default();
-        assert!(state.mark_new(7, MAX_SEQUENCE - 1));
+        // Walk the real initial window through to the sequence-space boundary. LiteNetLib
+        // starts at zero; it does not accept 32767 as an isolated first arrival.
+        for sequence in 0..MAX_SEQUENCE {
+            assert!(state.mark_new(7, sequence));
+        }
         assert!(state.mark_new(7, 0));
         assert!(!state.mark_new(7, 0));
+        assert_eq!(state.ack_window(7).unwrap().0, MAX_SEQUENCE - 127);
     }
 
     #[test]
@@ -6288,7 +6501,10 @@ mod tests {
         assert!(state.mark_new(CHANNEL, 200));
         assert_eq!(state.take_dirty_channels(), vec![CHANNEL]);
         assert_eq!(
-            state.ack_window(CHANNEL).expect("channel has seen packets").0,
+            state
+                .ack_window(CHANNEL)
+                .expect("channel has seen packets")
+                .0,
             73,
             "200 slides the window to 200 - 128 + 1"
         );
@@ -6309,7 +6525,7 @@ mod tests {
                 bits[index / 8] & (1 << (index % 8)) != 0
             })
             .collect();
-        let newcomer = (200u16 % DEFAULT_WINDOW_SIZE as u16) as u16;
+        let newcomer = 200u16 % DEFAULT_WINDOW_SIZE as u16;
         assert!(
             acked.contains(&72) && acked.contains(&newcomer),
             "bits stay absolute: the newcomer is acknowledged at its own index (acked={acked:?})"
@@ -6458,12 +6674,16 @@ mod tests {
             async move { shared_maintenance_loop(clients, refresh, shutdown).await }
         });
 
-        let mut buffer = [0u8; 64];
+        let mut buffer = [0u8; 2048];
         let len = time::timeout(Duration::from_secs(2), server.recv(&mut buffer))
             .await
             .expect("shared maintenance must flush the armed ACK")
             .unwrap();
-        assert_eq!(buffer[0] & 0x1f, PacketProperty::Ack as u8, "an ACK, not something else");
+        assert_eq!(
+            buffer[0] & 0x1f,
+            PacketProperty::Ack as u8,
+            "an ACK, not something else"
+        );
         assert_eq!(
             len,
             LITENETLIB_CHANNELED_HEADER_SIZE + (DEFAULT_WINDOW_SIZE - 1) / 8 + 2,
@@ -6475,7 +6695,11 @@ mod tests {
             0,
             "window start"
         );
-        assert_eq!(buffer[4] & 1, 1, "sequence 0 acknowledged at its absolute bit");
+        assert_eq!(
+            buffer[4] & 1,
+            1,
+            "sequence 0 acknowledged at its absolute bit"
+        );
 
         // The flag is cleared, so an unchanged window is not re-sent. That is the whole point of
         // batching: one datagram per change, not one per tick.
@@ -6484,6 +6708,121 @@ mod tests {
                 .await
                 .is_err(),
             "an unchanged ACK window must not be re-sent"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        refresh.notify_one();
+        let _ = time::timeout(Duration::from_secs(1), task).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shared_receive_keeps_one_reliable_window_across_merged_and_compact_packets() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = test_client(1, server.local_addr().unwrap()).await;
+        let channel_id =
+            DeliveryMethod::channel_id(channels::AUTH_IDENTITY, DeliveryMethod::ReliableOrdered);
+
+        // The shared epoll fast path handles Merged reliably, but it must update the same
+        // persistent window as CompactMerged packets that fall through to handle_packet.
+        let seq1 = vec![PacketProperty::Channeled as u8, 1, 0, channel_id, 0];
+        shared_receiver_mark_reliable(&client, &seq1);
+        let seq2 = vec![PacketProperty::Channeled as u8, 2, 0, channel_id, 0];
+        let mut merged = vec![PacketProperty::Merged as u8];
+        merged.extend_from_slice(&(seq2.len() as u16).to_le_bytes());
+        merged.extend_from_slice(&seq2);
+        shared_receiver_process_merged(&client, client.socket.as_raw_fd(), &merged);
+        assert!(client.ack_pending.load(Ordering::Relaxed));
+
+        let clients = Arc::new(Mutex::new(vec![Arc::clone(&client)]));
+        let refresh = Arc::new(Notify::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn({
+            let clients = Arc::clone(&clients);
+            let refresh = Arc::clone(&refresh);
+            let shutdown = Arc::clone(&shutdown);
+            async move { shared_maintenance_loop(clients, refresh, shutdown).await }
+        });
+
+        // The old stateless path immediately emitted header window 1 here. The persistent
+        // window instead flushes header 0 with bit 1 after the shared 15 ms maintenance tick.
+        let mut buffer = [0u8; 2048];
+        let len = time::timeout(Duration::from_secs(1), server.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parse_packet(&buffer[..len]).unwrap().property,
+            PacketProperty::Ack
+        );
+        assert_eq!(
+            u16::from_le_bytes([buffer[1], buffer[2]]),
+            0,
+            "the C# receive window remains anchored at zero after losing sequence zero"
+        );
+        assert_eq!(buffer[3], channel_id);
+        assert_eq!(buffer[4] & 0b110, 0b110);
+
+        // Sequence zero arrives as a CompactMerged raw entry and must be treated as new,
+        // dispatched to the auth handler, and included in the same ACK window.
+        let mut challenge = NetWriter::default();
+        put_bytes_message(&mut challenge, b"csharp-challenge");
+        let mut seq0 = vec![PacketProperty::Channeled as u8, 0, 0, channel_id];
+        seq0.extend_from_slice(&challenge.into_vec());
+        let mut compact = vec![PacketProperty::CompactMerged as u8, 0x40, seq0.len() as u8];
+        compact.extend_from_slice(&seq0);
+        client.handle_packet(&compact).await.unwrap();
+
+        let mut saw_auth_response = false;
+        let mut saw_recovered_ack = false;
+        while !(saw_auth_response && saw_recovered_ack) {
+            let len = time::timeout(Duration::from_secs(1), server.recv(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            match parse_packet(&buffer[..len]).unwrap() {
+                ParsedPacket {
+                    property: PacketProperty::Channeled,
+                    channel_id: Some(id),
+                    payload,
+                    ..
+                } if id == channel_id => {
+                    assert!(
+                        payload.len() >= 68 && u16::from_le_bytes([payload[0], payload[1]]) == 64,
+                        "sequence-zero auth challenge must produce a signature response"
+                    );
+                    saw_auth_response = true;
+                }
+                ParsedPacket {
+                    property: PacketProperty::Ack,
+                    sequence: Some(0),
+                    channel_id: Some(id),
+                    payload,
+                    ..
+                } if id == channel_id => {
+                    assert_eq!(payload[0] & 0b11, 0b11);
+                    saw_recovered_ack = true;
+                }
+                _ => {}
+            }
+        }
+
+        // A duplicate CompactMerged packet is ACKed from the accumulated window but does not
+        // dispatch another auth response.
+        client.handle_packet(&compact).await.unwrap();
+        let len = time::timeout(Duration::from_secs(1), server.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parse_packet(&buffer[..len]).unwrap().property,
+            PacketProperty::Ack
+        );
+        assert!(
+            time::timeout(Duration::from_millis(40), server.recv(&mut buffer))
+                .await
+                .is_err(),
+            "a duplicate must not trigger a second auth response"
         );
 
         shutdown.store(true, Ordering::Relaxed);
@@ -6512,7 +6851,12 @@ mod tests {
         assert_eq!(parse_packet(&buffer[..len]).unwrap().payload, boundary);
         let boundary_channel_id =
             DeliveryMethod::channel_id(boundary_channel, DeliveryMethod::ReliableOrdered);
-        client.process_ack(boundary_channel_id, 0, &[1]).await;
+        let mut boundary_ack = vec![0; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
+        boundary_ack[0] = 1;
+        client
+            .process_ack(boundary_channel_id, 0, &boundary_ack)
+            .await
+            .unwrap();
 
         let channel = 1;
         let channel_id = DeliveryMethod::channel_id(channel, DeliveryMethod::ReliableOrdered);
@@ -6573,14 +6917,17 @@ mod tests {
         // the sender's own would be rejected outright, exactly as LiteNetLib rejects it.
         let mut middle_ack = vec![0u8; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
         middle_ack[0] |= 1 << 1;
-        client.process_ack(channel_id, 0, &middle_ack).await;
+        client
+            .process_ack(channel_id, 0, &middle_ack)
+            .await
+            .unwrap();
         assert_eq!(client.pending_reliable.lock().await.len(), 2);
         assert!(client.pending_reliable_active.load(Ordering::Relaxed));
 
         let mut final_ack = vec![0u8; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
         final_ack[0] |= 1;
         final_ack[0] |= 1 << 2;
-        client.process_ack(channel_id, 0, &final_ack).await;
+        client.process_ack(channel_id, 0, &final_ack).await.unwrap();
         assert!(client.pending_reliable.lock().await.is_empty());
         assert!(!client.pending_reliable_active.load(Ordering::Relaxed));
     }
@@ -6670,6 +7017,31 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn shared_registration_replaces_reused_fd_without_retaining_old_client() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let old_client = test_client(1, server.local_addr().unwrap()).await;
+        let old_weak = Arc::downgrade(&old_client);
+        assert!(shared_receive_registration_matches(
+            42,
+            42,
+            &old_weak,
+            &old_client
+        ));
+
+        let replacement = test_client(1, server.local_addr().unwrap()).await;
+        assert!(
+            !shared_receive_registration_matches(42, 42, &old_weak, &replacement),
+            "a recycled descriptor must register the new receive window"
+        );
+        drop(old_client);
+        assert!(
+            old_weak.upgrade().is_none(),
+            "the epoll registry stores only Weak"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn connect_accept_filters_non_observers_only() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -6747,9 +7119,204 @@ mod tests {
         assert!(client.pending_reliable_active.load(Ordering::Relaxed));
         assert_eq!(client.pending_reliable.lock().await.len(), 1);
 
-        client.process_ack(channel_id, 0, &[1]).await;
+        let mut short_ack = vec![0; (DEFAULT_WINDOW_SIZE - 1) / 8 + 1];
+        short_ack[0] = 1;
+        client.process_ack(channel_id, 0, &short_ack).await.unwrap();
+        let mut long_ack = vec![0; (DEFAULT_WINDOW_SIZE - 1) / 8 + 3];
+        long_ack[0] = 1;
+        client.process_ack(channel_id, 0, &long_ack).await.unwrap();
+        let mut invalid_sequence_ack = vec![0; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
+        invalid_sequence_ack[0] = 1;
+        client
+            .process_ack(channel_id, MAX_SEQUENCE, &invalid_sequence_ack)
+            .await
+            .unwrap();
+        assert_eq!(
+            client.pending_reliable.lock().await.len(),
+            1,
+            "reject wrong ACK sizes and sequence values outside 0..32768"
+        );
+
+        let mut ack = vec![0; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
+        ack[0] = 1;
+        client.process_ack(channel_id, 0, &ack).await.unwrap();
         assert!(!client.pending_reliable_active.load(Ordering::Relaxed));
         assert!(client.pending_reliable.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reliable_window_promotion_bounds_large_queues_per_channel_and_wraps() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = test_client(0, server.local_addr().unwrap()).await;
+        let channel = DeliveryMethod::channel_id(1, DeliveryMethod::ReliableOrdered);
+        let mut pending = (0..=32_769)
+            .map(|_| ReliableSend {
+                channel_id: channel,
+                sequence: None,
+                bytes: vec![PacketProperty::Channeled as u8, 0, 0, channel],
+                last_sent: None,
+            })
+            .collect::<VecDeque<_>>();
+
+        let promoted = client.promote_reliable_window(&mut pending);
+        assert_eq!(promoted.len(), DEFAULT_WINDOW_SIZE);
+        assert_eq!(promoted.first().unwrap().sequence, Some(0));
+        assert_eq!(promoted.last().unwrap().sequence, Some(127));
+        assert_eq!(pending.len(), 32_770);
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|item| item.sequence.is_some())
+                .count(),
+            DEFAULT_WINDOW_SIZE
+        );
+        assert_eq!(
+            client.reliable_sequences[channel as usize].load(Ordering::Relaxed),
+            128
+        );
+
+        let mut wrapped = VecDeque::from([
+            ReliableSend {
+                channel_id: channel,
+                sequence: None,
+                bytes: vec![PacketProperty::Channeled as u8, 0, 0, channel],
+                last_sent: None,
+            },
+            ReliableSend {
+                channel_id: channel,
+                sequence: None,
+                bytes: vec![PacketProperty::Channeled as u8, 0, 0, channel],
+                last_sent: None,
+            },
+        ]);
+        client.reliable_sequences[channel as usize].store(MAX_SEQUENCE - 1, Ordering::Relaxed);
+        let promoted = client.promote_reliable_window(&mut wrapped);
+        assert_eq!(
+            promoted
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![Some(MAX_SEQUENCE - 1), Some(0)]
+        );
+        assert!(wrapped.iter().all(|item| item.sequence.is_some()));
+    }
+
+    #[tokio::test]
+    async fn reliable_sender_holds_seq128_until_missing_zero_is_acked() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = test_client(0, server.local_addr().unwrap()).await;
+        let channel = 3;
+        let channel_id = DeliveryMethod::channel_id(channel, DeliveryMethod::ReliableOrdered);
+        for _ in 0..=DEFAULT_WINDOW_SIZE {
+            client
+                .send_reliable_ordered(channel, b"queued")
+                .await
+                .unwrap();
+        }
+
+        let mut received = [0u8; 64];
+        for expected in 0..DEFAULT_WINDOW_SIZE as u16 {
+            let len = time::timeout(Duration::from_secs(1), server.recv(&mut received))
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for initial sequence {expected}"))
+                .unwrap();
+            let packet = parse_packet(&received[..len]).unwrap();
+            assert_eq!(packet.sequence, Some(expected));
+            assert_eq!(packet.channel_id, Some(channel_id));
+        }
+        assert_eq!(
+            client.pending_reliable.lock().await.len(),
+            DEFAULT_WINDOW_SIZE + 1
+        );
+
+        let mut ack = vec![0u8; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
+        for sequence in 1..DEFAULT_WINDOW_SIZE {
+            ack[sequence / 8] |= 1 << (sequence % 8);
+        }
+        client.process_ack(channel_id, 0, &ack).await.unwrap();
+        assert_eq!(client.pending_reliable.lock().await.len(), 2);
+        assert!(
+            time::timeout(Duration::from_millis(40), server.recv(&mut received))
+                .await
+                .is_err(),
+            "the missing sequence zero keeps the 128-sequence span full"
+        );
+
+        ack.fill(0);
+        for sequence in 0..DEFAULT_WINDOW_SIZE {
+            ack[sequence / 8] |= 1 << (sequence % 8);
+        }
+        client.process_ack(channel_id, 0, &ack).await.unwrap();
+        let len = time::timeout(Duration::from_secs(1), server.recv(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        let packet = parse_packet(&received[..len]).unwrap();
+        assert_eq!(packet.sequence, Some(DEFAULT_WINDOW_SIZE as u16));
+        assert_eq!(client.pending_reliable.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delayed_ack_window_cannot_alias_newer_client_sequences() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = test_client(0, server.local_addr().unwrap()).await;
+        let channel_id = DeliveryMethod::channel_id(1, DeliveryMethod::ReliableOrdered);
+        {
+            let mut pending = client.pending_reliable.lock().await;
+            for sequence in 10..=137u16 {
+                pending.push_back(ReliableSend {
+                    channel_id,
+                    sequence: Some(sequence),
+                    bytes: vec![PacketProperty::Channeled as u8, 0, 0, channel_id],
+                    last_sent: Some(SystemTime::now()),
+                });
+            }
+        }
+        let mut old_ack = vec![0u8; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
+        for sequence in 0..10 {
+            old_ack[sequence / 8] |= 1 << (sequence % 8);
+        }
+        client.process_ack(channel_id, 0, &old_ack).await.unwrap();
+        let pending = client.pending_reliable.lock().await;
+        assert!((128..=137).all(|sequence| pending
+            .iter()
+            .any(|item| { item.channel_id == channel_id && item.sequence == Some(sequence) })));
+    }
+
+    #[tokio::test]
+    async fn reliable_resend_skips_unassigned_records_and_retries_reserved_slots() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = test_client(0, server.local_addr().unwrap()).await;
+        let channel_id = DeliveryMethod::channel_id(1, DeliveryMethod::ReliableOrdered);
+        {
+            let mut pending = client.pending_reliable.lock().await;
+            pending.push_back(ReliableSend {
+                channel_id,
+                sequence: Some(0),
+                bytes: vec![PacketProperty::Channeled as u8, 0, 0, channel_id, 7],
+                last_sent: None, // reserved into the window, but its first send failed
+            });
+            pending.push_back(ReliableSend {
+                channel_id,
+                sequence: None,
+                bytes: vec![PacketProperty::Channeled as u8, 0, 0, channel_id, 8],
+                last_sent: None, // still queued beyond the window
+            });
+        }
+
+        client.resend_reliable().await.unwrap();
+        let mut received = [0u8; 64];
+        let len = time::timeout(Duration::from_secs(1), server.recv(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse_packet(&received[..len]).unwrap().sequence, Some(0));
+        assert!(
+            time::timeout(Duration::from_millis(40), server.recv(&mut received))
+                .await
+                .is_err(),
+            "the unsent record has no sequence and must not be retried"
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //   S4  arrival that forces a slide  -> bits cleared as the window advances
 //   S5  duplicate retransmits        -> re-acknowledged; window must not strand the sender
 //   S6  decode direction             -> a Rust-built ACK fed into the real C# ProcessAck
+//   S7  sequence 0 lost              -> first sequence 1 keeps header window at 0
 //
 // The output is pasted into the Rust test `csharp_reliable_channel_golden_vectors` as expected
 // values, so the wire format is pinned to this C# and not to our reading of it.
@@ -163,6 +164,18 @@ namespace LiteNetLib
                     Console.WriteLine($"S6 {name} ACK {Hex(ack)}");
                     Console.WriteLine($"S6 {name} DRAINED {(!anythingLeft).ToString().ToUpperInvariant()}");
                 }
+            }
+
+            // S7: packet 0 is lost, so sequence 1 is the first arrival. The real C# retains its
+            // initial window start of 0 and sets absolute bit 1. When 0 is retransmitted, the
+            // same window ACK reports both bits and allows ordered delivery to recover.
+            {
+                var peer = new NetPeer();
+                var ch = new ReliableChannel(peer, true, ChannelId);
+                ch.ProcessPacket(MakeChanneled(1, 1));
+                Emit("S7 FIRST_ONE", peer, ch);
+                ch.ProcessPacket(MakeChanneled(0, 0));
+                Emit("S7 RECOVER_ZERO", peer, ch);
             }
         }
 

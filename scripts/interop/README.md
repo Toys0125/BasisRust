@@ -38,7 +38,19 @@ dotnet run --project scripts/interop
 it puts on the wire. `S1`-`S5` are encode vectors; `S6` is the decode direction, and it is
 deliberately discriminating: the same coverage of sequences 64..=127 is offered twice, once
 with absolute bits and once with window-relative bits. The real C# drains on the first and
-releases **nothing** on the second.
+releases **nothing** on the second. `S7` drops sequence zero, checks that the first sequence-one
+ACK stays anchored at window zero, then verifies recovery when zero arrives.
+
+The Basis fork also has a separate `SequencedChannel`: reliable-sequenced ACKs are exactly the
+4-byte packet header, and the sequence field acknowledges the receiver's latest sequence. The
+transport has focused tests for that shape, duplicate/old updates, sequence wrap, and sender-side
+retirement. These checks mirror the vendored `SequencedChannel.cs` behavior; the small interop
+program compiles only `ReliableChannel.cs`.
+
+In the local validation environment, `dotnet` was unavailable and Unity's Mono compiler could not
+compile `Program.cs`'s newer C# syntax. The first-loss vectors were therefore rechecked using a
+temporary Mono harness around the verbatim `ReliableChannel.cs` and its existing stubs. This is a
+direct channel test with stub transport, not a live Rust/C# socket session.
 
 The expected values live in
 `crates/basis-transport/src/lib.rs::outgoing_acks_match_golden_vectors_from_the_csharp` and
