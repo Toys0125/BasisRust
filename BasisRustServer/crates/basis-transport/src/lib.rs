@@ -299,8 +299,8 @@ struct PeerState {
     pending_total: AtomicUsize,
     outgoing_reliable: parking_lot::Mutex<HashMap<u8, VecDeque<OutgoingReliable>>>,
     outgoing_acks: parking_lot::Mutex<HashMap<u8, AckState>>,
-    /// Set whenever this peer has queued payloads or in-flight packets. The dispatch loop
-    /// skips peers without it, so a settled server stops paying per-peer polling cost.
+    /// Set whenever this peer has queued payloads, in-flight packets, or dirty ACKs. The
+    /// dispatch loop skips peers without it, so a settled server stops paying per-peer polling cost.
     reliable_active: AtomicBool,
 }
 
@@ -317,9 +317,9 @@ impl PeerState {
             .sum()
     }
 
-    /// Clear `reliable_active` once nothing is queued or in flight. Must be called with the
-    /// pending and outgoing maps observed empty, while holding both, so a concurrent enqueue
-    /// cannot slip between the check and the clear.
+    /// Clear `reliable_active` once nothing is queued, in flight, or waiting to be ACKed.
+    /// Keep all producer locks held through the clear so a concurrent producer either becomes
+    /// visible here or sets the flag again after publishing its work.
     fn refresh_reliable_active(&self) {
         let pending = self.pending_reliable.lock();
         if pending.values().any(|queue| !queue.is_empty()) {
@@ -329,8 +329,10 @@ impl PeerState {
         if outgoing.values().any(|queue| !queue.is_empty()) {
             return;
         }
-        drop(outgoing);
-        drop(pending);
+        let acks = self.outgoing_acks.lock();
+        if acks.values().any(|ack| ack.dirty) {
+            return;
+        }
         self.reliable_active.store(false, Ordering::Release);
     }
 }
@@ -846,19 +848,31 @@ fn record_pending_reliable(
 ) {
     let mut pending = state.pending_reliable.lock();
     while state.pending_total.load(Ordering::Relaxed) >= MAX_PENDING_RELIABLE_PER_PEER {
-        // Shed the single oldest in-flight packet rather than growing without bound.
-        // LiteNetLib recovers via its own resend/sequence checks, and the 128-deep window is
-        // far below this cap in normal operation, so this only guards a peer that never acks.
-        let oldest = pending
-            .iter_mut()
-            .filter_map(|(_, queue)| queue.pop_front())
-            .min_by_key(|item| item.last_sent);
-        match oldest {
-            Some(_) => {
-                state.pending_total.fetch_sub(1, Ordering::Relaxed);
-            }
-            None => break,
+        // Shed exactly the single oldest in-flight packet rather than growing without bound.
+        // Inspect each queue front first; popping while searching would discard one packet from
+        // every non-empty channel and immediately desynchronize `pending_total`.
+        let oldest_channel = pending
+            .iter()
+            .filter_map(|(channel_id, queue)| {
+                queue.front().map(|item| (*channel_id, item.last_sent))
+            })
+            .min_by_key(|(_, last_sent)| *last_sent)
+            .map(|(channel_id, _)| channel_id);
+        let Some(oldest_channel) = oldest_channel else {
+            break;
+        };
+
+        let remove_channel = {
+            let queue = pending
+                .get_mut(&oldest_channel)
+                .expect("oldest pending channel disappeared while locked");
+            queue.pop_front();
+            queue.is_empty()
+        };
+        if remove_channel {
+            pending.remove(&oldest_channel);
         }
+        state.pending_total.fetch_sub(1, Ordering::Relaxed);
     }
     pending
         .entry(channel_id)
@@ -915,9 +929,6 @@ fn enqueue_reliable_payload(
     payload: &[u8],
 ) {
     let channel_id = DeliveryMethod::channel_id(channel, delivery);
-    // Flag before the payload becomes visible so the dispatch loop cannot observe an empty
-    // queue, clear the flag, and then miss this work.
-    state.reliable_active.store(true, Ordering::Release);
     let mut outgoing = state.outgoing_reliable.lock();
     let queue = outgoing.entry(channel_id).or_default();
 
@@ -931,6 +942,7 @@ fn enqueue_reliable_payload(
             payload: payload.to_vec(),
             fragment: None,
         });
+        state.reliable_active.store(true, Ordering::Release);
         return;
     }
 
@@ -957,6 +969,7 @@ fn enqueue_reliable_payload(
             }),
         });
     }
+    state.reliable_active.store(true, Ordering::Release);
 }
 
 fn build_queued_reliable_packet(
@@ -964,7 +977,11 @@ fn build_queued_reliable_packet(
     channel_id: u8,
     outgoing: OutgoingReliable,
 ) -> BuiltPacket {
-    let sequence = next_channel_sequence(&state.next_reliable_sequence, channel_id);
+    let sequence = if channel_id % 4 == DeliveryMethod::ReliableSequenced as u8 {
+        next_sequenced_channel_sequence(&state.next_reliable_sequence, channel_id)
+    } else {
+        next_channel_sequence(&state.next_reliable_sequence, channel_id)
+    };
     let header_size = if outgoing.fragment.is_some() {
         LITENETLIB_FRAGMENTED_HEADER_SIZE
     } else {
@@ -1547,7 +1564,8 @@ fn build_outbound_packet(
         }
         DeliveryMethod::Sequenced => {
             let channel_id = DeliveryMethod::channel_id(channel, delivery);
-            let sequence = next_channel_sequence(&state.next_sequenced_sequence, channel_id);
+            let sequence =
+                next_sequenced_channel_sequence(&state.next_sequenced_sequence, channel_id);
             let mut writer = NetWriter::with_capacity(payload.len() + 4);
             writer.put_u8(PacketProperty::Channeled as u8 | (state.connection_number << 5));
             writer.put_u16(sequence);
@@ -1582,6 +1600,16 @@ fn next_channel_sequence(sequences: &parking_lot::Mutex<HashMap<u8, u16>>, chann
     let current = *sequence;
     *sequence = sequence.wrapping_add(1) % MAX_SEQUENCE;
     current
+}
+
+fn next_sequenced_channel_sequence(
+    sequences: &parking_lot::Mutex<HashMap<u8, u16>>,
+    channel_id: u8,
+) -> u16 {
+    let mut sequences = sequences.lock();
+    let sequence = sequences.entry(channel_id).or_insert(0);
+    *sequence = sequence.wrapping_add(1) % MAX_SEQUENCE;
+    *sequence
 }
 
 /// Apply an incoming ACK window.
@@ -1714,7 +1742,7 @@ fn queue_ack(peer: &PeerState, channel_id: u8, sequence: u16) {
         // own oldest unacknowledged packet -- so this has to match the C# exactly.
         window_start: 0,
         bits: vec![0; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2],
-        dirty: true,
+        dirty: false,
     });
 
     let rel = relative_sequence(sequence, ack.window_start);
@@ -1745,6 +1773,7 @@ fn queue_ack(peer: &PeerState, channel_id: u8, sequence: u16) {
         *byte |= 1 << (index % 8);
     }
     ack.dirty = true;
+    peer.reliable_active.store(true, Ordering::Release);
 }
 
 /// Record the newest valid inbound ReliableSequenced packet and return the sequence the C#
@@ -2622,12 +2651,125 @@ mod tests {
     }
 
     #[test]
+    fn reliable_sequenced_starts_at_one_and_ack_zero_cannot_retire_it() {
+        let peer = test_peer_state(24);
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableSequenced);
+        let built = build_queued_reliable_packet(
+            &peer,
+            channel_id,
+            OutgoingReliable {
+                payload: vec![0x5a],
+                fragment: None,
+            },
+        );
+
+        assert_eq!(built.sequence, 1);
+        assert_eq!(
+            u16::from_le_bytes([built.bytes[1], built.bytes[2]]),
+            1,
+            "LiteNetLib SequencedChannel increments before its first send"
+        );
+
+        record_pending_reliable(&peer, channel_id, built.sequence, built.bytes, None);
+        let ack_zero = [PacketProperty::Ack as u8, 0, 0, channel_id];
+        process_ack(&peer, &ack_zero, None);
+        assert_eq!(
+            peer.pending_total.load(Ordering::Relaxed),
+            1,
+            "the receiver's initial ACK sequence 0 must not retire the first real update"
+        );
+
+        let ack_one = [PacketProperty::Ack as u8, 1, 0, channel_id];
+        process_ack(&peer, &ack_one, None);
+        assert_eq!(peer.pending_total.load(Ordering::Relaxed), 0);
+
+        let sequenced =
+            build_outbound_packet(&peer, channels::CHAT, DeliveryMethod::Sequenced, &[0x33]);
+        assert_eq!(
+            u16::from_le_bytes([sequenced.bytes[1], sequenced.bytes[2]]),
+            1,
+            "unreliable Sequenced uses the same C# SequencedChannel numbering"
+        );
+    }
+
+    #[test]
+    fn dirty_ack_keeps_peer_reliable_active_until_it_is_flushed() {
+        let peer = test_peer_state(25);
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+
+        assert!(!peer.reliable_active.load(Ordering::Acquire));
+        queue_ack(&peer, channel_id, 0);
+        assert!(peer.reliable_active.load(Ordering::Acquire));
+
+        peer.refresh_reliable_active();
+        assert!(
+            peer.reliable_active.load(Ordering::Acquire),
+            "dirty ACK work must keep the dispatch loop visiting this peer"
+        );
+
+        peer.outgoing_acks
+            .lock()
+            .get_mut(&channel_id)
+            .unwrap()
+            .dirty = false;
+        peer.refresh_reliable_active();
+        assert!(!peer.reliable_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pending_overflow_evicts_exactly_one_oldest_packet() {
+        let peer = test_peer_state(26);
+        let base = Instant::now();
+
+        {
+            let mut pending = peer.pending_reliable.lock();
+            for channel_id in 0..32u8 {
+                let queue = pending.entry(channel_id).or_default();
+                for sequence in 0..DEFAULT_WINDOW_SIZE as u16 {
+                    queue.push_back(PendingReliable {
+                        sequence,
+                        bytes: vec![channel_id, sequence as u8],
+                        last_sent: base
+                            + Duration::from_millis(channel_id as u64)
+                            + Duration::from_micros(sequence as u64),
+                    });
+                }
+            }
+        }
+        peer.pending_total
+            .store(MAX_PENDING_RELIABLE_PER_PEER, Ordering::Relaxed);
+
+        record_pending_reliable(&peer, 250, 0, vec![0xaa], None);
+
+        let pending = peer.pending_reliable.lock();
+        let actual_total: usize = pending.values().map(VecDeque::len).sum();
+        assert_eq!(actual_total, MAX_PENDING_RELIABLE_PER_PEER);
+        assert_eq!(
+            peer.pending_total.load(Ordering::Relaxed),
+            actual_total,
+            "the O(1) counter must stay equal to the actual queue population"
+        );
+        assert_eq!(pending[&0].len(), DEFAULT_WINDOW_SIZE - 1);
+        for channel_id in 1..32u8 {
+            assert_eq!(
+                pending[&channel_id].len(),
+                DEFAULT_WINDOW_SIZE,
+                "searching for the oldest packet must not pop other channel fronts"
+            );
+        }
+        assert_eq!(pending[&250].len(), 1);
+    }
+
+    #[test]
     fn invalid_inbound_reliable_sequence_does_not_dirty_an_ack_window() {
         let peer = test_peer_state(20);
         let channel_id =
             DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
         queue_ack(&peer, channel_id, MAX_SEQUENCE);
         assert!(peer.outgoing_acks.lock().is_empty());
+        assert!(!peer.reliable_active.load(Ordering::Acquire));
     }
 
     /// Regression: ACKs are individual UDP datagrams, so any one of them can be dropped. If
@@ -3161,6 +3303,53 @@ mod tests {
             }
             Some((self.remote_window_start, self.bits.to_vec()))
         }
+    }
+
+    #[tokio::test]
+    async fn idle_peer_reliable_receive_flushes_ack_without_server_reliable_send() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let server_addr = handle.local_addr().unwrap();
+        let client = UdpSocket::bind(loopback_addr(0)).await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        let peer_id = handle
+            .accept(&ConnectionRequest {
+                remote_addr: client_addr,
+                payload: Bytes::new(),
+                connection_number: 0,
+                connect_time: 0x1234_5678,
+                local_peer_id: 0,
+            })
+            .await
+            .unwrap();
+        let peer = handle.peers.get(&peer_id).unwrap().clone();
+
+        let mut buf = vec![0u8; 65_535];
+        let _ = tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf)).await;
+        assert!(
+            !peer.reliable_active.load(Ordering::Acquire),
+            "accepting an otherwise-idle peer must not require server reliable traffic"
+        );
+
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let packet = [PacketProperty::Channeled as u8, 0, 0, channel_id, 0x5a];
+        client.send_to(&packet, server_addr).await.unwrap();
+
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+            .await
+            .expect("idle peer ACK timed out")
+            .unwrap();
+        assert_eq!(buf[0] & 0x1f, PacketProperty::Ack as u8);
+        assert_eq!(
+            len,
+            LITENETLIB_CHANNELED_HEADER_SIZE + (DEFAULT_WINDOW_SIZE - 1) / 8 + 2
+        );
+        assert_eq!(u16::from_le_bytes([buf[1], buf[2]]), 0);
+        assert_eq!(buf[3], channel_id);
+        assert_ne!(buf[4] & 1, 0, "sequence 0 must be acknowledged");
+
+        handle.shutdown();
     }
 
     #[tokio::test]
