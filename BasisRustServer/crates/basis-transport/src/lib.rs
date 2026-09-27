@@ -14,7 +14,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -39,6 +39,19 @@ const LITENETLIB_FRAGMENTED_HEADER_SIZE: usize =
 const RELIABLE_FRAGMENT_PAYLOAD_SIZE: usize =
     LITENETLIB_INITIAL_MTU - LITENETLIB_FRAGMENTED_HEADER_SIZE;
 const DEFAULT_MAX_RECEIVE_WORKERS: usize = 8;
+
+/// Reliable window refill cadence. This is the throughput ceiling: a peer can move at most
+/// `DEFAULT_WINDOW_SIZE` messages per channel per pass, so the aggregate reliable rate is
+/// `DEFAULT_WINDOW_SIZE / RELIABLE_DISPATCH_INTERVAL` per peer per channel. The previous
+/// 15 ms pass capped every peer at ~8.5k messages/s and, because the loop also had to walk
+/// every peer's pending map twice, it could not even sustain that under load.
+const RELIABLE_DISPATCH_INTERVAL: Duration = Duration::from_millis(2);
+
+/// Retransmit and keepalive cadence. Nothing here needs millisecond resolution: a lost
+/// reliable packet is only declared late after 150 ms anyway, and pings go out every 1500 ms.
+const RELIABLE_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(150);
+const RELIABLE_RETRANSMIT_AFTER: Duration = Duration::from_millis(150);
+const PEER_PING_INTERVAL: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -229,6 +242,14 @@ pub struct TransportStatsSnapshot {
     pub raw_bytes_received: u64,
     pub raw_bytes_sent: u64,
     pub raw_send_would_block: u64,
+    pub reliable_window_fills: u64,
+    pub reliable_retransmits: u64,
+    pub reliable_dispatch_passes: u64,
+    pub reliable_peers_visited: u64,
+    pub reliable_acks_received: u64,
+    pub reliable_acks_released: u64,
+    pub reliable_acks_unknown_channel: u64,
+    pub reliable_window_stalls: u64,
 }
 
 #[derive(Debug, Default)]
@@ -238,6 +259,21 @@ struct TransportStats {
     raw_bytes_received: AtomicU64,
     raw_bytes_sent: AtomicU64,
     raw_send_would_block: AtomicU64,
+    /// Reliable messages promoted from the outgoing queue into the send window, and
+    /// retransmissions emitted, so reliable throughput can be verified from the outside.
+    reliable_window_fills: AtomicU64,
+    reliable_retransmits: AtomicU64,
+    reliable_dispatch_passes: AtomicU64,
+    reliable_peers_visited: AtomicU64,
+    /// ACK datagrams that named a channel this peer has in flight, and how many in-flight
+    /// packets those ACKs actually released. A large received-but-zero-released count means
+    /// the two sides disagree about the window encoding; equal counts mean the window is
+    /// healthy and the queue is being fed faster than it drains.
+    reliable_acks_received: AtomicU64,
+    reliable_acks_released: AtomicU64,
+    reliable_acks_unknown_channel: AtomicU64,
+    /// Dispatch passes where a channel had queued payloads but no free window space.
+    reliable_window_stalls: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -251,20 +287,59 @@ struct PeerState {
     next_ping_sequence: AtomicU16,
     next_reliable_sequence: parking_lot::Mutex<HashMap<u8, u16>>,
     next_sequenced_sequence: parking_lot::Mutex<HashMap<u8, u16>>,
+    remote_sequenced_sequence: parking_lot::Mutex<HashMap<u8, u16>>,
     next_fragment_id: AtomicU16,
-    pending_reliable: parking_lot::Mutex<HashMap<PendingReliableKey, PendingReliable>>,
+    /// In-flight reliable packets grouped by channel id. Each channel is an ordered deque so
+    /// that (a) the number of unacknowledged packets is `len()` in O(1) instead of a
+    /// per-pass HashMap build, and (b) an ACK only has to pop from the front, turning ACK
+    /// processing from O(pending) into O(acked).
+    pending_reliable: parking_lot::Mutex<HashMap<u8, VecDeque<PendingReliable>>>,
+    /// Mirror of the total length of every `pending_reliable` queue. Kept as a counter so the
+    /// overflow guard and the status line stay O(1) instead of walking every in-flight packet.
+    pending_total: AtomicUsize,
     outgoing_reliable: parking_lot::Mutex<HashMap<u8, VecDeque<OutgoingReliable>>>,
     outgoing_acks: parking_lot::Mutex<HashMap<u8, AckState>>,
+    /// Set whenever this peer has queued payloads, in-flight packets, or dirty ACKs. The
+    /// dispatch loop skips peers without it, so a settled server stops paying per-peer polling cost.
+    reliable_active: AtomicBool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct PendingReliableKey {
-    channel_id: u8,
-    sequence: u16,
+impl PeerState {
+    fn total_pending(&self) -> usize {
+        self.pending_total.load(Ordering::Relaxed)
+    }
+
+    fn total_queued(&self) -> usize {
+        self.outgoing_reliable
+            .lock()
+            .values()
+            .map(VecDeque::len)
+            .sum()
+    }
+
+    /// Clear `reliable_active` once nothing is queued, in flight, or waiting to be ACKed.
+    /// Keep all producer locks held through the clear so a concurrent producer either becomes
+    /// visible here or sets the flag again after publishing its work.
+    fn refresh_reliable_active(&self) {
+        let pending = self.pending_reliable.lock();
+        if pending.values().any(|queue| !queue.is_empty()) {
+            return;
+        }
+        let outgoing = self.outgoing_reliable.lock();
+        if outgoing.values().any(|queue| !queue.is_empty()) {
+            return;
+        }
+        let acks = self.outgoing_acks.lock();
+        if acks.values().any(|ack| ack.dirty) {
+            return;
+        }
+        self.reliable_active.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone)]
 struct PendingReliable {
+    sequence: u16,
     bytes: Vec<u8>,
     last_sent: Instant,
 }
@@ -286,6 +361,11 @@ struct ReliableFragment {
 struct AckState {
     window_start: u16,
     bits: Vec<u8>,
+    /// Set by `queue_ack` whenever a new bit is set or the window advances, and cleared by
+    /// the dispatch loop once the packet has been built. Previously every pass drained and
+    /// reallocated the whole window for every channel of every peer, even when nothing had
+    /// been received since the previous pass.
+    dirty: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -326,7 +406,8 @@ impl TransportHandle {
             tokio::spawn(read_loop(handle.clone(), tx.clone()));
         }
         tokio::spawn(timeout_loop(handle.clone(), tx));
-        tokio::spawn(reliable_resend_loop(handle.clone()));
+        tokio::spawn(reliable_dispatch_loop(handle.clone()));
+        tokio::spawn(reliable_maintenance_loop(handle.clone()));
         Ok((handle, rx))
     }
 
@@ -343,23 +424,11 @@ impl TransportHandle {
     }
 
     pub fn pending_reliable_count(&self) -> usize {
-        self.peers
-            .iter()
-            .map(|peer| peer.pending_reliable.lock().len())
-            .sum()
+        self.peers.iter().map(|peer| peer.total_pending()).sum()
     }
 
     pub fn queued_reliable_count(&self) -> usize {
-        self.peers
-            .iter()
-            .map(|peer| {
-                peer.outgoing_reliable
-                    .lock()
-                    .values()
-                    .map(VecDeque::len)
-                    .sum::<usize>()
-            })
-            .sum()
+        self.peers.iter().map(|peer| peer.total_queued()).sum()
     }
 
     pub fn stats_snapshot(&self) -> TransportStatsSnapshot {
@@ -369,6 +438,17 @@ impl TransportHandle {
             raw_bytes_received: self.stats.raw_bytes_received.load(Ordering::Relaxed),
             raw_bytes_sent: self.stats.raw_bytes_sent.load(Ordering::Relaxed),
             raw_send_would_block: self.stats.raw_send_would_block.load(Ordering::Relaxed),
+            reliable_window_fills: self.stats.reliable_window_fills.load(Ordering::Relaxed),
+            reliable_retransmits: self.stats.reliable_retransmits.load(Ordering::Relaxed),
+            reliable_dispatch_passes: self.stats.reliable_dispatch_passes.load(Ordering::Relaxed),
+            reliable_peers_visited: self.stats.reliable_peers_visited.load(Ordering::Relaxed),
+            reliable_acks_received: self.stats.reliable_acks_received.load(Ordering::Relaxed),
+            reliable_acks_released: self.stats.reliable_acks_released.load(Ordering::Relaxed),
+            reliable_acks_unknown_channel: self
+                .stats
+                .reliable_acks_unknown_channel
+                .load(Ordering::Relaxed),
+            reliable_window_stalls: self.stats.reliable_window_stalls.load(Ordering::Relaxed),
         }
     }
 
@@ -423,10 +503,13 @@ impl TransportHandle {
             next_ping_sequence: AtomicU16::new(0),
             next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),
             next_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
+            remote_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
             next_fragment_id: AtomicU16::new(0),
             pending_reliable: parking_lot::Mutex::new(HashMap::new()),
+            pending_total: AtomicUsize::new(0),
             outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
             outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
+            reliable_active: AtomicBool::new(false),
         });
         self.by_addr.insert(request.remote_addr, id);
         self.peers.insert(id, state);
@@ -502,7 +585,16 @@ impl TransportHandle {
             return Ok(());
         }
         let built = build_outbound_packet(&state, channel, delivery, payload);
-        record_pending_reliable(&state, &built);
+        if let Some((channel_id, sequence)) = built.reliable_key {
+            // A retained copy is required for retransmit, so this path still copies once.
+            record_pending_reliable(
+                &state,
+                channel_id,
+                sequence,
+                built.bytes.clone(),
+                Some(&self.stats),
+            );
+        }
         self.send_raw_to(&built.bytes, state.addr).await?;
         Ok(())
     }
@@ -550,7 +642,15 @@ impl TransportHandle {
                 continue;
             }
             let built = build_outbound_packet(&state, *channel, *delivery, payload.as_ref());
-            record_pending_reliable(&state, &built);
+            if let Some((channel_id, sequence)) = built.reliable_key {
+                record_pending_reliable(
+                    &state,
+                    channel_id,
+                    sequence,
+                    built.bytes.clone(),
+                    Some(&self.stats),
+                );
+            }
             outbound.push(built.bytes);
         }
 
@@ -653,7 +753,15 @@ impl TransportHandle {
                 continue;
             }
             let built = build_outbound_packet(&state, *channel, *delivery, payload);
-            record_pending_reliable(&state, &built);
+            if let Some((channel_id, sequence)) = built.reliable_key {
+                record_pending_reliable(
+                    &state,
+                    channel_id,
+                    sequence,
+                    built.bytes.clone(),
+                    Some(&self.stats),
+                );
+            }
             outbound.push(built.bytes);
         }
 
@@ -728,29 +836,58 @@ impl TransportHandle {
     }
 }
 
-fn record_pending_reliable(state: &PeerState, built: &BuiltPacket) {
-    if let Some((channel_id, sequence)) = built.reliable_key {
-        let mut pending = state.pending_reliable.lock();
-        if pending.len() >= MAX_PENDING_RELIABLE_PER_PEER {
-            let oldest = pending
-                .iter()
-                .min_by_key(|(_, item)| item.last_sent)
-                .map(|(key, _)| *key);
-            if let Some(oldest) = oldest {
-                pending.remove(&oldest);
-            }
+/// Record a freshly built reliable packet as in-flight. The built bytes are moved, not cloned:
+/// the merged datagram is assembled from this copy, so cloning here doubled both the
+/// allocation count and the memcpy volume on the reliable path.
+fn record_pending_reliable(
+    state: &PeerState,
+    channel_id: u8,
+    sequence: u16,
+    bytes: Vec<u8>,
+    stats: Option<&TransportStats>,
+) {
+    let mut pending = state.pending_reliable.lock();
+    while state.pending_total.load(Ordering::Relaxed) >= MAX_PENDING_RELIABLE_PER_PEER {
+        // Shed exactly the single oldest in-flight packet rather than growing without bound.
+        // Inspect each queue front first; popping while searching would discard one packet from
+        // every non-empty channel and immediately desynchronize `pending_total`.
+        let oldest_channel = pending
+            .iter()
+            .filter_map(|(channel_id, queue)| {
+                queue.front().map(|item| (*channel_id, item.last_sent))
+            })
+            .min_by_key(|(_, last_sent)| *last_sent)
+            .map(|(channel_id, _)| channel_id);
+        let Some(oldest_channel) = oldest_channel else {
+            break;
+        };
+
+        let remove_channel = {
+            let queue = pending
+                .get_mut(&oldest_channel)
+                .expect("oldest pending channel disappeared while locked");
+            queue.pop_front();
+            queue.is_empty()
+        };
+        if remove_channel {
+            pending.remove(&oldest_channel);
         }
-        pending.insert(
-            PendingReliableKey {
-                channel_id,
-                sequence,
-            },
-            PendingReliable {
-                bytes: built.bytes.clone(),
-                last_sent: Instant::now(),
-            },
-        );
+        state.pending_total.fetch_sub(1, Ordering::Relaxed);
     }
+    pending
+        .entry(channel_id)
+        .or_default()
+        .push_back(PendingReliable {
+            sequence,
+            bytes,
+            last_sent: Instant::now(),
+        });
+    state.pending_total.fetch_add(1, Ordering::Relaxed);
+    drop(pending);
+    if let Some(stats) = stats {
+        stats.reliable_window_fills.fetch_add(1, Ordering::Relaxed);
+    }
+    state.reliable_active.store(true, Ordering::Release);
 }
 
 fn is_reliable_delivery(delivery: DeliveryMethod) -> bool {
@@ -760,6 +897,29 @@ fn is_reliable_delivery(delivery: DeliveryMethod) -> bool {
             | DeliveryMethod::ReliableOrdered
             | DeliveryMethod::ReliableSequenced
     )
+}
+
+/// Number of new sequence values that fit before the LiteNetLib send-window span reaches 128.
+/// The oldest unacknowledged packet, not the number of outstanding packets, anchors the window:
+/// an ACK for sequence 1 cannot make room for sequence 128 while sequence 0 is still missing.
+fn reliable_window_capacity(next_sequence: u16, oldest_unacked: Option<u16>) -> usize {
+    let window_start = oldest_unacked.unwrap_or(next_sequence);
+    let span = relative_sequence(next_sequence, window_start);
+    if !(0..=DEFAULT_WINDOW_SIZE as i32).contains(&span) {
+        return 0;
+    }
+    DEFAULT_WINDOW_SIZE - span as usize
+}
+
+fn dequeue_reliable_window(
+    next_sequence: u16,
+    pending: &VecDeque<PendingReliable>,
+    outgoing: &mut VecDeque<OutgoingReliable>,
+) -> Vec<OutgoingReliable> {
+    let capacity =
+        reliable_window_capacity(next_sequence, pending.front().map(|item| item.sequence));
+    let count = capacity.min(outgoing.len());
+    (0..count).filter_map(|_| outgoing.pop_front()).collect()
 }
 
 fn enqueue_reliable_payload(
@@ -782,6 +942,7 @@ fn enqueue_reliable_payload(
             payload: payload.to_vec(),
             fragment: None,
         });
+        state.reliable_active.store(true, Ordering::Release);
         return;
     }
 
@@ -808,6 +969,7 @@ fn enqueue_reliable_payload(
             }),
         });
     }
+    state.reliable_active.store(true, Ordering::Release);
 }
 
 fn build_queued_reliable_packet(
@@ -815,7 +977,11 @@ fn build_queued_reliable_packet(
     channel_id: u8,
     outgoing: OutgoingReliable,
 ) -> BuiltPacket {
-    let sequence = next_channel_sequence(&state.next_reliable_sequence, channel_id);
+    let sequence = if channel_id % 4 == DeliveryMethod::ReliableSequenced as u8 {
+        next_sequenced_channel_sequence(&state.next_reliable_sequence, channel_id)
+    } else {
+        next_channel_sequence(&state.next_reliable_sequence, channel_id)
+    };
     let header_size = if outgoing.fragment.is_some() {
         LITENETLIB_FRAGMENTED_HEADER_SIZE
     } else {
@@ -837,6 +1003,7 @@ fn build_queued_reliable_packet(
     writer.put_bytes(&outgoing.payload);
     BuiltPacket {
         bytes: writer.into_vec(),
+        sequence,
         reliable_key: Some((channel_id, sequence)),
     }
 }
@@ -1141,7 +1308,7 @@ async fn process_packet(
             if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
                 if let Some(peer) = handle.peers.get(&peer_id) {
                     *peer.last_seen.lock() = Instant::now();
-                    process_ack(&peer, bytes);
+                    process_ack(&peer, bytes, Some(&handle.stats));
                 }
             }
         }
@@ -1151,15 +1318,39 @@ async fn process_packet(
                     *peer.last_seen.lock() = Instant::now();
                 }
                 if let Some((channel, delivery, payload)) = parse_message_packet(property, bytes) {
+                    let mut deliver_event = true;
                     if matches!(
                         delivery,
-                        DeliveryMethod::ReliableOrdered | DeliveryMethod::ReliableUnordered
+                        DeliveryMethod::ReliableOrdered
+                            | DeliveryMethod::ReliableUnordered
+                            | DeliveryMethod::ReliableSequenced
                     ) {
                         let sequence = u16::from_le_bytes([bytes[1], bytes[2]]);
+                        if sequence >= MAX_SEQUENCE {
+                            return Ok(());
+                        }
                         let channel_id = bytes[3];
-                        if let Some(peer) = handle.peers.get(&peer_id) {
+                        if delivery == DeliveryMethod::ReliableSequenced {
+                            if let Some(peer) = handle.peers.get(&peer_id).map(|peer| peer.clone())
+                            {
+                                if let Some((ack_sequence, is_new)) =
+                                    queue_reliable_sequenced_ack(&peer, channel_id, sequence)
+                                {
+                                    deliver_event = is_new;
+                                    let ack = build_reliable_sequenced_ack(
+                                        peer.connection_number,
+                                        channel_id,
+                                        ack_sequence,
+                                    );
+                                    handle.send_raw_to(&ack, peer.addr).await?;
+                                }
+                            }
+                        } else if let Some(peer) = handle.peers.get(&peer_id) {
                             queue_ack(&peer, channel_id, sequence);
                         }
+                    }
+                    if !deliver_event {
+                        return Ok(());
                     }
                     let event = ServerEvent::Message {
                         peer: peer_id,
@@ -1336,6 +1527,9 @@ fn parse_message_packet(
 
 struct BuiltPacket {
     bytes: Vec<u8>,
+    /// Assigned for reliable deliveries so the caller can record the in-flight entry without
+    /// re-deriving it from `reliable_key`.
+    sequence: u16,
     reliable_key: Option<(u8, u16)>,
 }
 
@@ -1364,12 +1558,14 @@ fn build_outbound_packet(
             writer.put_bytes(payload);
             BuiltPacket {
                 bytes: writer.into_vec(),
+                sequence: 0,
                 reliable_key: None,
             }
         }
         DeliveryMethod::Sequenced => {
             let channel_id = DeliveryMethod::channel_id(channel, delivery);
-            let sequence = next_channel_sequence(&state.next_sequenced_sequence, channel_id);
+            let sequence =
+                next_sequenced_channel_sequence(&state.next_sequenced_sequence, channel_id);
             let mut writer = NetWriter::with_capacity(payload.len() + 4);
             writer.put_u8(PacketProperty::Channeled as u8 | (state.connection_number << 5));
             writer.put_u16(sequence);
@@ -1377,6 +1573,7 @@ fn build_outbound_packet(
             writer.put_bytes(payload);
             BuiltPacket {
                 bytes: writer.into_vec(),
+                sequence: 0,
                 reliable_key: None,
             }
         }
@@ -1390,6 +1587,7 @@ fn build_outbound_packet(
             writer.put_bytes(payload);
             BuiltPacket {
                 bytes: writer.into_vec(),
+                sequence,
                 reliable_key: Some((channel_id, sequence)),
             }
         }
@@ -1404,65 +1602,219 @@ fn next_channel_sequence(sequences: &parking_lot::Mutex<HashMap<u8, u16>>, chann
     current
 }
 
-fn process_ack(peer: &PeerState, bytes: &[u8]) {
-    if bytes.len() < 4 {
+fn next_sequenced_channel_sequence(
+    sequences: &parking_lot::Mutex<HashMap<u8, u16>>,
+    channel_id: u8,
+) -> u16 {
+    let mut sequences = sequences.lock();
+    let sequence = sequences.entry(channel_id).or_insert(0);
+    *sequence = sequence.wrapping_add(1) % MAX_SEQUENCE;
+    *sequence
+}
+
+/// Apply an incoming ACK window.
+///
+/// Any in-flight packet the ACK covers is released, wherever it sits in the channel's deque.
+/// That leniency is load-bearing, not laziness: ACKs are individual UDP datagrams, so one can
+/// be lost. If this only released a prefix, a single dropped ACK would leave the oldest packet
+/// unacknowledged forever, every later ACK would compare negative against it, and the send
+/// window would deadlock permanently. The window is at most `DEFAULT_WINDOW_SIZE` deep, so
+/// scanning it is cheap -- and it is per channel, unlike the previous whole-peer scan.
+fn process_ack(peer: &PeerState, bytes: &[u8], stats: Option<&TransportStats>) {
+    if bytes.len() < LITENETLIB_CHANNELED_HEADER_SIZE {
+        return;
+    }
+    let channel_id = bytes[3];
+    let sequenced = channel_id % 4 == DeliveryMethod::ReliableSequenced as u8;
+    let expected_size = if sequenced {
+        LITENETLIB_CHANNELED_HEADER_SIZE
+    } else {
+        LITENETLIB_CHANNELED_HEADER_SIZE + (DEFAULT_WINDOW_SIZE - 1) / 8 + 2
+    };
+    if bytes.len() != expected_size {
         return;
     }
     let ack_window_start = u16::from_le_bytes([bytes[1], bytes[2]]);
-    let channel_id = bytes[3];
+    if sequenced {
+        if ack_window_start >= MAX_SEQUENCE {
+            return;
+        }
+        let mut pending = peer.pending_reliable.lock();
+        let Some(queue) = pending.get_mut(&channel_id) else {
+            return;
+        };
+        let Some(ack_index) = queue
+            .iter()
+            .position(|item| item.sequence == ack_window_start)
+        else {
+            return;
+        };
+        for _ in 0..=ack_index {
+            queue.pop_front();
+        }
+        let released = ack_index + 1;
+        if queue.is_empty() {
+            pending.remove(&channel_id);
+        }
+        drop(pending);
+        peer.pending_total.fetch_sub(released, Ordering::Relaxed);
+        if let Some(stats) = stats {
+            stats.reliable_acks_received.fetch_add(1, Ordering::Relaxed);
+            stats
+                .reliable_acks_released
+                .fetch_add(released as u64, Ordering::Relaxed);
+        }
+        return;
+    }
     let ack_bits = &bytes[4..];
     let mut pending = peer.pending_reliable.lock();
-    pending.retain(|key, _| {
-        if key.channel_id != channel_id {
-            return true;
+    let Some(queue) = pending.get_mut(&channel_id) else {
+        drop(pending);
+        if let Some(stats) = stats {
+            stats.reliable_acks_received.fetch_add(1, Ordering::Relaxed);
+            stats
+                .reliable_acks_unknown_channel
+                .fetch_add(1, Ordering::Relaxed);
         }
-        let rel = relative_sequence(key.sequence, ack_window_start);
-        if rel < 0 || rel as usize >= DEFAULT_WINDOW_SIZE {
-            return true;
+        return;
+    };
+    // LiteNetLib `ReliableChannel.ProcessAck` bounds check, reproduced exactly: the ACK's
+    // window start has to be a legal sequence and has to sit within one window *ahead* of our
+    // own oldest unacknowledged packet. Anything else is a stale or forged ACK and is dropped
+    // whole, rather than partially believed.
+    if ack_window_start >= MAX_SEQUENCE {
+        return;
+    }
+    let local_window_start = queue.front().map(|item| item.sequence).unwrap_or(0);
+    let window_rel = relative_sequence(local_window_start, ack_window_start);
+    if window_rel < 0 || window_rel as usize >= DEFAULT_WINDOW_SIZE {
+        return;
+    }
+    let mut released = 0usize;
+    queue.retain(|item| {
+        // C# stops walking pending sequences once they are beyond this ACK window. Without
+        // this bound, an old ACK for bits 0..9 would also release sequences 128..137 because
+        // the absolute 128-bit bitmap aliases them.
+        let relative = relative_sequence(item.sequence, ack_window_start);
+        // ACK bits are *absolute*: bit `sequence % DEFAULT_WINDOW_SIZE`, not an offset from
+        // `window_start`. That is what LiteNetLib does on both sides, and the window start is
+        // only the bounds check above. Modulo-128 is a bijection across any 128 consecutive
+        // sequences, so within the window a set bit identifies exactly one sequence.
+        let acknowledged = relative < DEFAULT_WINDOW_SIZE as i32
+            && ack_bit(ack_bits, item.sequence as usize % DEFAULT_WINDOW_SIZE);
+        if acknowledged {
+            released += 1;
         }
-        let pos = key.sequence as usize % DEFAULT_WINDOW_SIZE;
-        let acked = ack_bits
-            .get(pos / 8)
-            .map(|b| (b & (1 << (pos % 8))) != 0)
-            .unwrap_or(false);
-        !acked
+        !acknowledged
     });
+    if queue.is_empty() {
+        pending.remove(&channel_id);
+    }
+    drop(pending);
+    if let Some(stats) = stats {
+        stats.reliable_acks_received.fetch_add(1, Ordering::Relaxed);
+        stats
+            .reliable_acks_released
+            .fetch_add(released as u64, Ordering::Relaxed);
+    }
+    if released > 0 {
+        peer.pending_total.fetch_sub(released, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn ack_bit(ack_bits: &[u8], bit: usize) -> bool {
+    ack_bits
+        .get(bit / 8)
+        .map(|byte| (byte & (1 << (bit % 8))) != 0)
+        .unwrap_or(false)
 }
 
 fn queue_ack(peer: &PeerState, channel_id: u8, sequence: u16) {
+    if sequence >= MAX_SEQUENCE {
+        return;
+    }
     let mut acks = peer.outgoing_acks.lock();
     let ack = acks.entry(channel_id).or_insert_with(|| AckState {
-        window_start: sequence,
+        // LiteNetLib starts `_remoteWindowStart` and the ACK's sequence field at 0 and only
+        // ever moves them by sliding. Seeding from the first packet seen would differ on the
+        // wire, and the peer rejects an ACK whose window start is not within one window of its
+        // own oldest unacknowledged packet -- so this has to match the C# exactly.
+        window_start: 0,
         bits: vec![0; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2],
+        dirty: false,
     });
 
     let rel = relative_sequence(sequence, ack.window_start);
     if rel < 0 {
+        // Older than the window. LiteNetLib drops such a packet before it ever reaches its ACK
+        // bookkeeping (`if (relate < 0) return false;`), and believing it here would set a bit
+        // that aliases an in-window sequence, so refuse it rather than corrupt the window.
         return;
     }
     if rel as usize >= DEFAULT_WINDOW_SIZE {
+        // LiteNetLib `ReliableChannel.ProcessPacket`: a packet from beyond the window slides it
+        // forward just far enough to bring the newcomer back inside, clearing the bits that fall
+        // out on the way. The window never jumps to the newest sequence.
         let shift = rel as usize - DEFAULT_WINDOW_SIZE + 1;
-        for old_seq in ack.window_start..ack.window_start.wrapping_add(shift as u16) {
-            let idx = old_seq as usize % DEFAULT_WINDOW_SIZE;
-            if let Some(byte) = ack.bits.get_mut(idx / 8) {
-                *byte &= !(1 << (idx % 8));
+        for _ in 0..shift {
+            let index = ack.window_start as usize % DEFAULT_WINDOW_SIZE;
+            if let Some(byte) = ack.bits.get_mut(index / 8) {
+                *byte &= !(1 << (index % 8));
             }
+            ack.window_start = ack.window_start.wrapping_add(1) % MAX_SEQUENCE;
         }
-        ack.window_start = ack.window_start.wrapping_add(shift as u16) % MAX_SEQUENCE;
     }
 
-    let idx = sequence as usize % DEFAULT_WINDOW_SIZE;
-    if let Some(byte) = ack.bits.get_mut(idx / 8) {
-        *byte |= 1 << (idx % 8);
+    // Absolute bit index, matching LiteNetLib. `window_start` is written into the ACK header
+    // purely so the peer can bound-check; the bits themselves are not relative to it.
+    let index = sequence as usize % DEFAULT_WINDOW_SIZE;
+    if let Some(byte) = ack.bits.get_mut(index / 8) {
+        *byte |= 1 << (index % 8);
     }
+    ack.dirty = true;
+    peer.reliable_active.store(true, Ordering::Release);
 }
 
-fn build_ack_packet(connection_number: u8, channel_id: u8, ack: &AckState) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(4 + ack.bits.len());
+/// Record the newest valid inbound ReliableSequenced packet and return the sequence the C#
+/// SequencedChannel expects in its header-only ACK. Old/duplicate packets re-ACK the current
+/// sequence; invalid values are rejected by the caller before application dispatch.
+fn queue_reliable_sequenced_ack(
+    peer: &PeerState,
+    channel_id: u8,
+    sequence: u16,
+) -> Option<(u16, bool)> {
+    if sequence >= MAX_SEQUENCE {
+        return None;
+    }
+    let mut sequences = peer.remote_sequenced_sequence.lock();
+    let current = sequences.entry(channel_id).or_insert(0);
+    let is_new = relative_sequence(sequence, *current) > 0;
+    if is_new {
+        *current = sequence;
+    }
+    Some((*current, is_new))
+}
+
+fn build_reliable_sequenced_ack(connection_number: u8, channel_id: u8, sequence: u16) -> [u8; 4] {
+    let mut packet = [0; LITENETLIB_CHANNELED_HEADER_SIZE];
+    packet[0] = PacketProperty::Ack as u8 | (connection_number << 5);
+    packet[1..3].copy_from_slice(&sequence.to_le_bytes());
+    packet[3] = channel_id;
+    packet
+}
+
+fn build_ack_packet(
+    connection_number: u8,
+    channel_id: u8,
+    window_start: u16,
+    bits: &[u8],
+) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(4 + bits.len());
     packet.push(PacketProperty::Ack as u8 | (connection_number << 5));
-    packet.extend_from_slice(&ack.window_start.to_le_bytes());
+    packet.extend_from_slice(&window_start.to_le_bytes());
     packet.push(channel_id);
-    packet.extend_from_slice(&ack.bits);
+    packet.extend_from_slice(bits);
     packet
 }
 
@@ -1759,86 +2111,261 @@ async fn timeout_loop(handle: TransportHandle, tx: mpsc::Sender<ServerEvent>) {
     }
 }
 
-async fn reliable_resend_loop(handle: TransportHandle) {
-    let mut tick = time::interval(Duration::from_millis(15));
+/// Fill reliable send windows and flush pending ACKs.
+///
+/// This is the only reliable path that has to run fast: a peer can move at most
+/// `DEFAULT_WINDOW_SIZE` messages per channel per pass, so the pass interval *is* the
+/// reliable throughput ceiling. Everything that does not need millisecond resolution
+/// (retransmits, keepalive pings) lives in `reliable_maintenance_loop` instead, so this loop
+/// no longer has to touch peers that have nothing to send.
+async fn reliable_dispatch_loop(handle: TransportHandle) {
+    let mut tick = time::interval(RELIABLE_DISPATCH_INTERVAL);
+    tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut builder = MergedDatagramBuilder::new();
+    while !handle.shutdown.load(Ordering::Relaxed) {
+        tick.tick().await;
+        handle
+            .stats
+            .reliable_dispatch_passes
+            .fetch_add(1, Ordering::Relaxed);
+
+        for peer in handle.peers.iter() {
+            if !peer.reliable_active.load(Ordering::Acquire) {
+                continue;
+            }
+            handle
+                .stats
+                .reliable_peers_visited
+                .fetch_add(1, Ordering::Relaxed);
+            let addr = peer.addr;
+            let connection_number = peer.connection_number;
+            builder.reset(connection_number);
+
+            // 1. Release ACKs that have new bits. Unchanged windows are skipped entirely, so a
+            //    quiet channel costs one bool check instead of a packet rebuild.
+            {
+                let mut acks = peer.outgoing_acks.lock();
+                let mut built = Vec::new();
+                acks.retain(|channel_id, ack| {
+                    if !ack.dirty {
+                        return true;
+                    }
+                    ack.dirty = false;
+                    built.push(build_ack_packet(
+                        connection_number,
+                        *channel_id,
+                        ack.window_start,
+                        &ack.bits,
+                    ));
+                    true
+                });
+                drop(acks);
+                for packet in built {
+                    builder.push(&packet);
+                }
+            }
+
+            // 2. Move queued payloads into the free part of each channel's send window. Window
+            // occupancy is a deque length, so this is O(channels) rather than a per-pass
+            // HashMap built by walking every in-flight packet of the peer.
+            let newly_queued = {
+                let pending = peer.pending_reliable.lock();
+                let mut outgoing = peer.outgoing_reliable.lock();
+                let mut newly_queued = Vec::new();
+                for (channel_id, queue) in outgoing.iter_mut() {
+                    let next_sequence = peer
+                        .next_reliable_sequence
+                        .lock()
+                        .get(channel_id)
+                        .copied()
+                        .unwrap_or(0);
+                    let empty = VecDeque::new();
+                    let in_flight = pending.get(channel_id).unwrap_or(&empty);
+                    let capacity = reliable_window_capacity(
+                        next_sequence,
+                        in_flight.front().map(|item| item.sequence),
+                    );
+                    if capacity == 0 && !queue.is_empty() {
+                        handle
+                            .stats
+                            .reliable_window_stalls
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    for payload in dequeue_reliable_window(next_sequence, in_flight, queue) {
+                        newly_queued.push((*channel_id, payload));
+                    }
+                }
+                newly_queued
+            };
+
+            if !newly_queued.is_empty() {
+                for (channel_id, payload) in newly_queued {
+                    let built = build_queued_reliable_packet(&peer, channel_id, payload);
+                    let bytes = built.bytes;
+                    record_pending_reliable(
+                        &peer,
+                        channel_id,
+                        built.sequence,
+                        bytes.clone(),
+                        Some(&handle.stats),
+                    );
+                    builder.push(&bytes);
+                }
+            }
+
+            // 3. Nothing queued and nothing in flight: stop being visited.
+            if peer
+                .outgoing_reliable
+                .lock()
+                .values()
+                .all(|queue| queue.is_empty())
+                && peer.pending_total.load(Ordering::Relaxed) == 0
+            {
+                peer.refresh_reliable_active();
+            }
+
+            builder.flush(&handle, addr).await;
+        }
+    }
+}
+
+/// Retransmit overdue reliable packets and emit keepalive pings. Both are coarse-grained by
+/// nature (150 ms and 1500 ms), so keeping them out of the dispatch loop is what allows that
+/// loop to run at 2 ms without also re-walking every in-flight packet 500 times a second.
+async fn reliable_maintenance_loop(handle: TransportHandle) {
+    let mut tick = time::interval(RELIABLE_MAINTENANCE_INTERVAL);
+    tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut builder = MergedDatagramBuilder::new();
     while !handle.shutdown.load(Ordering::Relaxed) {
         tick.tick().await;
         let now = Instant::now();
-        let mut sends = Vec::new();
+
         for peer in handle.peers.iter() {
             let addr = peer.addr;
             let connection_number = peer.connection_number;
+            builder.reset(connection_number);
 
             {
                 let mut last_ping = peer.last_ping_sent.lock();
-                if now.duration_since(*last_ping) >= Duration::from_millis(1500) {
+                if now.duration_since(*last_ping) >= PEER_PING_INTERVAL {
                     *last_ping = now;
                     let sequence = peer.next_ping_sequence.fetch_add(1, Ordering::Relaxed);
-                    sends.push((
-                        addr,
-                        connection_number,
-                        build_ping_packet(connection_number, sequence),
-                    ));
+                    let packet = build_ping_packet(connection_number, sequence);
+                    builder.push(&packet);
                 }
             }
 
-            let ack_packets = {
-                let mut acks = peer.outgoing_acks.lock();
-                acks.drain()
-                    .map(|(channel_id, ack)| build_ack_packet(connection_number, channel_id, &ack))
-                    .collect::<Vec<_>>()
-            };
-            for packet in ack_packets {
-                sends.push((addr, connection_number, packet));
-            }
-
-            let mut newly_queued = Vec::new();
-            {
-                let mut outgoing = peer.outgoing_reliable.lock();
-                let pending = peer.pending_reliable.lock();
-                let mut pending_by_channel = HashMap::<u8, usize>::new();
-                for key in pending.keys() {
-                    *pending_by_channel.entry(key.channel_id).or_default() += 1;
+            if peer.reliable_active.load(Ordering::Acquire) {
+                let mut pending = peer.pending_reliable.lock();
+                let mut retransmits = Vec::new();
+                for queue in pending.values_mut() {
+                    for item in queue.iter_mut() {
+                        if now.duration_since(item.last_sent) >= RELIABLE_RETRANSMIT_AFTER {
+                            item.last_sent = now;
+                            retransmits.push(item.bytes.clone());
+                        }
+                    }
                 }
                 drop(pending);
-
-                for (channel_id, queue) in outgoing.iter_mut() {
-                    let pending_count = pending_by_channel.get(channel_id).copied().unwrap_or(0);
-                    let capacity = DEFAULT_WINDOW_SIZE.saturating_sub(pending_count);
-                    for _ in 0..capacity {
-                        let Some(payload) = queue.pop_front() else {
-                            break;
-                        };
-                        newly_queued.push((*channel_id, payload));
+                if !retransmits.is_empty() {
+                    handle
+                        .stats
+                        .reliable_retransmits
+                        .fetch_add(retransmits.len() as u64, Ordering::Relaxed);
+                    for bytes in &retransmits {
+                        builder.push(bytes);
                     }
                 }
             }
 
-            for (channel_id, payload) in newly_queued {
-                let built = build_queued_reliable_packet(&peer, channel_id, payload);
-                record_pending_reliable(&peer, &built);
-                sends.push((addr, connection_number, built.bytes));
-            }
+            builder.flush(&handle, addr).await;
+        }
+    }
+}
 
-            let mut pending = peer.pending_reliable.lock();
-            for item in pending.values_mut() {
-                if now.duration_since(item.last_sent) >= Duration::from_millis(150) {
-                    item.last_sent = now;
-                    sends.push((addr, connection_number, item.bytes.clone()));
-                }
-            }
+/// Accumulates one peer's packets into 1200-byte merged datagrams, reusing its buffers across
+/// peers and passes. The previous code allocated a `Vec` per packet, then copied every packet
+/// a second time into a global regroup `HashMap`, then allocated a third time while framing.
+struct MergedDatagramBuilder {
+    connection_number: u8,
+    current: Vec<u8>,
+    datagrams: Vec<Vec<u8>>,
+    count: usize,
+}
+
+impl MergedDatagramBuilder {
+    fn new() -> Self {
+        Self {
+            connection_number: 0,
+            current: Vec::with_capacity(MAX_MERGED_PACKET_SIZE),
+            datagrams: Vec::new(),
+            count: 0,
         }
-        let mut by_peer: HashMap<(SocketAddr, u8), Vec<Vec<u8>>> = HashMap::new();
-        for (addr, connection_number, bytes) in sends {
-            by_peer
-                .entry((addr, connection_number))
-                .or_default()
-                .push(bytes);
+    }
+
+    fn reset(&mut self, connection_number: u8) {
+        self.connection_number = connection_number;
+        self.current.clear();
+        for datagram in self.datagrams.iter_mut() {
+            datagram.clear();
         }
-        for ((addr, connection_number), packets) in by_peer {
-            for bytes in build_merged_datagrams(connection_number, packets) {
-                let _ = handle.send_raw_to(&bytes, addr).await;
+        self.datagrams.clear();
+        self.count = 0;
+    }
+
+    fn start_datagram(&mut self) {
+        self.current.clear();
+        self.current
+            .push(PacketProperty::Merged as u8 | (self.connection_number << 5));
+        self.count = 0;
+    }
+
+    fn push(&mut self, packet: &[u8]) {
+        let framed_len = 2 + packet.len();
+        if self.count > 0 && self.current.len() + framed_len > MAX_MERGED_PACKET_SIZE {
+            self.seal_datagram();
+        }
+        if framed_len + 1 > MAX_MERGED_PACKET_SIZE {
+            // A single packet that cannot fit alongside others travels on its own.
+            if self.count > 0 {
+                self.seal_datagram();
             }
+            self.datagrams.push(packet.to_vec());
+            return;
+        }
+        if self.count == 0 && self.current.is_empty() {
+            self.start_datagram();
+        }
+        self.current
+            .extend_from_slice(&(packet.len() as u16).to_le_bytes());
+        self.current.extend_from_slice(packet);
+        self.count += 1;
+    }
+
+    /// Move the in-progress datagram aside, unwrapping the single-packet case exactly as
+    /// `unpack_single_merged_packet` did.
+    fn seal_datagram(&mut self) {
+        if self.count == 0 {
+            return;
+        }
+        if self.count == 1 {
+            let mut single = Vec::with_capacity(self.current.len());
+            single.extend_from_slice(&unpack_single_merged_packet(&self.current));
+            self.datagrams.push(single);
+        } else {
+            self.datagrams.push(std::mem::take(&mut self.current));
+        }
+        self.current = Vec::with_capacity(MAX_MERGED_PACKET_SIZE);
+        self.count = 0;
+    }
+
+    async fn flush(&mut self, handle: &TransportHandle, addr: SocketAddr) {
+        self.seal_datagram();
+        for datagram in self.datagrams.drain(..) {
+            if datagram.is_empty() {
+                continue;
+            }
+            let _ = handle.send_raw_to(&datagram, addr).await;
         }
     }
 }
@@ -1972,6 +2499,1045 @@ mod tests {
         assert_eq!(datagrams, vec![packet]);
     }
 
+    /// The dispatch loop frames packets with `MergedDatagramBuilder` instead of
+    /// `build_merged_datagrams`. The two must stay byte-identical or real clients break, so
+    /// pin the equivalence across the size boundaries that exercise every branch: several
+    /// packets per datagram, an exact fit, an oversized single packet, and the single-packet
+    /// unwrap.
+    #[test]
+    fn merged_datagram_builder_matches_reference_framing() {
+        let cases: Vec<Vec<Vec<u8>>> = vec![
+            vec![],
+            vec![vec![1, 2, 3]],
+            vec![vec![1, 2, 3], vec![4, 5]],
+            vec![vec![7u8; 600], vec![8u8; 600]],
+            vec![vec![9u8; 1190]],
+            vec![vec![9u8; 1190], vec![1]],
+            vec![vec![1u8; 400]; 8],
+            vec![vec![0xabu8; 1300], vec![0xcd, 0xef]],
+        ];
+        for (case_index, packets) in cases.iter().enumerate() {
+            for connection_number in [0u8, 3] {
+                let reference = build_merged_datagrams(connection_number, packets.clone());
+                let mut builder = MergedDatagramBuilder::new();
+                builder.reset(connection_number);
+                for packet in packets.iter() {
+                    builder.push(packet);
+                }
+                builder.seal_datagram();
+                let built = std::mem::take(&mut builder.datagrams);
+                assert_eq!(
+                    built, reference,
+                    "framing diverged for case {case_index} at connection number {connection_number}"
+                );
+            }
+        }
+    }
+
+    /// Regression: an ACK must release exactly the packets it covers, from the oldest
+    /// outwards, and must never release a packet that is still in flight. A single wrong bit
+    /// here silently corrupts the reliable window for the life of the connection.
+    #[test]
+    fn ack_releases_only_acknowledged_prefix_of_the_window() {
+        let state = test_peer_state(11);
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        for sequence in 0..10u16 {
+            state
+                .pending_reliable
+                .lock()
+                .entry(channel_id)
+                .or_default()
+                .push_back(PendingReliable {
+                    sequence,
+                    bytes: vec![sequence as u8],
+                    last_sent: Instant::now(),
+                });
+            state.pending_total.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Acknowledge sequences 0..=3 with the client's convention: `window_start` is the
+        // oldest sequence the window covers and bits are set at `sequence % WINDOW_SIZE`.
+        let mut ack = vec![PacketProperty::Ack as u8, 0, 0, channel_id];
+        ack.extend_from_slice(&[0u8; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2]);
+        for sequence in 0..=3u16 {
+            let bit = sequence as usize % DEFAULT_WINDOW_SIZE;
+            ack[4 + bit / 8] |= 1 << (bit % 8);
+        }
+        ack[1..3].copy_from_slice(&0u16.to_le_bytes());
+        process_ack(&state, &ack, None);
+
+        let pending = state.pending_reliable.lock();
+        let queue = &pending[&channel_id];
+        assert_eq!(
+            queue.len(),
+            6,
+            "only the acknowledged prefix may be released"
+        );
+        assert_eq!(
+            queue.iter().map(|item| item.sequence).collect::<Vec<_>>(),
+            vec![4, 5, 6, 7, 8, 9]
+        );
+    }
+
+    #[test]
+    fn ack_out_of_order_does_not_release_newer_packets() {
+        let state = test_peer_state(12);
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        for sequence in 0..5u16 {
+            state
+                .pending_reliable
+                .lock()
+                .entry(channel_id)
+                .or_default()
+                .push_back(PendingReliable {
+                    sequence,
+                    bytes: vec![sequence as u8],
+                    last_sent: Instant::now(),
+                });
+            state.pending_total.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // An ACK for a sequence the peer has not reached yet must not disturb the window.
+        let mut ack = vec![PacketProperty::Ack as u8, 0, 0, channel_id];
+        ack.extend_from_slice(&[0u8; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2]);
+        let bit = 9usize % DEFAULT_WINDOW_SIZE;
+        ack[4 + bit / 8] |= 1 << (bit % 8);
+        ack[1..3].copy_from_slice(&9u16.to_le_bytes());
+        process_ack(&state, &ack, None);
+
+        assert_eq!(state.pending_reliable.lock()[&channel_id].len(), 5);
+    }
+
+    #[test]
+    fn reliable_sequenced_ack_bytes_match_csharp_header_only_semantics() {
+        let peer = test_peer_state(19);
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableSequenced);
+
+        assert_eq!(
+            queue_reliable_sequenced_ack(&peer, channel_id, 1),
+            Some((1, true))
+        );
+        assert_eq!(
+            build_reliable_sequenced_ack(2, channel_id, 1),
+            [PacketProperty::Ack as u8 | (2 << 5), 1, 0, channel_id]
+        );
+        assert_eq!(
+            queue_reliable_sequenced_ack(&peer, channel_id, 1),
+            Some((1, false)),
+            "a duplicate re-ACKs the current remote sequence"
+        );
+        assert_eq!(
+            queue_reliable_sequenced_ack(&peer, channel_id, 0),
+            Some((1, false)),
+            "an older update does not move the sequenced ACK backward"
+        );
+        assert_eq!(
+            queue_reliable_sequenced_ack(&peer, channel_id, MAX_SEQUENCE),
+            None,
+            "the C# rejects sequence values outside 0..32768"
+        );
+
+        peer.remote_sequenced_sequence
+            .lock()
+            .insert(channel_id, MAX_SEQUENCE - 1);
+        assert_eq!(
+            queue_reliable_sequenced_ack(&peer, channel_id, 0),
+            Some((0, true)),
+            "the ACK sequence advances correctly across 32767 to 0"
+        );
+    }
+
+    #[test]
+    fn reliable_sequenced_starts_at_one_and_ack_zero_cannot_retire_it() {
+        let peer = test_peer_state(24);
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableSequenced);
+        let built = build_queued_reliable_packet(
+            &peer,
+            channel_id,
+            OutgoingReliable {
+                payload: vec![0x5a],
+                fragment: None,
+            },
+        );
+
+        assert_eq!(built.sequence, 1);
+        assert_eq!(
+            u16::from_le_bytes([built.bytes[1], built.bytes[2]]),
+            1,
+            "LiteNetLib SequencedChannel increments before its first send"
+        );
+
+        record_pending_reliable(&peer, channel_id, built.sequence, built.bytes, None);
+        let ack_zero = [PacketProperty::Ack as u8, 0, 0, channel_id];
+        process_ack(&peer, &ack_zero, None);
+        assert_eq!(
+            peer.pending_total.load(Ordering::Relaxed),
+            1,
+            "the receiver's initial ACK sequence 0 must not retire the first real update"
+        );
+
+        let ack_one = [PacketProperty::Ack as u8, 1, 0, channel_id];
+        process_ack(&peer, &ack_one, None);
+        assert_eq!(peer.pending_total.load(Ordering::Relaxed), 0);
+
+        let sequenced =
+            build_outbound_packet(&peer, channels::CHAT, DeliveryMethod::Sequenced, &[0x33]);
+        assert_eq!(
+            u16::from_le_bytes([sequenced.bytes[1], sequenced.bytes[2]]),
+            1,
+            "unreliable Sequenced uses the same C# SequencedChannel numbering"
+        );
+    }
+
+    #[test]
+    fn dirty_ack_keeps_peer_reliable_active_until_it_is_flushed() {
+        let peer = test_peer_state(25);
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+
+        assert!(!peer.reliable_active.load(Ordering::Acquire));
+        queue_ack(&peer, channel_id, 0);
+        assert!(peer.reliable_active.load(Ordering::Acquire));
+
+        peer.refresh_reliable_active();
+        assert!(
+            peer.reliable_active.load(Ordering::Acquire),
+            "dirty ACK work must keep the dispatch loop visiting this peer"
+        );
+
+        peer.outgoing_acks
+            .lock()
+            .get_mut(&channel_id)
+            .unwrap()
+            .dirty = false;
+        peer.refresh_reliable_active();
+        assert!(!peer.reliable_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pending_overflow_evicts_exactly_one_oldest_packet() {
+        let peer = test_peer_state(26);
+        let base = Instant::now();
+
+        {
+            let mut pending = peer.pending_reliable.lock();
+            for channel_id in 0..32u8 {
+                let queue = pending.entry(channel_id).or_default();
+                for sequence in 0..DEFAULT_WINDOW_SIZE as u16 {
+                    queue.push_back(PendingReliable {
+                        sequence,
+                        bytes: vec![channel_id, sequence as u8],
+                        last_sent: base
+                            + Duration::from_millis(channel_id as u64)
+                            + Duration::from_micros(sequence as u64),
+                    });
+                }
+            }
+        }
+        peer.pending_total
+            .store(MAX_PENDING_RELIABLE_PER_PEER, Ordering::Relaxed);
+
+        record_pending_reliable(&peer, 250, 0, vec![0xaa], None);
+
+        let pending = peer.pending_reliable.lock();
+        let actual_total: usize = pending.values().map(VecDeque::len).sum();
+        assert_eq!(actual_total, MAX_PENDING_RELIABLE_PER_PEER);
+        assert_eq!(
+            peer.pending_total.load(Ordering::Relaxed),
+            actual_total,
+            "the O(1) counter must stay equal to the actual queue population"
+        );
+        assert_eq!(pending[&0].len(), DEFAULT_WINDOW_SIZE - 1);
+        for channel_id in 1..32u8 {
+            assert_eq!(
+                pending[&channel_id].len(),
+                DEFAULT_WINDOW_SIZE,
+                "searching for the oldest packet must not pop other channel fronts"
+            );
+        }
+        assert_eq!(pending[&250].len(), 1);
+    }
+
+    #[test]
+    fn invalid_inbound_reliable_sequence_does_not_dirty_an_ack_window() {
+        let peer = test_peer_state(20);
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        queue_ack(&peer, channel_id, MAX_SEQUENCE);
+        assert!(peer.outgoing_acks.lock().is_empty());
+        assert!(!peer.reliable_active.load(Ordering::Acquire));
+    }
+
+    /// Regression: ACKs are individual UDP datagrams, so any one of them can be dropped. If
+    /// only a prefix were released, one lost ACK would pin the oldest packet forever, every
+    /// later ACK would compare negative against it, and the send window would deadlock
+    /// permanently -- the queue would grow without bound while retransmits ran flat out.
+    ///
+    /// This reproduces that: skip the ACK for sequence 0, then deliver the rest, and require
+    /// the window to keep opening.
+    #[test]
+    fn a_single_dropped_ack_does_not_deadlock_the_window() {
+        let state = test_peer_state(13);
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        for sequence in 0..8u16 {
+            state
+                .pending_reliable
+                .lock()
+                .entry(channel_id)
+                .or_default()
+                .push_back(PendingReliable {
+                    sequence,
+                    bytes: vec![sequence as u8],
+                    last_sent: Instant::now(),
+                });
+            state.pending_total.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // The C# client never observes sequence 0, but observes 1..=7, and its window slides
+        // past 0 on arrival -- so its ACK covers 1..=7 and nothing acknowledges sequence 0.
+        let mut reference = CsReliableChannel::default();
+        for sequence in 1..8u16 {
+            assert!(reference.process(sequence));
+        }
+        let (window_start, bits) = reference.encode_ack().unwrap();
+        let mut ack = vec![PacketProperty::Ack as u8, 0, 0, channel_id];
+        ack.extend_from_slice(&bits);
+        ack[1..3].copy_from_slice(&window_start.to_le_bytes());
+        process_ack(&state, &ack, None);
+
+        let remaining = state
+            .pending_reliable
+            .lock()
+            .get(&channel_id)
+            .map(VecDeque::len)
+            .unwrap_or(0);
+        assert_eq!(
+            remaining, 1,
+            "only the unacknowledged packet may remain; a dropped ACK must not stall the window"
+        );
+        assert_eq!(state.pending_total.load(Ordering::Relaxed), 1);
+    }
+
+    /// An ACK produced by the C# reference must release exactly the sequences it covers, once
+    /// the window has slid well past the start of the sequence space.
+    ///
+    /// This is the interop proof in the decode direction: the Unity client's own ACK encoding,
+    /// fed to the server's `process_ack`, has to drain the window regardless of where in the
+    /// sequence space the channel has got to. The state here is the one a real connection is
+    /// actually in -- the client has received 0..=200 (bar one lost packet), so earlier ACKs
+    /// already released everything below 195, and this ACK is what releases the tail.
+    #[test]
+    fn csharp_reference_ack_releases_its_sequences_at_large_offsets() {
+        let state = test_peer_state(21);
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        // Only the tail is still in flight, because the earlier ACKs released the rest.
+        for sequence in 195..=200u16 {
+            state
+                .pending_reliable
+                .lock()
+                .entry(channel_id)
+                .or_default()
+                .push_back(PendingReliable {
+                    sequence,
+                    bytes: vec![sequence as u8],
+                    last_sent: Instant::now(),
+                });
+            state.pending_total.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // The C# received everything except sequence 198.
+        let mut reference = CsReliableChannel::default();
+        for sequence in (0..=200u16).filter(|s| *s != 198) {
+            assert!(reference.process(sequence));
+        }
+        let (window_start, bits) = reference.encode_ack().expect("channel has seen packets");
+        assert_eq!(
+            window_start, 73,
+            "the reference window must have slid off a 128 boundary for this test to mean anything"
+        );
+
+        let mut ack = vec![PacketProperty::Ack as u8, 0, 0, channel_id];
+        ack.extend_from_slice(&bits);
+        ack[1..3].copy_from_slice(&window_start.to_le_bytes());
+        process_ack(&state, &ack, None);
+
+        let remaining = state
+            .pending_reliable
+            .lock()
+            .get(&channel_id)
+            .map(VecDeque::len)
+            .unwrap_or(0);
+        assert_eq!(
+            remaining, 1,
+            "a C#-shaped windowed ACK must release the sequences it covers regardless of the \
+             absolute sequence values"
+        );
+    }
+
+    /// The reverse direction: the ACKs the server emits must be byte-identical to what the C#
+    /// would emit. A Unity client cannot drain its own send window otherwise, and this is the
+    /// only thing that catches it -- decode-side tests pass either way.
+    #[test]
+    fn outgoing_acks_match_the_csharp_reference_byte_for_byte() {
+        const COUNT: u16 = 201;
+        let state = test_peer_state(22);
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+
+        let mut reference = CsReliableChannel::default();
+        for sequence in 0..COUNT {
+            queue_ack(&state, channel_id, sequence);
+            reference.process(sequence);
+        }
+        let (expected_start, expected_bits) = reference.encode_ack().unwrap();
+        let packet = {
+            let acks = state.outgoing_acks.lock();
+            let ack = &acks[&channel_id];
+            build_ack_packet(0, channel_id, ack.window_start, &ack.bits)
+        };
+        assert_eq!(
+            &packet[1..3],
+            &expected_start.to_le_bytes(),
+            "ACK header window start must match the C#"
+        );
+        assert_eq!(
+            &packet[4..],
+            &expected_bits[..],
+            "ACK bit set must match the C# byte for byte"
+        );
+    }
+
+    /// Golden vectors captured by running the **verbatim** `ReliableChannel.cs` from
+    /// `Packages/com.basis.server/LiteNetLib` against a stub peer, and dumping the ACK datagrams
+    /// it puts on the wire.
+    ///
+    /// These are the whole point of the exercise: the expected bytes come from the C# itself, not
+    /// from this codebase's reading of it. Regenerate them by replaying the same sequences
+    /// through that file. `build_ack_packet` must reproduce every one of them exactly, because a
+    /// Unity client drops an ACK whose size or layout is off and cannot drain its send window.
+    #[test]
+    fn outgoing_acks_match_golden_vectors_from_the_csharp() {
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        fn ack_for(state: &PeerState, channel_id: u8) -> String {
+            let acks = state.outgoing_acks.lock();
+            let ack = &acks[&channel_id];
+            hex(&build_ack_packet(
+                0,
+                channel_id,
+                ack.window_start,
+                &ack.bits,
+            ))
+        }
+
+        // Six contiguous from zero: the window never slides, so it stays at 0.
+        let state = test_peer_state(31);
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        for sequence in 0..6u16 {
+            queue_ack(&state, channel_id, sequence);
+        }
+        assert_eq!(
+            ack_for(&state, channel_id),
+            "0200004a3f00000000000000000000000000000000"
+        );
+
+        // 201 contiguous with 198 lost. The window slides twice to 73, which is not a multiple
+        // of 128, and bit 70 stays clear. This is the case that separates absolute bit indexing
+        // from window-relative indexing, and it is why a lone client can look fine while the
+        // window wedges under load.
+        let state = test_peer_state(32);
+        for sequence in (0..=200u16).filter(|s| *s != 198) {
+            queue_ack(&state, channel_id, sequence);
+        }
+        assert_eq!(
+            ack_for(&state, channel_id),
+            "0249004affffffffffffffffbfffffffffffffff00"
+        );
+
+        // Out of order with unfilled gaps: the window start must not move.
+        let state = test_peer_state(33);
+        for sequence in [0u16, 1, 2, 5, 6, 9] {
+            queue_ack(&state, channel_id, sequence);
+        }
+        assert_eq!(
+            ack_for(&state, channel_id),
+            "0200004a6702000000000000000000000000000000"
+        );
+
+        // An arrival from beyond the window slides it by the minimum, landing the newcomer on
+        // the top bit rather than jumping the start to it.
+        let state = test_peer_state(34);
+        for sequence in 0..4u16 {
+            queue_ack(&state, channel_id, sequence);
+        }
+        queue_ack(&state, channel_id, DEFAULT_WINDOW_SIZE as u16 + 3);
+        assert_eq!(
+            ack_for(&state, channel_id),
+            "0204004a0800000000000000000000000000000000"
+        );
+
+        // Retransmits of sequences still inside the window must stay acknowledged. A window that
+        // slid on contiguous arrivals would strand the sender's oldest packet for good.
+        let state = test_peer_state(35);
+        for sequence in 0..8u16 {
+            queue_ack(&state, channel_id, sequence);
+        }
+        queue_ack(&state, channel_id, 0);
+        queue_ack(&state, channel_id, 3);
+        assert_eq!(
+            ack_for(&state, channel_id),
+            "0200004aff00000000000000000000000000000000"
+        );
+    }
+
+    /// The decode direction, pinned to what the C# actually accepts.
+    ///
+    /// Captured the same way: with 128 packets in flight and the sender's window start moved to
+    /// 64 by a first ACK, the C# drains completely on an ACK whose bits are absolute
+    /// (`sequence % 128`) and drains **nothing** on the same coverage expressed relative to the
+    /// window start. Reading those bits the second way is a silent stall, not a visible error,
+    /// which is why it is worth asserting.
+    #[test]
+    fn decoding_matches_what_the_csharp_accepts() {
+        fn ack(channel_id: u8, window_start: u16, first: u16, last: u16) -> Vec<u8> {
+            let mut bits = vec![0u8; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
+            for sequence in first..=last {
+                let index = sequence as usize % DEFAULT_WINDOW_SIZE;
+                bits[index / 8] |= 1 << (index % 8);
+            }
+            let mut packet = vec![PacketProperty::Ack as u8, 0, 0, channel_id];
+            packet.extend_from_slice(&bits);
+            packet[1..3].copy_from_slice(&window_start.to_le_bytes());
+            packet
+        }
+        fn queue(state: &PeerState, channel_id: u8, from: u16, to: u16) {
+            for sequence in from..=to {
+                state
+                    .pending_reliable
+                    .lock()
+                    .entry(channel_id)
+                    .or_default()
+                    .push_back(PendingReliable {
+                        sequence,
+                        bytes: vec![sequence as u8],
+                        last_sent: Instant::now(),
+                    });
+                state.pending_total.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn remaining(state: &PeerState, channel_id: u8) -> usize {
+            state
+                .pending_reliable
+                .lock()
+                .get(&channel_id)
+                .map(VecDeque::len)
+                .unwrap_or(0)
+        }
+
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let malformed = test_peer_state(38);
+        queue(&malformed, channel_id, 0, 1);
+        let valid_ack = ack(channel_id, 0, 0, 0);
+        process_ack(&malformed, &valid_ack[..valid_ack.len() - 1], None);
+        let mut overlong_ack = valid_ack.clone();
+        overlong_ack.push(0);
+        process_ack(&malformed, &overlong_ack, None);
+        process_ack(&malformed, &ack(channel_id, MAX_SEQUENCE, 0, 0), None);
+        assert_eq!(
+            remaining(&malformed, channel_id),
+            2,
+            "the C# rejects malformed sizes and sequence values outside 0..32768"
+        );
+
+        // C# limits the send window by sequence span, not by the number of packets that still
+        // need retransmission. ACKing 1..=127 while 0 is missing must not permit sequence 128.
+        let hole = test_peer_state(39);
+        queue(&hole, channel_id, 0, 127);
+        process_ack(&hole, &ack(channel_id, 0, 1, 127), None);
+        let mut outgoing = VecDeque::from([
+            OutgoingReliable {
+                payload: vec![1],
+                fragment: None,
+            },
+            OutgoingReliable {
+                payload: vec![2],
+                fragment: None,
+            },
+        ]);
+        {
+            let pending = hole.pending_reliable.lock();
+            let drained = dequeue_reliable_window(128, &pending[&channel_id], &mut outgoing);
+            assert!(drained.is_empty());
+            assert_eq!(
+                outgoing.len(),
+                2,
+                "the hole keeps the full sequence span occupied"
+            );
+        }
+        process_ack(&hole, &ack(channel_id, 0, 0, 127), None);
+        {
+            let pending = hole.pending_reliable.lock();
+            let drained = dequeue_reliable_window(128, &VecDeque::new(), &mut outgoing);
+            assert_eq!(
+                drained.len(),
+                2,
+                "covering sequence 0 opens the queued window"
+            );
+            assert!(outgoing.is_empty());
+            assert!(pending.get(&channel_id).is_none_or(VecDeque::is_empty));
+        }
+        assert_eq!(reliable_window_capacity(0, Some(MAX_SEQUENCE - 1)), 127);
+
+        // A delayed duplicate ACK for the original 0..=9 window is still a valid ACK header
+        // after the local start has advanced to 10, but its repeated low bits must not alias and
+        // release the newly sent 128..=137 packets. C# stops scanning at relative sequence 128.
+        let delayed = test_peer_state(40);
+        queue(&delayed, channel_id, 0, 127);
+        let old_ack = ack(channel_id, 0, 0, 9);
+        process_ack(&delayed, &old_ack, None);
+        assert_eq!(reliable_window_capacity(128, Some(10)), 10);
+        queue(&delayed, channel_id, 128, 137);
+        process_ack(&delayed, &old_ack, None);
+        let pending = delayed.pending_reliable.lock();
+        let delayed_queue = &pending[&channel_id];
+        assert!(delayed_queue.iter().any(|item| item.sequence == 128));
+        assert!(delayed_queue.iter().any(|item| item.sequence == 137));
+        drop(pending);
+
+        let absolute = test_peer_state(36);
+        queue(&absolute, channel_id, 0, 127);
+        process_ack(&absolute, &ack(channel_id, 0, 0, 63), None);
+        process_ack(&absolute, &ack(channel_id, 64, 64, 127), None);
+        assert_eq!(
+            remaining(&absolute, channel_id),
+            0,
+            "absolute bits must drain the window"
+        );
+
+        // Same coverage, bits placed relative to the window start. The C# releases nothing here.
+        let relative = test_peer_state(37);
+        queue(&relative, channel_id, 0, 127);
+        process_ack(&relative, &ack(channel_id, 0, 0, 63), None);
+        process_ack(&relative, &ack(channel_id, 64, 0, 63), None);
+        assert_eq!(remaining(&relative, channel_id), 64);
+    }
+
+    #[test]
+    fn reliable_sequenced_ack_uses_header_only_and_retires_superseded_records() {
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableSequenced);
+        let peer = test_peer_state(7);
+        {
+            let mut pending = peer.pending_reliable.lock();
+            pending.insert(
+                channel_id,
+                (8..=10)
+                    .map(|sequence| PendingReliable {
+                        sequence,
+                        bytes: vec![PacketProperty::Channeled as u8, 0, 0, channel_id],
+                        last_sent: Instant::now(),
+                    })
+                    .collect(),
+            );
+        }
+        peer.pending_total.store(3, Ordering::Relaxed);
+
+        // LiteNetLib's reliable SequencedChannel ACK packet has only its 4-byte header. An ACK
+        // for sequence 9 supersedes older updates but leaves already-sent newer sequence 10.
+        let mut ack = vec![PacketProperty::Ack as u8, 9, 0, channel_id];
+        process_ack(&peer, &ack, None);
+        assert_eq!(peer.pending_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            peer.pending_reliable.lock()[&channel_id]
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
+
+        // Header-only shape is specific to ReliableSequenced. A future ACK cannot retire any
+        // in-flight work, and an overlong ACK is rejected before window processing.
+        ack[1..3].copy_from_slice(&11u16.to_le_bytes());
+        process_ack(&peer, &ack, None);
+        assert_eq!(peer.pending_total.load(Ordering::Relaxed), 1);
+        ack[1..3].copy_from_slice(&MAX_SEQUENCE.to_le_bytes());
+        process_ack(&peer, &ack, None);
+        assert_eq!(peer.pending_total.load(Ordering::Relaxed), 1);
+        ack[1..3].copy_from_slice(&10u16.to_le_bytes());
+        ack.push(0);
+        process_ack(&peer, &ack, None);
+        assert_eq!(peer.pending_total.load(Ordering::Relaxed), 1);
+    }
+
+    /// When a packet arrives from beyond the window, LiteNetLib slides the window by the
+    /// minimum needed to bring the newcomer back inside -- the new sequence lands on the top
+    /// bit, and the window start does *not* jump to it -- clearing the bits left behind.
+    #[test]
+    fn outgoing_ack_window_slides_exactly_like_the_csharp() {
+        let state = test_peer_state(23);
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+
+        let mut reference = CsReliableChannel::default();
+        for sequence in 0..4u16 {
+            queue_ack(&state, channel_id, sequence);
+            reference.process(sequence);
+        }
+        // Far enough ahead to force a slide.
+        let jumped = DEFAULT_WINDOW_SIZE as u16 + 3;
+        queue_ack(&state, channel_id, jumped);
+        reference.process(jumped);
+
+        let (expected_start, expected_bits) = reference.encode_ack().unwrap();
+        let acks = state.outgoing_acks.lock();
+        let ack = &acks[&channel_id];
+        assert_eq!(ack.window_start, expected_start);
+        assert_eq!(
+            ack.bits, expected_bits,
+            "the slid window and its cleared bits must match the C#"
+        );
+        assert_eq!(
+            expected_start, 4,
+            "sliding brings the newcomer to the top of the window, it does not jump to it"
+        );
+        assert!(
+            ack_bit(&ack.bits, jumped as usize % DEFAULT_WINDOW_SIZE),
+            "the sequence that forced the slide is acknowledged at its absolute index"
+        );
+    }
+
+    /// A literal transcription of the receive side of LiteNetLib's C# `ReliableChannel`
+    /// (`Packages/com.basis.server/LiteNetLib/ReliableChannel.cs`), kept here as the reference
+    /// implementation the Rust transport is held to.
+    ///
+    /// Having the C# semantics written out beside the Rust means the wire format is pinned to
+    /// what the Unity client actually does, rather than to this codebase's assumptions about
+    /// it. The two things that are easy to get wrong, and that this pins down, are:
+    ///
+    /// - ACK bits are **absolute** (`seq % 128`), not offsets from the window start. The window
+    ///   start travels in the header only so the sender can bound-check the packet.
+    /// - The window slides only when a packet arrives from beyond it, so a retransmit inside
+    ///   the window re-sets its bit and is acknowledged again.
+    #[derive(Default)]
+    struct CsReliableChannel {
+        /// `_remoteWindowStart`, and also `_outgoingAcks.Sequence`. Both start at 0 and move
+        /// only by sliding.
+        remote_window_start: u16,
+        /// `_remoteSequence`: the next sequence expected in order.
+        remote_sequence: u16,
+        started: bool,
+        bits: [u8; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2],
+    }
+
+    impl CsReliableChannel {
+        /// C# `ReliableChannel.ProcessPacket`, non-ACK path. Returns whether the packet was
+        /// newly received (a duplicate returns false but must still be acknowledged).
+        fn process(&mut self, sequence: u16) -> bool {
+            if sequence >= MAX_SEQUENCE {
+                return false; // "Bad sequence"
+            }
+            // Note there is no first-packet special case: the C# initialises `_remoteWindowStart`
+            // and `_remoteSequence` to 0 in the constructor and every packet, including the
+            // first, goes through the window logic below. Per-channel sequences start at 0 in
+            // practice, so a channel never sees a sequence far from its own window start.
+            let relate = relative_sequence(sequence, self.remote_window_start);
+            let relate_seq = relative_sequence(sequence, self.remote_sequence);
+            if relate_seq > DEFAULT_WINDOW_SIZE as i32 {
+                return false; // "Bad sequence"
+            }
+            if relate < 0 {
+                return false; // "Too old packet doesn't ack"
+            }
+            if relate >= (DEFAULT_WINDOW_SIZE * 2) as i32 {
+                return false; // "Some very new packet"
+            }
+            if relate >= DEFAULT_WINDOW_SIZE as i32 {
+                // "If very new - move window"
+                let new_window_start = (self.remote_window_start as i32 + relate
+                    - DEFAULT_WINDOW_SIZE as i32
+                    + 1) as u16
+                    % MAX_SEQUENCE;
+                while self.remote_window_start != new_window_start {
+                    let leaving = self.remote_window_start as usize % DEFAULT_WINDOW_SIZE;
+                    self.bits[leaving / 8] &= !(1 << (leaving % 8));
+                    self.remote_window_start = (self.remote_window_start + 1) % MAX_SEQUENCE;
+                }
+            }
+            if self.get_bit(sequence) {
+                return false; // "ReliableInOrder duplicate"
+            }
+            // `_mustSendAcks = true` -- the ACK goes out for duplicates too, which is what lets
+            // a lost ACK recover.
+            self.started = true;
+            self.set_bit(sequence);
+            if sequence == self.remote_sequence {
+                self.remote_sequence = (self.remote_sequence + 1) % MAX_SEQUENCE;
+            }
+            true
+        }
+
+        fn get_bit(&self, sequence: u16) -> bool {
+            let index = sequence as usize % DEFAULT_WINDOW_SIZE;
+            self.bits[index / 8] & (1 << (index % 8)) != 0
+        }
+
+        fn set_bit(&mut self, sequence: u16) {
+            let index = sequence as usize % DEFAULT_WINDOW_SIZE;
+            self.bits[index / 8] |= 1 << (index % 8);
+        }
+
+        /// The ACK datagram the C# would send: the window start for the header, then the whole
+        /// accumulated bit set.
+        fn encode_ack(&self) -> Option<(u16, Vec<u8>)> {
+            if !self.started {
+                return None;
+            }
+            Some((self.remote_window_start, self.bits.to_vec()))
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_peer_reliable_receive_flushes_ack_without_server_reliable_send() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let server_addr = handle.local_addr().unwrap();
+        let client = UdpSocket::bind(loopback_addr(0)).await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        let peer_id = handle
+            .accept(&ConnectionRequest {
+                remote_addr: client_addr,
+                payload: Bytes::new(),
+                connection_number: 0,
+                connect_time: 0x1234_5678,
+                local_peer_id: 0,
+            })
+            .await
+            .unwrap();
+        let peer = handle.peers.get(&peer_id).unwrap().clone();
+
+        let mut buf = vec![0u8; 65_535];
+        let _ = tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf)).await;
+        assert!(
+            !peer.reliable_active.load(Ordering::Acquire),
+            "accepting an otherwise-idle peer must not require server reliable traffic"
+        );
+
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let packet = [PacketProperty::Channeled as u8, 0, 0, channel_id, 0x5a];
+        client.send_to(&packet, server_addr).await.unwrap();
+
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+            .await
+            .expect("idle peer ACK timed out")
+            .unwrap();
+        assert_eq!(buf[0] & 0x1f, PacketProperty::Ack as u8);
+        assert_eq!(
+            len,
+            LITENETLIB_CHANNELED_HEADER_SIZE + (DEFAULT_WINDOW_SIZE - 1) / 8 + 2
+        );
+        assert_eq!(u16::from_le_bytes([buf[1], buf[2]]), 0);
+        assert_eq!(buf[3], channel_id);
+        assert_ne!(buf[4] & 1, 0, "sequence 0 must be acknowledged");
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    /// End-to-end proof that a large reliable burst actually drains.
+    ///
+    /// This is the failure the 15 ms single-loop design produced: a burst far larger than the
+    /// 128-deep window never emptied because the window could only be refilled once per pass.
+    /// A real UDP socket stands in for the client, acknowledges every reliable packet it
+    /// receives, and the test asserts the server-side queue reaches zero.
+    async fn large_reliable_burst_drains_through_the_window() {
+        const MESSAGES: usize = 5_000;
+        const PAYLOAD: usize = 64;
+        const CHANNEL: u8 = channels::CHAT;
+
+        // NOTE: bind to loopback, not `any_addr(0)`. `bind_udp_socket` enables dual stack, and
+        // on Windows binding the wildcard address with an ephemeral port fails with
+        // AddrNotAvailable (10049). `any_addr(0)` is still correct for real servers.
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let server_addr = handle.local_addr().unwrap();
+        let client = UdpSocket::bind(loopback_addr(0)).await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        // Register the peer directly instead of hand-rolling a ConnectRequest. The reliable
+        // window is driven entirely by the peer tables plus the ACKs that arrive on the read
+        // path, so the handshake is not what this test is exercising.
+        let peer_id = handle
+            .accept(&ConnectionRequest {
+                remote_addr: client_addr,
+                payload: Bytes::new(),
+                connection_number: 0,
+                connect_time: 0x1234_5678_9abc_def0i64,
+                local_peer_id: 0,
+            })
+            .await
+            .unwrap();
+        let peer = handle.peers.get(&peer_id).unwrap().clone();
+
+        let mut buf = vec![0u8; 65_535];
+        // Drain the ConnectAccept the server just sent so it cannot be mistaken for payload.
+        let _ = tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf)).await;
+
+        // Queue the burst, then let the client acknowledge everything it receives.
+        for index in 0..MESSAGES {
+            handle
+                .send(
+                    peer.id,
+                    CHANNEL,
+                    DeliveryMethod::ReliableOrdered,
+                    &[(index % 251) as u8; PAYLOAD],
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(handle.queued_reliable_count(), MESSAGES);
+
+        let mut received = 0usize;
+        let mut seen: HashSet<u16> = HashSet::new();
+        let mut arrived: Vec<u16> = Vec::new();
+        let mut reference = CsReliableChannel::default();
+        let channel_id = DeliveryMethod::channel_id(CHANNEL, DeliveryMethod::ReliableOrdered);
+        let mut sent_acks = 0usize;
+        let mut dropped_acks = 0usize;
+        let drain_deadline = Instant::now() + Duration::from_secs(60);
+        // Keep reading until the burst is fully delivered AND the window has closed. The loop
+        // must not stop at "received everything": packets whose ACK was dropped are still
+        // in flight server-side and only clear once the retransmit is received and ACKed.
+        while Instant::now() < drain_deadline {
+            if received >= MESSAGES && handle.pending_reliable_count() == 0 {
+                break;
+            }
+            let Ok(Ok((len, _))) =
+                tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf)).await
+            else {
+                continue;
+            };
+            arrived.clear();
+            received += collect_reliable_sequences(&buf[..len], &mut seen, &mut arrived);
+            for sequence in arrived.iter() {
+                reference.process(*sequence);
+            }
+            // Acknowledge with the C# channel itself, so what the server has to understand here
+            // is the real client's encoding and not a convenient approximation of it. Every
+            // 17th ACK is deliberately dropped, because surviving that is the whole point --
+            // ACKs are individual UDP datagrams and real ones get lost.
+            if let Some((window_start, bits)) = reference.encode_ack() {
+                sent_acks += 1;
+                if !sent_acks.is_multiple_of(17) {
+                    let mut ack = vec![PacketProperty::Ack as u8, 0, 0, channel_id];
+                    ack.extend_from_slice(&bits);
+                    ack[1..3].copy_from_slice(&window_start.to_le_bytes());
+                    client.send_to(&ack, server_addr).await.unwrap();
+                } else {
+                    dropped_acks += 1;
+                }
+            }
+        }
+        assert!(
+            dropped_acks > 0,
+            "the test must actually drop ACKs to be meaningful"
+        );
+        assert_eq!(
+            received, MESSAGES,
+            "client never received the whole reliable burst"
+        );
+
+        // Give the final ACKs time to land, then require both the outgoing queue and the
+        // in-flight window to be empty.
+        let empty_deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < empty_deadline
+            && (handle.queued_reliable_count() > 0 || handle.pending_reliable_count() > 0)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let queued = handle.queued_reliable_count();
+        let in_flight = handle.pending_reliable_count();
+        let stats = handle.stats_snapshot();
+        handle.shutdown();
+        assert_eq!(
+            (queued, in_flight),
+            (0, 0),
+            "reliable state failed to drain: {queued} queued, {in_flight} in flight after receiving all {MESSAGES}"
+        );
+        assert!(
+            stats.reliable_window_fills >= MESSAGES as u64,
+            "expected at least {MESSAGES} window fills, saw {}",
+            stats.reliable_window_fills
+        );
+    }
+
+    /// Walk one datagram, appending every reliable sequence it carried to `arrived` (so the
+    /// caller can acknowledge retransmits as well as first-time packets) and returning how
+    /// many were seen for the first time. Handles both the bare and the `Merged` framing.
+    fn collect_reliable_sequences(
+        datagram: &[u8],
+        seen: &mut HashSet<u16>,
+        arrived: &mut Vec<u16>,
+    ) -> usize {
+        let Some(&header) = datagram.first() else {
+            return 0;
+        };
+        let property = header & 0x1f;
+        if property == PacketProperty::Merged as u8 {
+            let mut pos = 1usize;
+            let mut fresh = 0usize;
+            while pos + 2 <= datagram.len() {
+                let size = u16::from_le_bytes([datagram[pos], datagram[pos + 1]]) as usize;
+                pos += 2;
+                if size == 0 || pos + size > datagram.len() {
+                    break;
+                }
+                fresh += collect_reliable_sequences(&datagram[pos..pos + size], seen, arrived);
+                pos += size;
+            }
+            return fresh;
+        }
+        if property != PacketProperty::Channeled as u8 || datagram.len() < 4 {
+            return 0;
+        }
+        let sequence = u16::from_le_bytes([datagram[1], datagram[2]]);
+        arrived.push(sequence);
+        usize::from(seen.insert(sequence))
+    }
+
+    fn loopback_addr(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    fn test_peer_state(id: PeerId) -> Arc<PeerState> {
+        Arc::new(PeerState {
+            id,
+            addr: "127.0.0.1:4296".parse().unwrap(),
+            connection_number: 0,
+            connect_time: 1,
+            last_seen: parking_lot::Mutex::new(Instant::now()),
+            last_ping_sent: parking_lot::Mutex::new(Instant::now()),
+            next_ping_sequence: AtomicU16::new(0),
+            next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),
+            next_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
+            remote_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
+            next_fragment_id: AtomicU16::new(0),
+            pending_reliable: parking_lot::Mutex::new(HashMap::new()),
+            pending_total: AtomicUsize::new(0),
+            outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
+            outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
+            reliable_active: AtomicBool::new(false),
+        })
+    }
+
     #[test]
     fn oversized_reliable_payload_uses_litenetlib_fragments() {
         let state = PeerState {
@@ -1984,10 +3550,13 @@ mod tests {
             next_ping_sequence: AtomicU16::new(0),
             next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),
             next_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
+            remote_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
             next_fragment_id: AtomicU16::new(0),
             pending_reliable: parking_lot::Mutex::new(HashMap::new()),
+            pending_total: AtomicUsize::new(0),
             outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
             outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
+            reliable_active: AtomicBool::new(false),
         };
         let payload = (0..RELIABLE_FRAGMENT_PAYLOAD_SIZE * 2 + 1)
             .map(|index| (index & 0xff) as u8)
@@ -2055,8 +3624,10 @@ mod tests {
 
     #[tokio::test]
     async fn compact_merged_unreliable_entry_decodes_to_message_event() {
-        let (handle, _events) = TransportHandle::bind(any_addr(0)).await.unwrap();
-        let remote = UdpSocket::bind(any_addr(0)).await.unwrap();
+        // Loopback rather than `any_addr(0)`: dual-stack wildcard binds with an ephemeral port
+        // fail on Windows with AddrNotAvailable (10049).
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let remote = UdpSocket::bind(loopback_addr(0)).await.unwrap();
         let remote_addr = remote.local_addr().unwrap();
         let request = ConnectionRequest {
             remote_addr,

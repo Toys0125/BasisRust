@@ -488,10 +488,18 @@ impl ServerState {
             );
         }
         format!(
-            "Server is running and healthy\nPlayers: {}\nReliable: pending={} queued={}\nApp messages: inbound={} outbound={} protocol_errors={}\nRaw UDP: packets_in={} packets_out={} bytes_in={} bytes_out={} would_block={}\nAvatar sync: inbound_updates={} outbound_messages={} outbound_logical_avatar_sends={} outbound_batches={} active_states={} pending_updates={} receiver_slices={}\nAvatar timing: ticks={} avg_tick_us={} smooth_tick_us={} avg_build_us={} avg_flush_us={} max_tick_us={} receiver_cycle_ms={} cycle_budget_ms={} tick_budget_ms={}",
+            "Server is running and healthy\nPlayers: {}\nReliable: pending={} queued={} window_fills={} retransmits={} dispatch_passes={} peers_visited={} acks_in={} acks_released={} acks_unknown_chan={} window_stalls={}\nApp messages: inbound={} outbound={} protocol_errors={}\nRaw UDP: packets_in={} packets_out={} bytes_in={} bytes_out={} would_block={}\nAvatar sync: inbound_updates={} outbound_messages={} outbound_logical_avatar_sends={} outbound_batches={} active_states={} pending_updates={} receiver_slices={}\nAvatar timing: ticks={} avg_tick_us={} smooth_tick_us={} avg_build_us={} avg_flush_us={} max_tick_us={} receiver_cycle_ms={} cycle_budget_ms={} tick_budget_ms={}",
             self.player_count(),
             self.transport.pending_reliable_count(),
             self.transport.queued_reliable_count(),
+            transport.reliable_window_fills,
+            transport.reliable_retransmits,
+            transport.reliable_dispatch_passes,
+            transport.reliable_peers_visited,
+            transport.reliable_acks_received,
+            transport.reliable_acks_released,
+            transport.reliable_acks_unknown_channel,
+            transport.reliable_window_stalls,
             self.statistics.inbound_packets.load(Ordering::Relaxed),
             self.statistics.outbound_packets.load(Ordering::Relaxed),
             self.statistics.protocol_errors.load(Ordering::Relaxed),
