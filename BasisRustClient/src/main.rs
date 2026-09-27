@@ -63,9 +63,19 @@ const LITENETLIB_FRAGMENTED_HEADER_SIZE: usize =
     LITENETLIB_CHANNELED_HEADER_SIZE + LITENETLIB_FRAGMENT_HEADER_SIZE;
 const RELIABLE_FRAGMENT_PAYLOAD_SIZE: usize =
     LITENETLIB_INITIAL_MTU - LITENETLIB_FRAGMENTED_HEADER_SIZE;
-const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
-const PING_INTERVAL_TICKS: usize = 15;
-const SNAPSHOT_REFRESH_TICKS: usize = 10;
+/// LiteNetLib's `NetManager.UpdateTime` default, and so the cadence at which accumulated ACKs
+/// are flushed. This is the number that matters for throughput: it bounds how long a received
+/// packet waits to be acknowledged, and the sender's 128-deep window cannot refill faster.
+/// Both maintenance loops tick at this rate and derive their slower periods from the tick
+/// count, so there is no separate "maintenance interval" any more.
+const ACK_FLUSH_INTERVAL: Duration = Duration::from_millis(15);
+/// Ticks between resend passes, so the period stays the old 100 ms.
+const RESEND_INTERVAL_TICKS: usize = 7;
+/// Ticks between pings: 100 ticks keeps the previous ~1.5 s period at a 15 ms tick.
+const PING_INTERVAL_TICKS: usize = 100;
+/// Ticks between client-list refreshes in the shared loop, preserving the previous ~1 s period
+/// now that it ticks at 15 ms rather than 100 ms.
+const SHARED_SNAPSHOT_REFRESH_TICKS: usize = 64;
 const INITIAL_START_ATTEMPTS: usize = 3;
 const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 const SOCKET_TTL: u32 = 255;
@@ -1142,55 +1152,139 @@ struct ReliableSend {
     last_sent: Option<SystemTime>,
 }
 
+/// Mirror of the receive side of LiteNetLib's `ReliableChannel`.
+///
+/// Two details are load-bearing for wire compatibility, and both are easy to get wrong:
+///
+/// 1. ACK bits are **absolute** -- bit `sequence % DEFAULT_WINDOW_SIZE`. The window start is
+///    carried in the ACK header only so the peer can bound-check the packet; the bits are not
+///    offsets from it. Treating them as relative makes a real client's windowed ACK match
+///    almost nothing once sequence numbers grow, and its send window never refills.
+/// 2. The window slides forward only when a packet arrives from *beyond* it, never as
+///    contiguous packets arrive. So a retransmit of anything still inside the window re-sets
+///    its bit and gets acknowledged again. A window that slid on every contiguous packet would
+///    strand the sender's oldest unacknowledged packet permanently, because no ACK the
+///    receiver can still send would ever cover it again.
 #[derive(Debug)]
 struct ReliableReceiveState {
-    seen: [bool; 256],
-    highest: [u16; 256],
-    windows: [u128; 256],
+    /// Bits are absolute: bit `sequence % DEFAULT_WINDOW_SIZE` is set once that sequence has
+    /// been received.
+    received: [u128; 256],
+    /// LiteNetLib's `_remoteWindowStart`: the oldest sequence still inside the ACK window.
+    window_start: [u16; 256],
+    started: [bool; 256],
+    /// LiteNetLib's `_mustSendAcks`, per channel: the window has changed and an ACK is owed.
+    /// The C# sets this on arrival and flushes it in `SendNextPackets`, which the network
+    /// update tick calls; it never sends an ACK inline. We do the same, because sending one
+    /// datagram per received packet made roughly a third of all ACK traffic redundant --
+    /// re-sending a window that had not changed since the last ACK.
+    ack_dirty: [bool; 256],
 }
 
 impl Default for ReliableReceiveState {
     fn default() -> Self {
         Self {
-            seen: [false; 256],
-            highest: [0; 256],
-            windows: [0; 256],
+            received: [0; 256],
+            window_start: [0; 256],
+            started: [false; 256],
+            ack_dirty: [false; 256],
         }
     }
 }
 
 impl ReliableReceiveState {
+    /// Record a received sequence, returning whether it is newly seen.
+    ///
+    /// A `false` return for a *duplicate* still has to be acknowledged by the caller -- that is
+    /// what lets a lost ACK recover. A `false` return for a too-old or nonsensical sequence is
+    /// not acknowledged, matching LiteNetLib, which rejects those before its ACK bookkeeping.
     fn mark_new(&mut self, channel_id: u8, sequence: u16) -> bool {
         let index = channel_id as usize;
-        if !self.seen[index] {
-            self.seen[index] = true;
-            self.highest[index] = sequence;
-            self.windows[index] = 1;
+        if sequence >= MAX_SEQUENCE {
+            return false; // bad sequence
+        }
+        if !self.started[index] {
+            // The C# has no first-packet case: it starts `_remoteWindowStart` at 0 and sends 0
+            // in the header. Per-channel sequences start at 0, so the first packet to arrive on
+            // a channel is sequence 0 and this is a no-op -- the bytes are identical.
+            //
+            // It is kept because it is the only thing that keeps a first arrival far from 0
+            // working, and LiteNetLib drops such a packet outright ("Some very new packet")
+            // *without acknowledging it*, which would wedge the channel permanently. So the
+            // divergence only ever occurs in a state the C# cannot survive anyway.
+            self.started[index] = true;
+            self.window_start[index] = sequence;
+            self.received[index] = 1u128 << (sequence as usize % DEFAULT_WINDOW_SIZE);
+            self.ack_dirty[index] = true;
             return true;
         }
 
-        let relative = relative_sequence(sequence, self.highest[index]);
-        if relative > 0 {
-            let advance = relative as usize;
-            self.windows[index] = if advance >= DEFAULT_WINDOW_SIZE {
-                1
-            } else {
-                (self.windows[index] << advance) | 1
-            };
-            self.highest[index] = sequence;
-            return true;
+        let relate = relative_sequence(sequence, self.window_start[index]);
+        if relate < 0 {
+            // Too old to still be in the window. Believing it would set a bit that aliases an
+            // in-window sequence, so drop it -- and, as LiteNetLib does, do not acknowledge.
+            return false;
+        }
+        if relate >= (DEFAULT_WINDOW_SIZE * 2) as i32 {
+            return false; // implausibly far ahead of the window
+        }
+        // `_mustSendAcks = true` in the C#, set after every rejection and *before* the duplicate
+        // check. A retransmit therefore still schedules an ACK, which is what lets a lost ACK
+        // recover -- the sender would otherwise never hear about that packet again.
+        self.ack_dirty[index] = true;
+        if relate >= DEFAULT_WINDOW_SIZE as i32 {
+            // Slide just far enough to bring the newcomer back inside, clearing bits as we go.
+            let shift = relate as usize - DEFAULT_WINDOW_SIZE + 1;
+            for _ in 0..shift {
+                let leaving = self.window_start[index] as usize % DEFAULT_WINDOW_SIZE;
+                self.received[index] &= !(1u128 << leaving);
+                self.window_start[index] =
+                    self.window_start[index].wrapping_add(1) % MAX_SEQUENCE;
+            }
         }
 
-        let age = (-relative) as usize;
-        if age >= DEFAULT_WINDOW_SIZE {
-            return false;
+        let bit = 1u128 << (sequence as usize % DEFAULT_WINDOW_SIZE);
+        if self.received[index] & bit != 0 {
+            return false; // duplicate
         }
-        let bit = 1u128 << age;
-        if self.windows[index] & bit != 0 {
-            return false;
-        }
-        self.windows[index] |= bit;
+        self.received[index] |= bit;
         true
+    }
+
+    /// Render the receive window as a LiteNetLib ACK: the window start for the header, and the
+    /// absolute bit set for the payload. Returns `None` if the channel has received nothing.
+    ///
+    /// The whole window goes out every time, exactly as LiteNetLib sends its accumulated
+    /// `_outgoingAcks`, so one datagram can acknowledge a whole run of packets.
+    fn ack_window(&self, channel_id: u8) -> Option<(u16, Vec<u8>)> {
+        let index = channel_id as usize;
+        if !self.started[index] {
+            return None;
+        }
+        let mut bits = vec![0u8; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
+        for offset in 0..DEFAULT_WINDOW_SIZE {
+            if self.received[index] & (1u128 << offset) != 0 {
+                bits[offset / 8] |= 1 << (offset % 8);
+            }
+        }
+        Some((self.window_start[index], bits))
+    }
+
+    /// Take the channels that owe an ACK, clearing their flags.
+    ///
+    /// Flags are cleared *before* the datagrams go out, so a packet arriving during the send
+    /// re-arms the channel for the next pass instead of being lost. A send that fails outright
+    /// is recovered the same way LiteNetLib recovers it: the server retransmits, the
+    /// retransmit re-arms the channel, and the next pass acknowledges it.
+    fn take_dirty_channels(&mut self) -> Vec<u8> {
+        let mut channels = Vec::new();
+        for (channel_id, dirty) in self.ack_dirty.iter_mut().enumerate() {
+            if *dirty {
+                *dirty = false;
+                channels.push(channel_id as u8);
+            }
+        }
+        channels
     }
 }
 
@@ -1689,6 +1783,9 @@ struct BasisClient {
     ping_sequence: AtomicU16,
     pending_reliable: Mutex<VecDeque<ReliableSend>>,
     pending_reliable_active: AtomicBool,
+    /// Some channel's ACK window has changed and an ACK is owed. Lets the flush tick skip the
+    /// receive-state mutex entirely when there is nothing to send, which is the common case.
+    ack_pending: AtomicBool,
     shared_receive: AtomicBool,
     shared_receive_eligible: AtomicBool,
     receive_shutdown: Notify,
@@ -1941,6 +2038,7 @@ impl BasisClient {
             ping_sequence: AtomicU16::new(0),
             pending_reliable: Mutex::new(VecDeque::new()),
             pending_reliable_active: AtomicBool::new(false),
+            ack_pending: AtomicBool::new(false),
             shared_receive: AtomicBool::new(false),
             shared_receive_eligible: AtomicBool::new(false),
             receive_shutdown: Notify::new(),
@@ -2363,13 +2461,18 @@ impl BasisClient {
             delivery,
             DeliveryMethod::ReliableOrdered | DeliveryMethod::ReliableUnordered
         ) {
-            self.send_ack(channel_id, sequence).await?;
-            if !self
+            // Record first, then let the ACK flush pick the window up: `ack_window` reports what
+            // has been received so far, so the sequence being handled has to be in the bitmap.
+            // `mark_new` also arms the channel's dirty flag -- for duplicates too, which is
+            // what lets a lost ACK recover -- and the flush sends one datagram per armed
+            // channel rather than one per received packet.
+            let is_new = self
                 .received_reliable
                 .lock()
                 .expect("reliable receive state mutex poisoned")
-                .mark_new(channel_id, sequence)
-            {
+                .mark_new(channel_id, sequence);
+            self.ack_pending.store(true, Ordering::Relaxed);
+            if !is_new {
                 trace!(
                     "client {} suppressed duplicate reliable packet channel_id={} sequence={}",
                     self.index,
@@ -2444,14 +2547,39 @@ impl BasisClient {
         Ok(())
     }
 
-    async fn send_ack(&self, channel_id: u8, sequence: u16) -> Result<()> {
-        let mut packet = vec![0u8; 4 + ((DEFAULT_WINDOW_SIZE - 1) / 8 + 2)];
-        packet[0] = PacketProperty::Ack as u8 | (self.connection_number << 5);
-        packet[1..3].copy_from_slice(&sequence.to_le_bytes());
-        packet[3] = channel_id;
-        let bit_index = (sequence as usize) % DEFAULT_WINDOW_SIZE;
-        packet[4 + bit_index / 8] |= 1 << (bit_index % 8);
-        self.send_connected(&packet).await?;
+    /// Acknowledge every channel whose receive window has changed since the last ACK.
+    ///
+    /// This is LiteNetLib's batching: the C# sets `_mustSendAcks` on arrival and flushes the
+    /// accumulated window from `SendNextPackets` on the network update tick, so a burst of
+    /// reliable packets costs one ACK rather than one per packet. The bytes are identical either
+    /// way -- a full window with the same window start -- so this changes volume, not protocol.
+    ///
+    /// Windows are rendered under the lock and sent outside it, so a slow socket write never
+    /// blocks packet reception.
+    async fn flush_acks(&self) -> Result<()> {
+        let pending = {
+            let mut received = self
+                .received_reliable
+                .lock()
+                .expect("reliable receive state mutex poisoned");
+            received
+                .take_dirty_channels()
+                .into_iter()
+                .filter_map(|channel_id| {
+                    received
+                        .ack_window(channel_id)
+                        .map(|window| (channel_id, window))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (channel_id, (window_start, bits)) in pending {
+            let mut packet = Vec::with_capacity(4 + bits.len());
+            packet.push(PacketProperty::Ack as u8 | (self.connection_number << 5));
+            packet.extend_from_slice(&window_start.to_le_bytes());
+            packet.push(channel_id);
+            packet.extend_from_slice(&bits);
+            self.send_connected(&packet).await?;
+        }
         Ok(())
     }
 
@@ -2478,14 +2606,29 @@ impl BasisClient {
 
     async fn process_ack(&self, channel_id: u8, ack_window_start: u16, ack_bits: &[u8]) {
         let mut pending = self.pending_reliable.lock().await;
+        if pending.iter().all(|item| item.channel_id != channel_id) {
+            return;
+        }
+        // LiteNetLib `ReliableChannel.ProcessAck` bounds check: the window start must be a legal
+        // sequence and within one window ahead of our own oldest unacknowledged packet.
+        let local_window_start = pending
+            .iter()
+            .find(|item| item.channel_id == channel_id)
+            .map(|item| item.sequence)
+            .unwrap_or(0);
+        if ack_window_start >= MAX_SEQUENCE {
+            return;
+        }
+        let window_rel = relative_sequence(local_window_start, ack_window_start);
+        if window_rel < 0 || window_rel as usize >= DEFAULT_WINDOW_SIZE {
+            return;
+        }
         pending.retain(|item| {
             if item.channel_id != channel_id {
                 return true;
             }
-            let rel = relative_sequence(item.sequence, ack_window_start);
-            if rel < 0 || rel as usize >= DEFAULT_WINDOW_SIZE {
-                return true;
-            }
+            // ACK bits are absolute -- `sequence % DEFAULT_WINDOW_SIZE` -- not offsets from the
+            // window start. That is what the server sends, matching LiteNetLib.
             let pos = item.sequence as usize % DEFAULT_WINDOW_SIZE;
             let acked = ack_bits
                 .get(pos / 8)
@@ -2498,22 +2641,34 @@ impl BasisClient {
     }
 
     async fn maintenance_loop(self: Arc<Self>) {
-        let mut tick = time::interval(MAINTENANCE_INTERVAL);
+        // Ticks at LiteNetLib's network update rate rather than the old 100 ms maintenance
+        // period, because that is what bounds how long a received packet waits for its ACK.
+        // ACKs have to go out promptly: the sender's window is only 128 deep and refills no
+        // faster than we acknowledge, so a 100 ms flush cadence would throttle throughput
+        // rather than batch it. The slower work is derived from the tick count so its period
+        // is unchanged. Everything except the ACK flush is gated, so the extra ticks are a
+        // timer wake and one relaxed atomic load.
+        let mut tick = time::interval(ACK_FLUSH_INTERVAL);
         tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-        let mut ping_ticks = 0usize;
+        let mut ticks = 0usize;
         loop {
             tick.tick().await;
             if !self.in_use.load(Ordering::Relaxed) {
                 break;
             }
+            ticks = ticks.wrapping_add(1);
 
-            if self.pending_reliable_active.load(Ordering::Relaxed) {
+            // One ACK per channel whose window changed, however many packets arrived since.
+            if self.ack_pending.swap(false, Ordering::Relaxed) {
+                let _ = self.flush_acks().await;
+            }
+
+            if ticks % RESEND_INTERVAL_TICKS == 0 && self.pending_reliable_active.load(Ordering::Relaxed)
+            {
                 let _ = self.resend_reliable().await;
             }
 
-            ping_ticks = ping_ticks.wrapping_add(1);
-            if ping_ticks >= PING_INTERVAL_TICKS {
-                ping_ticks = 0;
+            if ticks % PING_INTERVAL_TICKS == 0 {
                 let _ = self.send_ping().await;
             }
         }
@@ -4232,7 +4387,7 @@ async fn shared_maintenance_loop(
     maintenance_refresh: Arc<Notify>,
     shutdown: Arc<AtomicBool>,
 ) {
-    let mut ticker = time::interval(MAINTENANCE_INTERVAL);
+    let mut ticker = time::interval(ACK_FLUSH_INTERVAL);
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut snapshot = clients.lock().await.clone();
     let mut tick_count = 0usize;
@@ -4256,18 +4411,30 @@ async fn shared_maintenance_loop(
         }
 
         tick_count = tick_count.wrapping_add(1);
-        if tick_count.is_multiple_of(SNAPSHOT_REFRESH_TICKS) {
+        if tick_count.is_multiple_of(SHARED_SNAPSHOT_REFRESH_TICKS) {
             snapshot = clients.lock().await.clone();
         }
 
+        // The ACK flush lives here, not only in the per-client `maintenance_loop`, because this
+        // is the path that actually runs: shared maintenance is on by default, so the per-client
+        // loop is never spawned. Ticking at LiteNetLib's update rate is what bounds how long a
+        // received packet waits to be acknowledged, and the sender's window only refills as fast
+        // as we acknowledge -- a slower cadence throttles throughput rather than batching it.
+        let resend_due = tick_count.is_multiple_of(RESEND_INTERVAL_TICKS);
         for client in &snapshot {
-            if client.in_use.load(Ordering::Relaxed)
-                && client.pending_reliable_active.load(Ordering::Relaxed)
-            {
+            if !client.in_use.load(Ordering::Relaxed) {
+                continue;
+            }
+            if client.ack_pending.swap(false, Ordering::Relaxed) {
+                let _ = client.flush_acks().await;
+            }
+            if resend_due && client.pending_reliable_active.load(Ordering::Relaxed) {
                 let _ = client.resend_reliable().await;
             }
         }
 
+        // Both loops now tick at ACK_FLUSH_INTERVAL, so PING_INTERVAL_TICKS means the same ~1.5 s
+        // period in each and pings stay spread across clients by slot.
         let ping_bucket = tick_count % PING_INTERVAL_TICKS;
         for (slot, client) in snapshot.iter().enumerate() {
             if !ping_bucket_matches(slot, ping_bucket) {
@@ -5419,6 +5586,7 @@ mod tests {
             ping_sequence: AtomicU16::new(0),
             pending_reliable: Mutex::new(VecDeque::new()),
             pending_reliable_active: AtomicBool::new(false),
+            ack_pending: AtomicBool::new(false),
             shared_receive: AtomicBool::new(false),
             shared_receive_eligible: AtomicBool::new(false),
             receive_shutdown: Notify::new(),
@@ -6081,6 +6249,113 @@ mod tests {
         assert!(!state.mark_new(7, 0));
     }
 
+    #[test]
+    fn ack_dirty_flag_batches_a_burst_into_one_datagram() {
+        const CHANNEL: u8 = 9;
+        let mut state = ReliableReceiveState::default();
+
+        // Nothing is owed before anything arrives.
+        assert!(state.take_dirty_channels().is_empty());
+
+        for sequence in 0..40u16 {
+            assert!(state.mark_new(CHANNEL, sequence));
+        }
+        // Forty received packets owe exactly one ACK, not forty.
+        assert_eq!(state.take_dirty_channels(), vec![CHANNEL]);
+        // And the flag is cleared, so a clean pass sends nothing.
+        assert!(state.take_dirty_channels().is_empty());
+    }
+
+    #[test]
+    fn ack_dirty_flag_rearms_on_retransmit_but_not_on_too_old() {
+        const CHANNEL: u8 = 9;
+        let mut state = ReliableReceiveState::default();
+        for sequence in 0..8u16 {
+            state.mark_new(CHANNEL, sequence);
+        }
+        assert_eq!(state.take_dirty_channels(), vec![CHANNEL]);
+
+        // A duplicate must re-arm: the sender only stops resending once it hears about that
+        // packet, so swallowing the ACK here would strand it.
+        assert!(!state.mark_new(CHANNEL, 3));
+        assert_eq!(
+            state.take_dirty_channels(),
+            vec![CHANNEL],
+            "a retransmit owes an ACK even though nothing new was recorded"
+        );
+
+        // A packet from beyond the window slides it, as the C# does, and is acknowledged.
+        assert!(state.mark_new(CHANNEL, 200));
+        assert_eq!(state.take_dirty_channels(), vec![CHANNEL]);
+        assert_eq!(
+            state.ack_window(CHANNEL).expect("channel has seen packets").0,
+            73,
+            "200 slides the window to 200 - 128 + 1"
+        );
+
+        // Now a packet below that window is too old. LiteNetLib drops it *without*
+        // acknowledging, and it must not re-arm either -- acking here would alias an in-window
+        // sequence and falsely release it at the sender.
+        assert!(!state.mark_new(CHANNEL, 10));
+        assert!(
+            state.take_dirty_channels().is_empty(),
+            "a too-old packet owes no ACK"
+        );
+        let (window_start, bits) = state.ack_window(CHANNEL).expect("channel has seen packets");
+        assert_eq!(window_start, 73);
+        let acked: Vec<u16> = (0..DEFAULT_WINDOW_SIZE as u16)
+            .filter(|s| {
+                let index = *s as usize % DEFAULT_WINDOW_SIZE;
+                bits[index / 8] & (1 << (index % 8)) != 0
+            })
+            .collect();
+        let newcomer = (200u16 % DEFAULT_WINDOW_SIZE as u16) as u16;
+        assert!(
+            acked.contains(&72) && acked.contains(&newcomer),
+            "bits stay absolute: the newcomer is acknowledged at its own index (acked={acked:?})"
+        );
+        assert!(
+            !acked.contains(&10),
+            "the rejected too-old packet must have set no bit"
+        );
+    }
+
+    #[test]
+    fn batching_does_not_change_the_bytes_on_the_wire() {
+        const CHANNEL: u8 = 4;
+        // What the pre-batching client sent: one full window per received packet, built from the
+        // state as it stood at that moment.
+        let mut eager = ReliableReceiveState::default();
+        let mut eager_acks = Vec::new();
+        for sequence in 0..12u16 {
+            eager.mark_new(CHANNEL, sequence);
+            if let Some(window) = eager.ack_window(CHANNEL) {
+                eager_acks.push(window);
+            }
+        }
+
+        // What the batched client sends: one window for the whole burst.
+        let mut batched = ReliableReceiveState::default();
+        for sequence in 0..12u16 {
+            batched.mark_new(CHANNEL, sequence);
+        }
+        let batched_acks: Vec<_> = batched
+            .take_dirty_channels()
+            .into_iter()
+            .filter_map(|channel| batched.ack_window(channel))
+            .collect();
+
+        assert_eq!(batched_acks.len(), 1, "a burst owes a single ACK");
+        assert_eq!(
+            &batched_acks[0],
+            eager_acks.last().expect("at least one eager ack"),
+            "batching must not change the final window; only how many datagrams carry it \
+             ({} eager vs {} batched)",
+            eager_acks.len(),
+            batched_acks.len()
+        );
+    }
+
     #[tokio::test]
     async fn reliable_sequences_are_independent_per_channel() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -6151,6 +6426,69 @@ mod tests {
             .unwrap();
         sending.await.unwrap().unwrap();
         assert_eq!(parse_packet(&buffer[..len]).unwrap().payload, b"queued");
+    }
+
+    #[tokio::test]
+    async fn shared_maintenance_loop_actually_flushes_pending_acks() {
+        // Regression test for a batching change that passed every unit test while being entirely
+        // dead: the flush was added to the per-client `maintenance_loop`, but shared maintenance
+        // defaults on, so that loop never spawns and nothing was ever sent. The symptom was a
+        // server that queued 32M reliable messages with 915 peers attached and `acks_in=37`.
+        //
+        // This drives the loop that actually runs, so a flush added to the wrong one fails here.
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = test_client(0, server.local_addr().unwrap()).await;
+        client.in_use.store(true, Ordering::Relaxed);
+
+        // A received reliable packet arms its channel, exactly as `handle_channeled` does.
+        assert!(client
+            .received_reliable
+            .lock()
+            .expect("receive state mutex poisoned")
+            .mark_new(9, 0));
+        client.ack_pending.store(true, Ordering::Relaxed);
+
+        let clients = Arc::new(Mutex::new(vec![Arc::clone(&client)]));
+        let refresh = Arc::new(Notify::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn({
+            let clients = Arc::clone(&clients);
+            let refresh = Arc::clone(&refresh);
+            let shutdown = Arc::clone(&shutdown);
+            async move { shared_maintenance_loop(clients, refresh, shutdown).await }
+        });
+
+        let mut buffer = [0u8; 64];
+        let len = time::timeout(Duration::from_secs(2), server.recv(&mut buffer))
+            .await
+            .expect("shared maintenance must flush the armed ACK")
+            .unwrap();
+        assert_eq!(buffer[0] & 0x1f, PacketProperty::Ack as u8, "an ACK, not something else");
+        assert_eq!(
+            len,
+            LITENETLIB_CHANNELED_HEADER_SIZE + (DEFAULT_WINDOW_SIZE - 1) / 8 + 2,
+            "a full LiteNetLib ACK window: 4-byte header plus 17 bytes of bits"
+        );
+        assert_eq!(buffer[3], 9, "the armed channel's id");
+        assert_eq!(
+            u16::from_le_bytes([buffer[1], buffer[2]]),
+            0,
+            "window start"
+        );
+        assert_eq!(buffer[4] & 1, 1, "sequence 0 acknowledged at its absolute bit");
+
+        // The flag is cleared, so an unchanged window is not re-sent. That is the whole point of
+        // batching: one datagram per change, not one per tick.
+        assert!(
+            time::timeout(Duration::from_millis(120), server.recv(&mut buffer))
+                .await
+                .is_err(),
+            "an unchanged ACK window must not be re-sent"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        refresh.notify_one();
+        let _ = time::timeout(Duration::from_secs(1), task).await;
     }
 
     #[tokio::test]
@@ -6230,9 +6568,12 @@ mod tests {
         }
         assert_eq!(reassembled, payload);
 
+        // ACK bits are absolute, and the window start is the oldest sequence still in the
+        // window -- here 0, since nothing has been acknowledged yet. A window start ahead of
+        // the sender's own would be rejected outright, exactly as LiteNetLib rejects it.
         let mut middle_ack = vec![0u8; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
         middle_ack[0] |= 1 << 1;
-        client.process_ack(channel_id, 1, &middle_ack).await;
+        client.process_ack(channel_id, 0, &middle_ack).await;
         assert_eq!(client.pending_reliable.lock().await.len(), 2);
         assert!(client.pending_reliable_active.load(Ordering::Relaxed));
 

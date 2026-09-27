@@ -1,0 +1,4 @@
+# .NET build output from the LiteNetLib wire harness. Regenerate with:
+#   dotnet run --project scripts/interop
+bin/
+obj/
