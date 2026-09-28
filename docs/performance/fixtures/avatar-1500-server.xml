@@ -31,6 +31,7 @@
   <HealthCheckPort>10666</HealthCheckPort>
   <HealthPath>/health</HealthPath>
   <HealthIncludeBSRProfiling>false</HealthIncludeBSRProfiling>
+  <HealthIncludeExtendedMetrics>true</HealthIncludeExtendedMetrics>
   <IdleMemoryReclaimEnabled>true</IdleMemoryReclaimEnabled>
   <IdleMemoryReclaimSettleSeconds>30</IdleMemoryReclaimSettleSeconds>
   <IdleMemoryReclaimMinimumPeak>8</IdleMemoryReclaimMinimumPeak>
