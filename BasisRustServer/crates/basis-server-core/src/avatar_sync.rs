@@ -91,6 +91,7 @@ pub struct AvatarSyncConfig {
     pub receiver_cycle_budget_ms: f64,
     pub spatial_cull_enabled: bool,
     pub enable_bsr_profiling: bool,
+    pub collect_extended_metrics: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -790,6 +791,33 @@ impl AvatarSyncDiagnostics {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct BsrProfilerSnapshot {
+    pub captured_at: SystemTime,
+    pub ticks: u64,
+    pub messages: u64,
+    pub sends: u64,
+    pub pre_serializations: u64,
+    pub pre_serializations_skipped: u64,
+    pub drain_micros: u64,
+    pub process_micros: u64,
+    pub distance_micros: u64,
+    pub update_micros: u64,
+    pub trigger_micros: u64,
+    pub bundles_emitted: u64,
+    pub bundle_messages: u64,
+    pub bundle_tail_uncompressed: u64,
+    pub bundle_fallbacks: u64,
+    pub bundle_retries: u64,
+    pub bundle_raw_bytes: u64,
+    pub bundle_compressed_bytes: u64,
+    pub bundle_deflate_micros: u64,
+    pub bundle_zstd_emitted: u64,
+    pub bundle_zstd_raw_bytes: u64,
+    pub bundle_zstd_compressed_bytes: u64,
+    pub bundle_zstd_micros: u64,
+}
+
 #[derive(Debug, Default)]
 struct BsrProfiler {
     enabled: AtomicBool,
@@ -809,9 +837,14 @@ struct BsrProfiler {
     bundle_raw_bytes: AtomicU64,
     bundle_compressed_bytes: AtomicU64,
     bundle_deflate_micros: AtomicU64,
+    bundle_zstd_emitted: AtomicU64,
+    bundle_zstd_raw_bytes: AtomicU64,
+    bundle_zstd_compressed_bytes: AtomicU64,
+    bundle_zstd_micros: AtomicU64,
     bundle_retries: AtomicU64,
     bundle_fallbacks: AtomicU64,
     bundle_tail_uncompressed: AtomicU64,
+    latest: parking_lot::RwLock<Option<BsrProfilerSnapshot>>,
 }
 
 impl BsrProfiler {
@@ -827,11 +860,40 @@ impl BsrProfiler {
     }
 
     fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Relaxed);
-        if enabled {
+        let was_enabled = self.enabled.load(Ordering::Relaxed);
+        if enabled && !was_enabled {
+            self.reset_window();
+            *self.latest.write() = None;
             self.last_print_micros
                 .store(now_micros(), Ordering::Relaxed);
         }
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    fn reset_window(&self) {
+        self.drain_micros.store(0, Ordering::Relaxed);
+        self.process_micros.store(0, Ordering::Relaxed);
+        self.distance_micros.store(0, Ordering::Relaxed);
+        self.update_micros.store(0, Ordering::Relaxed);
+        self.trigger_micros.store(0, Ordering::Relaxed);
+        self.tick_count.store(0, Ordering::Relaxed);
+        self.messages_processed.store(0, Ordering::Relaxed);
+        self.send_count.store(0, Ordering::Relaxed);
+        self.pre_serializations.store(0, Ordering::Relaxed);
+        self.pre_serializations_skipped.store(0, Ordering::Relaxed);
+        self.bundles_emitted.store(0, Ordering::Relaxed);
+        self.bundle_messages.store(0, Ordering::Relaxed);
+        self.bundle_raw_bytes.store(0, Ordering::Relaxed);
+        self.bundle_compressed_bytes.store(0, Ordering::Relaxed);
+        self.bundle_deflate_micros.store(0, Ordering::Relaxed);
+        self.bundle_zstd_emitted.store(0, Ordering::Relaxed);
+        self.bundle_zstd_raw_bytes.store(0, Ordering::Relaxed);
+        self.bundle_zstd_compressed_bytes
+            .store(0, Ordering::Relaxed);
+        self.bundle_zstd_micros.store(0, Ordering::Relaxed);
+        self.bundle_retries.store(0, Ordering::Relaxed);
+        self.bundle_fallbacks.store(0, Ordering::Relaxed);
+        self.bundle_tail_uncompressed.store(0, Ordering::Relaxed);
     }
 
     fn enabled(&self) -> bool {
@@ -872,6 +934,7 @@ impl BsrProfiler {
         raw_bytes: u64,
         compressed_bytes: u64,
         deflate_micros: u64,
+        is_zstd: bool,
     ) {
         if !self.enabled() {
             return;
@@ -884,6 +947,15 @@ impl BsrProfiler {
             .fetch_add(compressed_bytes, Ordering::Relaxed);
         self.bundle_deflate_micros
             .fetch_add(deflate_micros, Ordering::Relaxed);
+        if is_zstd {
+            self.bundle_zstd_emitted.fetch_add(1, Ordering::Relaxed);
+            self.bundle_zstd_raw_bytes
+                .fetch_add(raw_bytes, Ordering::Relaxed);
+            self.bundle_zstd_compressed_bytes
+                .fetch_add(compressed_bytes, Ordering::Relaxed);
+            self.bundle_zstd_micros
+                .fetch_add(deflate_micros, Ordering::Relaxed);
+        }
     }
 
     fn add_bundle_tail_uncompressed(&self, messages: u64) {
@@ -893,12 +965,22 @@ impl BsrProfiler {
         }
     }
 
+    fn add_bundle_retry(&self) {
+        if self.enabled() {
+            self.bundle_retries.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn add_bundle_fallback(&self, messages: u64) {
         if self.enabled() {
             self.bundle_fallbacks.fetch_add(1, Ordering::Relaxed);
             self.bundle_tail_uncompressed
                 .fetch_add(messages, Ordering::Relaxed);
         }
+    }
+
+    fn latest(&self) -> Option<BsrProfilerSnapshot> {
+        self.latest.read().clone()
     }
 
     fn try_print(&self) {
@@ -927,11 +1009,16 @@ impl BsrProfiler {
         let pre_ser = self.pre_serializations.swap(0, Ordering::Relaxed);
         let pre_skip = self.pre_serializations_skipped.swap(0, Ordering::Relaxed);
 
-        let drain = self.drain_micros.swap(0, Ordering::Relaxed) as f64 / 1000.0;
-        let process = self.process_micros.swap(0, Ordering::Relaxed) as f64 / 1000.0;
-        let distance = self.distance_micros.swap(0, Ordering::Relaxed) as f64 / 1000.0;
-        let update = self.update_micros.swap(0, Ordering::Relaxed) as f64 / 1000.0;
-        let trigger = self.trigger_micros.swap(0, Ordering::Relaxed) as f64 / 1000.0;
+        let drain_micros = self.drain_micros.swap(0, Ordering::Relaxed);
+        let process_micros = self.process_micros.swap(0, Ordering::Relaxed);
+        let distance_micros = self.distance_micros.swap(0, Ordering::Relaxed);
+        let update_micros = self.update_micros.swap(0, Ordering::Relaxed);
+        let trigger_micros = self.trigger_micros.swap(0, Ordering::Relaxed);
+        let drain = drain_micros as f64 / 1000.0;
+        let process = process_micros as f64 / 1000.0;
+        let distance = distance_micros as f64 / 1000.0;
+        let update = update_micros as f64 / 1000.0;
+        let trigger = trigger_micros as f64 / 1000.0;
         let total = (drain + process + distance + update + trigger).max(f64::EPSILON);
         let ticks_f = ticks as f64;
 
@@ -971,9 +1058,39 @@ impl BsrProfiler {
         let b_raw = self.bundle_raw_bytes.swap(0, Ordering::Relaxed);
         let b_comp = self.bundle_compressed_bytes.swap(0, Ordering::Relaxed);
         let b_deflate_micros = self.bundle_deflate_micros.swap(0, Ordering::Relaxed);
+        let b_zstd_emit = self.bundle_zstd_emitted.swap(0, Ordering::Relaxed);
+        let b_zstd_raw = self.bundle_zstd_raw_bytes.swap(0, Ordering::Relaxed);
+        let b_zstd_comp = self.bundle_zstd_compressed_bytes.swap(0, Ordering::Relaxed);
+        let b_zstd_micros = self.bundle_zstd_micros.swap(0, Ordering::Relaxed);
         let b_retry = self.bundle_retries.swap(0, Ordering::Relaxed);
         let b_fallback = self.bundle_fallbacks.swap(0, Ordering::Relaxed);
         let b_tail = self.bundle_tail_uncompressed.swap(0, Ordering::Relaxed);
+
+        *self.latest.write() = Some(BsrProfilerSnapshot {
+            captured_at: SystemTime::now(),
+            ticks,
+            messages: msgs,
+            sends,
+            pre_serializations: pre_ser,
+            pre_serializations_skipped: pre_skip,
+            drain_micros,
+            process_micros,
+            distance_micros,
+            update_micros,
+            trigger_micros,
+            bundles_emitted: b_emit,
+            bundle_messages: b_msg,
+            bundle_tail_uncompressed: b_tail,
+            bundle_fallbacks: b_fallback,
+            bundle_retries: b_retry,
+            bundle_raw_bytes: b_raw,
+            bundle_compressed_bytes: b_comp,
+            bundle_deflate_micros: b_deflate_micros,
+            bundle_zstd_emitted: b_zstd_emit,
+            bundle_zstd_raw_bytes: b_zstd_raw,
+            bundle_zstd_compressed_bytes: b_zstd_comp,
+            bundle_zstd_micros: b_zstd_micros,
+        });
 
         if b_emit > 0 || b_tail > 0 || b_fallback > 0 {
             let ratio = if b_raw > 0 {
@@ -1106,6 +1223,7 @@ pub struct AvatarSyncSystem {
     payload_pool: Arc<BytePool>,
     counters: Arc<AvatarSyncCounters>,
     profiler: Arc<BsrProfiler>,
+    collect_extended_metrics: Arc<AtomicBool>,
     offloaded_pairs: Arc<DashMap<u64, ()>>,
     bypass_reduction_ids: Arc<DashMap<PeerId, ()>>,
     diagnostics: Option<Arc<AvatarSyncDiagnostics>>,
@@ -1114,6 +1232,7 @@ pub struct AvatarSyncSystem {
 impl AvatarSyncSystem {
     pub fn new(config: AvatarSyncConfig) -> Self {
         let profiler_enabled = config.enable_bsr_profiling;
+        let collect_extended_metrics = config.collect_extended_metrics;
         let counters = Arc::new(AvatarSyncCounters::default());
         let diagnostics = AvatarSyncDiagnostics::from_env(Arc::clone(&counters));
         Self {
@@ -1133,6 +1252,7 @@ impl AvatarSyncSystem {
             payload_pool: Arc::new(BytePool::new()),
             counters,
             profiler: Arc::new(BsrProfiler::new(profiler_enabled)),
+            collect_extended_metrics: Arc::new(AtomicBool::new(collect_extended_metrics)),
             offloaded_pairs: Arc::new(DashMap::new()),
             bypass_reduction_ids: Arc::new(DashMap::new()),
             diagnostics,
@@ -1151,7 +1271,13 @@ impl AvatarSyncSystem {
                 .clamp(config.min_receiver_slices, config.max_receiver_slices);
         }
         self.profiler.set_enabled(config.enable_bsr_profiling);
+        self.collect_extended_metrics
+            .store(config.collect_extended_metrics, Ordering::Relaxed);
         *self.config.write() = config;
+    }
+
+    fn extended_metrics_enabled(&self) -> bool {
+        self.collect_extended_metrics.load(Ordering::Relaxed) || self.diagnostics.is_some()
     }
 
     pub fn upsert_from_channel_payload(
@@ -1163,9 +1289,11 @@ impl AvatarSyncSystem {
         if payload.is_empty() {
             return Ok(());
         }
-        self.counters
-            .inbound_updates
-            .fetch_add(1, Ordering::Relaxed);
+        if self.extended_metrics_enabled() {
+            self.counters
+                .inbound_updates
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let quality = basis_protocol::channels::quality_from_channel(channel);
         let quality = match quality {
             0 => BitQuality::VeryLow,
@@ -1252,6 +1380,10 @@ impl AvatarSyncSystem {
         self.states.get(&peer_id).map(|state| state.position)
     }
 
+    pub fn bsr_profile_snapshot(&self) -> Option<BsrProfilerSnapshot> {
+        self.profiler.latest()
+    }
+
     pub fn stats(&self) -> AvatarSyncStats {
         let state = self.slice_state.lock();
         let config = self.config.read();
@@ -1335,6 +1467,7 @@ impl AvatarSyncSystem {
         F: Fn() -> Vec<PeerId>,
     {
         let config = self.config.read().clone();
+        let collect_extended_metrics = self.extended_metrics_enabled();
         let tick_start = Instant::now();
         let now_ms = self.monotonic_millis();
         let messages_processed = self.process_pending_updates(&config);
@@ -1348,11 +1481,13 @@ impl AvatarSyncSystem {
         let receiver_plan = self.advance_slice_state(&peer_states, &config);
         if receiver_plan.receivers.is_empty() {
             let tick_micros = tick_start.elapsed().as_micros() as u64;
-            self.counters
-                .tick_micros
-                .fetch_add(tick_micros, Ordering::Relaxed);
-            self.counters.tick_count.fetch_add(1, Ordering::Relaxed);
-            update_max_atomic(&self.counters.max_tick_micros, tick_micros);
+            if collect_extended_metrics {
+                self.counters
+                    .tick_micros
+                    .fetch_add(tick_micros, Ordering::Relaxed);
+                self.counters.tick_count.fetch_add(1, Ordering::Relaxed);
+                update_max_atomic(&self.counters.max_tick_micros, tick_micros);
+            }
             self.adapt_slice_count(tick_micros, &config);
             return Ok(());
         }
@@ -1393,20 +1528,22 @@ impl AvatarSyncSystem {
             )
             .filter_map(|batch| batch)
             .collect::<Vec<_>>();
-        self.counters
-            .build_micros
-            .fetch_add(build_start.elapsed().as_micros() as u64, Ordering::Relaxed);
-        self.profiler
-            .add_phase_micros(BsrPhase::Update, build_start.elapsed().as_micros() as u64);
-
-        for batch in &receiver_groups {
+        let build_micros = build_start.elapsed().as_micros() as u64;
+        if collect_extended_metrics {
             self.counters
-                .outbound_messages
-                .fetch_add(batch.sends.len() as u64, Ordering::Relaxed);
-            self.counters
-                .outbound_batches
-                .fetch_add(1, Ordering::Relaxed);
+                .build_micros
+                .fetch_add(build_micros, Ordering::Relaxed);
+            for batch in &receiver_groups {
+                self.counters
+                    .outbound_messages
+                    .fetch_add(batch.sends.len() as u64, Ordering::Relaxed);
+                self.counters
+                    .outbound_batches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
+        self.profiler
+            .add_phase_micros(BsrPhase::Update, build_micros);
         let flush_start = Instant::now();
         flush_receiver_groups_parallel(
             transport.clone(),
@@ -1416,20 +1553,25 @@ impl AvatarSyncSystem {
         if let Some(diagnostics) = self.diagnostics.as_ref() {
             diagnostics.maybe_emit(&self.states, &self.tracking);
         }
-        self.counters
-            .flush_micros
-            .fetch_add(flush_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let flush_micros = flush_start.elapsed().as_micros() as u64;
+        if collect_extended_metrics {
+            self.counters
+                .flush_micros
+                .fetch_add(flush_micros, Ordering::Relaxed);
+        }
         self.profiler
-            .add_phase_micros(BsrPhase::Update, flush_start.elapsed().as_micros() as u64);
+            .add_phase_micros(BsrPhase::Update, flush_micros);
         self.profiler.add_phase_micros(BsrPhase::Trigger, 0);
         let tick_elapsed = tick_start.elapsed();
         let tick_micros = tick_elapsed.as_micros() as u64;
-        self.counters
-            .tick_micros
-            .fetch_add(tick_micros, Ordering::Relaxed);
-        self.counters.tick_count.fetch_add(1, Ordering::Relaxed);
+        if collect_extended_metrics {
+            self.counters
+                .tick_micros
+                .fetch_add(tick_micros, Ordering::Relaxed);
+            self.counters.tick_count.fetch_add(1, Ordering::Relaxed);
+            update_max_atomic(&self.counters.max_tick_micros, tick_micros);
+        }
         self.profiler.add_tick(messages_processed as u64);
-        update_max_atomic(&self.counters.max_tick_micros, tick_micros);
         self.adapt_slice_count(tick_micros, &config);
         self.profiler.try_print();
         Ok(())
@@ -1787,9 +1929,11 @@ impl AvatarSyncSystem {
             self.bundle_ratios.insert(receiver_id, bundle_ratio);
         }
         self.profiler.add_sends(logical_sends);
-        self.counters
-            .outbound_logical_avatar_sends
-            .fetch_add(logical_sends, Ordering::Relaxed);
+        if self.extended_metrics_enabled() {
+            self.counters
+                .outbound_logical_avatar_sends
+                .fetch_add(logical_sends, Ordering::Relaxed);
+        }
         // Only the independently owned `direct` sends escape this receiver build. In
         // particular, release every Bytes clone held by scratch before it is reused.
         bundle.clear();
@@ -2076,7 +2220,7 @@ fn emit_greedy_avatar_bundles<'a>(
                 if retry_raw_len < config.bundle_min_bytes {
                     break;
                 }
-                profiler.bundle_retries.fetch_add(1, Ordering::Relaxed);
+                profiler.add_bundle_retry();
                 match try_emit_bundle_range(direct, bundle, cursor, retry_end, profiler, config) {
                     Ok(BundleEmit::Emitted {
                         raw_len,
@@ -2173,6 +2317,7 @@ fn try_emit_bundle_range<'a>(
         encoded.raw_len as u64,
         compressed_len as u64,
         deflate_micros,
+        matches!(compression, AvatarBundleCompression::ZstdDictionary { .. }),
     );
     Ok(BundleEmit::Emitted {
         raw_len: encoded.raw_len,
@@ -2845,6 +2990,7 @@ mod tests {
             receiver_cycle_budget_ms: DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
             spatial_cull_enabled: false,
             enable_bsr_profiling: true,
+            collect_extended_metrics: true,
         }
     }
 
@@ -3864,6 +4010,7 @@ mod tests {
             receiver_cycle_budget_ms: DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
             spatial_cull_enabled: false,
             enable_bsr_profiling: false,
+            collect_extended_metrics: false,
         };
         let (interval_byte, actual_ms) = calculate_interval_from_distance_sq(100.0, &config);
         assert_eq!(interval_byte, 25);
@@ -3895,6 +4042,7 @@ mod tests {
             receiver_cycle_budget_ms: DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
             spatial_cull_enabled: false,
             enable_bsr_profiling: false,
+            collect_extended_metrics: false,
         };
         assert_eq!(effective_keyframe_interval_ms(&config, 0), 500);
         assert_eq!(effective_keyframe_interval_ms(&config, 1), 1000);
@@ -4151,6 +4299,7 @@ mod tests {
             receiver_cycle_budget_ms: DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
             spatial_cull_enabled: false,
             enable_bsr_profiling: false,
+            collect_extended_metrics: false,
         };
         let system = AvatarSyncSystem::new(config.clone());
 

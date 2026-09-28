@@ -10,5 +10,6 @@ axum.workspace = true
 basis-protocol = { path = "../basis-protocol" }
 parking_lot.workspace = true
 serde.workspace = true
+time.workspace = true
 tokio.workspace = true
 tracing.workspace = true

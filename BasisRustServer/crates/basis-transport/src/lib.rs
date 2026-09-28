@@ -252,8 +252,10 @@ pub struct TransportStatsSnapshot {
     pub reliable_window_stalls: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct TransportStats {
+    enabled: AtomicBool,
+    extended_enabled: AtomicBool,
     raw_packets_received: AtomicU64,
     raw_packets_sent: AtomicU64,
     raw_bytes_received: AtomicU64,
@@ -274,6 +276,48 @@ struct TransportStats {
     reliable_acks_unknown_channel: AtomicU64,
     /// Dispatch passes where a channel had queued payloads but no free window space.
     reliable_window_stalls: AtomicU64,
+}
+
+impl TransportStats {
+    fn new(enabled: bool, extended_enabled: bool) -> Self {
+        Self {
+            enabled: AtomicBool::new(enabled),
+            extended_enabled: AtomicBool::new(extended_enabled),
+            raw_packets_received: AtomicU64::new(0),
+            raw_packets_sent: AtomicU64::new(0),
+            raw_bytes_received: AtomicU64::new(0),
+            raw_bytes_sent: AtomicU64::new(0),
+            raw_send_would_block: AtomicU64::new(0),
+            reliable_window_fills: AtomicU64::new(0),
+            reliable_retransmits: AtomicU64::new(0),
+            reliable_dispatch_passes: AtomicU64::new(0),
+            reliable_peers_visited: AtomicU64::new(0),
+            reliable_acks_received: AtomicU64::new(0),
+            reliable_acks_released: AtomicU64::new(0),
+            reliable_acks_unknown_channel: AtomicU64::new(0),
+            reliable_window_stalls: AtomicU64::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        self.raw_packets_received.store(0, Ordering::Relaxed);
+        self.raw_packets_sent.store(0, Ordering::Relaxed);
+        self.raw_bytes_received.store(0, Ordering::Relaxed);
+        self.raw_bytes_sent.store(0, Ordering::Relaxed);
+        self.raw_send_would_block.store(0, Ordering::Relaxed);
+    }
+
+    fn reset_extended(&self) {
+        self.reliable_window_fills.store(0, Ordering::Relaxed);
+        self.reliable_retransmits.store(0, Ordering::Relaxed);
+        self.reliable_dispatch_passes.store(0, Ordering::Relaxed);
+        self.reliable_peers_visited.store(0, Ordering::Relaxed);
+        self.reliable_acks_received.store(0, Ordering::Relaxed);
+        self.reliable_acks_released.store(0, Ordering::Relaxed);
+        self.reliable_acks_unknown_channel
+            .store(0, Ordering::Relaxed);
+        self.reliable_window_stalls.store(0, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug)]
@@ -389,6 +433,21 @@ pub struct TransportHandle {
 
 impl TransportHandle {
     pub async fn bind(addr: SocketAddr) -> Result<(Self, mpsc::Receiver<ServerEvent>)> {
+        Self::bind_with_statistics_options(addr, true, true).await
+    }
+
+    pub async fn bind_with_statistics(
+        addr: SocketAddr,
+        enable_statistics: bool,
+    ) -> Result<(Self, mpsc::Receiver<ServerEvent>)> {
+        Self::bind_with_statistics_options(addr, enable_statistics, enable_statistics).await
+    }
+
+    pub async fn bind_with_statistics_options(
+        addr: SocketAddr,
+        enable_statistics: bool,
+        enable_extended_statistics: bool,
+    ) -> Result<(Self, mpsc::Receiver<ServerEvent>)> {
         let socket = Arc::new(bind_udp_socket(addr)?);
         let (tx, rx) = mpsc::channel(262_144);
         let handle = Self {
@@ -400,7 +459,10 @@ impl TransportHandle {
             reusable_peer_ids: Arc::new(parking_lot::Mutex::new(VecDeque::new())),
             retired_peer_ids: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
-            stats: Arc::new(TransportStats::default()),
+            stats: Arc::new(TransportStats::new(
+                enable_statistics,
+                enable_extended_statistics,
+            )),
         };
         for _ in 0..udp_receive_worker_count() {
             tokio::spawn(read_loop(handle.clone(), tx.clone()));
@@ -431,49 +493,137 @@ impl TransportHandle {
         self.peers.iter().map(|peer| peer.total_queued()).sum()
     }
 
+    pub fn set_statistics_enabled(&self, enabled: bool) {
+        let was_enabled = self.stats.enabled.load(Ordering::Relaxed);
+        if enabled && !was_enabled {
+            self.stats.reset();
+        }
+        self.stats.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn statistics_enabled(&self) -> bool {
+        self.stats.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_extended_statistics_enabled(&self, enabled: bool) {
+        let was_enabled = self.stats.extended_enabled.load(Ordering::Relaxed);
+        if enabled && !was_enabled {
+            self.stats.reset_extended();
+        }
+        self.stats
+            .extended_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn extended_statistics_enabled(&self) -> bool {
+        self.stats.extended_enabled.load(Ordering::Relaxed)
+    }
+
     pub fn stats_snapshot(&self) -> TransportStatsSnapshot {
+        let statistics_enabled = self.statistics_enabled();
+        let extended_enabled = self.extended_statistics_enabled();
+        if !statistics_enabled && !extended_enabled {
+            return TransportStatsSnapshot::default();
+        }
         TransportStatsSnapshot {
-            raw_packets_received: self.stats.raw_packets_received.load(Ordering::Relaxed),
-            raw_packets_sent: self.stats.raw_packets_sent.load(Ordering::Relaxed),
-            raw_bytes_received: self.stats.raw_bytes_received.load(Ordering::Relaxed),
-            raw_bytes_sent: self.stats.raw_bytes_sent.load(Ordering::Relaxed),
-            raw_send_would_block: self.stats.raw_send_would_block.load(Ordering::Relaxed),
-            reliable_window_fills: self.stats.reliable_window_fills.load(Ordering::Relaxed),
-            reliable_retransmits: self.stats.reliable_retransmits.load(Ordering::Relaxed),
-            reliable_dispatch_passes: self.stats.reliable_dispatch_passes.load(Ordering::Relaxed),
-            reliable_peers_visited: self.stats.reliable_peers_visited.load(Ordering::Relaxed),
-            reliable_acks_received: self.stats.reliable_acks_received.load(Ordering::Relaxed),
-            reliable_acks_released: self.stats.reliable_acks_released.load(Ordering::Relaxed),
-            reliable_acks_unknown_channel: self
-                .stats
-                .reliable_acks_unknown_channel
-                .load(Ordering::Relaxed),
-            reliable_window_stalls: self.stats.reliable_window_stalls.load(Ordering::Relaxed),
+            raw_packets_received: if statistics_enabled {
+                self.stats.raw_packets_received.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            raw_packets_sent: if statistics_enabled {
+                self.stats.raw_packets_sent.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            raw_bytes_received: if statistics_enabled {
+                self.stats.raw_bytes_received.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            raw_bytes_sent: if statistics_enabled {
+                self.stats.raw_bytes_sent.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            raw_send_would_block: if statistics_enabled {
+                self.stats.raw_send_would_block.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            reliable_window_fills: if extended_enabled {
+                self.stats.reliable_window_fills.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            reliable_retransmits: if extended_enabled {
+                self.stats.reliable_retransmits.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            reliable_dispatch_passes: if extended_enabled {
+                self.stats.reliable_dispatch_passes.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            reliable_peers_visited: if extended_enabled {
+                self.stats.reliable_peers_visited.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            reliable_acks_received: if extended_enabled {
+                self.stats.reliable_acks_received.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            reliable_acks_released: if extended_enabled {
+                self.stats.reliable_acks_released.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            reliable_acks_unknown_channel: if extended_enabled {
+                self.stats
+                    .reliable_acks_unknown_channel
+                    .load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            reliable_window_stalls: if extended_enabled {
+                self.stats.reliable_window_stalls.load(Ordering::Relaxed)
+            } else {
+                0
+            },
         }
     }
 
     async fn send_raw_to(&self, bytes: &[u8], addr: SocketAddr) -> Result<usize> {
         let sent = self.socket.send_to(bytes, addr).await?;
-        self.stats.raw_packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .raw_bytes_sent
-            .fetch_add(sent as u64, Ordering::Relaxed);
+        if self.statistics_enabled() {
+            self.stats.raw_packets_sent.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .raw_bytes_sent
+                .fetch_add(sent as u64, Ordering::Relaxed);
+        }
         Ok(sent)
     }
 
     fn try_send_raw_to(&self, bytes: &[u8], addr: SocketAddr) -> Result<bool> {
         match self.socket.try_send_to(bytes, addr) {
             Ok(sent) => {
-                self.stats.raw_packets_sent.fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .raw_bytes_sent
-                    .fetch_add(sent as u64, Ordering::Relaxed);
+                if self.statistics_enabled() {
+                    self.stats.raw_packets_sent.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .raw_bytes_sent
+                        .fetch_add(sent as u64, Ordering::Relaxed);
+                }
                 Ok(true)
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                self.stats
-                    .raw_send_would_block
-                    .fetch_add(1, Ordering::Relaxed);
+                if self.statistics_enabled() {
+                    self.stats
+                        .raw_send_would_block
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(false)
             }
             Err(err) => Err(err.into()),
@@ -884,7 +1034,7 @@ fn record_pending_reliable(
         });
     state.pending_total.fetch_add(1, Ordering::Relaxed);
     drop(pending);
-    if let Some(stats) = stats {
+    if let Some(stats) = stats.filter(|stats| stats.extended_enabled.load(Ordering::Relaxed)) {
         stats.reliable_window_fills.fetch_add(1, Ordering::Relaxed);
     }
     state.reliable_active.store(true, Ordering::Release);
@@ -1104,14 +1254,16 @@ async fn read_loop(handle: TransportHandle, tx: mpsc::Sender<ServerEvent>) {
     while !handle.shutdown.load(Ordering::Relaxed) {
         match handle.socket.recv_from(&mut buf).await {
             Ok((len, remote_addr)) => {
-                handle
-                    .stats
-                    .raw_packets_received
-                    .fetch_add(1, Ordering::Relaxed);
-                handle
-                    .stats
-                    .raw_bytes_received
-                    .fetch_add(len as u64, Ordering::Relaxed);
+                if handle.statistics_enabled() {
+                    handle
+                        .stats
+                        .raw_packets_received
+                        .fetch_add(1, Ordering::Relaxed);
+                    handle
+                        .stats
+                        .raw_bytes_received
+                        .fetch_add(len as u64, Ordering::Relaxed);
+                }
                 if let Err(err) = process_packet(&handle, &tx, remote_addr, &buf[..len]).await {
                     warn!("transport packet processing failed: {err}");
                 }
@@ -1658,7 +1810,7 @@ fn process_ack(peer: &PeerState, bytes: &[u8], stats: Option<&TransportStats>) {
         }
         drop(pending);
         peer.pending_total.fetch_sub(released, Ordering::Relaxed);
-        if let Some(stats) = stats {
+        if let Some(stats) = stats.filter(|stats| stats.extended_enabled.load(Ordering::Relaxed)) {
             stats.reliable_acks_received.fetch_add(1, Ordering::Relaxed);
             stats
                 .reliable_acks_released
@@ -1670,7 +1822,7 @@ fn process_ack(peer: &PeerState, bytes: &[u8], stats: Option<&TransportStats>) {
     let mut pending = peer.pending_reliable.lock();
     let Some(queue) = pending.get_mut(&channel_id) else {
         drop(pending);
-        if let Some(stats) = stats {
+        if let Some(stats) = stats.filter(|stats| stats.extended_enabled.load(Ordering::Relaxed)) {
             stats.reliable_acks_received.fetch_add(1, Ordering::Relaxed);
             stats
                 .reliable_acks_unknown_channel
@@ -1711,7 +1863,7 @@ fn process_ack(peer: &PeerState, bytes: &[u8], stats: Option<&TransportStats>) {
         pending.remove(&channel_id);
     }
     drop(pending);
-    if let Some(stats) = stats {
+    if let Some(stats) = stats.filter(|stats| stats.extended_enabled.load(Ordering::Relaxed)) {
         stats.reliable_acks_received.fetch_add(1, Ordering::Relaxed);
         stats
             .reliable_acks_released
@@ -2124,19 +2276,23 @@ async fn reliable_dispatch_loop(handle: TransportHandle) {
     let mut builder = MergedDatagramBuilder::new();
     while !handle.shutdown.load(Ordering::Relaxed) {
         tick.tick().await;
-        handle
-            .stats
-            .reliable_dispatch_passes
-            .fetch_add(1, Ordering::Relaxed);
+        if handle.extended_statistics_enabled() {
+            handle
+                .stats
+                .reliable_dispatch_passes
+                .fetch_add(1, Ordering::Relaxed);
+        }
 
         for peer in handle.peers.iter() {
             if !peer.reliable_active.load(Ordering::Acquire) {
                 continue;
             }
-            handle
-                .stats
-                .reliable_peers_visited
-                .fetch_add(1, Ordering::Relaxed);
+            if handle.extended_statistics_enabled() {
+                handle
+                    .stats
+                    .reliable_peers_visited
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             let addr = peer.addr;
             let connection_number = peer.connection_number;
             builder.reset(connection_number);
@@ -2185,7 +2341,7 @@ async fn reliable_dispatch_loop(handle: TransportHandle) {
                         next_sequence,
                         in_flight.front().map(|item| item.sequence),
                     );
-                    if capacity == 0 && !queue.is_empty() {
+                    if capacity == 0 && !queue.is_empty() && handle.extended_statistics_enabled() {
                         handle
                             .stats
                             .reliable_window_stalls
@@ -2268,10 +2424,12 @@ async fn reliable_maintenance_loop(handle: TransportHandle) {
                 }
                 drop(pending);
                 if !retransmits.is_empty() {
-                    handle
-                        .stats
-                        .reliable_retransmits
-                        .fetch_add(retransmits.len() as u64, Ordering::Relaxed);
+                    if handle.extended_statistics_enabled() {
+                        handle
+                            .stats
+                            .reliable_retransmits
+                            .fetch_add(retransmits.len() as u64, Ordering::Relaxed);
+                    }
                     for bytes in &retransmits {
                         builder.push(bytes);
                     }
@@ -3536,6 +3694,19 @@ mod tests {
             outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
             reliable_active: AtomicBool::new(false),
         })
+    }
+
+    #[test]
+    fn extended_reliable_counters_do_not_collect_until_enabled() {
+        let peer = test_peer_state(1);
+        let stats = TransportStats::new(true, false);
+
+        record_pending_reliable(&peer, 1, 0, vec![1], Some(&stats));
+        assert_eq!(stats.reliable_window_fills.load(Ordering::Relaxed), 0);
+
+        stats.extended_enabled.store(true, Ordering::Relaxed);
+        record_pending_reliable(&peer, 1, 1, vec![2], Some(&stats));
+        assert_eq!(stats.reliable_window_fills.load(Ordering::Relaxed), 1);
     }
 
     #[test]
