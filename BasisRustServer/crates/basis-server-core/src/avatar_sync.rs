@@ -2,7 +2,8 @@ use anyhow::Result;
 use basis_protocol::{
     avatar::{
         read_position, repack_high_to_lower_into, try_encode_avatar_bundle_slices_with_compression,
-        AvatarBundleCompression, AvatarBundleSlice, BitQuality,
+        AvatarBundleCompression, AvatarBundleSlice, BitQuality, EncodedAvatarBundle,
+        AVATAR_BUNDLE_DICTIONARY_GENERATION,
     },
     avatar_delta::build_delta,
     channels,
@@ -12,12 +13,13 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use rayon::prelude::*;
 use std::{
+    borrow::Borrow,
     collections::HashMap,
     env,
-    hash::{BuildHasherDefault, Hasher},
+    hash::{BuildHasherDefault, Hash, Hasher},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
     thread,
@@ -548,6 +550,211 @@ struct BundleAvatarSend {
 #[derive(Default)]
 struct ReceiverBuildScratch {
     bundle: Vec<BundleAvatarSend>,
+}
+
+const MAX_BUNDLE_CACHE_ENTRIES_PER_TICK: usize = 4096;
+const MAX_BUNDLE_CACHE_BYTES_PER_TICK: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+struct BundleCacheItemIdentity {
+    backing_address: usize,
+    payload_len: usize,
+    channel: u8,
+    patch_offset: usize,
+    patch_byte: u8,
+}
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+struct BundleCacheLookup {
+    flags: u8,
+    zstd_level: i32,
+    raw_len: usize,
+    items: Vec<BundleCacheItemIdentity>,
+}
+
+struct BundleCacheKey {
+    lookup: BundleCacheLookup,
+    // Retain immutable backing allocations for the full cache lifetime so an address
+    // cannot be reused for different payload bytes during this tick.
+    _owners: Vec<Bytes>,
+}
+
+impl Borrow<BundleCacheLookup> for BundleCacheKey {
+    fn borrow(&self) -> &BundleCacheLookup {
+        &self.lookup
+    }
+}
+
+impl Hash for BundleCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.lookup.hash(state);
+    }
+}
+
+impl PartialEq for BundleCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.lookup == other.lookup
+    }
+}
+
+impl Eq for BundleCacheKey {}
+
+impl BundleCacheLookup {
+    fn new(items: &[BundleAvatarSend], compression: AvatarBundleCompression) -> Self {
+        let mut channel_counts = [0u8; 256];
+        let mut raw_len = 0usize;
+        let mut identities = Vec::with_capacity(items.len());
+        for item in items {
+            let count = &mut channel_counts[item.original_channel as usize];
+            if *count == 0 {
+                raw_len += 2; // Channel and group size headers, once per group of 255.
+            }
+            *count = if *count == u8::MAX - 1 { 0 } else { *count + 1 };
+            raw_len += 2 + item.payload.len(); // Item size and patched payload.
+            identities.push(BundleCacheItemIdentity {
+                backing_address: item.payload.as_ptr() as usize,
+                payload_len: item.payload.len(),
+                channel: item.original_channel,
+                patch_offset: item.interval_offset,
+                patch_byte: item.interval_byte,
+            });
+        }
+        let (flags, zstd_level) = match compression {
+            AvatarBundleCompression::Lz4 => (0, 0),
+            AvatarBundleCompression::ZstdDictionary { level } => {
+                (1 | (AVATAR_BUNDLE_DICTIONARY_GENERATION << 3), level)
+            }
+        };
+        Self {
+            flags,
+            zstd_level,
+            raw_len,
+            items: identities,
+        }
+    }
+
+    fn admission_charge(&self) -> usize {
+        // A successful encoded raw payload is at most u16::MAX bytes. Charge twice
+        // that size for either codec's output plus the key's two item vectors and
+        // generous map/cell overhead. Bytes owners share their backing allocations.
+        self.raw_len
+            .saturating_mul(2)
+            .saturating_add(self.items.len().saturating_mul(
+                std::mem::size_of::<BundleCacheItemIdentity>() + std::mem::size_of::<Bytes>(),
+            ))
+            .saturating_add(512)
+    }
+}
+
+struct CachedAvatarBundle {
+    bytes: Bytes,
+    raw_len: usize,
+    compressed_len: usize,
+}
+
+impl From<EncodedAvatarBundle> for CachedAvatarBundle {
+    fn from(encoded: EncodedAvatarBundle) -> Self {
+        Self {
+            bytes: Bytes::from(encoded.bytes),
+            raw_len: encoded.raw_len,
+            compressed_len: encoded.compressed_len,
+        }
+    }
+}
+
+#[derive(Default)]
+struct BundleCacheCell {
+    encoded: OnceLock<CachedAvatarBundle>,
+    build_lock: parking_lot::Mutex<()>,
+}
+
+impl BundleCacheCell {
+    fn get_or_encode(
+        &self,
+        encode: impl FnOnce() -> Result<EncodedAvatarBundle>,
+    ) -> Result<(&CachedAvatarBundle, u64)> {
+        if let Some(encoded) = self.encoded.get() {
+            return Ok((encoded, 0));
+        }
+        let _guard = self.build_lock.lock();
+        if let Some(encoded) = self.encoded.get() {
+            return Ok((encoded, 0));
+        }
+        let started = Instant::now();
+        let encoded = encode()?;
+        let micros = started.elapsed().as_micros() as u64;
+        let _ = self.encoded.set(encoded.into());
+        Ok((
+            self.encoded.get().expect("encoded under build lock"),
+            micros,
+        ))
+    }
+}
+
+struct AvatarBundleCache {
+    entries: DashMap<BundleCacheKey, Arc<BundleCacheCell>>,
+    reserved_entries: AtomicUsize,
+    reserved_bytes: AtomicUsize,
+    entry_limit: usize,
+    byte_limit: usize,
+}
+
+impl Default for AvatarBundleCache {
+    fn default() -> Self {
+        Self {
+            entries: DashMap::new(),
+            reserved_entries: AtomicUsize::new(0),
+            reserved_bytes: AtomicUsize::new(0),
+            entry_limit: MAX_BUNDLE_CACHE_ENTRIES_PER_TICK,
+            byte_limit: MAX_BUNDLE_CACHE_BYTES_PER_TICK,
+        }
+    }
+}
+
+impl AvatarBundleCache {
+    fn cell_for(
+        &self,
+        items: &[BundleAvatarSend],
+        compression: AvatarBundleCompression,
+    ) -> Option<Arc<BundleCacheCell>> {
+        let lookup = BundleCacheLookup::new(items, compression);
+        if let Some(cell) = self.entries.get(&lookup) {
+            return Some(Arc::clone(cell.value()));
+        }
+        let charge = lookup.admission_charge();
+        self.reserved_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(charge)
+                    .filter(|total| *total <= self.byte_limit)
+            })
+            .ok()?;
+        if self
+            .reserved_entries
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < self.entry_limit).then_some(count + 1)
+            })
+            .is_err()
+        {
+            self.reserved_bytes.fetch_sub(charge, Ordering::Relaxed);
+            return None;
+        }
+        let key = BundleCacheKey {
+            lookup,
+            _owners: items.iter().map(|item| item.payload.clone()).collect(),
+        };
+        match self.entries.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                self.reserved_entries.fetch_sub(1, Ordering::Relaxed);
+                self.reserved_bytes.fetch_sub(charge, Ordering::Relaxed);
+                Some(Arc::clone(entry.get()))
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let cell = Arc::new(BundleCacheCell::default());
+                entry.insert(Arc::clone(&cell));
+                Some(cell)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1499,6 +1706,9 @@ impl AvatarSyncSystem {
         self.profiler.add_phase_micros(BsrPhase::Distance, 0);
 
         let build_start = Instant::now();
+        // A tick owns one immutable sender snapshot, so identical bundle chunks can
+        // share their encoded bytes across all receiver builds in this tick.
+        let bundle_cache = AvatarBundleCache::default();
         // Avoid cloning states for receiver_states: par_iter over slice directly.
         // build_sends_for_receiver only needs position from receiver state.
         let offloaded_empty = self.offloaded_pairs.is_empty();
@@ -1522,6 +1732,7 @@ impl AvatarSyncSystem {
                         receiver_plan.update_distances,
                         offloaded_empty,
                         bypass_empty,
+                        &bundle_cache,
                         scratch,
                     )
                 },
@@ -1711,6 +1922,7 @@ impl AvatarSyncSystem {
         update_distances: bool,
         offloaded_empty: bool,
         bypass_empty: bool,
+        bundle_cache: &AvatarBundleCache,
         scratch: &mut ReceiverBuildScratch,
     ) -> Option<OutboundAvatarBatch<'a>> {
         let peer_count = peer_states.len();
@@ -1925,6 +2137,7 @@ impl AvatarSyncSystem {
                 &mut bundle_ratio,
                 &self.profiler,
                 config,
+                bundle_cache,
             );
             self.bundle_ratios.insert(receiver_id, bundle_ratio);
         }
@@ -2169,6 +2382,7 @@ fn emit_greedy_avatar_bundles<'a>(
     bundle_ratio: &mut f32,
     profiler: &BsrProfiler,
     config: &AvatarSyncConfig,
+    bundle_cache: &AvatarBundleCache,
 ) {
     if bundle.is_empty() {
         return;
@@ -2189,7 +2403,15 @@ fn emit_greedy_avatar_bundles<'a>(
             break;
         }
 
-        match try_emit_bundle_range(direct, bundle, cursor, chunk_end, profiler, config) {
+        match try_emit_bundle_range(
+            direct,
+            bundle,
+            cursor,
+            chunk_end,
+            profiler,
+            config,
+            bundle_cache,
+        ) {
             Ok(BundleEmit::Emitted {
                 raw_len,
                 compressed_len,
@@ -2221,7 +2443,15 @@ fn emit_greedy_avatar_bundles<'a>(
                     break;
                 }
                 profiler.add_bundle_retry();
-                match try_emit_bundle_range(direct, bundle, cursor, retry_end, profiler, config) {
+                match try_emit_bundle_range(
+                    direct,
+                    bundle,
+                    cursor,
+                    retry_end,
+                    profiler,
+                    config,
+                    bundle_cache,
+                ) {
                     Ok(BundleEmit::Emitted {
                         raw_len,
                         compressed_len,
@@ -2277,6 +2507,7 @@ fn try_emit_bundle_range<'a>(
     end: usize,
     profiler: &BsrProfiler,
     config: &AvatarSyncConfig,
+    bundle_cache: &AvatarBundleCache,
 ) -> Result<BundleEmit> {
     let slices = bundle[start..end]
         .iter()
@@ -2297,9 +2528,18 @@ fn try_emit_bundle_range<'a>(
         } else {
             AvatarBundleCompression::Lz4
         };
-    let deflate_start = Instant::now();
-    let encoded = try_encode_avatar_bundle_slices_with_compression(&slices, compression)?;
-    let deflate_micros = deflate_start.elapsed().as_micros() as u64;
+    let cell = bundle_cache.cell_for(&bundle[start..end], compression);
+    let encode = || try_encode_avatar_bundle_slices_with_compression(&slices, compression);
+    let (encoded, deflate_micros);
+    let uncached;
+    if let Some(cell) = &cell {
+        (encoded, deflate_micros) = cell.get_or_encode(encode)?;
+    } else {
+        let started = Instant::now();
+        uncached = CachedAvatarBundle::from(encode()?);
+        deflate_micros = started.elapsed().as_micros() as u64;
+        encoded = &uncached;
+    }
     let compressed_len = encoded.compressed_len;
     if encoded.bytes.len() > AVATAR_BUNDLE_WIRE_BUDGET_BYTES {
         return Ok(BundleEmit::Overshot {
@@ -2309,7 +2549,7 @@ fn try_emit_bundle_range<'a>(
     }
     direct.push(OutboundAvatarSend::Owned {
         channel: channels::COMPRESSED_AVATAR_BUNDLE,
-        payload: Bytes::from(encoded.bytes),
+        payload: encoded.bytes.clone(),
         patch: None,
     });
     profiler.add_bundle_emitted(
@@ -2966,6 +3206,159 @@ mod tests {
     use super::*;
     use basis_protocol::avatar::{decode_avatar_bundle, encode_avatar_bundle, AvatarBundleItem};
 
+    #[test]
+    fn bundle_cache_preserves_exact_encoded_bytes_and_patch_identity() {
+        let config = receiver_build_test_config();
+        let profiler = BsrProfiler::new(false);
+        let cache = AvatarBundleCache::default();
+        let mut bundle = (0..6)
+            .map(|index| BundleAvatarSend {
+                original_channel: channels::DELTA_AVATAR,
+                payload: Bytes::from(
+                    (0..80)
+                        .map(|offset| ((index * 37 + offset * 13) % 256) as u8)
+                        .collect::<Vec<_>>(),
+                ),
+                interval_offset: 2,
+                interval_byte: 20,
+            })
+            .collect::<Vec<_>>();
+        let expected = |items: &[BundleAvatarSend]| {
+            let slices = items
+                .iter()
+                .map(|item| AvatarBundleSlice {
+                    original_channel: item.original_channel,
+                    payload: &item.payload,
+                    interval_patch: Some((item.interval_offset, item.interval_byte)),
+                })
+                .collect::<Vec<_>>();
+            try_encode_avatar_bundle_slices_with_compression(&slices, AvatarBundleCompression::Lz4)
+                .unwrap()
+        };
+        let key = BundleCacheLookup::new(&bundle, AvatarBundleCompression::Lz4);
+        assert_eq!(key.raw_len, expected(&bundle).raw_len);
+        assert_eq!(key.flags, expected(&bundle).bytes[0]);
+        for _ in 0..2 {
+            let mut direct = Vec::new();
+            let result = try_emit_bundle_range(
+                &mut direct,
+                &bundle,
+                0,
+                bundle.len(),
+                &profiler,
+                &config,
+                &cache,
+            )
+            .unwrap();
+            assert!(matches!(result, BundleEmit::Emitted { .. }));
+            assert_eq!(direct.len(), 1);
+            assert_eq!(direct[0].payload(), expected(&bundle).bytes);
+        }
+        assert_eq!(cache.entries.len(), 1);
+
+        bundle[0].interval_byte += 1;
+        let mut direct = Vec::new();
+        try_emit_bundle_range(
+            &mut direct,
+            &bundle,
+            0,
+            bundle.len(),
+            &profiler,
+            &config,
+            &cache,
+        )
+        .unwrap();
+        assert_eq!(direct[0].payload(), expected(&bundle).bytes);
+        assert_eq!(cache.entries.len(), 2);
+        assert_ne!(
+            BundleCacheLookup::new(&bundle, AvatarBundleCompression::Lz4),
+            BundleCacheLookup::new(
+                &bundle,
+                AvatarBundleCompression::ZstdDictionary { level: -2 }
+            )
+        );
+    }
+
+    #[test]
+    fn failed_bundle_encoding_is_not_cached() {
+        let cell = BundleCacheCell::default();
+        let mut attempts = 0;
+        assert!(cell
+            .get_or_encode(|| {
+                attempts += 1;
+                anyhow::bail!("transient encode failure")
+            })
+            .is_err());
+        let (encoded, _) = cell
+            .get_or_encode(|| {
+                attempts += 1;
+                Ok(EncodedAvatarBundle {
+                    bytes: vec![1, 2, 3],
+                    raw_len: 5,
+                    compressed_len: 0,
+                })
+            })
+            .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(encoded.bytes.as_ref(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn bundle_cache_budget_falls_back_and_preserves_overshoot() {
+        let mut random = 0x1234_5678u32;
+        let payload = (0..2048)
+            .map(|_| {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                random as u8
+            })
+            .collect::<Vec<_>>();
+        let mut bundle = vec![BundleAvatarSend {
+            original_channel: channels::DELTA_AVATAR,
+            payload: Bytes::from(payload),
+            interval_offset: 2,
+            interval_byte: 20,
+        }];
+        let charge =
+            BundleCacheLookup::new(&bundle, AvatarBundleCompression::Lz4).admission_charge();
+        let cache = AvatarBundleCache {
+            entry_limit: 2,
+            byte_limit: charge,
+            ..AvatarBundleCache::default()
+        };
+        let config = receiver_build_test_config();
+        let profiler = BsrProfiler::new(false);
+        for patch_byte in [20, 21] {
+            bundle[0].interval_byte = patch_byte;
+            let expected = try_encode_avatar_bundle_slices_with_compression(
+                &[AvatarBundleSlice {
+                    original_channel: bundle[0].original_channel,
+                    payload: &bundle[0].payload,
+                    interval_patch: Some((bundle[0].interval_offset, patch_byte)),
+                }],
+                AvatarBundleCompression::Lz4,
+            )
+            .unwrap();
+            assert!(expected.bytes.len() > AVATAR_BUNDLE_WIRE_BUDGET_BYTES);
+            let mut direct = Vec::new();
+            let actual =
+                try_emit_bundle_range(&mut direct, &bundle, 0, 1, &profiler, &config, &cache)
+                    .unwrap();
+            assert!(matches!(
+                actual,
+                BundleEmit::Overshot {
+                    raw_len,
+                    compressed_len
+                } if raw_len == expected.raw_len && compressed_len == expected.compressed_len
+            ));
+            assert!(direct.is_empty());
+        }
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.reserved_entries.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.reserved_bytes.load(Ordering::Relaxed), charge);
+    }
+
     fn receiver_build_test_config() -> AvatarSyncConfig {
         AvatarSyncConfig {
             default_interval_ms: 1,
@@ -3169,6 +3562,7 @@ mod tests {
             .unwrap()
             .1
             .position;
+        let bundle_cache = AvatarBundleCache::default();
         let build = |system: &AvatarSyncSystem, scratch: &mut ReceiverBuildScratch| {
             system.build_sends_for_receiver(
                 receiver,
@@ -3182,6 +3576,7 @@ mod tests {
                 false,
                 true,
                 true,
+                &bundle_cache,
                 scratch,
             )
         };
