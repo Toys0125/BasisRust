@@ -220,7 +220,7 @@ impl Default for ServerConfig {
             enable_avatar_bundle_compression: true,
             avatar_bundle_min_messages: 2,
             avatar_bundle_min_bytes: 128,
-            enable_avatar_bundle_zstd: true,
+            enable_avatar_bundle_zstd: false,
             avatar_bundle_zstd_delta_bundles: false,
             avatar_bundle_zstd_level: -2,
             avatar_bundle_zstd_max_shed_tier: 1,
@@ -692,7 +692,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn defaults_match_current_csharp_server() {
+    fn rust_server_defaults_are_sane() {
         let config = ServerConfig::default();
         assert_eq!(config.peer_limit, u16::MAX as i32);
         assert_eq!(config.set_port, 4296);
@@ -711,6 +711,7 @@ mod tests {
         assert!(config.worlds_locked);
         assert!(!config.avatars_locked);
         assert!(!config.health_include_extended_metrics);
+        assert!(!config.enable_avatar_bundle_zstd);
     }
 
     #[test]
@@ -741,6 +742,7 @@ mod tests {
             Some("0")
         );
         config.set_field("AvatarBundleZstdLevel", "-5").unwrap();
+        config.set_field("EnableAvatarBundleZstd", "true").unwrap();
         config.set_field("ImagePickupRangeMeters", "42.5").unwrap();
         config.set_field("CompanyName", "Custom Company").unwrap();
         config.set_field("ProductName", "Custom Product").unwrap();
@@ -751,6 +753,7 @@ mod tests {
             .set_field("BasisUserRestrictionMode", "blacklist")
             .unwrap();
         assert_eq!(config.avatar_bundle_zstd_level, -5);
+        assert!(config.enable_avatar_bundle_zstd);
         assert_eq!(config.image_pickup_range_meters, 42.5);
         assert_eq!(config.company_name, "Custom Company");
         assert_eq!(config.product_name, "Custom Product");
