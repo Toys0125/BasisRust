@@ -417,6 +417,12 @@ struct ReceiverTracking {
     baseline_quality: u8,
 }
 
+#[derive(Debug, Default)]
+struct ReceiverTrackingState {
+    senders: PeerIdMap<ReceiverTracking>,
+    last_distance_update_ms: Option<u64>,
+}
+
 struct SpatialGrid {
     cell_size: f32,
     cells: HashMap<(i32, i32, i32), Vec<usize>>,
@@ -486,7 +492,6 @@ struct ReceiverCycle {
 struct ReceiverSlicePlan {
     receiver_cycle: usize,
     receivers: Vec<(PeerId, Arc<PlayerAvatarState>)>,
-    update_distances: bool,
     effective_tick_interval_ms: u64,
 }
 
@@ -494,7 +499,6 @@ struct ReceiverSlicePlan {
 struct SliceState {
     slice_count: usize,
     cycle: Option<ReceiverCycle>,
-    last_distance_update: Instant,
     smoothed_tick_micros: u64,
 }
 
@@ -902,7 +906,7 @@ impl AvatarSyncDiagnostics {
     fn maybe_emit(
         &self,
         states: &DashMap<PeerId, Arc<PlayerAvatarState>>,
-        tracking: &DashMap<PeerId, PeerIdMap<ReceiverTracking>>,
+        tracking: &DashMap<PeerId, ReceiverTrackingState>,
     ) {
         let now = Instant::now();
         let mut window = self.state.lock();
@@ -959,7 +963,7 @@ impl AvatarSyncDiagnostics {
             let sender = entry.value();
             let pair = receiver_tracking
                 .as_ref()
-                .and_then(|map| map.get(&sender_id));
+                .and_then(|state| state.senders.get(&sender_id));
             let count = counts.get(&sender_id).copied().unwrap_or_default();
             let (last_seen, last_sent, baseline_quality) = pair
                 .map(|value| {
@@ -1426,7 +1430,7 @@ pub struct AvatarSyncSystem {
     config: Arc<parking_lot::RwLock<AvatarSyncConfig>>,
     states: Arc<DashMap<PeerId, Arc<PlayerAvatarState>>>,
     pending: Arc<DashMap<PeerId, PendingAvatarUpdate>>,
-    tracking: Arc<DashMap<PeerId, PeerIdMap<ReceiverTracking>>>,
+    tracking: Arc<DashMap<PeerId, ReceiverTrackingState>>,
     bundle_ratios: Arc<DashMap<PeerId, f32>>,
     generation: Arc<AtomicU64>,
     monotonic_origin: Instant,
@@ -1457,7 +1461,6 @@ impl AvatarSyncSystem {
             slice_state: Arc::new(parking_lot::Mutex::new(SliceState {
                 slice_count: 1,
                 cycle: None,
-                last_distance_update: Instant::now(),
                 smoothed_tick_micros: 0,
             })),
             payload_pool: Arc::new(BytePool::new()),
@@ -1554,7 +1557,7 @@ impl AvatarSyncSystem {
             self.bypass_reduction_ids.remove(&sender_id);
         }
         for mut receiver in self.tracking.iter_mut() {
-            if let Some(tracking) = receiver.value_mut().get_mut(&sender_id) {
+            if let Some(tracking) = receiver.value_mut().senders.get_mut(&sender_id) {
                 tracking.baseline_keyframe_generation = 0;
                 tracking.baseline_quality = u8::MAX;
                 tracking.last_seen_generation = 0;
@@ -1565,7 +1568,7 @@ impl AvatarSyncSystem {
 
     pub fn request_keyframe(&self, sender_id: PeerId, receiver_id: PeerId) {
         if let Some(mut receiver) = self.tracking.get_mut(&receiver_id) {
-            if let Some(tracking) = receiver.get_mut(&sender_id) {
+            if let Some(tracking) = receiver.senders.get_mut(&sender_id) {
                 tracking.baseline_keyframe_generation = 0;
                 tracking.baseline_quality = u8::MAX;
                 tracking.last_seen_generation = 0;
@@ -1583,7 +1586,7 @@ impl AvatarSyncSystem {
         self.bundle_ratios.remove(&peer_id);
         self.bypass_reduction_ids.remove(&peer_id);
         for mut entry in self.tracking.iter_mut() {
-            entry.value_mut().remove(&peer_id);
+            entry.value_mut().senders.remove(&peer_id);
         }
     }
 
@@ -1739,7 +1742,6 @@ impl AvatarSyncSystem {
                         now_ms,
                         receiver_plan.receiver_cycle,
                         receiver_plan.effective_tick_interval_ms,
-                        receiver_plan.update_distances,
                         offloaded_empty,
                         bypass_empty,
                         &bundle_cache,
@@ -1930,7 +1932,6 @@ impl AvatarSyncSystem {
         now_ms: u64,
         receiver_cycle: usize,
         effective_tick_interval_ms: u64,
-        update_distances: bool,
         offloaded_empty: bool,
         bypass_empty: bool,
         bundle_cache: &AvatarBundleCache,
@@ -1963,6 +1964,15 @@ impl AvatarSyncSystem {
             bundle.reserve_exact(initial_send_capacity);
         }
         let mut receiver_tracking = self.tracking.entry(receiver_id).or_default();
+        // Refresh on this receiver's first eligible build, rather than consuming a
+        // global due flag in whichever slice happens to run at the time. A receiver
+        // cycle longer than the refresh interval therefore refreshes every visit.
+        let update_distances = receiver_tracking
+            .last_distance_update_ms
+            .is_none_or(|last| now_ms.saturating_sub(last) >= DISTANCE_UPDATE_INTERVAL_MS);
+        if update_distances {
+            receiver_tracking.last_distance_update_ms = Some(now_ms);
+        }
         let mut logical_sends = 0u64;
         let mut bundle_ratio = if config.enable_bundle_compression {
             self.bundle_ratios
@@ -1992,20 +2002,23 @@ impl AvatarSyncSystem {
             }
             let bypass_reduction =
                 !bypass_empty && self.bypass_reduction_ids.contains_key(&sender_id);
-            let tracking = receiver_tracking.entry(sender_id).or_insert_with(|| {
-                let dist_sq = distance_sq_position(receiver_position, sender_state.position);
-                let (interval_byte, interval_ms) =
-                    calculate_interval_from_distance_sq(dist_sq, config);
-                ReceiverTracking {
-                    last_seen_generation: 0,
-                    last_sent_ms: 0,
-                    cached_quality_index: quality_from_distance_sq(dist_sq, config),
-                    cached_interval_byte: interval_byte,
-                    cached_interval_ms: interval_ms,
-                    baseline_keyframe_generation: 0,
-                    baseline_quality: u8::MAX,
-                }
-            });
+            let tracking = receiver_tracking
+                .senders
+                .entry(sender_id)
+                .or_insert_with(|| {
+                    let dist_sq = distance_sq_position(receiver_position, sender_state.position);
+                    let (interval_byte, interval_ms) =
+                        calculate_interval_from_distance_sq(dist_sq, config);
+                    ReceiverTracking {
+                        last_seen_generation: 0,
+                        last_sent_ms: 0,
+                        cached_quality_index: quality_from_distance_sq(dist_sq, config),
+                        cached_interval_byte: interval_byte,
+                        cached_interval_ms: interval_ms,
+                        baseline_keyframe_generation: 0,
+                        baseline_quality: u8::MAX,
+                    }
+                });
             if update_distances {
                 let dist_sq = distance_sq_position(receiver_position, sender_state.position);
                 tracking.cached_quality_index = quality_from_distance_sq(dist_sq, config);
@@ -2175,7 +2188,6 @@ impl AvatarSyncSystem {
         config: &AvatarSyncConfig,
     ) -> ReceiverSlicePlan {
         let mut state = self.slice_state.lock();
-        let now = Instant::now();
 
         if peer_states.len() <= 1 {
             // There is no recipient work with zero or one authenticated active avatar.
@@ -2219,17 +2231,11 @@ impl AvatarSyncSystem {
             0
         };
 
-        let update_distances = now.duration_since(state.last_distance_update)
-            >= Duration::from_millis(DISTANCE_UPDATE_INTERVAL_MS);
-        if update_distances {
-            state.last_distance_update = now;
-        }
         let effective_tick_interval_ms =
             AVATAR_TICK_INTERVAL_MS.max(state.smoothed_tick_micros.div_ceil(1_000));
         ReceiverSlicePlan {
             receiver_cycle,
             receivers: selected,
-            update_distances,
             effective_tick_interval_ms,
         }
     }
@@ -3475,6 +3481,167 @@ mod tests {
         map
     }
 
+    #[test]
+    fn distance_cache_refresh_is_due_per_receiver() {
+        let mut config = receiver_build_test_config();
+        config.default_interval_ms = 20;
+        config.high_distance_sq = 100.0;
+        config.medium_distance_sq = 400.0;
+        config.low_distance_sq = 1600.0;
+        config.enable_bundle_compression = false;
+        let system = AvatarSyncSystem::new(config.clone());
+        let mut peers = receiver_build_test_peers(&[]);
+        peers.retain(|(id, _)| *id <= 3);
+        for (_, state) in &mut peers {
+            Arc::make_mut(state).position = [0.0; 3];
+        }
+        Arc::make_mut(&mut peers[2].1).position[0] = 5.0;
+        let build = |receiver, peers: &[(PeerId, Arc<PlayerAvatarState>)], now_ms| {
+            let mut scratch = ReceiverBuildScratch::default();
+            let cache = AvatarBundleCache::default();
+            system.build_sends_for_receiver(
+                receiver,
+                [0.0; 3],
+                AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
+                peers,
+                None,
+                &config,
+                now_ms,
+                1,
+                AVATAR_TICK_INTERVAL_MS,
+                true,
+                true,
+                &cache,
+                &mut scratch,
+            );
+        };
+        let assert_cached = |receiver, distance: f32, quality| {
+            let tracking = system.tracking.get(&receiver).unwrap();
+            let pair = tracking.senders.get(&3).unwrap();
+            assert_eq!(pair.cached_quality_index, quality as u8);
+            let (byte, millis) = calculate_interval_from_distance_sq(distance * distance, &config);
+            assert_eq!(pair.cached_interval_byte, byte);
+            assert_eq!(pair.cached_interval_ms, millis);
+        };
+        build(1, &peers, 0);
+        build(2, &peers, 0);
+        for (step, distance, previous_distance, previous, expected) in [
+            (1, 15.0, 5.0, BitQuality::High, BitQuality::Medium),
+            (2, 30.0, 15.0, BitQuality::Medium, BitQuality::Low),
+            (3, 45.0, 30.0, BitQuality::Low, BitQuality::VeryLow),
+            (4, 5.0, 45.0, BitQuality::VeryLow, BitQuality::High),
+        ] {
+            let sender = Arc::make_mut(&mut peers[2].1);
+            sender.position[0] = distance;
+            sender.generation += 1;
+            let due_ms = step * DISTANCE_UPDATE_INTERVAL_MS;
+            build(1, &peers, due_ms - 1);
+            assert_cached(1, previous_distance, previous);
+            build(1, &peers, due_ms);
+            assert_cached(1, distance, expected);
+        }
+        // Another receiver's refreshes must not consume this receiver's due time.
+        assert_cached(2, 5.0, BitQuality::High);
+        Arc::make_mut(&mut peers[2].1).position[0] = 15.0;
+        build(2, &peers, 2_001);
+        assert_cached(2, 15.0, BitQuality::Medium);
+        system.remove_player(2);
+        assert!(!system.tracking.contains_key(&2));
+        Arc::make_mut(&mut peers[2].1).position[0] = 45.0;
+        build(2, &peers, 2_002);
+        assert_cached(2, 45.0, BitQuality::VeryLow);
+    }
+
+    #[test]
+    fn moving_quality_tiers_refresh_for_every_receiver_in_32_slices() {
+        let mut config = receiver_build_test_config();
+        config.default_interval_ms = 20;
+        config.high_distance_sq = 100.0;
+        config.medium_distance_sq = 400.0;
+        config.low_distance_sq = 1600.0;
+        config.min_receiver_slices = 32;
+        config.max_receiver_slices = 32;
+        config.enable_bundle_compression = false;
+        let system = AvatarSyncSystem::new(config.clone());
+        let sender_id = 63;
+        let mut peers = receiver_build_test_peers_from_ids(0..=sender_id, &[]);
+        for (_, state) in &mut peers {
+            Arc::make_mut(state).position = [0.0; 3];
+        }
+        let mut now_ms = 0;
+        for (distance, quality) in [
+            (5.0, BitQuality::High),
+            (15.0, BitQuality::Medium),
+            (30.0, BitQuality::Low),
+            (45.0, BitQuality::VeryLow),
+            (5.0, BitQuality::High),
+        ] {
+            for (id, state) in &mut peers {
+                let state = Arc::make_mut(state);
+                state.generation += 1;
+                if *id == sender_id {
+                    state.position[0] = distance;
+                }
+            }
+            let mut visited = vec![false; peers.len()];
+            for _ in 0..32 {
+                let plan = system.advance_slice_state(&peers, &config);
+                assert_eq!(plan.receiver_cycle, 32);
+                assert_eq!(plan.receivers.len(), 2);
+                let cache = AvatarBundleCache::default();
+                let mut scratch = ReceiverBuildScratch::default();
+                for (receiver_id, receiver) in &plan.receivers {
+                    assert!(!visited[*receiver_id as usize]);
+                    visited[*receiver_id as usize] = true;
+                    let batch = system
+                        .build_sends_for_receiver(
+                            *receiver_id,
+                            receiver.position,
+                            AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
+                            &peers,
+                            None,
+                            &config,
+                            now_ms,
+                            plan.receiver_cycle,
+                            plan.effective_tick_interval_ms,
+                            true,
+                            true,
+                            &cache,
+                            &mut scratch,
+                        )
+                        .unwrap();
+                    assert_eq!(batch.sends.len(), peers.len() - 1);
+                    if *receiver_id != sender_id {
+                        // Direct sends preserve the peer snapshot's order. The moving
+                        // sender is last, so verify the transmitted quality and interval.
+                        let send = batch.sends.last().unwrap();
+                        assert_eq!(
+                            channels::quality_from_channel(send.channel()),
+                            quality as u8
+                        );
+                        let tracking = system.tracking.get(receiver_id).unwrap();
+                        let pair = tracking.senders.get(&sender_id).unwrap();
+                        assert_eq!(pair.cached_quality_index, quality as u8);
+                        let (byte, millis) =
+                            calculate_interval_from_distance_sq(distance * distance, &config);
+                        assert_eq!(pair.cached_interval_byte, byte);
+                        assert_eq!(pair.cached_interval_ms, millis);
+                        let advertised = advertised_interval_byte(
+                            byte,
+                            millis,
+                            plan.receiver_cycle,
+                            plan.effective_tick_interval_ms,
+                            config.default_interval_ms,
+                        );
+                        assert_eq!(send.interval_patch().unwrap().1, advertised);
+                    }
+                }
+                now_ms += 31;
+            }
+            assert!(visited.into_iter().all(|seen| seen));
+        }
+    }
+
     fn reference_build_delta_packets(
         peer_id: PeerId,
         outbound_sequence: u8,
@@ -3548,9 +3715,15 @@ mod tests {
     fn receiver_build_test_peers(
         changed: &[(PeerId, u64)],
     ) -> Vec<(PeerId, Arc<PlayerAvatarState>)> {
-        (1..=8)
-            .map(|id| id as PeerId)
-            .chain([300])
+        receiver_build_test_peers_from_ids((1..=8).map(|id| id as PeerId).chain([300]), changed)
+    }
+
+    fn receiver_build_test_peers_from_ids(
+        peer_ids: impl IntoIterator<Item = PeerId>,
+        changed: &[(PeerId, u64)],
+    ) -> Vec<(PeerId, Arc<PlayerAvatarState>)> {
+        peer_ids
+            .into_iter()
             .map(|peer_id| {
                 let generation = changed
                     .iter()
@@ -3654,7 +3827,6 @@ mod tests {
                 now_ms,
                 8,
                 4,
-                false,
                 true,
                 true,
                 &bundle_cache,
