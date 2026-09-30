@@ -33,7 +33,7 @@ use crate::p2p::pack_pair;
 
 const DISTANCE_UPDATE_INTERVAL_MS: u64 = 500;
 const AVATAR_TICK_INTERVAL_MS: u64 = 4;
-const RECEIVER_BUILD_MIN_BATCH: usize = 16;
+const RECEIVER_BUILD_MIN_BATCH: usize = 4;
 const RECEIVER_FLUSH_MIN_BATCH: usize = 8;
 const TICK_SPIN_RESERVE_MICROS: u64 = 100;
 const MAX_SLICE_COUNT: usize = 32;
