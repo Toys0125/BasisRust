@@ -17,6 +17,7 @@ use std::{
     collections::HashMap,
     env,
     hash::{BuildHasherDefault, Hash, Hasher},
+    ops::Range,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -2418,8 +2419,7 @@ fn emit_greedy_avatar_bundles<'a>(
         match try_emit_bundle_range(
             direct,
             bundle,
-            cursor,
-            chunk_end,
+            cursor..chunk_end,
             profiler,
             config,
             bundle_cache,
@@ -2458,8 +2458,7 @@ fn emit_greedy_avatar_bundles<'a>(
                 match try_emit_bundle_range(
                     direct,
                     bundle,
-                    cursor,
-                    retry_end,
+                    cursor..retry_end,
                     profiler,
                     config,
                     bundle_cache,
@@ -2516,14 +2515,13 @@ enum BundleEmit {
 fn try_emit_bundle_range<'a>(
     direct: &mut Vec<OutboundAvatarSend<'a>>,
     bundle: &[BundleAvatarSend],
-    start: usize,
-    end: usize,
+    range: Range<usize>,
     profiler: &BsrProfiler,
     config: &AvatarSyncConfig,
     bundle_cache: &AvatarBundleCache,
     wire_budget: usize,
 ) -> Result<BundleEmit> {
-    let slices = bundle[start..end]
+    let slices = bundle[range.clone()]
         .iter()
         .map(|item| AvatarBundleSlice {
             original_channel: item.original_channel,
@@ -2531,7 +2529,7 @@ fn try_emit_bundle_range<'a>(
             interval_patch: Some((item.interval_offset, item.interval_byte)),
         })
         .collect::<Vec<_>>();
-    let delta_only = bundle[start..end]
+    let delta_only = bundle[range.clone()]
         .iter()
         .all(|item| item.original_channel == channels::DELTA_AVATAR);
     let compression =
@@ -2542,7 +2540,7 @@ fn try_emit_bundle_range<'a>(
         } else {
             AvatarBundleCompression::Lz4
         };
-    let cell = bundle_cache.cell_for(&bundle[start..end], compression);
+    let cell = bundle_cache.cell_for(&bundle[range.clone()], compression);
     let encode = || try_encode_avatar_bundle_slices_with_compression(&slices, compression);
     let (encoded, deflate_micros);
     let uncached;
@@ -2567,7 +2565,7 @@ fn try_emit_bundle_range<'a>(
         patch: None,
     });
     profiler.add_bundle_emitted(
-        (end - start) as u64,
+        range.len() as u64,
         encoded.raw_len as u64,
         compressed_len as u64,
         deflate_micros,
@@ -3257,8 +3255,7 @@ mod tests {
             let result = try_emit_bundle_range(
                 &mut direct,
                 &bundle,
-                0,
-                bundle.len(),
+                0..bundle.len(),
                 &profiler,
                 &config,
                 &cache,
@@ -3276,8 +3273,7 @@ mod tests {
         try_emit_bundle_range(
             &mut direct,
             &bundle,
-            0,
-            bundle.len(),
+            0..bundle.len(),
             &profiler,
             &config,
             &cache,
@@ -3344,8 +3340,7 @@ mod tests {
             try_emit_bundle_range(
                 &mut direct,
                 &bundle,
-                0,
-                1,
+                0..1,
                 &profiler,
                 &config,
                 &cache,
@@ -3359,8 +3354,7 @@ mod tests {
             try_emit_bundle_range(
                 &mut direct,
                 &bundle,
-                0,
-                1,
+                0..1,
                 &profiler,
                 &config,
                 &cache,
@@ -3424,8 +3418,7 @@ mod tests {
             let actual = try_emit_bundle_range(
                 &mut direct,
                 &bundle,
-                0,
-                1,
+                0..1,
                 &profiler,
                 &config,
                 &cache,
