@@ -57,6 +57,8 @@ use uuid::Uuid;
 const DEFAULT_WINDOW_SIZE: usize = 128;
 const MAX_SEQUENCE: u16 = 32768;
 const LITENETLIB_INITIAL_MTU: usize = 1024;
+#[cfg(target_os = "linux")]
+const LITENETLIB_MAX_MTU: usize = 1432;
 const LITENETLIB_CHANNELED_HEADER_SIZE: usize = 4;
 const LITENETLIB_FRAGMENT_HEADER_SIZE: usize = 6;
 const LITENETLIB_FRAGMENTED_HEADER_SIZE: usize =
@@ -4215,6 +4217,26 @@ fn shared_receiver_send_pong(fd: RawFd, first_byte: u8, sequence: u16) {
 }
 
 #[cfg(target_os = "linux")]
+fn shared_receiver_send_mtu_ok(fd: RawFd, packet: &mut [u8], connection_number: u8) {
+    if !(LITENETLIB_INITIAL_MTU..=LITENETLIB_MAX_MTU).contains(&packet.len())
+        || packet[0] != (PacketProperty::MtuCheck as u8 | (connection_number << 5))
+    {
+        return;
+    }
+    let mtu = i32::from_le_bytes(packet[1..5].try_into().unwrap());
+    if usize::try_from(mtu).ok() != Some(packet.len())
+        || packet[13..packet.len() - 4].iter().any(|&byte| byte != 0)
+        || packet[packet.len() - 4..] != packet[1..5]
+    {
+        return;
+    }
+    packet[0] = (packet[0] & 0xe0) | PacketProperty::MtuOk as u8;
+    unsafe {
+        libc::send(fd, packet.as_ptr().cast(), packet.len(), libc::MSG_DONTWAIT);
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn shared_receiver_process_merged(client: &BasisClient, fd: RawFd, bytes: &[u8]) {
     let mut pos = 1usize;
     while pos + 2 <= bytes.len() {
@@ -4362,8 +4384,15 @@ fn run_shared_epoll_receiver(
                             }
                             continue;
                         }
+                        p if p == PacketProperty::MtuCheck as u8 => {
+                            shared_receiver_send_mtu_ok(
+                                fd,
+                                &mut buffer[..len],
+                                client.connection_number,
+                            );
+                            continue;
+                        }
                         p if p == PacketProperty::Pong as u8
-                            || p == PacketProperty::MtuCheck as u8
                             || p == PacketProperty::MtuOk as u8 =>
                         {
                             continue;
@@ -6713,6 +6742,62 @@ mod tests {
         shutdown.store(true, Ordering::Relaxed);
         refresh.notify_one();
         let _ = time::timeout(Duration::from_secs(1), task).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shared_receiver_echoes_only_valid_mtu_probe() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut client = test_client(1, server.local_addr().unwrap()).await;
+        Arc::get_mut(&mut client).unwrap().connection_number = 2;
+        let fd = client.socket.as_raw_fd();
+        let make_probe = |mtu: usize| {
+            let mut packet = vec![0u8; mtu];
+            packet[0] = PacketProperty::MtuCheck as u8 | (2 << 5);
+            packet[1..5].copy_from_slice(&(mtu as i32).to_le_bytes());
+            packet[5..13].copy_from_slice(&0x0123_4567_89ab_cdefu64.to_le_bytes());
+            packet[mtu - 4..].copy_from_slice(&(mtu as i32).to_le_bytes());
+            packet
+        };
+        let probe = make_probe(1164);
+
+        let mut bad_size = probe.clone();
+        bad_size[1] ^= 1;
+        let mut bad_trailer = probe.clone();
+        bad_trailer[probe.len() - 1] ^= 1;
+        let mut bad_padding = probe.clone();
+        bad_padding[13] = 1;
+        let mut bad_connection = probe.clone();
+        bad_connection[0] = PacketProperty::MtuCheck as u8 | (1 << 5);
+        for mut invalid in [
+            bad_size,
+            bad_trailer,
+            bad_padding,
+            bad_connection,
+            make_probe(LITENETLIB_INITIAL_MTU - 1),
+            make_probe(LITENETLIB_MAX_MTU + 1),
+        ] {
+            shared_receiver_send_mtu_ok(fd, &mut invalid, 2);
+        }
+        let mut received = [0u8; 2048];
+        assert!(
+            time::timeout(Duration::from_millis(50), server.recv(&mut received))
+                .await
+                .is_err()
+        );
+
+        for mtu in [LITENETLIB_INITIAL_MTU, 1164, LITENETLIB_MAX_MTU] {
+            let mut probe = make_probe(mtu);
+            let mut expected = probe.clone();
+            expected[0] = PacketProperty::MtuOk as u8 | (2 << 5);
+            shared_receiver_send_mtu_ok(fd, &mut probe, 2);
+            let len = time::timeout(Duration::from_secs(1), server.recv(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(len, mtu);
+            assert_eq!(&received[..len], expected);
+        }
     }
 
     #[cfg(target_os = "linux")]

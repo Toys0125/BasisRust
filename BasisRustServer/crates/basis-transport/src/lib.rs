@@ -422,6 +422,28 @@ impl MtuProbeState {
     }
 }
 
+fn try_send_mtu_probe(
+    state: &mut MtuProbeState,
+    now: Instant,
+    connection_number: u8,
+    mut send: impl FnMut(&[u8]) -> Result<bool>,
+) -> Result<()> {
+    let previous_pending = state.pending;
+    let Some(packet) = state.next_packet(now, connection_number) else {
+        return Ok(());
+    };
+    match send(&packet) {
+        Ok(true) => Ok(()),
+        result => {
+            // No new token was sent. Keep any earlier in-flight probe valid, and retry this
+            // step after the usual interval without spending an attempt.
+            state.attempts -= 1;
+            state.pending = previous_pending;
+            result.map(|_| ())
+        }
+    }
+}
+
 impl PeerState {
     fn total_pending(&self) -> usize {
         self.pending_total.load(Ordering::Relaxed)
@@ -2530,10 +2552,14 @@ async fn reliable_maintenance_loop(handle: TransportHandle) {
         for peer in handle.peers.iter() {
             let addr = peer.addr;
             let connection_number = peer.connection_number;
-            if let Some(probe) = peer.mtu_probe.lock().next_packet(now, connection_number) {
-                // A failed or blocked probe simply times out and retries. It never raises MTU.
-                let _ = handle.try_send_raw_to(&probe, addr);
-            }
+            // Hold the state lock through the nonblocking send so a response cannot replace the
+            // pending token between preparation and send bookkeeping.
+            let _ = try_send_mtu_probe(
+                &mut peer.mtu_probe.lock(),
+                now,
+                connection_number,
+                |probe| handle.try_send_raw_to(probe, addr),
+            );
             builder.reset(connection_number);
             let Some(_send_turn) = try_peer_send_turn(&peer) else {
                 continue;
@@ -4186,6 +4212,65 @@ mod tests {
             )
             .is_none());
         assert_eq!(failed.next_step, LITENETLIB_MTU_STEPS.len());
+    }
+
+    #[tokio::test]
+    async fn blocked_mtu_probes_do_not_use_attempts_or_replace_sent_token() {
+        let (server, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let client = UdpSocket::bind(loopback_addr(0)).await.unwrap();
+        let addr = client.local_addr().unwrap();
+        let now = Instant::now();
+        let mut probe = MtuProbeState::new(now);
+        server.test_blocked_send_addrs.write().insert(addr);
+        for interval in 1..=MAX_MTU_PROBE_ATTEMPTS {
+            try_send_mtu_probe(
+                &mut probe,
+                now + MTU_PROBE_INTERVAL * u32::from(interval),
+                2,
+                |packet| server.try_send_raw_to(packet, addr),
+            )
+            .unwrap();
+            assert_eq!(probe.attempts, 0);
+            assert_eq!(probe.pending, None);
+            assert_eq!(probe.next_step, 1);
+        }
+
+        server.test_blocked_send_addrs.write().remove(&addr);
+        server.socket.writable().await.unwrap();
+        try_send_mtu_probe(
+            &mut probe,
+            now + MTU_PROBE_INTERVAL * u32::from(MAX_MTU_PROBE_ATTEMPTS + 1),
+            2,
+            |packet| server.try_send_raw_to(packet, addr),
+        )
+        .unwrap();
+        let mut received = [0u8; 2048];
+        let (len, _) = time::timeout(Duration::from_secs(1), client.recv_from(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut response = received[..len].to_vec();
+        response[0] = PacketProperty::MtuOk as u8 | (2 << 5);
+        assert_eq!(probe.attempts, 1);
+        let sent_token = probe.pending;
+
+        server.test_blocked_send_addrs.write().insert(addr);
+        try_send_mtu_probe(
+            &mut probe,
+            now + MTU_PROBE_INTERVAL * u32::from(MAX_MTU_PROBE_ATTEMPTS + 2),
+            2,
+            |packet| server.try_send_raw_to(packet, addr),
+        )
+        .unwrap();
+        assert_eq!(probe.pending, sent_token);
+        assert_eq!(probe.attempts, 1);
+        let mut forged = response.clone();
+        forged[5] ^= 1;
+        assert_eq!(probe.accept_response(&forged, 2), None);
+        assert_eq!(probe.accept_response(&response, 1), None);
+        assert_eq!(probe.accept_response(&response, 2), Some(len));
+        assert_eq!(probe.accept_response(&response, 2), None);
+        server.shutdown();
     }
 
     #[tokio::test]
