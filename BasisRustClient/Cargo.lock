@@ -135,6 +135,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "parking_lot",
+ "rand 0.8.6",
  "socket2 0.5.10",
  "thiserror",
  "tokio",

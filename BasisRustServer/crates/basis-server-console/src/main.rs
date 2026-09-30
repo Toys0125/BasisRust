@@ -215,21 +215,19 @@ impl ConsoleHelper {
         }
 
         match completed[0].to_ascii_lowercase().as_str() {
-            "/status" => {
-                if completed.len() == 1 {
-                    return Ok((
-                        current_start,
-                        filter_pairs(
-                            current,
-                            [
-                                ("live", "live  - continuously refresh status"),
-                                ("watch", "watch  - alias for live"),
-                                ("verbose", "verbose  - detailed counters"),
-                                ("-v", "-v  - alias for verbose"),
-                            ],
-                        ),
-                    ));
-                }
+            "/status" if completed.len() == 1 => {
+                return Ok((
+                    current_start,
+                    filter_pairs(
+                        current,
+                        [
+                            ("live", "live  - continuously refresh status"),
+                            ("watch", "watch  - alias for live"),
+                            ("verbose", "verbose  - detailed counters"),
+                            ("-v", "-v  - alias for verbose"),
+                        ],
+                    ),
+                ));
             }
             "/config" => {
                 if completed.len() == 1 {

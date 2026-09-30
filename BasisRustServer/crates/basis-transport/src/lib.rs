@@ -32,6 +32,10 @@ const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 const SOCKET_TTL: u32 = 255;
 const MAX_MERGED_PACKET_SIZE: usize = 1200;
 const LITENETLIB_INITIAL_MTU: usize = 1024;
+// The LiteNetLib client accepts this ladder. Grow only after it echoes our exact probe.
+const LITENETLIB_MTU_STEPS: [usize; 6] = [1024, 1164, 1392, 1404, 1424, 1432];
+const MTU_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_MTU_PROBE_ATTEMPTS: u8 = 4;
 const LITENETLIB_CHANNELED_HEADER_SIZE: usize = 4;
 const LITENETLIB_FRAGMENT_HEADER_SIZE: usize = 6;
 const LITENETLIB_FRAGMENTED_HEADER_SIZE: usize =
@@ -341,11 +345,103 @@ struct PeerState {
     /// Mirror of the total length of every `pending_reliable` queue. Kept as a counter so the
     /// overflow guard and the status line stay O(1) instead of walking every in-flight packet.
     pending_total: AtomicUsize,
+    /// Datagrams not yet accepted by the kernel. Kept per peer so one full socket send queue
+    /// cannot block dispatch to other peers or lose ACKs cleared while building the batch.
+    /// Both producers share `reliable_send_turn`; a blocked retry skips batch construction, so
+    /// this holds at most one batch, bounded by MAX_PENDING_RELIABLE_PER_PEER reliable packets
+    /// plus dirty ACKs for at most 256 channel IDs.
+    pending_datagrams: parking_lot::Mutex<VecDeque<Vec<u8>>>,
+    /// The dispatcher and retransmit loop share one peer send queue. A nonblocking try-lock
+    /// gives one loop exclusive ownership for a peer turn without making either loop wait.
+    reliable_send_turn: parking_lot::Mutex<()>,
     outgoing_reliable: parking_lot::Mutex<HashMap<u8, VecDeque<OutgoingReliable>>>,
     outgoing_acks: parking_lot::Mutex<HashMap<u8, AckState>>,
     /// Set whenever this peer has queued payloads, in-flight packets, or dirty ACKs. The
     /// dispatch loop skips peers without it, so a settled server stops paying per-peer polling cost.
     reliable_active: AtomicBool,
+    confirmed_mtu: AtomicUsize,
+    mtu_probe: parking_lot::Mutex<MtuProbeState>,
+}
+
+#[derive(Debug)]
+struct MtuProbeState {
+    next_step: usize,
+    attempts: u8,
+    next_at: Instant,
+    pending: Option<(usize, u64)>,
+}
+
+impl MtuProbeState {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_step: 1,
+            attempts: 0,
+            next_at: now + MTU_PROBE_INTERVAL,
+            pending: None,
+        }
+    }
+
+    fn next_packet(&mut self, now: Instant, connection_number: u8) -> Option<Vec<u8>> {
+        if now < self.next_at || self.next_step >= LITENETLIB_MTU_STEPS.len() {
+            return None;
+        }
+        if self.attempts >= MAX_MTU_PROBE_ATTEMPTS {
+            self.next_step = LITENETLIB_MTU_STEPS.len();
+            self.pending = None;
+            return None;
+        }
+        let mtu = LITENETLIB_MTU_STEPS[self.next_step];
+        let token = rand::random::<u64>();
+        self.attempts += 1;
+        self.next_at = now + MTU_PROBE_INTERVAL;
+        self.pending = Some((mtu, token));
+        let mut packet = vec![0; mtu];
+        packet[0] = PacketProperty::MtuCheck as u8 | (connection_number << 5);
+        packet[1..5].copy_from_slice(&(mtu as i32).to_le_bytes());
+        packet[5..13].copy_from_slice(&token.to_le_bytes());
+        packet[mtu - 4..].copy_from_slice(&(mtu as i32).to_le_bytes());
+        Some(packet)
+    }
+
+    fn accept_response(&mut self, bytes: &[u8], connection_number: u8) -> Option<usize> {
+        let (mtu, token) = self.pending?;
+        if bytes.len() != mtu
+            || bytes[0] != (PacketProperty::MtuOk as u8 | (connection_number << 5))
+            || bytes[1..5] != (mtu as i32).to_le_bytes()
+            || bytes[5..13] != token.to_le_bytes()
+            || bytes[13..mtu - 4].iter().any(|&byte| byte != 0)
+            || bytes[mtu - 4..] != (mtu as i32).to_le_bytes()
+        {
+            return None;
+        }
+        self.pending = None;
+        self.next_step += 1;
+        self.attempts = 0;
+        self.next_at = Instant::now() + MTU_PROBE_INTERVAL;
+        Some(mtu)
+    }
+}
+
+fn try_send_mtu_probe(
+    state: &mut MtuProbeState,
+    now: Instant,
+    connection_number: u8,
+    mut send: impl FnMut(&[u8]) -> Result<bool>,
+) -> Result<()> {
+    let previous_pending = state.pending;
+    let Some(packet) = state.next_packet(now, connection_number) else {
+        return Ok(());
+    };
+    match send(&packet) {
+        Ok(true) => Ok(()),
+        result => {
+            // No new token was sent. Keep any earlier in-flight probe valid, and retry this
+            // step after the usual interval without spending an attempt.
+            state.attempts -= 1;
+            state.pending = previous_pending;
+            result.map(|_| ())
+        }
+    }
 }
 
 impl PeerState {
@@ -365,6 +461,10 @@ impl PeerState {
     /// Keep all producer locks held through the clear so a concurrent producer either becomes
     /// visible here or sets the flag again after publishing its work.
     fn refresh_reliable_active(&self) {
+        let datagrams = self.pending_datagrams.lock();
+        if !datagrams.is_empty() {
+            return;
+        }
         let pending = self.pending_reliable.lock();
         if pending.values().any(|queue| !queue.is_empty()) {
             return;
@@ -429,6 +529,8 @@ pub struct TransportHandle {
     retired_peer_ids: Arc<parking_lot::Mutex<HashSet<PeerId>>>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<TransportStats>,
+    #[cfg(test)]
+    test_blocked_send_addrs: Arc<parking_lot::RwLock<HashSet<SocketAddr>>>,
 }
 
 impl TransportHandle {
@@ -463,6 +565,8 @@ impl TransportHandle {
                 enable_statistics,
                 enable_extended_statistics,
             )),
+            #[cfg(test)]
+            test_blocked_send_addrs: Arc::new(parking_lot::RwLock::new(HashSet::new())),
         };
         for _ in 0..udp_receive_worker_count() {
             tokio::spawn(read_loop(handle.clone(), tx.clone()));
@@ -479,6 +583,15 @@ impl TransportHandle {
 
     pub fn connected_peers_count(&self) -> usize {
         self.peers.len()
+    }
+
+    /// The outbound datagram size confirmed for this peer. Until an exact MTU probe reply,
+    /// retain the transport's previous 1200-byte packing limit.
+    pub fn peer_mtu(&self, peer: PeerId) -> usize {
+        self.peers
+            .get(&peer)
+            .map(|state| state.confirmed_mtu.load(Ordering::Relaxed))
+            .unwrap_or(MAX_MERGED_PACKET_SIZE)
     }
 
     pub fn shutdown(&self) {
@@ -608,6 +721,15 @@ impl TransportHandle {
     }
 
     fn try_send_raw_to(&self, bytes: &[u8], addr: SocketAddr) -> Result<bool> {
+        #[cfg(test)]
+        if self.test_blocked_send_addrs.read().contains(&addr) {
+            if self.statistics_enabled() {
+                self.stats
+                    .raw_send_would_block
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(false);
+        }
         match self.socket.try_send_to(bytes, addr) {
             Ok(sent) => {
                 if self.statistics_enabled() {
@@ -657,9 +779,13 @@ impl TransportHandle {
             next_fragment_id: AtomicU16::new(0),
             pending_reliable: parking_lot::Mutex::new(HashMap::new()),
             pending_total: AtomicUsize::new(0),
+            pending_datagrams: parking_lot::Mutex::new(VecDeque::new()),
+            reliable_send_turn: parking_lot::Mutex::new(()),
             outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
             outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
             reliable_active: AtomicBool::new(false),
+            confirmed_mtu: AtomicUsize::new(MAX_MERGED_PACKET_SIZE),
+            mtu_probe: parking_lot::Mutex::new(MtuProbeState::new(Instant::now())),
         });
         self.by_addr.insert(request.remote_addr, id);
         self.peers.insert(id, state);
@@ -843,7 +969,8 @@ impl TransportHandle {
         }
 
         let mut sent = 0usize;
-        let mut current = Vec::with_capacity(MAX_MERGED_PACKET_SIZE);
+        let mtu = state.confirmed_mtu.load(Ordering::Relaxed);
+        let mut current = Vec::with_capacity(mtu);
         current.push(PacketProperty::Merged as u8 | (state.connection_number << 5));
         let mut current_count = 0usize;
 
@@ -851,7 +978,7 @@ impl TransportHandle {
             let payload = packet.payload();
             let packet_len = payload.len() + 2;
             let framed_len = packet_len + 2;
-            if current_count > 0 && current.len() + framed_len > MAX_MERGED_PACKET_SIZE {
+            if current_count > 0 && current.len() + framed_len > mtu {
                 if self.try_send_raw_to(&current, state.addr)? {
                     sent += 1;
                 }
@@ -860,7 +987,7 @@ impl TransportHandle {
                 current_count = 0;
             }
 
-            if framed_len + 1 > MAX_MERGED_PACKET_SIZE {
+            if framed_len + 1 > mtu {
                 let mut oversized = Vec::with_capacity(packet_len);
                 oversized.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
                 oversized.push(packet.channel());
@@ -1065,10 +1192,11 @@ fn dequeue_reliable_window(
     next_sequence: u16,
     pending: &VecDeque<PendingReliable>,
     outgoing: &mut VecDeque<OutgoingReliable>,
+    max_count: usize,
 ) -> Vec<OutgoingReliable> {
     let capacity =
         reliable_window_capacity(next_sequence, pending.front().map(|item| item.sequence));
-    let count = capacity.min(outgoing.len());
+    let count = capacity.min(outgoing.len()).min(max_count);
     (0..count).filter_map(|_| outgoing.pop_front()).collect()
 }
 
@@ -1438,7 +1566,15 @@ async fn process_packet(
         PacketProperty::MtuOk => {
             if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
                 if let Some(peer) = handle.peers.get(&peer_id) {
-                    *peer.last_seen.lock() = Instant::now();
+                    if let Some(mtu) = peer
+                        .mtu_probe
+                        .lock()
+                        .accept_response(bytes, peer.connection_number)
+                    {
+                        peer.confirmed_mtu
+                            .store(mtu.max(MAX_MERGED_PACKET_SIZE), Ordering::Relaxed);
+                        *peer.last_seen.lock() = Instant::now();
+                    }
                 }
             }
         }
@@ -2287,6 +2423,9 @@ async fn reliable_dispatch_loop(handle: TransportHandle) {
             if !peer.reliable_active.load(Ordering::Acquire) {
                 continue;
             }
+            let Some(_send_turn) = try_peer_send_turn(&peer) else {
+                continue;
+            };
             if handle.extended_statistics_enabled() {
                 handle
                     .stats
@@ -2296,6 +2435,9 @@ async fn reliable_dispatch_loop(handle: TransportHandle) {
             let addr = peer.addr;
             let connection_number = peer.connection_number;
             builder.reset(connection_number);
+            if !retry_peer_datagrams(&peer, &handle, addr) {
+                continue;
+            }
 
             // 1. Release ACKs that have new bits. Unchanged windows are skipped entirely, so a
             //    quiet channel costs one bool check instead of a packet rebuild.
@@ -2328,7 +2470,15 @@ async fn reliable_dispatch_loop(handle: TransportHandle) {
                 let pending = peer.pending_reliable.lock();
                 let mut outgoing = peer.outgoing_reliable.lock();
                 let mut newly_queued = Vec::new();
+                // Keep the datagram batch in one-to-one correspondence with tracked in-flight
+                // packets. Without an aggregate budget, 128 slots from every channel could be
+                // moved here before record_pending_reliable evicts past its per-peer cap.
+                let mut remaining = MAX_PENDING_RELIABLE_PER_PEER
+                    .saturating_sub(peer.pending_total.load(Ordering::Relaxed));
                 for (channel_id, queue) in outgoing.iter_mut() {
+                    if remaining == 0 {
+                        break;
+                    }
                     let next_sequence = peer
                         .next_reliable_sequence
                         .lock()
@@ -2347,9 +2497,10 @@ async fn reliable_dispatch_loop(handle: TransportHandle) {
                             .reliable_window_stalls
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    for payload in dequeue_reliable_window(next_sequence, in_flight, queue) {
-                        newly_queued.push((*channel_id, payload));
-                    }
+                    let payloads =
+                        dequeue_reliable_window(next_sequence, in_flight, queue, remaining);
+                    remaining = remaining.saturating_sub(payloads.len());
+                    newly_queued.extend(payloads.into_iter().map(|payload| (*channel_id, payload)));
                 }
                 newly_queued
             };
@@ -2380,7 +2531,9 @@ async fn reliable_dispatch_loop(handle: TransportHandle) {
                 peer.refresh_reliable_active();
             }
 
-            builder.flush(&handle, addr).await;
+            // A single UDP send must not park the global dispatcher. Preserve unsent datagrams
+            // on this peer and let later peers progress; the next pass retries this peer first.
+            builder.flush_for_peer(&peer, &handle, addr);
         }
     }
 }
@@ -2399,7 +2552,21 @@ async fn reliable_maintenance_loop(handle: TransportHandle) {
         for peer in handle.peers.iter() {
             let addr = peer.addr;
             let connection_number = peer.connection_number;
+            // Hold the state lock through the nonblocking send so a response cannot replace the
+            // pending token between preparation and send bookkeeping.
+            let _ = try_send_mtu_probe(
+                &mut peer.mtu_probe.lock(),
+                now,
+                connection_number,
+                |probe| handle.try_send_raw_to(probe, addr),
+            );
             builder.reset(connection_number);
+            let Some(_send_turn) = try_peer_send_turn(&peer) else {
+                continue;
+            };
+            if !retry_peer_datagrams(&peer, &handle, addr) {
+                continue;
+            }
 
             {
                 let mut last_ping = peer.last_ping_sent.lock();
@@ -2436,7 +2603,7 @@ async fn reliable_maintenance_loop(handle: TransportHandle) {
                 }
             }
 
-            builder.flush(&handle, addr).await;
+            builder.flush_for_peer(&peer, &handle, addr);
         }
     }
 }
@@ -2517,15 +2684,54 @@ impl MergedDatagramBuilder {
         self.count = 0;
     }
 
-    async fn flush(&mut self, handle: &TransportHandle, addr: SocketAddr) {
+    fn flush_for_peer(
+        &mut self,
+        peer: &PeerState,
+        handle: &TransportHandle,
+        addr: SocketAddr,
+    ) -> bool {
         self.seal_datagram();
-        for datagram in self.datagrams.drain(..) {
-            if datagram.is_empty() {
-                continue;
+        if !self.datagrams.is_empty() {
+            peer.pending_datagrams
+                .lock()
+                .extend(self.datagrams.drain(..));
+            peer.reliable_active.store(true, Ordering::Release);
+        }
+        retry_peer_datagrams(peer, handle, addr)
+    }
+
+    #[cfg(test)]
+    fn flush_with(&mut self, peer: &PeerState, mut try_send: impl FnMut(&[u8]) -> bool) -> bool {
+        self.seal_datagram();
+        peer.pending_datagrams
+            .lock()
+            .extend(self.datagrams.drain(..));
+        peer_send_turn(peer, |datagram| Ok(try_send(datagram)))
+    }
+}
+
+/// Attempt a peer's queued UDP datagrams without waiting for socket writability. A WouldBlock
+/// leaves the entire unsent suffix queued for its next fair turn; permanent socket errors retain
+/// the historical drop behavior because UDP cannot be partially sent.
+fn retry_peer_datagrams(peer: &PeerState, handle: &TransportHandle, addr: SocketAddr) -> bool {
+    peer_send_turn(peer, |datagram| handle.try_send_raw_to(datagram, addr))
+}
+
+fn try_peer_send_turn(peer: &PeerState) -> Option<parking_lot::MutexGuard<'_, ()>> {
+    peer.reliable_send_turn.try_lock()
+}
+
+fn peer_send_turn(peer: &PeerState, mut try_send: impl FnMut(&[u8]) -> Result<bool>) -> bool {
+    let mut pending = peer.pending_datagrams.lock();
+    while let Some(datagram) = pending.front() {
+        match try_send(datagram) {
+            Ok(true) | Err(_) => {
+                pending.pop_front();
             }
-            let _ = handle.send_raw_to(&datagram, addr).await;
+            Ok(false) => return false,
         }
     }
+    true
 }
 
 fn relative_sequence(seq: u16, expected: u16) -> i32 {
@@ -2569,6 +2775,250 @@ pub fn channel_name(channel: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_peer_retains_reliable_and_ack_datagrams_without_stalling_next_peer() {
+        let blocked = test_peer_state(1);
+        let later = test_peer_state(2);
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let built = build_queued_reliable_packet(
+            &blocked,
+            channel_id,
+            OutgoingReliable {
+                payload: vec![0x5a],
+                fragment: None,
+            },
+        );
+        record_pending_reliable(
+            &blocked,
+            channel_id,
+            built.sequence,
+            built.bytes.clone(),
+            None,
+        );
+
+        // Match dispatch's ACK collection: once encoded, the ACK is no longer dirty. The
+        // datagram itself must remain queued until the kernel accepts it.
+        queue_ack(&blocked, channel_id, 7);
+        let ack_packet = {
+            let mut acks = blocked.outgoing_acks.lock();
+            let ack = acks.get_mut(&channel_id).unwrap();
+            assert!(ack_bit(&ack.bits, 7));
+            let packet = build_ack_packet(
+                blocked.connection_number,
+                channel_id,
+                ack.window_start,
+                &ack.bits,
+            );
+            ack.dirty = false;
+            packet
+        };
+
+        let mut blocked_batch = MergedDatagramBuilder::new();
+        blocked_batch.push(&built.bytes);
+        blocked_batch.push(&ack_packet);
+        let mut attempted = None;
+        let _blocked_turn = try_peer_send_turn(&blocked).expect("first peer turn is free");
+        assert!(!blocked_batch.flush_with(&blocked, |datagram| {
+            attempted = Some(datagram.to_vec());
+            false // deterministic kernel WouldBlock
+        }));
+        assert_eq!(blocked.pending_datagrams.lock().len(), 1);
+        assert!(blocked.reliable_active.load(Ordering::Acquire));
+        assert_eq!(
+            blocked.pending_reliable.lock()[&channel_id][0].bytes,
+            built.bytes
+        );
+
+        // The dispatcher can visit another peer immediately while the first peer remains
+        // blocked. This is the head-of-line condition the old awaited flush could not pass.
+        assert!(try_peer_send_turn(&blocked).is_none());
+        let mut later_batch = MergedDatagramBuilder::new();
+        later_batch.push(&[0x33]);
+        let mut later_sent = false;
+        let _later_turn = try_peer_send_turn(&later).expect("later peer has its own turn");
+        assert!(later_batch.flush_with(&later, |_| {
+            later_sent = true;
+            true
+        }));
+        assert!(later_sent);
+
+        // On the next fair turn, retry the exact retained datagram and then allow its reliable
+        // packet to be retired by the matching ACK.
+        drop(_blocked_turn);
+        let _blocked_retry_turn = try_peer_send_turn(&blocked).expect("next peer turn is free");
+        let mut retried = None;
+        assert!(peer_send_turn(&blocked, |datagram| {
+            retried = Some(datagram.to_vec());
+            Ok(true)
+        }));
+        assert_eq!(retried, attempted);
+        assert!(blocked.pending_datagrams.lock().is_empty());
+        assert!(!blocked.outgoing_acks.lock()[&channel_id].dirty);
+
+        let mut ack = build_ack_packet(
+            blocked.connection_number,
+            channel_id,
+            built.sequence,
+            &[1; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2],
+        );
+        // Keep only the bit for the sent sequence set.
+        ack[4..].fill(0);
+        ack[4 + (built.sequence as usize / 8)] |= 1 << (built.sequence % 8);
+        process_ack(&blocked, &ack, None);
+        assert_eq!(blocked.total_pending(), 0);
+    }
+
+    #[tokio::test]
+    async fn blocked_udp_send_preserves_dispatch_fairness_and_ack_delivery() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let client_a = UdpSocket::bind(loopback_addr(0)).await.unwrap();
+        let client_b = UdpSocket::bind(loopback_addr(0)).await.unwrap();
+        let addr_a = client_a.local_addr().unwrap();
+        let addr_b = client_b.local_addr().unwrap();
+        let peer_a = handle
+            .accept(&ConnectionRequest {
+                remote_addr: addr_a,
+                payload: Bytes::new(),
+                connection_number: 0,
+                connect_time: 1,
+                local_peer_id: 0,
+            })
+            .await
+            .unwrap();
+        let peer_b = handle
+            .accept(&ConnectionRequest {
+                remote_addr: addr_b,
+                payload: Bytes::new(),
+                connection_number: 0,
+                connect_time: 2,
+                local_peer_id: 0,
+            })
+            .await
+            .unwrap();
+        let state_a = handle.peers.get(&peer_a).unwrap().clone();
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+
+        // Clear the two ConnectAccept packets before the actual dispatcher starts.
+        let mut buf = vec![0; 65_535];
+        for client in [&client_a, &client_b] {
+            tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+                .await
+                .expect("ConnectAccept timed out")
+                .unwrap();
+        }
+
+        // This test-only fault injection makes try_send_to report WouldBlock for exactly one
+        // peer while the real reliable dispatcher, maintenance loop, and UDP receive loops run.
+        handle.test_blocked_send_addrs.write().insert(addr_a);
+        handle
+            .send(
+                peer_a,
+                channels::CHAT,
+                DeliveryMethod::ReliableOrdered,
+                &[0x5a],
+            )
+            .await
+            .unwrap();
+        handle
+            .send(
+                peer_b,
+                channels::CHAT,
+                DeliveryMethod::ReliableOrdered,
+                &[0x6b],
+            )
+            .await
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut b_received = false;
+        while Instant::now() < deadline && !b_received {
+            if let Ok(Ok((len, _))) =
+                tokio::time::timeout(Duration::from_millis(100), client_b.recv_from(&mut buf)).await
+            {
+                let mut seen = HashSet::new();
+                let mut arrived = Vec::new();
+                collect_reliable_sequences(&buf[..len], &mut seen, &mut arrived);
+                b_received = !arrived.is_empty();
+            }
+        }
+        assert!(
+            b_received,
+            "the later peer must receive despite peer A's WouldBlock"
+        );
+        assert_eq!(state_a.pending_datagrams.lock().len(), 1);
+        assert_eq!(state_a.total_queued(), 0);
+
+        // While A is blocked, its incoming reliable packet queues a server ACK. The dispatcher
+        // must leave that ACK dirty and avoid growing A's retained batch on subsequent turns.
+        let inbound = vec![PacketProperty::Channeled as u8, 0, 0, channel_id, 0x31];
+        client_a
+            .send_to(&inbound, handle.local_addr().unwrap())
+            .await
+            .unwrap();
+        let ack_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < ack_deadline
+            && !state_a
+                .outgoing_acks
+                .lock()
+                .get(&channel_id)
+                .is_some_and(|ack| ack.dirty)
+        {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(state_a.outgoing_acks.lock()[&channel_id].dirty);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(state_a.pending_datagrams.lock().len(), 1);
+
+        // Acknowledge B's first send, then allow A's send queue to recover.
+        let mut ack_b = vec![PacketProperty::Ack as u8, 0, 0, channel_id];
+        ack_b.extend_from_slice(&[1; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2]);
+        client_b
+            .send_to(&ack_b, handle.local_addr().unwrap())
+            .await
+            .unwrap();
+        handle.test_blocked_send_addrs.write().remove(&addr_a);
+
+        let mut a_received_reliable = false;
+        let mut a_received_ack = false;
+        let retry_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < retry_deadline && !(a_received_reliable && a_received_ack) {
+            if let Ok(Ok((len, _))) =
+                tokio::time::timeout(Duration::from_millis(100), client_a.recv_from(&mut buf)).await
+            {
+                let packet = &buf[..len];
+                let mut seen = HashSet::new();
+                let mut arrived = Vec::new();
+                collect_reliable_sequences(packet, &mut seen, &mut arrived);
+                a_received_reliable |= !arrived.is_empty();
+                a_received_ack |= packet_has_ack(packet, channel_id, 0);
+            }
+        }
+        assert!(
+            a_received_reliable,
+            "peer A's reliable datagram must be retried"
+        );
+        assert!(
+            a_received_ack,
+            "peer A's pending ACK must be delivered after recovery"
+        );
+
+        let mut ack_a = vec![PacketProperty::Ack as u8, 0, 0, channel_id];
+        ack_a.extend_from_slice(&[1; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2]);
+        client_a
+            .send_to(&ack_a, handle.local_addr().unwrap())
+            .await
+            .unwrap();
+        let clear_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < clear_deadline && handle.pending_reliable_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(handle.pending_reliable_count(), 0);
+        assert!(state_a.pending_datagrams.lock().is_empty());
+        handle.shutdown();
+    }
 
     #[test]
     fn packet_property_masks_connection_number() {
@@ -3233,7 +3683,8 @@ mod tests {
         ]);
         {
             let pending = hole.pending_reliable.lock();
-            let drained = dequeue_reliable_window(128, &pending[&channel_id], &mut outgoing);
+            let drained =
+                dequeue_reliable_window(128, &pending[&channel_id], &mut outgoing, usize::MAX);
             assert!(drained.is_empty());
             assert_eq!(
                 outgoing.len(),
@@ -3244,7 +3695,7 @@ mod tests {
         process_ack(&hole, &ack(channel_id, 0, 0, 127), None);
         {
             let pending = hole.pending_reliable.lock();
-            let drained = dequeue_reliable_window(128, &VecDeque::new(), &mut outgoing);
+            let drained = dequeue_reliable_window(128, &VecDeque::new(), &mut outgoing, usize::MAX);
             assert_eq!(
                 drained.len(),
                 2,
@@ -3671,6 +4122,35 @@ mod tests {
         usize::from(seen.insert(sequence))
     }
 
+    fn packet_has_ack(datagram: &[u8], channel_id: u8, sequence: u16) -> bool {
+        let Some(&header) = datagram.first() else {
+            return false;
+        };
+        match header & 0x1f {
+            value if value == PacketProperty::Merged as u8 => {
+                let mut pos = 1usize;
+                while pos + 2 <= datagram.len() {
+                    let size = u16::from_le_bytes([datagram[pos], datagram[pos + 1]]) as usize;
+                    pos += 2;
+                    if size == 0 || pos + size > datagram.len() {
+                        break;
+                    }
+                    if packet_has_ack(&datagram[pos..pos + size], channel_id, sequence) {
+                        return true;
+                    }
+                    pos += size;
+                }
+                false
+            }
+            value if value == PacketProperty::Ack as u8 => {
+                datagram.len() >= 5
+                    && datagram[3] == channel_id
+                    && ack_bit(&datagram[4..], sequence as usize % DEFAULT_WINDOW_SIZE)
+            }
+            _ => false,
+        }
+    }
+
     fn loopback_addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
     }
@@ -3690,10 +4170,168 @@ mod tests {
             next_fragment_id: AtomicU16::new(0),
             pending_reliable: parking_lot::Mutex::new(HashMap::new()),
             pending_total: AtomicUsize::new(0),
+            pending_datagrams: parking_lot::Mutex::new(VecDeque::new()),
+            reliable_send_turn: parking_lot::Mutex::new(()),
             outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
             outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
             reliable_active: AtomicBool::new(false),
+            confirmed_mtu: AtomicUsize::new(MAX_MERGED_PACKET_SIZE),
+            mtu_probe: parking_lot::Mutex::new(MtuProbeState::new(Instant::now())),
         })
+    }
+
+    #[test]
+    fn mtu_probe_requires_exact_pending_echo_and_stops_after_timeout() {
+        let now = Instant::now();
+        let mut probe = MtuProbeState::new(now);
+        assert!(probe.next_packet(now, 2).is_none());
+        let first = probe.next_packet(now + MTU_PROBE_INTERVAL, 2).unwrap();
+        assert_eq!(first.len(), 1164);
+        assert_eq!(first[0], PacketProperty::MtuCheck as u8 | (2 << 5));
+        let mut response = first.clone();
+        response[0] = PacketProperty::MtuOk as u8 | (2 << 5);
+        let mut forged = response.clone();
+        forged[5] ^= 1;
+        assert_eq!(probe.accept_response(&forged, 2), None);
+        assert_eq!(probe.accept_response(&response, 1), None);
+        assert_eq!(probe.accept_response(&response[..1163], 2), None);
+        assert_eq!(probe.accept_response(&response, 2), Some(1164));
+        assert_eq!(probe.accept_response(&response, 2), None);
+
+        let mut failed = MtuProbeState::new(now);
+        for attempt in 0..MAX_MTU_PROBE_ATTEMPTS {
+            let packet = failed
+                .next_packet(now + MTU_PROBE_INTERVAL * (u32::from(attempt) + 1), 0)
+                .unwrap();
+            assert_eq!(packet.len(), 1164);
+        }
+        assert!(failed
+            .next_packet(
+                now + MTU_PROBE_INTERVAL * (u32::from(MAX_MTU_PROBE_ATTEMPTS) + 1),
+                0
+            )
+            .is_none());
+        assert_eq!(failed.next_step, LITENETLIB_MTU_STEPS.len());
+    }
+
+    #[tokio::test]
+    async fn blocked_mtu_probes_do_not_use_attempts_or_replace_sent_token() {
+        let (server, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let client = UdpSocket::bind(loopback_addr(0)).await.unwrap();
+        let addr = client.local_addr().unwrap();
+        let now = Instant::now();
+        let mut probe = MtuProbeState::new(now);
+        server.test_blocked_send_addrs.write().insert(addr);
+        for interval in 1..=MAX_MTU_PROBE_ATTEMPTS {
+            try_send_mtu_probe(
+                &mut probe,
+                now + MTU_PROBE_INTERVAL * u32::from(interval),
+                2,
+                |packet| server.try_send_raw_to(packet, addr),
+            )
+            .unwrap();
+            assert_eq!(probe.attempts, 0);
+            assert_eq!(probe.pending, None);
+            assert_eq!(probe.next_step, 1);
+        }
+
+        server.test_blocked_send_addrs.write().remove(&addr);
+        server.socket.writable().await.unwrap();
+        try_send_mtu_probe(
+            &mut probe,
+            now + MTU_PROBE_INTERVAL * u32::from(MAX_MTU_PROBE_ATTEMPTS + 1),
+            2,
+            |packet| server.try_send_raw_to(packet, addr),
+        )
+        .unwrap();
+        let mut received = [0u8; 2048];
+        let (len, _) = time::timeout(Duration::from_secs(1), client.recv_from(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut response = received[..len].to_vec();
+        response[0] = PacketProperty::MtuOk as u8 | (2 << 5);
+        assert_eq!(probe.attempts, 1);
+        let sent_token = probe.pending;
+
+        server.test_blocked_send_addrs.write().insert(addr);
+        try_send_mtu_probe(
+            &mut probe,
+            now + MTU_PROBE_INTERVAL * u32::from(MAX_MTU_PROBE_ATTEMPTS + 2),
+            2,
+            |packet| server.try_send_raw_to(packet, addr),
+        )
+        .unwrap();
+        assert_eq!(probe.pending, sent_token);
+        assert_eq!(probe.attempts, 1);
+        let mut forged = response.clone();
+        forged[5] ^= 1;
+        assert_eq!(probe.accept_response(&forged, 2), None);
+        assert_eq!(probe.accept_response(&response, 1), None);
+        assert_eq!(probe.accept_response(&response, 2), Some(len));
+        assert_eq!(probe.accept_response(&response, 2), None);
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn negotiated_mtu_allows_larger_merged_unreliable_datagram() {
+        let (server, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let client = UdpSocket::bind(loopback_addr(0)).await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let peer = server
+            .accept(&ConnectionRequest {
+                remote_addr: client_addr,
+                payload: Bytes::new(),
+                connection_number: 1,
+                connect_time: 1,
+                local_peer_id: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(server.peer_mtu(peer), MAX_MERGED_PACKET_SIZE);
+
+        let mut recv = vec![0u8; 2048];
+        time::timeout(Duration::from_secs(5), async {
+            while server.peer_mtu(peer) < 1392 {
+                let (len, from) = client.recv_from(&mut recv).await.unwrap();
+                if recv[0] & 0x1f != PacketProperty::MtuCheck as u8 {
+                    continue;
+                }
+                assert_eq!(from, server.local_addr().unwrap());
+                assert!(LITENETLIB_MTU_STEPS.contains(&len));
+                let mut response = recv[..len].to_vec();
+                response[0] = (response[0] & 0xe0) | PacketProperty::MtuOk as u8;
+                client.send_to(&response, from).await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(server.peer_mtu(peer) >= 1392);
+
+        let packets = [
+            (channels::CHAT, Bytes::from(vec![1u8; 650])),
+            (channels::CHAT, Bytes::from(vec![2u8; 650])),
+        ];
+        assert_eq!(
+            server
+                .try_send_many_unreliable_bytes(peer, &packets)
+                .unwrap(),
+            1
+        );
+        let len = time::timeout(Duration::from_secs(1), async {
+            loop {
+                let (len, _) = client.recv_from(&mut recv).await.unwrap();
+                if recv[0] & 0x1f == PacketProperty::Merged as u8 {
+                    break len;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(recv[0] & 0x1f, PacketProperty::Merged as u8);
+        assert_eq!(len, 1 + 2 * (2 + 2 + 650));
+        assert!(len <= server.peer_mtu(peer));
+        server.shutdown();
     }
 
     #[test]
@@ -3725,9 +4363,13 @@ mod tests {
             next_fragment_id: AtomicU16::new(0),
             pending_reliable: parking_lot::Mutex::new(HashMap::new()),
             pending_total: AtomicUsize::new(0),
+            pending_datagrams: parking_lot::Mutex::new(VecDeque::new()),
+            reliable_send_turn: parking_lot::Mutex::new(()),
             outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
             outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
             reliable_active: AtomicBool::new(false),
+            confirmed_mtu: AtomicUsize::new(MAX_MERGED_PACKET_SIZE),
+            mtu_probe: parking_lot::Mutex::new(MtuProbeState::new(Instant::now())),
         };
         let payload = (0..RELIABLE_FRAGMENT_PAYLOAD_SIZE * 2 + 1)
             .map(|index| (index & 0xff) as u8)
