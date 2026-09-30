@@ -3871,6 +3871,92 @@ mod tests {
         }
     }
 
+    /// Isolate distance consumption from transport, scheduling, and GPU waits.
+    #[test]
+    #[ignore = "manual release-mode performance experiment; requires hardware GPU"]
+    fn profile_gpu_distance_consumption() {
+        use crate::{gpu_distance::DistanceBucket, gpu_distance_backend::GpuDistanceBackend};
+        use std::hint::black_box;
+        const COUNT: usize = 2000;
+        let mut config = receiver_build_test_config();
+        config.default_interval_ms = 20;
+        config.high_distance_sq = 100.0;
+        config.medium_distance_sq = 400.0;
+        config.low_distance_sq = 1600.0;
+        let mut backend = GpuDistanceBackend::new("").unwrap();
+        println!("DISTANCE_PROFILE adapter={}", backend.adapter_name());
+        for phase in [0.0_f32, 0.8, 2.0, 4.0] {
+            let peers = (0..COUNT)
+                .map(|i| {
+                    let group = i / 500;
+                    let motion = if group == 0 { 0.0 } else { 7.0 * phase.sin() };
+                    DistancePeer {
+                        id: i as PeerId,
+                        incarnation: i as u64 + 1,
+                        position: [group as f32 * 15.0 + motion, 0.0, 0.0, 0.0],
+                    }
+                })
+                .collect::<Vec<_>>();
+            let positions = peers.iter().map(|p| p.position).collect::<Vec<_>>();
+            let matrix = backend.compute(0, &positions).unwrap();
+            let bucket = DistanceBucket::for_test(1, peers.clone(), matrix);
+            let indices = bucket.sender_indices(&peers);
+            // All modes share the same captured positions, GPU output, policy,
+            // roster mapping, and decision count. Timing excludes computation,
+            // transfer, allocation, and one-off correctness comparison.
+            let pass = |mode: usize, config: &AvatarSyncConfig| {
+                let mut checksum = 0_u64;
+                for (receiver_index, receiver) in peers.iter().enumerate() {
+                    let row = bucket.row(receiver, &indices).unwrap();
+                    for (sender_index, sender) in peers.iter().enumerate() {
+                        if receiver_index == sender_index {
+                            continue;
+                        }
+                        let distance = match mode {
+                            0 => distance_sq_position(
+                                receiver.position[..3].try_into().unwrap(),
+                                sender.position[..3].try_into().unwrap(),
+                            ),
+                            1 => row.get(sender_index).unwrap(),
+                            2 => checked_gpu_distance(row, sender_index, config).unwrap(),
+                            3 => row.exact_snapshot_distance(sender_index).unwrap(),
+                            _ => unreachable!(),
+                        };
+                        let quality = quality_from_distance_sq(distance, config);
+                        let (byte, interval) =
+                            calculate_interval_from_distance_sq(distance, config);
+                        checksum = checksum.wrapping_add(
+                            ((quality as u64) << 32) + ((byte as u64) << 24) + interval,
+                        );
+                    }
+                }
+                black_box(checksum)
+            };
+            let expected = pass(0, &config);
+            assert_eq!(pass(2, &config), expected);
+            assert_eq!(pass(3, &config), expected);
+            println!(
+                "DISTANCE_PROFILE phase={phase} raw_checksum_matches={}",
+                pass(1, &config) == expected
+            );
+            for round in 0..8 {
+                let order = if round % 2 == 0 {
+                    [0, 1, 2, 3]
+                } else {
+                    [3, 2, 1, 0]
+                };
+                for mode in order {
+                    let started = Instant::now();
+                    let checksum = pass(black_box(mode), black_box(&config));
+                    println!(
+                        "DISTANCE_PROFILE phase={phase} round={round} mode={mode} pairs={} elapsed_us={} checksum={checksum}",
+                        COUNT * (COUNT - 1), started.elapsed().as_micros()
+                    );
+                }
+            }
+        }
+    }
+
     fn reference_build_delta_packets(
         peer_id: PeerId,
         outbound_sequence: u8,

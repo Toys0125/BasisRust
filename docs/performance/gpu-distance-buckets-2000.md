@@ -11,6 +11,9 @@ distance processing for this workload. Keep `EnableComputeOffload=false` when
 optimizing this particular 2,000-client workload. Two runs per mode establish an
 observation, not a general result for other GPUs, workloads, or client counts.
 
+The [follow-up investigation](gpu-update-gap-investigation.md) isolates CPU-side
+GPU-result processing as a contributor and examines the original outlier stall.
+
 ## Implementation
 
 Two retained GPU buffer sets and two immutable CPU result buckets alternate.
