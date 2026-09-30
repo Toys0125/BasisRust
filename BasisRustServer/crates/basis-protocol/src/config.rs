@@ -49,6 +49,7 @@ pub struct ServerConfig {
         alias = "HealthIncludeBsrProfiling"
     )]
     pub health_include_bsr_profiling: bool,
+    pub health_include_extended_metrics: bool,
     pub idle_memory_reclaim_enabled: bool,
     pub idle_memory_reclaim_settle_seconds: i32,
     pub idle_memory_reclaim_minimum_peak: i32,
@@ -189,6 +190,7 @@ impl Default for ServerConfig {
             health_check_port: 10666,
             health_path: "/health".to_string(),
             health_include_bsr_profiling: false,
+            health_include_extended_metrics: false,
             idle_memory_reclaim_enabled: true,
             idle_memory_reclaim_settle_seconds: 30,
             idle_memory_reclaim_minimum_peak: 8,
@@ -289,7 +291,9 @@ impl ServerConfig {
                 .with_context(|| format!("reading config {}", path.display()))?;
             let mut config = quick_xml::de::from_str::<Self>(&text)
                 .with_context(|| format!("parsing config {}", path.display()))?;
-            if config.config_version != Self::CURRENT_CONFIG_VERSION {
+            let needs_extended_metrics_field = !text.contains("<HealthIncludeExtendedMetrics>");
+            if config.config_version != Self::CURRENT_CONFIG_VERSION || needs_extended_metrics_field
+            {
                 config.config_version = Self::CURRENT_CONFIG_VERSION;
                 config.save(path)?;
             }
@@ -433,6 +437,11 @@ impl ServerConfig {
         override_field!(
             "HealthIncludeBSRProfiling",
             health_include_bsr_profiling,
+            bool
+        );
+        override_field!(
+            "HealthIncludeExtendedMetrics",
+            health_include_extended_metrics,
             bool
         );
         override_field!(
@@ -701,6 +710,7 @@ mod tests {
         assert!(config.use_auth_identity);
         assert!(config.worlds_locked);
         assert!(!config.avatars_locked);
+        assert!(!config.health_include_extended_metrics);
     }
 
     #[test]
@@ -714,6 +724,7 @@ mod tests {
         assert!(xml.contains("<BSRSMillisecondDefaultInterval>50</BSRSMillisecondDefaultInterval>"));
         assert!(xml.contains("<IPv4Address>0.0.0.0</IPv4Address>"));
         assert!(xml.contains("<EndEffectorIKDisabled>false</EndEffectorIKDisabled>"));
+        assert!(xml.contains("<HealthIncludeExtendedMetrics>false</HealthIncludeExtendedMetrics>"));
         let parsed: ServerConfig = quick_xml::de::from_str(&xml).unwrap();
         assert_eq!(parsed, config);
     }
@@ -734,12 +745,16 @@ mod tests {
         config.set_field("CompanyName", "Custom Company").unwrap();
         config.set_field("ProductName", "Custom Product").unwrap();
         config
+            .set_field("HealthIncludeExtendedMetrics", "true")
+            .unwrap();
+        config
             .set_field("BasisUserRestrictionMode", "blacklist")
             .unwrap();
         assert_eq!(config.avatar_bundle_zstd_level, -5);
         assert_eq!(config.image_pickup_range_meters, 42.5);
         assert_eq!(config.company_name, "Custom Company");
         assert_eq!(config.product_name, "Custom Product");
+        assert!(config.health_include_extended_metrics);
         assert_eq!(
             config.basis_user_restriction_mode,
             BasisUserRestrictionMode::BlackList
@@ -747,6 +762,34 @@ mod tests {
         assert!(config.set_field("DefinitelyNotAField", "1").is_err());
         assert!(ServerConfig::is_secret_field_name("ApiKey"));
         assert!(ServerConfig::is_secret_field_name("Password"));
+    }
+
+    #[test]
+    fn current_config_heals_missing_extended_metrics_field() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("basis-config-heal-test-{unique}"));
+        let path = dir.join("config.xml");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let config = ServerConfig::default();
+        config.save(&path).unwrap();
+        let xml = std::fs::read_to_string(&path).unwrap().replace(
+            "  <HealthIncludeExtendedMetrics>false</HealthIncludeExtendedMetrics>\n",
+            "",
+        );
+        std::fs::write(&path, xml).unwrap();
+
+        let loaded = ServerConfig::load_or_create(&path).unwrap();
+        assert!(!loaded.health_include_extended_metrics);
+        let healed = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            healed.contains("<HealthIncludeExtendedMetrics>false</HealthIncludeExtendedMetrics>")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

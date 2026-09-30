@@ -554,6 +554,8 @@ pub enum AvatarBundleCompression {
     ZstdDictionary { level: i32 },
 }
 
+pub const AVATAR_BUNDLE_DICTIONARY_GENERATION: u8 = avatar_bundle_dictionary::GENERATION;
+
 const BUNDLE_CODEC_LZ4: u8 = 0;
 const BUNDLE_CODEC_ZSTD_DICTIONARY: u8 = 1;
 const BUNDLE_CODEC_MASK: u8 = 0x07;

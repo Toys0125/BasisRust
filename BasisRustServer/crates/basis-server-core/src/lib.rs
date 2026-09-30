@@ -1,6 +1,8 @@
 mod avatar_sync;
 mod p2p;
 
+pub use avatar_sync::BsrProfilerSnapshot;
+
 use anyhow::{Context, Result};
 use basis_protocol::{
     application::NetworkApplication,
@@ -211,11 +213,88 @@ struct JiggleTokenBucket {
     last_refill: Instant,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StatisticsSnapshot {
+    pub inbound_packets: u64,
+    pub outbound_packets: u64,
+    pub protocol_errors: u64,
+}
+
+#[derive(Debug)]
+struct GatedCounter {
+    enabled: Arc<AtomicBool>,
+    value: AtomicU64,
+}
+
+impl GatedCounter {
+    fn new(enabled: Arc<AtomicBool>) -> Self {
+        Self {
+            enabled,
+            value: AtomicU64::new(0),
+        }
+    }
+
+    fn fetch_add(&self, value: u64, ordering: Ordering) -> u64 {
+        if self.enabled.load(Ordering::Relaxed) {
+            self.value.fetch_add(value, ordering)
+        } else {
+            0
+        }
+    }
+
+    fn load(&self, ordering: Ordering) -> u64 {
+        if self.enabled.load(Ordering::Relaxed) {
+            self.value.load(ordering)
+        } else {
+            0
+        }
+    }
+
+    fn store(&self, value: u64, ordering: Ordering) {
+        self.value.store(value, ordering);
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Statistics {
-    pub inbound_packets: Arc<AtomicU64>,
-    pub outbound_packets: Arc<AtomicU64>,
-    pub protocol_errors: Arc<AtomicU64>,
+    enabled: Arc<AtomicBool>,
+    inbound_packets: Arc<GatedCounter>,
+    outbound_packets: Arc<GatedCounter>,
+    protocol_errors: Arc<GatedCounter>,
+}
+
+impl Statistics {
+    fn new(enabled: bool) -> Self {
+        let enabled = Arc::new(AtomicBool::new(enabled));
+        Self {
+            enabled: Arc::clone(&enabled),
+            inbound_packets: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
+            outbound_packets: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
+            protocol_errors: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        let was_enabled = self.enabled.load(Ordering::Relaxed);
+        if enabled && !was_enabled {
+            self.inbound_packets.store(0, Ordering::Relaxed);
+            self.outbound_packets.store(0, Ordering::Relaxed);
+            self.protocol_errors.store(0, Ordering::Relaxed);
+        }
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> StatisticsSnapshot {
+        StatisticsSnapshot {
+            inbound_packets: self.inbound_packets.load(Ordering::Relaxed),
+            outbound_packets: self.outbound_packets.load(Ordering::Relaxed),
+            protocol_errors: self.protocol_errors.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -266,7 +345,12 @@ impl ServerState {
         } else {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.set_port)
         };
-        let (transport, events) = TransportHandle::bind(bind_addr).await?;
+        let (transport, events) = TransportHandle::bind_with_statistics_options(
+            bind_addr,
+            config.enable_statistics || config.health_include_extended_metrics,
+            config.health_include_extended_metrics,
+        )
+        .await?;
         info!("server listening on {}", transport.local_addr()?);
 
         let config_path = base_dir
@@ -312,7 +396,9 @@ impl ServerState {
                 tick_budget_ms: avatar_sync::DEFAULT_AVATAR_TICK_BUDGET_MS,
                 receiver_cycle_budget_ms: avatar_sync::DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
                 spatial_cull_enabled: false,
-                enable_bsr_profiling: config.enable_bsrprofiling,
+                enable_bsr_profiling: config.enable_bsrprofiling
+                    || config.health_include_bsr_profiling,
+                collect_extended_metrics: config.health_include_extended_metrics,
             }
             .apply_env_tuning(),
         );
@@ -345,7 +431,7 @@ impl ServerState {
             p2p_broker,
             moderation,
             global_state: Arc::new(RwLock::new(GlobalState::from(&config))),
-            statistics: Statistics::default(),
+            statistics: Statistics::new(config.health_include_extended_metrics),
             pending_leaves: Arc::new(Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
         };
@@ -448,10 +534,32 @@ impl ServerState {
                 tick_budget_ms: avatar_sync::DEFAULT_AVATAR_TICK_BUDGET_MS,
                 receiver_cycle_budget_ms: avatar_sync::DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
                 spatial_cull_enabled: false,
-                enable_bsr_profiling: config.enable_bsrprofiling,
+                enable_bsr_profiling: config.enable_bsrprofiling
+                    || config.health_include_bsr_profiling,
+                collect_extended_metrics: config.health_include_extended_metrics,
             }
             .apply_env_tuning(),
         );
+        self.transport.set_statistics_enabled(
+            config.enable_statistics || config.health_include_extended_metrics,
+        );
+        self.transport
+            .set_extended_statistics_enabled(config.health_include_extended_metrics);
+        self.statistics
+            .set_enabled(config.health_include_extended_metrics);
+
+        let previous_globals = self.global_state.read().clone();
+        let mut globals = GlobalState::from(&config);
+        globals.headless_audio_off = previous_globals.headless_audio_off;
+        globals.opus_packet_loss_percent = previous_globals.opus_packet_loss_percent;
+        globals.opus_frame_duration_ms = previous_globals.opus_frame_duration_ms;
+        globals.global_opus_bitrate = previous_globals.global_opus_bitrate;
+        *self.global_state.write() = globals;
+    }
+
+    pub async fn refresh_runtime_config_live(&self) {
+        self.refresh_runtime_config();
+        broadcast_lock_state(self).await;
     }
 
     pub fn players_text(&self) -> String {
@@ -470,26 +578,38 @@ impl ServerState {
     }
 
     pub fn status_text_with_detail(&self, verbose: bool) -> String {
+        let players = self.player_count();
+        if !self.config.read().health_include_extended_metrics {
+            return if verbose {
+                format!(
+                    "Server is running and healthy\nPlayers: {players}\nExtended metrics: disabled (set HealthIncludeExtendedMetrics=true to collect them)"
+                )
+            } else {
+                format!("Server is running and healthy. Players: {players}")
+            };
+        }
+
         let transport = self.transport.stats_snapshot();
         let avatar = self.avatar_sync.stats();
+        let app = self.statistics.snapshot();
         if !verbose {
             return format!(
                 "Server is running and healthy. Players: {} PendingReliable: {} QueuedReliable: {} AppIn: {} AppOut: {} RawIn: {} RawOut: {} AvatarIn: {} AvatarOut: {} ProtocolErrors: {}",
-                self.player_count(),
+                players,
                 self.transport.pending_reliable_count(),
                 self.transport.queued_reliable_count(),
-                self.statistics.inbound_packets.load(Ordering::Relaxed),
-                self.statistics.outbound_packets.load(Ordering::Relaxed),
+                app.inbound_packets,
+                app.outbound_packets,
                 transport.raw_packets_received,
                 transport.raw_packets_sent,
                 avatar.inbound_updates,
                 avatar.outbound_messages,
-                self.statistics.protocol_errors.load(Ordering::Relaxed),
+                app.protocol_errors,
             );
         }
         format!(
             "Server is running and healthy\nPlayers: {}\nReliable: pending={} queued={} window_fills={} retransmits={} dispatch_passes={} peers_visited={} acks_in={} acks_released={} acks_unknown_chan={} window_stalls={}\nApp messages: inbound={} outbound={} protocol_errors={}\nRaw UDP: packets_in={} packets_out={} bytes_in={} bytes_out={} would_block={}\nAvatar sync: inbound_updates={} outbound_messages={} outbound_logical_avatar_sends={} outbound_batches={} active_states={} pending_updates={} receiver_slices={}\nAvatar timing: ticks={} avg_tick_us={} smooth_tick_us={} avg_build_us={} avg_flush_us={} max_tick_us={} receiver_cycle_ms={} cycle_budget_ms={} tick_budget_ms={}",
-            self.player_count(),
+            players,
             self.transport.pending_reliable_count(),
             self.transport.queued_reliable_count(),
             transport.reliable_window_fills,
@@ -500,9 +620,9 @@ impl ServerState {
             transport.reliable_acks_released,
             transport.reliable_acks_unknown_channel,
             transport.reliable_window_stalls,
-            self.statistics.inbound_packets.load(Ordering::Relaxed),
-            self.statistics.outbound_packets.load(Ordering::Relaxed),
-            self.statistics.protocol_errors.load(Ordering::Relaxed),
+            app.inbound_packets,
+            app.outbound_packets,
+            app.protocol_errors,
             transport.raw_packets_received,
             transport.raw_packets_sent,
             transport.raw_bytes_received,
@@ -4477,6 +4597,31 @@ pub fn migrate_legacy_resource_dirs(base_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extended_statistics_do_not_count_until_enabled() {
+        let statistics = Statistics::new(false);
+        statistics.inbound_packets.fetch_add(1, Ordering::Relaxed);
+        statistics.outbound_packets.fetch_add(1, Ordering::Relaxed);
+        statistics.protocol_errors.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(statistics.snapshot().inbound_packets, 0);
+        assert_eq!(statistics.snapshot().outbound_packets, 0);
+        assert_eq!(statistics.snapshot().protocol_errors, 0);
+
+        statistics.set_enabled(true);
+        statistics.inbound_packets.fetch_add(2, Ordering::Relaxed);
+        statistics.outbound_packets.fetch_add(3, Ordering::Relaxed);
+        statistics.protocol_errors.fetch_add(4, Ordering::Relaxed);
+        let snapshot = statistics.snapshot();
+        assert_eq!(snapshot.inbound_packets, 2);
+        assert_eq!(snapshot.outbound_packets, 3);
+        assert_eq!(snapshot.protocol_errors, 4);
+
+        statistics.set_enabled(false);
+        statistics.inbound_packets.fetch_add(10, Ordering::Relaxed);
+        statistics.set_enabled(true);
+        assert_eq!(statistics.snapshot().inbound_packets, 0);
+    }
 
     fn test_ready_message() -> ReadyMessage {
         ReadyMessage {
