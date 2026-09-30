@@ -29,6 +29,9 @@ use std::{
 use tokio::runtime::Handle;
 use tracing::warn;
 
+use crate::gpu_distance::{
+    DistanceOffload, DistancePeer, DistanceRow, GpuDistanceStats, OffloadSettings,
+};
 use crate::p2p::pack_pair;
 
 const DISTANCE_UPDATE_INTERVAL_MS: u64 = 500;
@@ -96,6 +99,9 @@ pub struct AvatarSyncConfig {
     pub tick_budget_ms: f64,
     pub receiver_cycle_budget_ms: f64,
     pub spatial_cull_enabled: bool,
+    pub enable_compute_offload: bool,
+    pub compute_device: String,
+    pub compute_distance_update_interval_ticks: u64,
     pub enable_bsr_profiling: bool,
     pub collect_extended_metrics: bool,
 }
@@ -421,6 +427,7 @@ struct ReceiverTracking {
 struct ReceiverTrackingState {
     senders: PeerIdMap<ReceiverTracking>,
     last_distance_update_ms: Option<u64>,
+    last_gpu_epoch: Option<u64>,
 }
 
 struct SpatialGrid {
@@ -767,6 +774,7 @@ impl AvatarBundleCache {
 
 #[derive(Debug, Clone, Default)]
 pub struct AvatarSyncStats {
+    pub gpu_distance: GpuDistanceStats,
     pub inbound_updates: u64,
     pub outbound_messages: u64,
     pub outbound_logical_avatar_sends: u64,
@@ -1427,6 +1435,7 @@ impl BytePool {
 
 #[derive(Debug, Clone)]
 pub struct AvatarSyncSystem {
+    distance_offload: Arc<parking_lot::Mutex<DistanceOffload>>,
     config: Arc<parking_lot::RwLock<AvatarSyncConfig>>,
     states: Arc<DashMap<PeerId, Arc<PlayerAvatarState>>>,
     pending: Arc<DashMap<PeerId, PendingAvatarUpdate>>,
@@ -1451,6 +1460,7 @@ impl AvatarSyncSystem {
         let counters = Arc::new(AvatarSyncCounters::default());
         let diagnostics = AvatarSyncDiagnostics::from_env(Arc::clone(&counters));
         Self {
+            distance_offload: Arc::new(parking_lot::Mutex::new(DistanceOffload::default())),
             config: Arc::new(parking_lot::RwLock::new(config)),
             states: Arc::new(DashMap::new()),
             pending: Arc::new(DashMap::new()),
@@ -1475,6 +1485,18 @@ impl AvatarSyncSystem {
 
     pub fn set_offloaded_pairs(&mut self, offloaded_pairs: Arc<DashMap<u64, ()>>) {
         self.offloaded_pairs = offloaded_pairs;
+    }
+
+    pub async fn stop_compute_offload(&self) {
+        let threads = self.distance_offload.lock().stop();
+        if !threads.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || {
+                for thread in threads {
+                    let _ = thread.join();
+                }
+            })
+            .await;
+        }
     }
 
     pub fn update_config(&self, config: AvatarSyncConfig) {
@@ -1609,6 +1631,7 @@ impl AvatarSyncSystem {
             .checked_div(tick_count)
             .unwrap_or(0);
         AvatarSyncStats {
+            gpu_distance: self.distance_offload.lock().stats(),
             inbound_updates: self.counters.inbound_updates.load(Ordering::Relaxed),
             outbound_messages: self.counters.outbound_messages.load(Ordering::Relaxed),
             outbound_logical_avatar_sends: self
@@ -1692,6 +1715,35 @@ impl AvatarSyncSystem {
                 peer_states.push((*peer, Arc::clone(state.value())));
             }
         }
+        let distance_start = Instant::now();
+        let distance_peers = if config.enable_compute_offload {
+            peer_states
+                .iter()
+                .map(|(id, state)| DistancePeer {
+                    id: *id,
+                    incarnation: state.incarnation,
+                    position: [state.position[0], state.position[1], state.position[2], 0.0],
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let distance_bucket = self.distance_offload.lock().advance(
+            OffloadSettings {
+                enabled: config.enable_compute_offload,
+                device: config.compute_device.clone(),
+                interval_ticks: config.compute_distance_update_interval_ticks,
+            },
+            &distance_peers,
+        );
+        let gpu_sender_indices = distance_bucket
+            .as_ref()
+            .map(|bucket| bucket.sender_indices(&distance_peers))
+            .unwrap_or_default();
+        self.profiler.add_phase_micros(
+            BsrPhase::Distance,
+            distance_start.elapsed().as_micros() as u64,
+        );
         let receiver_plan = self.advance_slice_state(&peer_states, &config);
         if receiver_plan.receivers.is_empty() {
             let tick_micros = tick_start.elapsed().as_micros() as u64;
@@ -1710,7 +1762,6 @@ impl AvatarSyncSystem {
         } else {
             None
         };
-        self.profiler.add_phase_micros(BsrPhase::Distance, 0);
 
         let build_start = Instant::now();
         // A tick owns one immutable sender snapshot, so identical bundle chunks can
@@ -1738,6 +1789,16 @@ impl AvatarSyncSystem {
                         },
                         &peer_states,
                         spatial_grid.as_ref(),
+                        distance_bucket.as_ref().and_then(|bucket| {
+                            bucket.row(
+                                &DistancePeer {
+                                    id: *receiver_id,
+                                    incarnation: receiver_state.incarnation,
+                                    position: [0.0; 4],
+                                },
+                                &gpu_sender_indices,
+                            )
+                        }),
                         &config,
                         now_ms,
                         receiver_plan.receiver_cycle,
@@ -1928,6 +1989,7 @@ impl AvatarSyncSystem {
         bundle_wire_budget: usize,
         peer_states: &'a [(PeerId, Arc<PlayerAvatarState>)],
         spatial_grid: Option<&SpatialGrid>,
+        distance_row: Option<DistanceRow<'_>>,
         config: &AvatarSyncConfig,
         now_ms: u64,
         receiver_cycle: usize,
@@ -1967,11 +2029,14 @@ impl AvatarSyncSystem {
         // Refresh on this receiver's first eligible build, rather than consuming a
         // global due flag in whichever slice happens to run at the time. A receiver
         // cycle longer than the refresh interval therefore refreshes every visit.
-        let update_distances = receiver_tracking
-            .last_distance_update_ms
-            .is_none_or(|last| now_ms.saturating_sub(last) >= DISTANCE_UPDATE_INTERVAL_MS);
+        let gpu_epoch = distance_row.map(|row| row.epoch);
+        let update_distances = gpu_epoch != receiver_tracking.last_gpu_epoch
+            || receiver_tracking
+                .last_distance_update_ms
+                .is_none_or(|last| now_ms.saturating_sub(last) >= DISTANCE_UPDATE_INTERVAL_MS);
         if update_distances {
             receiver_tracking.last_distance_update_ms = Some(now_ms);
+            receiver_tracking.last_gpu_epoch = gpu_epoch;
         }
         let mut logical_sends = 0u64;
         let mut bundle_ratio = if config.enable_bundle_compression {
@@ -2002,11 +2067,18 @@ impl AvatarSyncSystem {
             }
             let bypass_reduction =
                 !bypass_empty && self.bypass_reduction_ids.contains_key(&sender_id);
+            let pair_distance = || {
+                distance_row
+                    .and_then(|row| checked_gpu_distance(row, peer_index, config))
+                    .unwrap_or_else(|| {
+                        distance_sq_position(receiver_position, sender_state.position)
+                    })
+            };
             let tracking = receiver_tracking
                 .senders
                 .entry(sender_id)
                 .or_insert_with(|| {
-                    let dist_sq = distance_sq_position(receiver_position, sender_state.position);
+                    let dist_sq = pair_distance();
                     let (interval_byte, interval_ms) =
                         calculate_interval_from_distance_sq(dist_sq, config);
                     ReceiverTracking {
@@ -2020,7 +2092,7 @@ impl AvatarSyncSystem {
                     }
                 });
             if update_distances {
-                let dist_sq = distance_sq_position(receiver_position, sender_state.position);
+                let dist_sq = pair_distance();
                 tracking.cached_quality_index = quality_from_distance_sq(dist_sq, config);
                 let (interval_byte, interval_ms) =
                     calculate_interval_from_distance_sq(dist_sq, config);
@@ -3176,6 +3248,36 @@ fn distance_sq_position(receiver: [f32; 3], sender: [f32; 3]) -> f32 {
     dx * dx + dy * dy + dz * dz
 }
 
+fn checked_gpu_distance(
+    row: DistanceRow<'_>,
+    sender_index: usize,
+    config: &AvatarSyncConfig,
+) -> Option<f32> {
+    let distance = row.get(sender_index)?;
+    // GPUs may contract multiply/add or flush subnormals. Around a protocol
+    // decision boundary use the original snapshot's CPU arithmetic, not a newer
+    // live position, so bucket timing stays consistent with the GPU result.
+    let tolerance = 8.0 * f32::EPSILON * distance.max(1.0);
+    let near_quality = [
+        config.high_distance_sq,
+        config.medium_distance_sq,
+        config.low_distance_sq,
+    ]
+    .iter()
+    .any(|threshold| (distance - threshold).abs() <= tolerance);
+    let base = config.default_interval_ms.max(1) as i32 as f32;
+    let raw_interval = base * (config.base_multiplier + distance * config.increase_rate);
+    let interval_tolerance = base.abs() * config.increase_rate.abs() * tolerance
+        + 4.0 * f32::EPSILON * raw_interval.abs();
+    let near_interval =
+        raw_interval > base && (raw_interval - raw_interval.round()).abs() <= interval_tolerance;
+    if near_quality || near_interval {
+        row.exact_snapshot_distance(sender_index)
+    } else {
+        Some(distance)
+    }
+}
+
 fn quality_from_distance_sq(distance_sq: f32, config: &AvatarSyncConfig) -> u8 {
     if distance_sq <= config.high_distance_sq {
         BitQuality::High as u8
@@ -3468,6 +3570,9 @@ mod tests {
             tick_budget_ms: DEFAULT_AVATAR_TICK_BUDGET_MS,
             receiver_cycle_budget_ms: DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
             spatial_cull_enabled: false,
+            enable_compute_offload: false,
+            compute_device: String::new(),
+            compute_distance_update_interval_ticks: 32,
             enable_bsr_profiling: true,
             collect_extended_metrics: true,
         }
@@ -3504,6 +3609,7 @@ mod tests {
                 [0.0; 3],
                 AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
                 peers,
+                None,
                 None,
                 &config,
                 now_ms,
@@ -3600,6 +3706,7 @@ mod tests {
                             AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
                             &peers,
                             None,
+                            None,
                             &config,
                             now_ms,
                             plan.receiver_cycle,
@@ -3639,6 +3746,128 @@ mod tests {
                 now_ms += 31;
             }
             assert!(visited.into_iter().all(|seen| seen));
+        }
+    }
+
+    #[test]
+    fn gpu_bucket_epoch_refreshes_tiers_and_cpu_fallback_immediately() {
+        use crate::gpu_distance::DistanceBucket;
+        let mut config = receiver_build_test_config();
+        config.high_distance_sq = 100.0;
+        config.medium_distance_sq = 400.0;
+        config.low_distance_sq = 1600.0;
+        config.enable_bundle_compression = false;
+        let system = AvatarSyncSystem::new(config.clone());
+        let mut peers = receiver_build_test_peers_from_ids([1, 2], &[]);
+        Arc::make_mut(&mut peers[0].1).position = [0.0; 3];
+        Arc::make_mut(&mut peers[1].1).position = [15.0, 0.0, 0.0];
+        let roster = peers
+            .iter()
+            .map(|(id, state)| DistancePeer {
+                id: *id,
+                incarnation: state.incarnation,
+                position: [state.position[0], state.position[1], state.position[2], 0.0],
+            })
+            .collect::<Vec<_>>();
+        let mut first_roster = roster.clone();
+        first_roster[1].position[0] = 5.0;
+        let first = DistanceBucket::for_test(1, first_roster, vec![0.0, 25.0, 25.0, 0.0]);
+        let second = DistanceBucket::for_test(2, roster.clone(), vec![0.0, 225.0, 225.0, 0.0]);
+        let build = |bucket: Option<&DistanceBucket>,
+                     peers: &[(PeerId, Arc<PlayerAvatarState>)],
+                     roster: &[DistancePeer],
+                     now_ms| {
+            let indices = bucket
+                .map(|bucket| bucket.sender_indices(roster))
+                .unwrap_or_default();
+            let row = bucket.and_then(|bucket| bucket.row(&roster[0], &indices));
+            let mut scratch = ReceiverBuildScratch::default();
+            system.build_sends_for_receiver(
+                1,
+                [0.0; 3],
+                AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
+                peers,
+                None,
+                row,
+                &config,
+                now_ms,
+                1,
+                AVATAR_TICK_INTERVAL_MS,
+                true,
+                true,
+                &AvatarBundleCache::default(),
+                &mut scratch,
+            );
+        };
+        build(Some(&first), &peers, &roster, 0);
+        assert_eq!(
+            system.tracking.get(&1).unwrap().senders[&2].cached_quality_index,
+            BitQuality::High as u8
+        );
+        build(Some(&second), &peers, &roster, 1);
+        assert_eq!(
+            system.tracking.get(&1).unwrap().senders[&2].cached_quality_index,
+            BitQuality::Medium as u8
+        );
+        Arc::make_mut(&mut peers[1].1).position[0] = 30.0;
+        build(None, &peers, &roster, 2);
+        assert_eq!(
+            system.tracking.get(&1).unwrap().senders[&2].cached_quality_index,
+            BitQuality::Low as u8
+        );
+        system.remove_player(2);
+        Arc::make_mut(&mut peers[1].1).position[0] = 45.0;
+        Arc::make_mut(&mut peers[1].1).incarnation += 1;
+        let mut reused = roster.clone();
+        reused[1].incarnation += 1;
+        build(Some(&second), &peers, &reused, 3);
+        assert_eq!(
+            system.tracking.get(&1).unwrap().senders[&2].cached_quality_index,
+            BitQuality::VeryLow as u8
+        );
+    }
+
+    #[test]
+    fn ambiguous_gpu_decisions_use_captured_positions() {
+        use crate::gpu_distance::DistanceBucket;
+        let mut config = receiver_build_test_config();
+        config.default_interval_ms = 20;
+        config.high_distance_sq = 100.0;
+        config.medium_distance_sq = 400.0;
+        config.low_distance_sq = 1600.0;
+        for (position, rounded) in [
+            ([6.0, 8.0, 0.0, 0.0], 100.00001),
+            ([30.0, 0.0, 0.0, 0.0], 899.99994),
+        ] {
+            let captured = vec![
+                DistancePeer {
+                    id: 1,
+                    incarnation: 1,
+                    position: [0.0; 4],
+                },
+                DistancePeer {
+                    id: 2,
+                    incarnation: 2,
+                    position,
+                },
+            ];
+            let bucket =
+                DistanceBucket::for_test(1, captured.clone(), vec![0.0, rounded, rounded, 0.0]);
+            let mut live = captured.clone();
+            live[1].position[0] = 50.0;
+            let indices = bucket.sender_indices(&live);
+            let row = bucket.row(&live[0], &indices).unwrap();
+            let expected = distance_sq_position([0.0; 3], [position[0], position[1], position[2]]);
+            let actual = checked_gpu_distance(row, 1, &config).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                quality_from_distance_sq(actual, &config),
+                quality_from_distance_sq(expected, &config)
+            );
+            assert_eq!(
+                calculate_interval_from_distance_sq(actual, &config),
+                calculate_interval_from_distance_sq(expected, &config)
+            );
         }
     }
 
@@ -3822,6 +4051,7 @@ mod tests {
                 receiver_position,
                 AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
                 peers,
+                None,
                 None,
                 config,
                 now_ms,
@@ -4657,6 +4887,9 @@ mod tests {
             tick_budget_ms: DEFAULT_AVATAR_TICK_BUDGET_MS,
             receiver_cycle_budget_ms: DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
             spatial_cull_enabled: false,
+            enable_compute_offload: false,
+            compute_device: String::new(),
+            compute_distance_update_interval_ticks: 32,
             enable_bsr_profiling: false,
             collect_extended_metrics: false,
         };
@@ -4689,6 +4922,9 @@ mod tests {
             tick_budget_ms: DEFAULT_AVATAR_TICK_BUDGET_MS,
             receiver_cycle_budget_ms: DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
             spatial_cull_enabled: false,
+            enable_compute_offload: false,
+            compute_device: String::new(),
+            compute_distance_update_interval_ticks: 32,
             enable_bsr_profiling: false,
             collect_extended_metrics: false,
         };
@@ -4946,6 +5182,9 @@ mod tests {
             tick_budget_ms: DEFAULT_AVATAR_TICK_BUDGET_MS,
             receiver_cycle_budget_ms: DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
             spatial_cull_enabled: false,
+            enable_compute_offload: false,
+            compute_device: String::new(),
+            compute_distance_update_interval_ticks: 32,
             enable_bsr_profiling: false,
             collect_extended_metrics: false,
         };

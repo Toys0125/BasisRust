@@ -29,6 +29,30 @@ Useful flags:
 cargo test
 ```
 
+## GPU distance processing
+
+`EnableComputeOffload` enables hardware GPU computation of the avatar distance
+matrix. `ComputeDevice` accepts an adapter name substring or index; an empty
+value selects an available hardware adapter. Software adapters are rejected.
+An unavailable or failed GPU falls back to CPU distance processing.
+
+Two buckets hold captured peer positions and their distances. The server reads
+one immutable bucket while a dedicated worker uploads, computes, and reads back
+the other. Completed buckets are published every
+`ComputeDistanceUpdateIntervalTicks` ticks (32 by default). The server tick never
+waits for GPU completion. A late result keeps the previous bucket active; data
+older than two publication periods falls back to CPU processing. New peers and
+reused peer IDs also use CPU processing until their incarnation appears in a
+completed bucket. Tier and interval decisions near floating-point boundaries
+use CPU arithmetic on the captured positions.
+
+This deliberately delays distance decisions until bucket publication; packet
+building and transport remain on the CPU. With `HealthIncludeExtendedMetrics`
+enabled, `extended.avatarSync.gpuDistance` reports the adapter, active epoch,
+submissions, swaps, missed swaps, stale fallbacks, and errors. A non-null active
+epoch confirms that GPU results are in use. Set `EnableComputeOffload=false`
+to use CPU distance processing exclusively.
+
 ## Drift Check
 
 Checks C# source from the Basis git repo against local Rust source:
@@ -73,4 +97,3 @@ Remaining work is the deeper subsystem parity: full DID identity resolution,
 full LiteNetLib fragmentation/merge behavior, admin payload coverage, resource
 preload semantics, PIP/camera/content-share state, full voice optimization, and
 high-scale avatar reduction tuning.
-

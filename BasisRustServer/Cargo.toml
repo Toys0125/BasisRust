@@ -33,6 +33,7 @@ license = "MIT"
 anyhow = "1"
 axum = "0.8"
 bytes = "1"
+bytemuck = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 dashmap = "6"
@@ -42,6 +43,7 @@ lz4_flex = "0.11"
 base64 = "0.22"
 zstd-safe = { version = "7.2.4", features = ["experimental"] }
 parking_lot = "0.12"
+pollster = "0.4"
 quick-xml = { version = "0.38", features = ["serialize"] }
 rand = "0.8"
 rayon = "1"
@@ -57,4 +59,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "fast-rng", "serde"] }
 walkdir = "2"
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "dx12", "metal"] }
 windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }

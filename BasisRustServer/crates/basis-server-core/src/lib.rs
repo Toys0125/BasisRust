@@ -1,4 +1,6 @@
 mod avatar_sync;
+mod gpu_distance;
+mod gpu_distance_backend;
 mod p2p;
 
 pub use avatar_sync::BsrProfilerSnapshot;
@@ -396,6 +398,11 @@ impl ServerState {
                 tick_budget_ms: avatar_sync::DEFAULT_AVATAR_TICK_BUDGET_MS,
                 receiver_cycle_budget_ms: avatar_sync::DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
                 spatial_cull_enabled: false,
+                enable_compute_offload: config.enable_compute_offload,
+                compute_device: config.compute_device.clone(),
+                compute_distance_update_interval_ticks: config
+                    .compute_distance_update_interval_ticks
+                    .max(1) as u64,
                 enable_bsr_profiling: config.enable_bsrprofiling
                     || config.health_include_bsr_profiling,
                 collect_extended_metrics: config.health_include_extended_metrics,
@@ -534,6 +541,11 @@ impl ServerState {
                 tick_budget_ms: avatar_sync::DEFAULT_AVATAR_TICK_BUDGET_MS,
                 receiver_cycle_budget_ms: avatar_sync::DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
                 spatial_cull_enabled: false,
+                enable_compute_offload: config.enable_compute_offload,
+                compute_device: config.compute_device.clone(),
+                compute_distance_update_interval_ticks: config
+                    .compute_distance_update_interval_ticks
+                    .max(1) as u64,
                 enable_bsr_profiling: config.enable_bsrprofiling
                     || config.health_include_bsr_profiling,
                 collect_extended_metrics: config.health_include_extended_metrics,
@@ -651,6 +663,7 @@ impl ServerState {
         if self.shutdown.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        self.avatar_sync.stop_compute_offload().await;
         self.transport.shutdown();
         for peer in self.authenticated_peers.iter() {
             let _ = self

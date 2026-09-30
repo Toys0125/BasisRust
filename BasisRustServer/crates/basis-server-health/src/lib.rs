@@ -59,6 +59,7 @@ pub struct RawUdpMetrics {
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AvatarSyncMetrics {
+    pub gpu_distance: GpuDistanceMetrics,
     pub inbound_updates: u64,
     pub outbound_messages: u64,
     pub outbound_logical_avatar_sends: u64,
@@ -66,6 +67,20 @@ pub struct AvatarSyncMetrics {
     pub active_states: usize,
     pub pending_updates: usize,
     pub receiver_slices: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuDistanceMetrics {
+    pub enabled: bool,
+    pub adapter: Option<String>,
+    pub interval_ticks: u64,
+    pub submissions: u64,
+    pub swaps: u64,
+    pub missed_swaps: u64,
+    pub stale_fallbacks: u64,
+    pub active_epoch: Option<u64>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
