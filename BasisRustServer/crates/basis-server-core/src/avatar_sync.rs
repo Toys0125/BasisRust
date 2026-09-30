@@ -38,6 +38,9 @@ const TICK_SPIN_RESERVE_MICROS: u64 = 100;
 const MAX_SLICE_COUNT: usize = 32;
 const NO_RECEIVER_BASELINE: u64 = u64::MAX;
 const AVATAR_BUNDLE_WIRE_BUDGET_BYTES: usize = 1100;
+// Match LiteNetLib's 32-byte datagram headroom plus the three-byte bundle header.
+const AVATAR_BUNDLE_MTU_HEADROOM_BYTES: usize = 35;
+const AVATAR_BUNDLE_UNCONFIRMED_MTU_BYTES: usize = 1200;
 const AVATAR_BUNDLE_INITIAL_RATIO: f32 = 0.60;
 const AVATAR_BUNDLE_MIN_RATIO: f32 = 0.05;
 const AVATAR_BUNDLE_MAX_RATIO: f32 = 0.95;
@@ -1720,9 +1723,15 @@ impl AvatarSyncSystem {
             .map_init(
                 ReceiverBuildScratch::default,
                 |scratch, (receiver_id, receiver_state)| {
+                    let mtu = transport.peer_mtu(*receiver_id);
                     self.build_sends_for_receiver(
                         *receiver_id,
                         receiver_state.position,
+                        if mtu > AVATAR_BUNDLE_UNCONFIRMED_MTU_BYTES {
+                            mtu - AVATAR_BUNDLE_MTU_HEADROOM_BYTES
+                        } else {
+                            AVATAR_BUNDLE_WIRE_BUDGET_BYTES
+                        },
                         &peer_states,
                         spatial_grid.as_ref(),
                         &config,
@@ -1913,6 +1922,7 @@ impl AvatarSyncSystem {
         &self,
         receiver_id: PeerId,
         receiver_position: [f32; 3],
+        bundle_wire_budget: usize,
         peer_states: &'a [(PeerId, Arc<PlayerAvatarState>)],
         spatial_grid: Option<&SpatialGrid>,
         config: &AvatarSyncConfig,
@@ -2138,6 +2148,7 @@ impl AvatarSyncSystem {
                 &self.profiler,
                 config,
                 bundle_cache,
+                bundle_wire_budget,
             );
             self.bundle_ratios.insert(receiver_id, bundle_ratio);
         }
@@ -2383,6 +2394,7 @@ fn emit_greedy_avatar_bundles<'a>(
     profiler: &BsrProfiler,
     config: &AvatarSyncConfig,
     bundle_cache: &AvatarBundleCache,
+    wire_budget: usize,
 ) {
     if bundle.is_empty() {
         return;
@@ -2393,7 +2405,7 @@ fn emit_greedy_avatar_bundles<'a>(
     let mut ratio = valid_bundle_ratio(*bundle_ratio);
 
     while count - cursor >= config.bundle_min_messages {
-        let target_raw = ((AVATAR_BUNDLE_WIRE_BUDGET_BYTES as f32 * 0.95) / ratio) as usize;
+        let target_raw = ((wire_budget as f32 * 0.95) / ratio) as usize;
         let chunk_end = pick_bundle_chunk_end(bundle, cursor, count, target_raw);
         if chunk_end <= cursor {
             break;
@@ -2411,6 +2423,7 @@ fn emit_greedy_avatar_bundles<'a>(
             profiler,
             config,
             bundle_cache,
+            wire_budget,
         ) {
             Ok(BundleEmit::Emitted {
                 raw_len,
@@ -2428,8 +2441,7 @@ fn emit_greedy_avatar_bundles<'a>(
                 update_bundle_ratio(bundle_ratio, compressed_len, raw_len, 0.7);
                 let observed = (compressed_len as f32 / raw_len.max(1) as f32)
                     .clamp(AVATAR_BUNDLE_MIN_RATIO, 0.99);
-                let retry_target_raw =
-                    ((AVATAR_BUNDLE_WIRE_BUDGET_BYTES as f32 * 0.92) / observed) as usize;
+                let retry_target_raw = ((wire_budget as f32 * 0.92) / observed) as usize;
                 let mut retry_end =
                     pick_bundle_chunk_end(bundle, cursor, chunk_end, retry_target_raw);
                 if retry_end >= chunk_end {
@@ -2451,6 +2463,7 @@ fn emit_greedy_avatar_bundles<'a>(
                     profiler,
                     config,
                     bundle_cache,
+                    wire_budget,
                 ) {
                     Ok(BundleEmit::Emitted {
                         raw_len,
@@ -2508,6 +2521,7 @@ fn try_emit_bundle_range<'a>(
     profiler: &BsrProfiler,
     config: &AvatarSyncConfig,
     bundle_cache: &AvatarBundleCache,
+    wire_budget: usize,
 ) -> Result<BundleEmit> {
     let slices = bundle[start..end]
         .iter()
@@ -2541,7 +2555,7 @@ fn try_emit_bundle_range<'a>(
         encoded = &uncached;
     }
     let compressed_len = encoded.compressed_len;
-    if encoded.bytes.len() > AVATAR_BUNDLE_WIRE_BUDGET_BYTES {
+    if encoded.bytes.len() > wire_budget {
         return Ok(BundleEmit::Overshot {
             raw_len: encoded.raw_len,
             compressed_len,
@@ -3248,6 +3262,7 @@ mod tests {
                 &profiler,
                 &config,
                 &cache,
+                AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
             )
             .unwrap();
             assert!(matches!(result, BundleEmit::Emitted { .. }));
@@ -3266,6 +3281,7 @@ mod tests {
             &profiler,
             &config,
             &cache,
+            AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
         )
         .unwrap();
         assert_eq!(direct[0].payload(), expected(&bundle).bytes);
@@ -3301,6 +3317,69 @@ mod tests {
             .unwrap();
         assert_eq!(attempts, 2);
         assert_eq!(encoded.bytes.as_ref(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn confirmed_mtu_expands_bundle_without_changing_encoded_bytes() {
+        let mut random = 0x9876_5432u32;
+        let payload = (0..1200)
+            .map(|_| {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                random as u8
+            })
+            .collect::<Vec<_>>();
+        let bundle = vec![BundleAvatarSend {
+            original_channel: channels::DELTA_AVATAR,
+            payload: Bytes::from(payload),
+            interval_offset: 2,
+            interval_byte: 17,
+        }];
+        let cache = AvatarBundleCache::default();
+        let config = receiver_build_test_config();
+        let profiler = BsrProfiler::new(false);
+        let mut direct = Vec::new();
+        assert!(matches!(
+            try_emit_bundle_range(
+                &mut direct,
+                &bundle,
+                0,
+                1,
+                &profiler,
+                &config,
+                &cache,
+                AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
+            )
+            .unwrap(),
+            BundleEmit::Overshot { .. }
+        ));
+        assert!(direct.is_empty());
+        assert!(matches!(
+            try_emit_bundle_range(
+                &mut direct,
+                &bundle,
+                0,
+                1,
+                &profiler,
+                &config,
+                &cache,
+                1392 - AVATAR_BUNDLE_MTU_HEADROOM_BYTES,
+            )
+            .unwrap(),
+            BundleEmit::Emitted { .. }
+        ));
+        let expected = try_encode_avatar_bundle_slices_with_compression(
+            &[AvatarBundleSlice {
+                original_channel: bundle[0].original_channel,
+                payload: &bundle[0].payload,
+                interval_patch: Some((2, 17)),
+            }],
+            AvatarBundleCompression::Lz4,
+        )
+        .unwrap();
+        assert_eq!(direct[0].payload(), expected.bytes);
+        assert!(direct[0].payload().len() <= 1392 - AVATAR_BUNDLE_MTU_HEADROOM_BYTES);
     }
 
     #[test]
@@ -3342,9 +3421,17 @@ mod tests {
             .unwrap();
             assert!(expected.bytes.len() > AVATAR_BUNDLE_WIRE_BUDGET_BYTES);
             let mut direct = Vec::new();
-            let actual =
-                try_emit_bundle_range(&mut direct, &bundle, 0, 1, &profiler, &config, &cache)
-                    .unwrap();
+            let actual = try_emit_bundle_range(
+                &mut direct,
+                &bundle,
+                0,
+                1,
+                &profiler,
+                &config,
+                &cache,
+                AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
+            )
+            .unwrap();
             assert!(matches!(
                 actual,
                 BundleEmit::Overshot {
@@ -3567,6 +3654,7 @@ mod tests {
             system.build_sends_for_receiver(
                 receiver,
                 receiver_position,
+                AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
                 peers,
                 None,
                 config,

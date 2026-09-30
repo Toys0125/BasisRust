@@ -32,6 +32,10 @@ const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 const SOCKET_TTL: u32 = 255;
 const MAX_MERGED_PACKET_SIZE: usize = 1200;
 const LITENETLIB_INITIAL_MTU: usize = 1024;
+// The LiteNetLib client accepts this ladder. Grow only after it echoes our exact probe.
+const LITENETLIB_MTU_STEPS: [usize; 6] = [1024, 1164, 1392, 1404, 1424, 1432];
+const MTU_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_MTU_PROBE_ATTEMPTS: u8 = 4;
 const LITENETLIB_CHANNELED_HEADER_SIZE: usize = 4;
 const LITENETLIB_FRAGMENT_HEADER_SIZE: usize = 6;
 const LITENETLIB_FRAGMENTED_HEADER_SIZE: usize =
@@ -355,6 +359,67 @@ struct PeerState {
     /// Set whenever this peer has queued payloads, in-flight packets, or dirty ACKs. The
     /// dispatch loop skips peers without it, so a settled server stops paying per-peer polling cost.
     reliable_active: AtomicBool,
+    confirmed_mtu: AtomicUsize,
+    mtu_probe: parking_lot::Mutex<MtuProbeState>,
+}
+
+#[derive(Debug)]
+struct MtuProbeState {
+    next_step: usize,
+    attempts: u8,
+    next_at: Instant,
+    pending: Option<(usize, u64)>,
+}
+
+impl MtuProbeState {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_step: 1,
+            attempts: 0,
+            next_at: now + MTU_PROBE_INTERVAL,
+            pending: None,
+        }
+    }
+
+    fn next_packet(&mut self, now: Instant, connection_number: u8) -> Option<Vec<u8>> {
+        if now < self.next_at || self.next_step >= LITENETLIB_MTU_STEPS.len() {
+            return None;
+        }
+        if self.attempts >= MAX_MTU_PROBE_ATTEMPTS {
+            self.next_step = LITENETLIB_MTU_STEPS.len();
+            self.pending = None;
+            return None;
+        }
+        let mtu = LITENETLIB_MTU_STEPS[self.next_step];
+        let token = rand::random::<u64>();
+        self.attempts += 1;
+        self.next_at = now + MTU_PROBE_INTERVAL;
+        self.pending = Some((mtu, token));
+        let mut packet = vec![0; mtu];
+        packet[0] = PacketProperty::MtuCheck as u8 | (connection_number << 5);
+        packet[1..5].copy_from_slice(&(mtu as i32).to_le_bytes());
+        packet[5..13].copy_from_slice(&token.to_le_bytes());
+        packet[mtu - 4..].copy_from_slice(&(mtu as i32).to_le_bytes());
+        Some(packet)
+    }
+
+    fn accept_response(&mut self, bytes: &[u8], connection_number: u8) -> Option<usize> {
+        let (mtu, token) = self.pending?;
+        if bytes.len() != mtu
+            || bytes[0] != (PacketProperty::MtuOk as u8 | (connection_number << 5))
+            || bytes[1..5] != (mtu as i32).to_le_bytes()
+            || bytes[5..13] != token.to_le_bytes()
+            || bytes[13..mtu - 4].iter().any(|&byte| byte != 0)
+            || bytes[mtu - 4..] != (mtu as i32).to_le_bytes()
+        {
+            return None;
+        }
+        self.pending = None;
+        self.next_step += 1;
+        self.attempts = 0;
+        self.next_at = Instant::now() + MTU_PROBE_INTERVAL;
+        Some(mtu)
+    }
 }
 
 impl PeerState {
@@ -496,6 +561,15 @@ impl TransportHandle {
 
     pub fn connected_peers_count(&self) -> usize {
         self.peers.len()
+    }
+
+    /// The outbound datagram size confirmed for this peer. Until an exact MTU probe reply,
+    /// retain the transport's previous 1200-byte packing limit.
+    pub fn peer_mtu(&self, peer: PeerId) -> usize {
+        self.peers
+            .get(&peer)
+            .map(|state| state.confirmed_mtu.load(Ordering::Relaxed))
+            .unwrap_or(MAX_MERGED_PACKET_SIZE)
     }
 
     pub fn shutdown(&self) {
@@ -688,6 +762,8 @@ impl TransportHandle {
             outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
             outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
             reliable_active: AtomicBool::new(false),
+            confirmed_mtu: AtomicUsize::new(MAX_MERGED_PACKET_SIZE),
+            mtu_probe: parking_lot::Mutex::new(MtuProbeState::new(Instant::now())),
         });
         self.by_addr.insert(request.remote_addr, id);
         self.peers.insert(id, state);
@@ -871,7 +947,8 @@ impl TransportHandle {
         }
 
         let mut sent = 0usize;
-        let mut current = Vec::with_capacity(MAX_MERGED_PACKET_SIZE);
+        let mtu = state.confirmed_mtu.load(Ordering::Relaxed);
+        let mut current = Vec::with_capacity(mtu);
         current.push(PacketProperty::Merged as u8 | (state.connection_number << 5));
         let mut current_count = 0usize;
 
@@ -879,7 +956,7 @@ impl TransportHandle {
             let payload = packet.payload();
             let packet_len = payload.len() + 2;
             let framed_len = packet_len + 2;
-            if current_count > 0 && current.len() + framed_len > MAX_MERGED_PACKET_SIZE {
+            if current_count > 0 && current.len() + framed_len > mtu {
                 if self.try_send_raw_to(&current, state.addr)? {
                     sent += 1;
                 }
@@ -888,7 +965,7 @@ impl TransportHandle {
                 current_count = 0;
             }
 
-            if framed_len + 1 > MAX_MERGED_PACKET_SIZE {
+            if framed_len + 1 > mtu {
                 let mut oversized = Vec::with_capacity(packet_len);
                 oversized.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
                 oversized.push(packet.channel());
@@ -1467,7 +1544,15 @@ async fn process_packet(
         PacketProperty::MtuOk => {
             if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
                 if let Some(peer) = handle.peers.get(&peer_id) {
-                    *peer.last_seen.lock() = Instant::now();
+                    if let Some(mtu) = peer
+                        .mtu_probe
+                        .lock()
+                        .accept_response(bytes, peer.connection_number)
+                    {
+                        peer.confirmed_mtu
+                            .store(mtu.max(MAX_MERGED_PACKET_SIZE), Ordering::Relaxed);
+                        *peer.last_seen.lock() = Instant::now();
+                    }
                 }
             }
         }
@@ -2445,6 +2530,10 @@ async fn reliable_maintenance_loop(handle: TransportHandle) {
         for peer in handle.peers.iter() {
             let addr = peer.addr;
             let connection_number = peer.connection_number;
+            if let Some(probe) = peer.mtu_probe.lock().next_packet(now, connection_number) {
+                // A failed or blocked probe simply times out and retries. It never raises MTU.
+                let _ = handle.try_send_raw_to(&probe, addr);
+            }
             builder.reset(connection_number);
             let Some(_send_turn) = try_peer_send_turn(&peer) else {
                 continue;
@@ -4060,7 +4149,104 @@ mod tests {
             outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
             outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
             reliable_active: AtomicBool::new(false),
+            confirmed_mtu: AtomicUsize::new(MAX_MERGED_PACKET_SIZE),
+            mtu_probe: parking_lot::Mutex::new(MtuProbeState::new(Instant::now())),
         })
+    }
+
+    #[test]
+    fn mtu_probe_requires_exact_pending_echo_and_stops_after_timeout() {
+        let now = Instant::now();
+        let mut probe = MtuProbeState::new(now);
+        assert!(probe.next_packet(now, 2).is_none());
+        let first = probe.next_packet(now + MTU_PROBE_INTERVAL, 2).unwrap();
+        assert_eq!(first.len(), 1164);
+        assert_eq!(first[0], PacketProperty::MtuCheck as u8 | (2 << 5));
+        let mut response = first.clone();
+        response[0] = PacketProperty::MtuOk as u8 | (2 << 5);
+        let mut forged = response.clone();
+        forged[5] ^= 1;
+        assert_eq!(probe.accept_response(&forged, 2), None);
+        assert_eq!(probe.accept_response(&response, 1), None);
+        assert_eq!(probe.accept_response(&response[..1163], 2), None);
+        assert_eq!(probe.accept_response(&response, 2), Some(1164));
+        assert_eq!(probe.accept_response(&response, 2), None);
+
+        let mut failed = MtuProbeState::new(now);
+        for attempt in 0..MAX_MTU_PROBE_ATTEMPTS {
+            let packet = failed
+                .next_packet(now + MTU_PROBE_INTERVAL * (u32::from(attempt) + 1), 0)
+                .unwrap();
+            assert_eq!(packet.len(), 1164);
+        }
+        assert!(failed
+            .next_packet(
+                now + MTU_PROBE_INTERVAL * (u32::from(MAX_MTU_PROBE_ATTEMPTS) + 1),
+                0
+            )
+            .is_none());
+        assert_eq!(failed.next_step, LITENETLIB_MTU_STEPS.len());
+    }
+
+    #[tokio::test]
+    async fn negotiated_mtu_allows_larger_merged_unreliable_datagram() {
+        let (server, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let client = UdpSocket::bind(loopback_addr(0)).await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let peer = server
+            .accept(&ConnectionRequest {
+                remote_addr: client_addr,
+                payload: Bytes::new(),
+                connection_number: 1,
+                connect_time: 1,
+                local_peer_id: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(server.peer_mtu(peer), MAX_MERGED_PACKET_SIZE);
+
+        let mut recv = vec![0u8; 2048];
+        time::timeout(Duration::from_secs(5), async {
+            while server.peer_mtu(peer) < 1392 {
+                let (len, from) = client.recv_from(&mut recv).await.unwrap();
+                if recv[0] & 0x1f != PacketProperty::MtuCheck as u8 {
+                    continue;
+                }
+                assert_eq!(from, server.local_addr().unwrap());
+                assert!(LITENETLIB_MTU_STEPS.contains(&len));
+                let mut response = recv[..len].to_vec();
+                response[0] = (response[0] & 0xe0) | PacketProperty::MtuOk as u8;
+                client.send_to(&response, from).await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(server.peer_mtu(peer) >= 1392);
+
+        let packets = [
+            (channels::CHAT, Bytes::from(vec![1u8; 650])),
+            (channels::CHAT, Bytes::from(vec![2u8; 650])),
+        ];
+        assert_eq!(
+            server
+                .try_send_many_unreliable_bytes(peer, &packets)
+                .unwrap(),
+            1
+        );
+        let len = time::timeout(Duration::from_secs(1), async {
+            loop {
+                let (len, _) = client.recv_from(&mut recv).await.unwrap();
+                if recv[0] & 0x1f == PacketProperty::Merged as u8 {
+                    break len;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(recv[0] & 0x1f, PacketProperty::Merged as u8);
+        assert_eq!(len, 1 + 2 * (2 + 2 + 650));
+        assert!(len <= server.peer_mtu(peer));
+        server.shutdown();
     }
 
     #[test]
@@ -4097,6 +4283,8 @@ mod tests {
             outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
             outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
             reliable_active: AtomicBool::new(false),
+            confirmed_mtu: AtomicUsize::new(MAX_MERGED_PACKET_SIZE),
+            mtu_probe: parking_lot::Mutex::new(MtuProbeState::new(Instant::now())),
         };
         let payload = (0..RELIABLE_FRAGMENT_PAYLOAD_SIZE * 2 + 1)
             .map(|index| (index & 0xff) as u8)

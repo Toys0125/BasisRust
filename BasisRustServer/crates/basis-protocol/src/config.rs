@@ -220,9 +220,9 @@ impl Default for ServerConfig {
             enable_avatar_bundle_compression: true,
             avatar_bundle_min_messages: 2,
             avatar_bundle_min_bytes: 128,
-            enable_avatar_bundle_zstd: false,
+            enable_avatar_bundle_zstd: true,
             avatar_bundle_zstd_delta_bundles: false,
-            avatar_bundle_zstd_level: -2,
+            avatar_bundle_zstd_level: -5,
             avatar_bundle_zstd_max_shed_tier: 1,
             enable_avatar_delta_compression: true,
             avatar_delta_keyframe_interval_ms: 500,
@@ -711,7 +711,9 @@ mod tests {
         assert!(config.worlds_locked);
         assert!(!config.avatars_locked);
         assert!(!config.health_include_extended_metrics);
-        assert!(!config.enable_avatar_bundle_zstd);
+        assert!(config.enable_avatar_bundle_zstd);
+        assert!(!config.avatar_bundle_zstd_delta_bundles);
+        assert_eq!(config.avatar_bundle_zstd_level, -5);
     }
 
     #[test]
@@ -726,8 +728,32 @@ mod tests {
         assert!(xml.contains("<IPv4Address>0.0.0.0</IPv4Address>"));
         assert!(xml.contains("<EndEffectorIKDisabled>false</EndEffectorIKDisabled>"));
         assert!(xml.contains("<HealthIncludeExtendedMetrics>false</HealthIncludeExtendedMetrics>"));
+        assert!(xml.contains("<EnableAvatarBundleZstd>true</EnableAvatarBundleZstd>"));
+        assert!(xml.contains("<AvatarBundleZstdLevel>-5</AvatarBundleZstdLevel>"));
         let parsed: ServerConfig = quick_xml::de::from_str(&xml).unwrap();
         assert_eq!(parsed, config);
+
+        // Saved user choices continue to override the new defaults.
+        let explicit = xml
+            .replace(
+                "<EnableAvatarBundleZstd>true</EnableAvatarBundleZstd>",
+                "<EnableAvatarBundleZstd>false</EnableAvatarBundleZstd>",
+            )
+            .replace(
+                "<AvatarBundleZstdLevel>-5</AvatarBundleZstdLevel>",
+                "<AvatarBundleZstdLevel>-2</AvatarBundleZstdLevel>",
+            );
+        let explicit: ServerConfig = quick_xml::de::from_str(&explicit).unwrap();
+        assert!(!explicit.enable_avatar_bundle_zstd);
+        assert_eq!(explicit.avatar_bundle_zstd_level, -2);
+
+        // Older configs without the fields receive the current defaults.
+        let omitted = xml
+            .replace("<EnableAvatarBundleZstd>true</EnableAvatarBundleZstd>", "")
+            .replace("<AvatarBundleZstdLevel>-5</AvatarBundleZstdLevel>", "");
+        let omitted: ServerConfig = quick_xml::de::from_str(&omitted).unwrap();
+        assert!(omitted.enable_avatar_bundle_zstd);
+        assert_eq!(omitted.avatar_bundle_zstd_level, -5);
     }
 
     #[test]
@@ -741,8 +767,8 @@ mod tests {
             config.get_field("BSRMaxDegreeOfParallelism").as_deref(),
             Some("0")
         );
-        config.set_field("AvatarBundleZstdLevel", "-5").unwrap();
-        config.set_field("EnableAvatarBundleZstd", "true").unwrap();
+        config.set_field("AvatarBundleZstdLevel", "-2").unwrap();
+        config.set_field("EnableAvatarBundleZstd", "false").unwrap();
         config.set_field("ImagePickupRangeMeters", "42.5").unwrap();
         config.set_field("CompanyName", "Custom Company").unwrap();
         config.set_field("ProductName", "Custom Product").unwrap();
@@ -752,8 +778,8 @@ mod tests {
         config
             .set_field("BasisUserRestrictionMode", "blacklist")
             .unwrap();
-        assert_eq!(config.avatar_bundle_zstd_level, -5);
-        assert!(config.enable_avatar_bundle_zstd);
+        assert_eq!(config.avatar_bundle_zstd_level, -2);
+        assert!(!config.enable_avatar_bundle_zstd);
         assert_eq!(config.image_pickup_range_meters, 42.5);
         assert_eq!(config.company_name, "Custom Company");
         assert_eq!(config.product_name, "Custom Product");
