@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+gpu = ["dep:bytemuck", "dep:pollster", "dep:wgpu"]
+
 [dependencies]
 anyhow.workspace = true
 basis-protocol = { path = "../basis-protocol" }
@@ -13,10 +17,10 @@ basis-server-resources = { path = "../basis-server-resources" }
 basis-server-storage = { path = "../basis-server-storage" }
 basis-transport = { path = "../basis-transport" }
 bytes.workspace = true
-bytemuck.workspace = true
+bytemuck = { workspace = true, optional = true }
 dashmap.workspace = true
 parking_lot.workspace = true
-pollster.workspace = true
+pollster = { workspace = true, optional = true }
 rayon.workspace = true
 rustc-hash.workspace = true
 serde_json.workspace = true
@@ -25,4 +29,4 @@ lz4_flex.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 windows-sys.workspace = true
-wgpu.workspace = true
+wgpu = { workspace = true, optional = true }

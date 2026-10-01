@@ -1735,7 +1735,7 @@ impl AvatarSyncSystem {
             }
         }
         let distance_start = Instant::now();
-        let distance_peers = if config.enable_compute_offload {
+        let distance_peers = if cfg!(feature = "gpu") && config.enable_compute_offload {
             peer_states
                 .iter()
                 .map(|(id, state)| DistancePeer {
@@ -3815,6 +3815,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "gpu")]
     #[test]
     fn gpu_bucket_epoch_refreshes_tiers_and_cpu_fallback_immediately() {
         use crate::gpu_distance::DistanceBucket;
@@ -3903,6 +3904,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gpu")]
     #[test]
     fn ambiguous_gpu_decisions_are_corrected_before_publication() {
         use crate::{gpu_distance::DistanceBucket, gpu_policy::DECISION_CORRECTION_FLAG};
@@ -4036,6 +4038,7 @@ mod tests {
     }
 
     /// Isolate distance consumption from transport, scheduling, and GPU waits.
+    #[cfg(feature = "gpu")]
     #[test]
     #[ignore = "manual release-mode performance experiment; requires hardware GPU"]
     fn profile_gpu_distance_consumption() {

@@ -1,6 +1,12 @@
 mod avatar_sync;
+#[cfg(feature = "gpu")]
 mod gpu_distance;
+#[cfg(not(feature = "gpu"))]
+#[path = "gpu_distance_disabled.rs"]
+mod gpu_distance;
+#[cfg(feature = "gpu")]
 mod gpu_distance_backend;
+mod gpu_distance_types;
 mod gpu_policy;
 mod p2p;
 

@@ -612,9 +612,9 @@ mod tests {
             ]);
         }
         let decisions = assert_parity(&mut gpu, 0, &positions, &policy);
-        for sender in 1..positions.len() {
+        for decision in decisions.iter().take(positions.len()).skip(1) {
             assert_ne!(
-                decisions[sender] & DECISION_CORRECTION_FLAG,
+                decision & DECISION_CORRECTION_FLAG,
                 0,
                 "quality threshold must request CPU snapshot correction"
             );

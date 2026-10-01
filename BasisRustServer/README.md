@@ -31,14 +31,27 @@ cargo test
 
 ## GPU distance processing
 
-CPU processing is the default. Set `EnableComputeOffload=true` to enable hardware GPU computation of avatar distances,
-quality tiers, and encoded send intervals. `ComputeDevice` accepts an adapter name substring or index; an empty
-value selects an available hardware adapter. Software adapters are rejected.
-An unavailable or failed GPU falls back to CPU distance processing.
+GPU offload is excluded from default builds, including its backend dependencies.
+CPU processing is used even if a saved config sets `EnableComputeOffload=true`.
+To compile GPU support, build from this workspace with the explicit feature flag:
 
-Saved configurations retain their explicit setting. Set `EnableComputeOffload=false`
-in an existing config to select CPU processing. The [matched 2,000-client comparison](../docs/performance/cpu-vs-gpu-decisions-2000.md)
-found equivalent latency and throughput with higher resource use in GPU mode.
+```powershell
+cargo build --release -p basis-server-console --features gpu
+```
+
+Then set `EnableComputeOffload=true` in the server config to use GPU computation
+of avatar distances, quality tiers, and encoded send intervals. The runtime
+setting defaults to false even in GPU-capable builds. `ComputeDevice` accepts an
+adapter name substring or index; an empty value selects an available hardware
+adapter. Software adapters are rejected. An unavailable or failed GPU falls
+back to CPU distance processing.
+
+In the [matched 2,000-client tests](../docs/performance/cpu-vs-gpu-decisions-2000.md),
+GPU offload was slightly slower on average: p95 update gaps were 862 ms versus
+861 ms on CPU. That difference was within run variation, and throughput was
+effectively tied. GPU also used 1.4% more server CPU and 50% more peak resident
+memory. CPU is the recommended option for this tested workload; other hardware
+and workloads may differ.
 
 Two buckets hold captured peer positions and packed tier/interval decisions. The server reads
 one immutable bucket while a dedicated worker uploads, computes, and reads back

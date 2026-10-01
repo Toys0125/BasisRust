@@ -1,8 +1,12 @@
 //! Policy captured with each GPU bucket. Packed decisions contain no live state.
+#[cfg(any(feature = "gpu", test))]
 use basis_protocol::channels;
 
+#[cfg(feature = "gpu")]
 pub(crate) const DECISION_VALUE_MASK: u16 = 0x03ff;
+#[cfg(feature = "gpu")]
 pub(crate) const DECISION_CORRECTION_FLAG: u16 = 0x0400;
+#[cfg(feature = "gpu")]
 pub(crate) const DECISION_INVALID_FLAG: u16 = 0x0800;
 
 #[derive(Debug, Clone, Copy)]
@@ -53,6 +57,7 @@ impl Default for ReductionPolicy {
 }
 
 impl ReductionPolicy {
+    #[cfg(feature = "gpu")]
     pub fn validate(&self) -> bool {
         (1..=i32::MAX - 2048).contains(&self.base_interval_ms)
             && [
@@ -69,6 +74,7 @@ impl ReductionPolicy {
             && (self.increase_rate == 0.0 || self.increase_rate >= f32::MIN_POSITIVE)
     }
 
+    #[cfg(any(feature = "gpu", test))]
     pub fn cpu_decision(&self, distance_sq: f32) -> u16 {
         let quality = if distance_sq <= self.high_distance_sq {
             3
@@ -85,6 +91,7 @@ impl ReductionPolicy {
         ((quality as u16) << 8) | byte as u16
     }
 
+    #[cfg(any(feature = "gpu", test))]
     pub fn interval_table(&self) -> [u64; 256] {
         std::array::from_fn(|byte| {
             channels::decode_avatar_interval_ms(byte as u8, self.base_interval_ms).max(1) as u64

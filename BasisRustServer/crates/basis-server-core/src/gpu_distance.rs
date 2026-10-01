@@ -1,29 +1,15 @@
 //! Two immutable distance buckets; GPU waits are confined to a worker thread.
 use crate::gpu_distance_backend::GpuDistanceBackend;
+pub use crate::gpu_distance_types::GpuDistanceStats;
+pub(crate) use crate::gpu_distance_types::{DistancePeer, OffloadSettings};
 use crate::gpu_policy::{
     ReductionDecision, ReductionPolicy, DECISION_CORRECTION_FLAG, DECISION_VALUE_MASK,
 };
-use basis_transport::PeerId;
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{mpsc, Arc},
     thread,
 };
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OffloadSettings {
-    pub enabled: bool,
-    pub device: String,
-    pub interval_ticks: u64,
-    pub policy: ReductionPolicy,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DistancePeer {
-    pub id: PeerId,
-    pub incarnation: u64,
-    pub position: [f32; 4],
-}
 
 #[derive(Debug)]
 pub(crate) struct DistanceBucket {
@@ -190,23 +176,6 @@ impl DistanceRow<'_> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct GpuDistanceStats {
-    pub enabled: bool,
-    pub adapter: Option<String>,
-    pub interval_ticks: u64,
-    pub submissions: u64,
-    pub swaps: u64,
-    pub missed_swaps: u64,
-    pub stale_fallbacks: u64,
-    pub active_epoch: Option<u64>,
-    pub last_error: Option<String>,
-    pub computed_pairs: u64,
-    pub corrected_pairs: u64,
-    pub last_worker_micros: u64,
-    pub max_worker_micros: u64,
-}
-
 #[derive(Debug)]
 struct Job {
     bucket: usize,
@@ -218,7 +187,7 @@ struct Job {
 #[derive(Debug)]
 enum WorkerEvent {
     Initialized(String),
-    Completed(usize, Result<DistanceBucket, String>),
+    Completed(usize, Result<Arc<DistanceBucket>, String>),
 }
 #[derive(Debug)]
 struct WorkerLink {
@@ -251,7 +220,7 @@ fn spawn_worker(device: String) -> Result<(WorkerLink, thread::JoinHandle<()>), 
                         .and_then(|decisions| DistanceBucket::new(job, decisions))
                         .map(|mut result| {
                             result.worker_micros = started.elapsed().as_micros() as u64;
-                            result
+                            Arc::new(result)
                         });
                     let failed = result.is_err();
                     if events.send(WorkerEvent::Completed(bucket, result)).is_err() {
@@ -385,7 +354,7 @@ impl DistanceOffload {
                         self.stats.last_worker_micros = result.worker_micros;
                         self.stats.max_worker_micros =
                             self.stats.max_worker_micros.max(result.worker_micros);
-                        self.buckets[bucket] = Some(Arc::new(result));
+                        self.buckets[bucket] = Some(result);
                     }
                 }
                 Some(Ok(WorkerEvent::Completed(_, Err(error)))) => {
@@ -403,7 +372,7 @@ impl DistanceOffload {
             return None;
         }
         self.advance_buckets(settings.interval_ticks);
-        let boundary = self.tick % settings.interval_ticks == 0;
+        let boundary = self.tick.is_multiple_of(settings.interval_ticks);
         if self.initialized
             && self.pending.is_none()
             && peers.len() > 1
@@ -443,7 +412,7 @@ impl DistanceOffload {
 
     fn advance_buckets(&mut self, period: u64) {
         let max_age = period.saturating_mul(2);
-        if self.tick % period == 0 {
+        if self.tick.is_multiple_of(period) {
             if let Some((bucket, _, submitted)) = self.pending {
                 if self.buckets[bucket].is_some() {
                     self.pending = None;
@@ -525,7 +494,8 @@ mod tests {
         let packed = job.policy.cpu_decision(value);
         let zero = job.policy.cpu_decision(0.0);
         let result = DistanceBucket::new(job, vec![zero, packed, packed, zero]);
-        tx.send(WorkerEvent::Completed(bucket, result)).unwrap();
+        tx.send(WorkerEvent::Completed(bucket, result.map(Arc::new)))
+            .unwrap();
     }
 
     #[test]

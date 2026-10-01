@@ -39,6 +39,11 @@ jobs:
           - name: Server check, test, clippy
             manifest: BasisRustServer/Cargo.toml
             workspace: "true"
+            features: ""
+          - name: Server GPU feature check, test, clippy
+            manifest: BasisRustServer/Cargo.toml
+            workspace: "true"
+            features: "--features basis-server-console/gpu"
           - name: Client check, test, clippy
             manifest: BasisRustClient/Cargo.toml
             workspace: "false"
@@ -58,7 +63,7 @@ jobs:
 
       - name: Cargo check workspace
         if: matrix.workspace == 'true'
-        run: cargo check --manifest-path ${{ matrix.manifest }} --workspace --all-targets
+        run: cargo check --manifest-path ${{ matrix.manifest }} --workspace --all-targets ${{ matrix.features }}
 
       - name: Cargo test
         if: matrix.workspace == 'false'
@@ -66,7 +71,7 @@ jobs:
 
       - name: Cargo test workspace
         if: matrix.workspace == 'true'
-        run: cargo test --manifest-path ${{ matrix.manifest }} --workspace
+        run: cargo test --manifest-path ${{ matrix.manifest }} --workspace ${{ matrix.features }}
 
       - name: Cargo clippy
         if: matrix.workspace == 'false'
@@ -74,4 +79,4 @@ jobs:
 
       - name: Cargo clippy workspace
         if: matrix.workspace == 'true'
-        run: cargo clippy --manifest-path ${{ matrix.manifest }} --workspace --all-targets -- -D warnings
+        run: cargo clippy --manifest-path ${{ matrix.manifest }} --workspace --all-targets ${{ matrix.features }} -- -D warnings
