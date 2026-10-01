@@ -29,6 +29,53 @@ Useful flags:
 cargo test
 ```
 
+## GPU distance processing
+
+GPU offload is excluded from default builds, including its backend dependencies.
+CPU processing is used even if a saved config sets `EnableComputeOffload=true`.
+To compile GPU support, build from this workspace with the explicit feature flag:
+
+```powershell
+cargo build --release -p basis-server-console --features gpu
+```
+
+Then set `EnableComputeOffload=true` in the server config to use GPU computation
+of avatar distances, quality tiers, and encoded send intervals. The runtime
+setting defaults to false even in GPU-capable builds. `ComputeDevice` accepts an
+adapter name substring or index; an empty value selects an available hardware
+adapter. Software adapters are rejected. An unavailable or failed GPU falls
+back to CPU distance processing.
+
+In the [matched 2,000-client tests](../docs/performance/cpu-vs-gpu-decisions-2000.md),
+GPU offload was slightly slower on average: p95 update gaps were 862 ms versus
+861 ms on CPU. That difference was within run variation, and throughput was
+effectively tied. GPU also used 1.4% more server CPU and 50% more peak resident
+memory. CPU is the recommended option for this tested workload; other hardware
+and workloads may differ.
+
+Two buckets hold captured peer positions and packed tier/interval decisions. The server reads
+one immutable bucket while a dedicated worker uploads, computes, and reads back
+the other. Completed buckets are published every
+`ComputeDistanceUpdateIntervalTicks` ticks (32 by default). The server tick never
+waits for GPU completion. A late result keeps the previous bucket active; data
+older than two publication periods falls back to CPU processing. New peers and
+reused peer IDs also use CPU processing until their incarnation appears in a
+completed bucket. The GPU flags decisions near floating-point boundaries, and
+the worker corrects them using CPU arithmetic on the captured positions before
+publication. Receiver builds read ready decisions without floating-point checks.
+Each pair uses two result bytes. Reduction-policy changes invalidate old buckets
+and cached decisions; unsupported GPU policies use CPU processing.
+
+This deliberately delays distance decisions until bucket publication; packet
+building and transport remain on the CPU. With `HealthIncludeExtendedMetrics`
+enabled, `extended.avatarSync.gpuDistance` reports the adapter, active epoch,
+submissions, swaps, missed swaps, stale fallbacks, and errors. `computedPairs`
+and `correctedPairs` count worker-produced decisions and boundary corrections;
+`lastWorkerMicros` and `maxWorkerMicros` measure complete worker jobs, including
+GPU waits, readback, and correction. A non-null active
+epoch confirms that GPU results are in use. Set `EnableComputeOffload=false`
+to use CPU distance processing exclusively.
+
 ## Drift Check
 
 Checks C# source from the Basis git repo against local Rust source:
@@ -73,4 +120,3 @@ Remaining work is the deeper subsystem parity: full DID identity resolution,
 full LiteNetLib fragmentation/merge behavior, admin payload coverage, resource
 preload semantics, PIP/camera/content-share state, full voice optimization, and
 high-scale avatar reduction tuning.
-
