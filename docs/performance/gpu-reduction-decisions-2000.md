@@ -121,3 +121,8 @@ The runner expects the retained binaries and earlier fixture/runner artifacts.
 
 The preceding [update-gap investigation](gpu-update-gap-investigation.md)
 explains why moving only distance arithmetic had increased CPU consumption.
+
+A subsequent [matched CPU versus GPU comparison](cpu-vs-gpu-decisions-2000.md)
+on `291d044` found effectively tied update latency and throughput, with higher
+CPU and resident-memory use in GPU mode. CPU remains the recommended default
+for this 2,000-client workload.
