@@ -31,10 +31,14 @@ cargo test
 
 ## GPU distance processing
 
-`EnableComputeOffload` enables hardware GPU computation of avatar distances,
+CPU processing is the default. Set `EnableComputeOffload=true` to enable hardware GPU computation of avatar distances,
 quality tiers, and encoded send intervals. `ComputeDevice` accepts an adapter name substring or index; an empty
 value selects an available hardware adapter. Software adapters are rejected.
 An unavailable or failed GPU falls back to CPU distance processing.
+
+Saved configurations retain their explicit setting. Set `EnableComputeOffload=false`
+in an existing config to select CPU processing. The [matched 2,000-client comparison](../docs/performance/cpu-vs-gpu-decisions-2000.md)
+found equivalent latency and throughput with higher resource use in GPU mode.
 
 Two buckets hold captured peer positions and packed tier/interval decisions. The server reads
 one immutable bucket while a dedicated worker uploads, computes, and reads back
