@@ -7,6 +7,7 @@ use quick_xml::{
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -115,8 +116,11 @@ impl PermissionManager {
         if !pending.file_support {
             return Ok(());
         }
+        let is_primary_path = path.as_ref() == self.get_xml_path().as_path();
         save_permissions(path.as_ref(), &store)?;
-        pending.dirty_since = None;
+        if is_primary_path {
+            pending.dirty_since = None;
+        }
         Ok(())
     }
 
@@ -790,10 +794,26 @@ fn save_permissions(path: &Path, store: &PermissionStore) -> Result<()> {
     out.push_str("  </SeededDefaults>\n</Permissions>\n");
     // Keep the previous complete file if writing fails or the process stops before replacement.
     let temporary = path.with_extension("xml.tmp");
-    fs::write(&temporary, out)
+    let mut file = fs::File::create(&temporary)
         .with_context(|| format!("writing permissions {}", temporary.display()))?;
+    file.write_all(out.as_bytes())
+        .with_context(|| format!("writing permissions {}", temporary.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing permissions {}", temporary.display()))?;
+    drop(file);
     fs::rename(&temporary, path)
         .with_context(|| format!("replacing permissions {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::File::open(parent)
+            .with_context(|| format!("opening permissions directory {}", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("syncing permissions directory {}", parent.display()))?;
+    }
     Ok(())
 }
 fn write_set(out: &mut String, tag: &str, attribute: &str, set: &HashSet<String>) {
@@ -1093,5 +1113,26 @@ mod tests {
         manager.set_xml_path(fixture.path());
         manager.flush_pending_save().unwrap();
         assert!(manager.pending.lock().dirty_since.is_none());
+    }
+
+    #[test]
+    fn exporting_backup_does_not_cancel_primary_pending_save() {
+        let fixture = Fixture::new();
+        let primary = fixture.path();
+        let backup = fixture.0.join("backup.xml");
+        let manager = PermissionManager::new(&primary);
+        manager.add_user_node("u", "basis.old");
+        manager.flush_pending_save().unwrap();
+
+        manager.add_user_node("u", "basis.new");
+        manager.save_to_xml_path(&backup).unwrap();
+        assert!(fs::read_to_string(&backup).unwrap().contains("basis.new"));
+        assert!(!fs::read_to_string(&primary).unwrap().contains("basis.new"));
+
+        manager.flush_pending_save().unwrap();
+        assert!(fs::read_to_string(&primary).unwrap().contains("basis.new"));
+        let reloaded = PermissionManager::new(&primary);
+        reloaded.load_from_xml().unwrap();
+        assert!(reloaded.has("u", "basis.new"));
     }
 }

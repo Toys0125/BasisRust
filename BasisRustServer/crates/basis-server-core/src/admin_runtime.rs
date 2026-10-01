@@ -1075,6 +1075,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn truncated_server_settings_preserve_live_and_persisted_values() {
+        let (state, shutdown, dir) = test_server(true).await;
+        add_peer(&state, 1, "admin");
+        state.permissions.add_user_to_group("admin", "admin");
+        request(&state, 1, AdminRequestMode::SetServerName, |w| {
+            w.put_string("Existing server")
+        })
+        .await;
+        request(&state, 1, AdminRequestMode::SetServerMotd, |w| {
+            w.put_string("Existing MOTD")
+        })
+        .await;
+        let config_path = dir.join("config/config.xml");
+        let before = fs::read(&config_path).unwrap();
+        for mode in [
+            AdminRequestMode::SetServerName,
+            AdminRequestMode::SetServerMotd,
+        ] {
+            let mut malformed = NetWriter::new();
+            AdminRequest { mode }.serialize(&mut malformed);
+            malformed.put_u16(50); // Advertised string bytes never arrive.
+            assert!(handle_admin_message(&state, 1, malformed.as_slice())
+                .await
+                .is_err());
+            assert_eq!(state.config.read().server_name, "Existing server");
+            assert_eq!(state.config.read().server_motd, "Existing MOTD");
+            assert_eq!(fs::read(&config_path).unwrap(), before);
+        }
+        // An explicitly supplied empty value remains a valid, deliberate edit.
+        request(&state, 1, AdminRequestMode::SetServerMotd, |w| {
+            w.put_string("")
+        })
+        .await;
+        assert!(ServerConfig::load_or_create(&config_path)
+            .unwrap()
+            .server_motd
+            .is_empty());
+        state.shutdown().await.unwrap();
+        let _ = shutdown.send(());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn oversized_existing_library_starts_and_can_be_reduced_without_data_loss() {
         let dir =
             std::env::temp_dir().join(format!("basis-large-library-{}", uuid::Uuid::new_v4()));

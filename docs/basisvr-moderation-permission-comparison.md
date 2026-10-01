@@ -55,8 +55,11 @@ contract; legacy XML names retain their intended policies.
 Malformed permission/moderation reloads return errors and retain live state.
 Startup fails before overwriting invalid stores. Permission saves preserve
 seed history and use atomic replacement; automatic writes are debounced and
-flushed during shutdown. Moderation writes complete before replacing live
-state. `HasFileSupport=false` initializes these stores in memory and suppresses
+flushed during shutdown. Backup exports retain pending primary saves. Both
+permission and moderation files are synced before atomic replacement, and Unix
+parent directories are synced after rename. Moderation writes complete before
+replacing live state. Malformed server-name/MOTD requests preserve live and saved
+settings. `HasFileSupport=false` initializes these stores in memory and suppresses
 their disk reads/writes and automatic admin config writes. The console still
 reads its selected configuration; explicit `/config save` remains available.
 Changing `HasFileSupport` requires restart.
@@ -96,7 +99,7 @@ verify spoofed captured/configuration-editor DIDs, signature replay on a fresh
 nonce, valid captured-player rejoin, malformed responses, identity-disabled
 rejoin rejection, and handshake timeout.
 
-The final Rust workspace suite passes: **183 tests passed, 1 ignored**. Both
+The final Rust workspace suite passes: **185 tests passed, 1 ignored**. Both
 server-console and client compilation checks pass. Client tests pass (67), and
 server/client Clippy checks pass with warnings denied. Unicode comparison uses
 Rust's Unicode tables with .NET ordinal casing rules; older .NET/ICU versions

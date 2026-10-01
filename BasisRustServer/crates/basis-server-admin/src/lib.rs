@@ -4,6 +4,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -397,8 +398,26 @@ fn write_xml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes).with_context(|| format!("writing {}", temporary.display()))?;
-    fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))
+    let mut file = fs::File::create(&temporary)
+        .with_context(|| format!("creating {}", temporary.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing {}", temporary.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing {}", temporary.display()))?;
+    drop(file);
+    fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::File::open(parent)
+            .with_context(|| format!("opening {}", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("syncing {}", parent.display()))?;
+    }
+    Ok(())
 }
 fn read_line_list_with_fallback(path: &Path, legacy: &str) -> Result<Vec<String>> {
     let fallback = path.with_file_name(legacy);

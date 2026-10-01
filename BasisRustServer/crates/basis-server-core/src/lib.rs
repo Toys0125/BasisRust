@@ -3734,10 +3734,10 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
             delete_all_logs(state, peer).await?;
         }
         AdminRequestMode::SetServerName => {
-            state.config.write().server_name = reader.get_string().unwrap_or_default();
+            state.config.write().server_name = reader.get_string()?;
         }
         AdminRequestMode::SetServerMotd => {
-            state.config.write().server_motd = reader.get_string().unwrap_or_default();
+            state.config.write().server_motd = reader.get_string()?;
         }
         AdminRequestMode::AddAllowlist => {
             if let Ok(uuid) = reader.get_string() {
