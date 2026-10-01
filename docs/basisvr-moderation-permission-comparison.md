@@ -57,7 +57,9 @@ Startup fails before overwriting invalid stores. Permission saves preserve
 seed history and use atomic replacement; automatic writes are debounced and
 flushed during shutdown. Backup exports retain pending primary saves. Both
 permission and moderation files are synced before atomic replacement, and Unix
-parent directories are synced after rename. Moderation writes complete before
+parent directories are synced after rename. A moderation directory-sync failure
+after replacement logs a durability warning and still updates live restrictions
+to match the committed file. Moderation writes complete before
 replacing live state. Malformed server-name/MOTD requests preserve live and saved
 settings. `HasFileSupport=false` initializes these stores in memory and suppresses
 their disk reads/writes and automatic admin config writes. The console still
@@ -99,7 +101,7 @@ verify spoofed captured/configuration-editor DIDs, signature replay on a fresh
 nonce, valid captured-player rejoin, malformed responses, identity-disabled
 rejoin rejection, and handshake timeout.
 
-The final Rust workspace suite passes: **185 tests passed, 1 ignored**. Both
+The final Rust workspace suite passes: **192 tests passed, 1 ignored**. Both
 server-console and client compilation checks pass. Client tests pass (67), and
 server/client Clippy checks pass with warnings denied. Unicode comparison uses
 Rust's Unicode tables with .NET ordinal casing rules; older .NET/ICU versions

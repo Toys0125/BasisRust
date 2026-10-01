@@ -397,6 +397,13 @@ fn write_xml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     atomic_write(path, xml.as_bytes())
 }
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_with_directory_sync(path, bytes, sync_parent_directory)
+}
+fn atomic_write_with_directory_sync(
+    path: &Path,
+    bytes: &[u8],
+    sync_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<()> {
     let temporary = path.with_extension("tmp");
     let mut file = fs::File::create(&temporary)
         .with_context(|| format!("creating {}", temporary.display()))?;
@@ -406,17 +413,25 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("syncing {}", temporary.display()))?;
     drop(file);
     fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
+    // Rename commits the change. Returning an error afterward would prevent callers
+    // from updating live restrictions even though their saved file has changed.
+    if let Err(error) = sync_directory(path) {
+        tracing::warn!(path = %path.display(), %error,
+            "Moderation file replaced, but directory sync failed; crash durability is uncertain");
+    }
+    Ok(())
+}
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        fs::File::open(parent)
-            .with_context(|| format!("opening {}", parent.display()))?
-            .sync_all()
-            .with_context(|| format!("syncing {}", parent.display()))?;
+        fs::File::open(parent)?.sync_all()?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 fn read_line_list_with_fallback(path: &Path, legacy: &str) -> Result<Vec<String>> {
@@ -598,6 +613,27 @@ impl From<&ServerConfig> for GlobalState {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn directory_sync_failure_still_reports_committed_moderation_write() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("BasisBanList.txt");
+        fs::write(&path, "old-user\n").unwrap();
+        let result = atomic_write_with_directory_sync(&path, b"new-user\n", |path| {
+            assert_eq!(fs::read_to_string(path).unwrap(), "new-user\n");
+            Err(std::io::Error::other("injected directory-sync failure"))
+        });
+        assert!(
+            result.is_ok(),
+            "a committed write must update live restrictions"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new-user\n");
+        let reloaded = ModerationLists::file_backed(&dir).unwrap();
+        assert!(reloaded.is_blacklisted("new-user"));
+        assert!(!reloaded.is_blacklisted("old-user"));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn moderation_lists_persist_whitelist_blacklist_and_bans() {
