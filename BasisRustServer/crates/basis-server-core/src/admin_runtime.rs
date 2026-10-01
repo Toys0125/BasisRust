@@ -12,7 +12,7 @@ pub(super) struct AdminRuntime {
     shouting: RwLock<HashSet<PeerId>>,
     rejoin_population: RwLock<HashSet<String>>,
     library: RwLock<DefaultLibrary>,
-    library_wire: RwLock<Vec<u8>>,
+    library_wire: RwLock<Option<Vec<u8>>>,
     library_path: PathBuf,
 }
 
@@ -24,7 +24,13 @@ impl AdminRuntime {
         } else {
             DefaultLibrary::default()
         };
-        let wire = library.encode_library()?;
+        let wire = match library.encode_library() {
+            Ok(wire) => Some(wire),
+            Err(error) => {
+                warn!("default library loaded but cannot be broadcast: {error:#}; remove entries to fit the client packet limit");
+                None
+            }
+        };
         Ok(Self {
             queries: Mutex::new(HashMap::new()),
             permission_retries: Mutex::new(HashSet::new()),
@@ -213,15 +219,17 @@ pub(super) async fn send_join_state(state: &ServerState, peer: PeerId) -> Result
         }
     }
     let wire = state.admin_runtime.library_wire.read().clone();
-    state
-        .transport
-        .send(
-            peer,
-            channels::SERVER_LIBRARY,
-            DeliveryMethod::ReliableOrdered,
-            &wire,
-        )
-        .await?;
+    if let Some(wire) = wire {
+        state
+            .transport
+            .send(
+                peer,
+                channels::SERVER_LIBRARY,
+                DeliveryMethod::ReliableOrdered,
+                &wire,
+            )
+            .await?;
+    }
     Ok(())
 }
 
@@ -528,13 +536,15 @@ async fn handle_query(state: &ServerState, peer: PeerId, reader: &mut NetReader<
 fn sanitize_display_name(name: &str) -> String {
     name.chars()
         .filter(|ch| {
-            !ch.is_control()
-                // BasisVR checks UTF-16 char categories; supplementary scalars are surrogates there.
-                && !(ch.len_utf16() == 1 && get_general_category(*ch) == GeneralCategory::Format)
-                && !matches!(
+            // BasisVR checks UTF-16 char categories; supplementary scalars are surrogates there.
+            let is_format =
+                ch.len_utf16() == 1 && get_general_category(*ch) == GeneralCategory::Format;
+            !(ch.is_control()
+                || is_format
+                || matches!(
                     ch,
                     '\u{115f}' | '\u{1160}' | '\u{3164}' | '\u{ffa0}' | '\u{2800}' | '\u{180e}'
-                )
+                ))
         })
         .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
         .collect::<String>()
@@ -593,7 +603,7 @@ async fn handle_library(
     reader: &mut NetReader<'_>,
 ) -> Result<()> {
     let file_support = state.config.read().has_file_support;
-    let result = (|| -> Result<Vec<u8>> {
+    let result = (|| -> Result<Option<Vec<u8>>> {
         let mut library = state.admin_runtime.library.write();
         let mut candidate = library.clone();
         if mode == AdminRequestMode::AddDefaultLibraryItem {
@@ -612,11 +622,12 @@ async fn handle_library(
             } else {
                 *library = candidate;
             }
-            Ok(wire)
+            Ok(Some(wire))
         } else {
             let url = reader.get_string()?;
             candidate.remove_item_in_memory(&url)?;
-            let wire = candidate.encode_library()?;
+            // Existing oversized collections remain editable until enough entries are removed.
+            let wire = candidate.encode_library().ok();
             if file_support {
                 library.remove_item(&state.admin_runtime.library_path, &url)?;
             } else {
@@ -628,15 +639,25 @@ async fn handle_library(
     match result {
         Ok(wire) => {
             *state.admin_runtime.library_wire.write() = wire.clone();
-            state
-                .broadcast(
-                    channels::SERVER_LIBRARY,
-                    DeliveryMethod::ReliableOrdered,
-                    &wire,
-                    None,
+            if let Some(wire) = wire {
+                state
+                    .broadcast(
+                        channels::SERVER_LIBRARY,
+                        DeliveryMethod::ReliableOrdered,
+                        &wire,
+                        None,
+                    )
+                    .await;
+                send_admin_text(state, peer, "Default library updated.").await?;
+            } else {
+                warn!("default library updated but still exceeds client packet limits");
+                send_admin_text(
+                    state,
+                    peer,
+                    "Default library updated; remove more entries to fit the client packet limit.",
                 )
-                .await;
-            send_admin_text(state, peer, "Default library updated.").await?;
+                .await?;
+            }
         }
         Err(err) => {
             send_admin_text(
@@ -1050,6 +1071,49 @@ mod tests {
             fs::read_to_string(dir.join("config/permissions.xml")).unwrap(),
             malformed
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_existing_library_starts_and_can_be_reduced_without_data_loss() {
+        let dir =
+            std::env::temp_dir().join(format!("basis-large-library-{}", uuid::Uuid::new_v4()));
+        let path = dir.join(ServerConfig::DEFAULT_LIBRARY_FOLDER_NAME);
+        let mut library = DefaultLibrary::default();
+        for i in 0..3 {
+            library
+                .add_item(&path, 0, &format!("{i}{}", "x".repeat(35_000)), "")
+                .unwrap();
+        }
+        assert!(library.encode_library().is_err());
+        let config = ServerConfig {
+            has_file_support: true,
+            use_auth: false,
+            use_auth_identity: false,
+            override_auto_discovery_of_ipv: true,
+            ipv4_address: "127.0.0.1".into(),
+            set_port: 0,
+            ..ServerConfig::default()
+        };
+        let (state, shutdown) = ServerState::start(config, &dir).await.unwrap();
+        assert_eq!(state.admin_runtime.library.read().entries.len(), 3);
+        assert!(state.admin_runtime.library_wire.read().is_none());
+        add_peer(&state, 1, "admin");
+        state.permissions.add_user_to_group("admin", "admin");
+        for i in 0..2 {
+            request(&state, 1, AdminRequestMode::RemoveDefaultLibraryItem, |w| {
+                w.put_string(&library.entries[i].url);
+            })
+            .await;
+            assert_eq!(
+                DefaultLibrary::load_xml_dir(&path).unwrap().entries.len(),
+                2 - i
+            );
+            assert_eq!(state.admin_runtime.library.read().entries.len(), 2 - i);
+            assert_eq!(state.admin_runtime.library_wire.read().is_some(), i == 1);
+        }
+        state.shutdown().await.unwrap();
+        let _ = shutdown.send(());
         fs::remove_dir_all(dir).unwrap();
     }
 

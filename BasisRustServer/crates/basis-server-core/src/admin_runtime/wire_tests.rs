@@ -1,6 +1,7 @@
 //! Loopback checks exercise the dispatcher and actual outbound client packets.
 use super::*;
 use basis_transport::PacketProperty;
+use ed25519_dalek::{Signer, SigningKey};
 use tokio::net::UdpSocket;
 
 struct Client {
@@ -13,6 +14,14 @@ struct Client {
 
 impl Client {
     async fn connect(state: &ServerState, uuid: &str) -> Self {
+        let mut client = Self::connect_pending(state, uuid).await;
+        client
+            .receive(|channel, _| channel == channels::META_DATA)
+            .await;
+        client
+    }
+
+    async fn connect_pending(state: &ServerState, uuid: &str) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket
             .connect(state.transport.local_addr().unwrap())
@@ -31,17 +40,60 @@ impl Client {
         BytesMessage { data: Vec::new() }.serialize(&mut writer);
         super::tests::ready_message(uuid).serialize(&mut writer);
         socket.send(writer.as_slice()).await.unwrap();
-        let mut client = Self {
+        Self {
             socket,
             pending: Vec::new(),
             received: HashSet::new(),
             sequences: HashMap::new(),
             fragments: HashMap::new(),
-        };
-        client
-            .receive(|channel, _| channel == channels::META_DATA)
+        }
+    }
+
+    async fn answer_identity(&mut self, key: &SigningKey) -> Vec<u8> {
+        let challenge = self.receive_identity_challenge().await;
+        let signature = key.sign(&challenge);
+        self.send_identity_response(signature.to_bytes().to_vec())
             .await;
-        client
+        challenge
+    }
+
+    async fn receive_identity_challenge(&mut self) -> Vec<u8> {
+        let payload = self
+            .receive(|channel, _| channel == channels::AUTH_IDENTITY)
+            .await;
+        BytesMessage::deserialize(&mut NetReader::new(&payload))
+            .unwrap()
+            .data
+    }
+
+    async fn send_identity_response(&mut self, signature: Vec<u8>) {
+        let mut response = NetWriter::new();
+        BytesMessage { data: signature }.serialize(&mut response);
+        BytesMessage {
+            data: b"N/A".to_vec(),
+        }
+        .serialize(&mut response);
+        self.send(channels::AUTH_IDENTITY, response.as_slice(), true)
+            .await;
+    }
+
+    async fn send_raw_identity(&mut self, payload: &[u8]) {
+        self.send(channels::AUTH_IDENTITY, payload, true).await;
+    }
+
+    async fn receive_disconnect(&mut self) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mut packet = vec![0; 65535];
+                let length = self.socket.recv(&mut packet).await.unwrap();
+                packet.truncate(length);
+                if PacketProperty::from_byte(packet[0]) == Some(PacketProperty::Disconnect) {
+                    return packet;
+                }
+            }
+        })
+        .await
+        .expect("server did not disconnect rejected identity")
     }
 
     async fn send(&mut self, channel: u8, payload: &[u8], reliable: bool) {
@@ -274,6 +326,98 @@ async fn client_packets_verify_snapshot_gate_queries_mutes_and_live_permission_u
         0,
         "live refresh should grant the permissions.view bit"
     );
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+fn client_did(key: &SigningKey) -> String {
+    let mut multicodec = [0u8; 34];
+    multicodec[0] = 0xed;
+    multicodec[1] = 0x01;
+    multicodec[2..].copy_from_slice(&key.verifying_key().to_bytes());
+    format!("did:key:z{}", bs58::encode(multicodec).into_string())
+}
+
+#[tokio::test]
+async fn identity_admission_rejects_spoofed_rejoin_and_editor_claims_and_replay() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let captured_key = SigningKey::from_bytes(&[31; 32]);
+    let captured_did = client_did(&captured_key);
+    let editor_key = SigningKey::from_bytes(&[47; 32]);
+    let editor_did = client_did(&editor_key);
+    let attacker_key = SigningKey::from_bytes(&[63; 32]);
+    {
+        let mut config = state.config.write();
+        config.use_auth_identity = true;
+        config.basis_user_restriction_mode =
+            basis_protocol::config::BasisUserRestrictionMode::RejoinOnly;
+    }
+    state
+        .admin_runtime
+        .rejoin_population
+        .write()
+        .insert(captured_did.clone());
+    state.permissions.add_user_node(
+        &editor_did,
+        basis_protocol::permissions::nodes::CONFIGURATION_EDITOR,
+    );
+
+    let mut spoof = Client::connect_pending(&state, &captured_did).await;
+    let first_challenge = spoof.receive_identity_challenge().await;
+    let replayable_signature = captured_key.sign(&first_challenge).to_bytes().to_vec();
+    spoof
+        .send_identity_response(attacker_key.sign(&first_challenge).to_bytes().to_vec())
+        .await;
+    spoof.receive_disconnect().await;
+
+    let mut replay = Client::connect_pending(&state, &captured_did).await;
+    let second_challenge = replay.receive_identity_challenge().await;
+    assert_ne!(first_challenge, second_challenge);
+    replay.send_identity_response(replayable_signature).await;
+    replay.receive_disconnect().await;
+
+    let mut legitimate = Client::connect_pending(&state, &captured_did).await;
+    legitimate.answer_identity(&captured_key).await;
+    legitimate
+        .receive(|channel, _| channel == channels::META_DATA)
+        .await;
+    assert!(peer_by_uuid(&state, &captured_did).is_some());
+
+    let mut editor_spoof = Client::connect_pending(&state, &editor_did).await;
+    let editor_challenge = editor_spoof.receive_identity_challenge().await;
+    editor_spoof
+        .send_identity_response(attacker_key.sign(&editor_challenge).to_bytes().to_vec())
+        .await;
+    editor_spoof.receive_disconnect().await;
+    assert!(peer_by_uuid(&state, &editor_did).is_none());
+
+    let mut malformed = Client::connect_pending(&state, &editor_did).await;
+    malformed.receive_identity_challenge().await;
+    malformed.send_raw_identity(&[0xff]).await;
+    malformed.receive_disconnect().await;
+    assert!(peer_by_uuid(&state, &editor_did).is_none());
+
+    state.config.write().use_auth_identity = false;
+    let mut unauthenticated_editor = Client::connect_pending(&state, &editor_did).await;
+    unauthenticated_editor.receive_disconnect().await;
+    assert!(peer_by_uuid(&state, &editor_did).is_none());
+
+    {
+        let mut config = state.config.write();
+        config.use_auth_identity = true;
+        config.auth_validation_time_out_miliseconds = 50;
+    }
+    let mut silent = Client::connect_pending(&state, &captured_did).await;
+    silent.receive_disconnect().await;
+    assert_eq!(
+        state
+            .authenticated_peers
+            .iter()
+            .filter(|peer| peer.metadata.player_uuid == captured_did)
+            .count(),
+        1
+    );
+
     state.shutdown().await.unwrap();
     let _ = shutdown.send(());
 }

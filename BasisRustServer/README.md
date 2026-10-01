@@ -73,13 +73,13 @@ Implemented now:
   - Tab completion is context-aware for commands, subcommands, config fields/values, permission users/groups/nodes, and permission file paths.
   - `/config set <field> <value>` applies supported settings live without writing disk; `/config save` persists the current in-memory config. Legacy `/config <field> [value]` syntax remains available.
   - Listener/bootstrap settings such as server/health bind addresses and `EnableConsole` are accepted into the in-memory config but are reported as requiring restart to fully take effect.
+- signed Ed25519 `did:key` challenge verification before UUID admission gates; rejoin-only mode requires `UseAuthIdentity=true`
 - moderation/admin permission parity with the pinned BasisVR reference: persistent bans and independent voice/text mutes, protected targets, announce/shout, rename, restriction modes, locomotion policy, GIF lock, permission queries and live metadata refresh
 - BasisVR XML/text file compatibility, case-insensitive permission resolution, seeded default upgrades, and default-library mutation/broadcast; `HasFileSupport=false` keeps these stores in memory
 - [Moderation and permission parity report](../docs/basisvr-moderation-permission-comparison.md)
 - read-only source drift checker
 
-Remaining work is the deeper subsystem parity: full DID identity resolution,
-full LiteNetLib fragmentation/merge behavior, resource
+Remaining work is the deeper subsystem parity: full LiteNetLib fragmentation/merge behavior, resource
 preload semantics, PIP/camera/content-share state, full voice optimization, and
 high-scale avatar reduction tuning.
 

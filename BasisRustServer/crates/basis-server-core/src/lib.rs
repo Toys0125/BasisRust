@@ -11,6 +11,7 @@ use basis_protocol::{
     avatar_delta::apply_delta,
     channels,
     config::{BasisUserRestrictionMode, ServerConfig},
+    did::{did_key_verifying_key, DidResponse},
     io::{NetReader, NetWriter},
     messages::{
         core_message_supply, decompress_permission_extras, AdminRequest, AdminRequestMode,
@@ -61,6 +62,52 @@ pub struct ConnectedPeer {
     pub id: PeerId,
     pub metadata: ClientMetaDataMessage,
     pub ready: ReadyMessage,
+}
+
+struct PendingIdentity {
+    ready: ReadyMessage,
+    challenge: Vec<u8>,
+    expires_at: Instant,
+    _timeout_cancel: oneshot::Sender<()>,
+}
+
+fn identity_challenge_ttl(state: &ServerState, configured_ms: i32) -> Duration {
+    let configured_ms = configured_ms.max(0) as u64;
+    let population_extra_ms = (state.transport.peer_snapshots().len() as u64)
+        .saturating_mul(12)
+        .min(45_000);
+    Duration::from_millis(
+        configured_ms
+            .saturating_add(population_extra_ms)
+            .min(i32::MAX as u64),
+    )
+}
+
+fn admission_rejection(state: &ServerState, ready: &ReadyMessage) -> Option<&'static str> {
+    let uuid = &ready.player_meta_data_message.player_uuid;
+    let config = state.config.read();
+    if state.moderation.is_uuid_banned(uuid) {
+        return Some("Banned");
+    }
+    if config.basis_user_restriction_mode == BasisUserRestrictionMode::WhiteList
+        && !state.moderation.is_whitelisted(uuid)
+    {
+        return Some("You are not on the whitelist.");
+    }
+    if config.basis_user_restriction_mode == BasisUserRestrictionMode::BlackList
+        && state.moderation.is_blacklisted(uuid)
+    {
+        return Some("You are on the blacklist.");
+    }
+    if config.basis_user_restriction_mode == BasisUserRestrictionMode::RejoinOnly
+        && !state.admin_runtime.can_rejoin(uuid)
+        && !state
+            .permissions
+            .has(uuid, basis_server_permissions::nodes::CONFIGURATION_EDITOR)
+    {
+        return Some("The server is locked — only players already here may rejoin.");
+    }
+    None
 }
 
 const JOIN_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
@@ -306,7 +353,7 @@ pub struct ServerState {
     pub transport: TransportHandle,
     pub authenticated_peers: Arc<DashMap<PeerId, ConnectedPeer>>,
     join_broadcast: Arc<Mutex<JoinBroadcastState>>,
-    pub pending_identity: Arc<DashMap<PeerId, ReadyMessage>>,
+    pending_identity: Arc<DashMap<PeerId, PendingIdentity>>,
     pub permissions: PermissionManager,
     pub database: PersistentDatabase,
     pub resources: ResourceState,
@@ -1131,61 +1178,71 @@ async fn handle_connection_request(
         return Ok(());
     }
 
-    if state
-        .moderation
-        .is_uuid_banned(&ready.player_meta_data_message.player_uuid)
-    {
-        state.transport.reject(&request, "Banned").await?;
-        return Ok(());
-    }
-
-    if config.basis_user_restriction_mode == BasisUserRestrictionMode::WhiteList
-        && !state
-            .moderation
-            .is_whitelisted(&ready.player_meta_data_message.player_uuid)
-    {
-        state
-            .transport
-            .reject(&request, "You are not on the whitelist.")
-            .await?;
-        return Ok(());
-    }
-    if config.basis_user_restriction_mode == BasisUserRestrictionMode::BlackList
-        && state
-            .moderation
-            .is_blacklisted(&ready.player_meta_data_message.player_uuid)
-    {
-        state
-            .transport
-            .reject(&request, "You are on the blacklist.")
-            .await?;
-        return Ok(());
-    }
-
-    if config.basis_user_restriction_mode == BasisUserRestrictionMode::RejoinOnly
-        && !state
-            .admin_runtime
-            .can_rejoin(&ready.player_meta_data_message.player_uuid)
-        && !state.permissions.has(
-            &ready.player_meta_data_message.player_uuid,
-            basis_server_permissions::nodes::CONFIGURATION_EDITOR,
-        )
-    {
+    if config.use_auth_identity {
+        if let Err(error) = did_key_verifying_key(&ready.player_meta_data_message.player_uuid) {
+            state
+                .transport
+                .reject(&request, &format!("Unsupported identity: {error}"))
+                .await?;
+            return Ok(());
+        }
+    } else if config.basis_user_restriction_mode == BasisUserRestrictionMode::RejoinOnly {
         state
             .transport
             .reject(
                 &request,
-                "The server is locked — only players already here may rejoin.",
+                "Rejoin-only mode requires authenticated identity.",
             )
             .await?;
         return Ok(());
+    } else if let Some(reason) = admission_rejection(state, &ready) {
+        state.transport.reject(&request, reason).await?;
+        return Ok(());
     }
+
     let peer_id = state.transport.accept(&request).await?;
     if config.use_auth_identity {
-        state.pending_identity.insert(peer_id, ready);
-        let challenge = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let challenge_ttl =
+            identity_challenge_ttl(state, config.auth_validation_time_out_miliseconds);
+        let mut challenge = vec![0; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut challenge);
+        let expires_at = Instant::now() + challenge_ttl;
+        let (timeout_cancel, mut timeout_cancelled) = oneshot::channel();
+        state.pending_identity.insert(
+            peer_id,
+            PendingIdentity {
+                ready,
+                challenge: challenge.clone(),
+                expires_at,
+                _timeout_cancel: timeout_cancel,
+            },
+        );
+        let timeout_challenge = challenge.clone();
+        let pending_identity = state.pending_identity.clone();
+        let transport = state.transport.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(challenge_ttl) => {
+                    if pending_identity
+                        .remove_if(&peer_id, |_, pending| {
+                            pending.challenge == timeout_challenge
+                                && pending.expires_at <= Instant::now()
+                        })
+                        .is_some()
+                    {
+                        let _ = transport
+                            .disconnect(peer_id, "Authentication timeout")
+                            .await;
+                    }
+                }
+                _ = &mut timeout_cancelled => {}
+            }
+        });
         let mut writer = NetWriter::new();
-        BytesMessage { data: challenge }.serialize(&mut writer);
+        BytesMessage {
+            data: challenge.clone(),
+        }
+        .serialize(&mut writer);
         state
             .transport
             .send(
@@ -1196,7 +1253,7 @@ async fn handle_connection_request(
             )
             .await?;
     } else {
-        finalize_accept(state, peer_id, ready).await?;
+        finalize_accept(state, peer_id, ready, false).await?;
     }
     Ok(())
 }
@@ -1211,9 +1268,27 @@ fn password_matches(server_password: &str, auth_bytes: &[u8]) -> bool {
     auth_bytes == server_password.as_bytes()
 }
 
-async fn finalize_accept(state: &ServerState, peer_id: PeerId, ready: ReadyMessage) -> Result<()> {
+async fn finalize_accept(
+    state: &ServerState,
+    peer_id: PeerId,
+    ready: ReadyMessage,
+    identity_verified: bool,
+) -> Result<()> {
     let uuid = ready.player_meta_data_message.player_uuid.clone();
     let config = state.config.read().clone();
+    if config.basis_user_restriction_mode == BasisUserRestrictionMode::RejoinOnly
+        && !identity_verified
+    {
+        state
+            .transport
+            .disconnect(peer_id, "Rejoin-only mode requires authenticated identity.")
+            .await?;
+        return Ok(());
+    }
+    if let Some(reason) = admission_rejection(state, &ready) {
+        state.transport.disconnect(peer_id, reason).await?;
+        return Ok(());
+    }
     let metadata = ready.player_meta_data_message.clone();
     let connected = ConnectedPeer {
         id: peer_id,
@@ -1674,8 +1749,34 @@ async fn handle_message(
         .fetch_add(1, Ordering::Relaxed);
     match channel {
         channels::AUTH_IDENTITY => {
-            if let Some((_, ready)) = state.pending_identity.remove(&peer) {
-                finalize_accept(state, peer, ready).await?;
+            if let Some((_, pending)) = state.pending_identity.remove(&peer) {
+                if pending.expires_at <= Instant::now() {
+                    state
+                        .transport
+                        .disconnect(peer, "Authentication timeout")
+                        .await?;
+                    return Ok(());
+                }
+                let identity_check = (|| -> Result<()> {
+                    let mut reader = NetReader::new(&payload);
+                    let response = DidResponse::deserialize(&mut reader)
+                        .context("malformed identity response")?;
+                    anyhow::ensure!(
+                        reader.remaining() == 0,
+                        "trailing bytes in identity response"
+                    );
+                    let verifying_key =
+                        did_key_verifying_key(&pending.ready.player_meta_data_message.player_uuid)?;
+                    response.verify(&pending.challenge, &verifying_key)
+                })();
+                if let Err(error) = identity_check {
+                    state
+                        .transport
+                        .disconnect(peer, &format!("Identity verification failed: {error}"))
+                        .await?;
+                    return Ok(());
+                }
+                finalize_accept(state, peer, pending.ready, true).await?;
             }
         }
         channels::PLAYER_AVATAR_HIGH | channels::PLAYER_AVATAR_HIGH_ADDITIONAL => {

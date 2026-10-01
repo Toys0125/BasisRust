@@ -15,6 +15,7 @@ basis-transport = { path = "../basis-transport" }
 bytes.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
+rand.workspace = true
 rayon.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -23,3 +24,7 @@ tracing.workspace = true
 uuid.workspace = true
 windows-sys.workspace = true
 unicode-general-category = "1"
+
+[dev-dependencies]
+bs58 = "0.5"
+ed25519-dalek.workspace = true

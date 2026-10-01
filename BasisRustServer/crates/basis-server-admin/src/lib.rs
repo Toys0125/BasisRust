@@ -358,15 +358,13 @@ fn read_xml<T: for<'de> Deserialize<'de> + Default>(path: &Path, root: &str) -> 
                 }
                 depth += 1;
             }
-            quick_xml::events::Event::Empty(e) => {
-                if depth == 0 {
-                    anyhow::ensure!(
-                        !root_seen && e.name().as_ref() == root.as_bytes(),
-                        "invalid root in {}: expected {root}",
-                        path.display()
-                    );
-                    root_seen = true;
-                }
+            quick_xml::events::Event::Empty(e) if depth == 0 => {
+                anyhow::ensure!(
+                    !root_seen && e.name().as_ref() == root.as_bytes(),
+                    "invalid root in {}: expected {root}",
+                    path.display()
+                );
+                root_seen = true;
             }
             quick_xml::events::Event::End(_) => {
                 anyhow::ensure!(depth > 0, "unexpected closing tag in {}", path.display());

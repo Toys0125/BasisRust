@@ -159,19 +159,27 @@ impl PermissionManager {
 
     pub fn ensure_defaults(&self) {
         self.mutate(None, |store| {
-            let mut changed = seed_group(
+            let mut changed = seed_legacy_group(
                 store,
                 "default",
                 None,
                 basis_protocol::permissions::DEFAULT_GROUP_NODES,
+                LEGACY_DEFAULT_GROUP_NODES,
             );
-            changed |= seed_group(
+            changed |= seed_legacy_group(
                 store,
                 "moderator",
                 Some("default"),
                 basis_protocol::permissions::MODERATOR_GROUP_NODES,
+                LEGACY_MODERATOR_GROUP_NODES,
             );
-            changed |= seed_group(store, "admin", Some("moderator"), &[nodes::ALL]);
+            changed |= seed_legacy_group(
+                store,
+                "admin",
+                Some("moderator"),
+                &[nodes::ALL],
+                &[nodes::ALL],
+            );
             changed
         });
     }
@@ -434,6 +442,60 @@ fn seed_group(
         }
     }
     changed
+}
+
+const LEGACY_DEFAULT_GROUP_NODES: &[&str] = &[
+    nodes::HELP,
+    nodes::RESOURCE_LOAD_PROP,
+    nodes::RESOURCE_UNLOAD_PROP,
+    nodes::RESOURCE_LOAD_AVATAR,
+    nodes::RESOURCE_UNLOAD_AVATAR,
+    nodes::RESOURCE_LOAD_WORLD,
+    nodes::RESOURCE_UNLOAD_WORLD,
+    nodes::OWNERSHIP_TRANSFER,
+    nodes::OWNERSHIP_REMOVE,
+    nodes::OWNERSHIP_GET,
+    nodes::CONTENT_SHARE_DELETE,
+    nodes::CONTENT_SHARE_CREATE,
+];
+const LEGACY_MODERATOR_GROUP_NODES: &[&str] = &[
+    nodes::MODERATION_BAN,
+    nodes::MODERATION_KICK,
+    nodes::MODERATION_IP_BAN,
+    nodes::MODERATION_UNBAN,
+    nodes::MODERATION_UNBAN_IP,
+    nodes::MODERATION_MESSAGE,
+    nodes::MODERATION_MESSAGE_ALL,
+    nodes::MODERATION_TELEPORT,
+    nodes::MODERATION_ANNOUNCE,
+    nodes::MODERATION_GLOBAL_LOCK,
+    nodes::MODERATION_HEADLESS_AUDIO,
+    nodes::MODERATION_OPUS_BITRATE,
+    nodes::PERMISSIONS_VIEW,
+    nodes::RESOURCE_LOCK_BYPASS_AVATAR,
+    nodes::RESOURCE_LOCK_BYPASS_PROP,
+    nodes::RESOURCE_LOCK_BYPASS_WORLD,
+    nodes::RESOURCE_LOCK_BYPASS_SERVER,
+];
+
+fn seed_legacy_group(
+    store: &mut PermissionStore,
+    name: &str,
+    parent: Option<&str>,
+    nodes: &[&str],
+    legacy_nodes: &[&str],
+) -> bool {
+    if key(&store.groups, name).is_none() {
+        return seed_group(store, name, parent, nodes);
+    }
+    let mut history_added = false;
+    if key(&store.seeded_defaults, name).is_none() {
+        let seeded = store.seeded_defaults.entry(name.to_string()).or_default();
+        for node in legacy_nodes {
+            history_added |= insert(seeded, node);
+        }
+    }
+    seed_group(store, name, parent, nodes) | history_added
 }
 fn inherits_group(
     name: &str,
@@ -873,8 +935,77 @@ mod tests {
         assert_eq!(manager.snapshot().seeded_defaults["Moderator"].len(), 25);
         let fresh = PermissionManager::default();
         fresh.ensure_defaults();
+        assert_eq!(fresh.snapshot().groups["default"].nodes.len(), 12);
         assert_eq!(fresh.snapshot().groups["moderator"].nodes.len(), 25);
         assert!(fresh.is_in_group("unknown", "default"));
+    }
+
+    #[test]
+    fn upgrades_legacy_xml_without_restoring_removed_grants() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.path(),
+            format!(
+                "<Permissions><Groups><Group name='default'><Node value='{}'/></Group><Group name='moderator'><Node value='{}'/></Group></Groups><Users/></Permissions>",
+                nodes::RESOURCE_LOAD_PROP,
+                nodes::MODERATION_KICK,
+            ),
+        )
+        .unwrap();
+        let manager = PermissionManager::new(fixture.path());
+        manager.load_from_xml().unwrap();
+        manager.ensure_defaults();
+        manager.add_user_to_group("u", "moderator");
+
+        assert!(!manager.has("unknown", nodes::HELP));
+        assert!(!manager.has("u", nodes::MODERATION_BAN));
+        assert!(manager.has("u", nodes::MODERATION_KICK));
+        assert!(manager.has("u", nodes::MODERATION_MUTE));
+        assert!(manager.snapshot().seeded_defaults["moderator"].contains(nodes::MODERATION_BAN));
+
+        manager.remove_group_node("moderator", nodes::MODERATION_MUTE);
+        manager.ensure_defaults();
+        assert!(!manager.has("u", nodes::MODERATION_MUTE));
+        manager.save_to_xml().unwrap();
+
+        let reloaded = PermissionManager::new(fixture.path());
+        reloaded.load_from_xml().unwrap();
+        reloaded.ensure_defaults();
+        reloaded.add_user_to_group("u", "moderator");
+        assert!(!reloaded.has("unknown", nodes::HELP));
+        assert!(!reloaded.has("u", nodes::MODERATION_BAN));
+        assert!(!reloaded.has("u", nodes::MODERATION_MUTE));
+    }
+
+    #[test]
+    fn history_only_legacy_migration_is_dirty_and_persisted() {
+        let fixture = Fixture::new();
+        let node_elements = |nodes: &[&str]| {
+            nodes
+                .iter()
+                .map(|node| format!("<Node value='{node}'/>"))
+                .collect::<String>()
+        };
+        let xml = format!(
+            "<Permissions><Groups><Group name='default'>{}</Group><Group name='moderator'>{}</Group><Group name='admin'><Node value='{}'/></Group></Groups><Users/><SeededDefaults><Group name='moderator'>{}</Group></SeededDefaults></Permissions>",
+            node_elements(basis_protocol::permissions::DEFAULT_GROUP_NODES),
+            node_elements(basis_protocol::permissions::MODERATOR_GROUP_NODES),
+            nodes::ALL,
+            node_elements(basis_protocol::permissions::MODERATOR_GROUP_NODES),
+        );
+        fs::write(fixture.path(), xml).unwrap();
+        let manager = PermissionManager::new(fixture.path());
+        manager.load_from_xml().unwrap();
+        manager.ensure_defaults();
+
+        assert_eq!(manager.take_changes(), vec![None]);
+        assert!(manager.pending.lock().dirty_since.is_some());
+        manager.flush_pending_save().unwrap();
+
+        let reloaded = PermissionManager::new(fixture.path());
+        reloaded.load_from_xml().unwrap();
+        assert_eq!(reloaded.snapshot().seeded_defaults["default"].len(), 12);
+        assert!(reloaded.snapshot().seeded_defaults["admin"].contains(nodes::ALL));
     }
 
     #[test]

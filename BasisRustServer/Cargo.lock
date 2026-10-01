@@ -149,6 +149,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "bs58",
  "bytes",
  "ed25519-dalek",
  "flate2",
@@ -202,10 +203,13 @@ dependencies = [
  "basis-server-resources",
  "basis-server-storage",
  "basis-transport",
+ "bs58",
  "bytes",
  "dashmap",
+ "ed25519-dalek",
  "lz4_flex",
  "parking_lot",
+ "rand 0.8.6",
  "rayon",
  "serde_json",
  "tokio",
@@ -300,6 +304,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
 ]
 
 [[package]]
@@ -1654,6 +1667,12 @@ dependencies = [
  "num-conv",
  "time-core",
 ]
+
+[[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"

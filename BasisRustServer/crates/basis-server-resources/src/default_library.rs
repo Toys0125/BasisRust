@@ -32,6 +32,7 @@ impl DefaultLibrary {
         if !path.exists() {
             return Ok(Self::default());
         }
+        recover_removals(path)?;
         let mut entries = Vec::new();
         for file in xml_files(path)? {
             let entry = read_entry(&file)?;
@@ -53,6 +54,7 @@ impl DefaultLibrary {
         let entry = normalized_entry(mode, url, password)?;
         let xml = quick_xml::se::to_string(&entry)?;
         fs::create_dir_all(path)?;
+        recover_removals(path)?;
         let mode_name = ["avatar", "world", "prop"][mode as usize];
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
         let mut counter = 0u64;
@@ -92,22 +94,75 @@ impl DefaultLibrary {
     /// Remove every XML with a matching URL, comparing case-insensitively like BasisVR.
     /// Unreadable files are retained, as they cannot safely be matched to the request.
     pub fn remove_item(&mut self, path: &Path, url: &str) -> Result<usize> {
+        self.remove_item_with(path, url, |from, to| fs::rename(from, to))
+    }
+
+    fn remove_item_with(
+        &mut self,
+        path: &Path,
+        url: &str,
+        mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    ) -> Result<usize> {
         ensure!(!url.trim().is_empty(), "URL was empty.");
-        let mut removed = 0;
-        if path.exists() {
-            for file in xml_files(path)? {
-                let Ok(entry) = read_entry(&file) else {
-                    continue;
-                };
-                if urls_match(&entry.url, url) {
-                    fs::remove_file(&file)
-                        .with_context(|| format!("removing default library {}", file.display()))?;
-                    removed += 1;
+        let files = if path.exists() {
+            recover_removals(path)?;
+            xml_files(path)?
+                .into_iter()
+                .filter(|file| read_entry(file).is_ok_and(|entry| urls_match(&entry.url, url)))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if files.is_empty() {
+            self.remove_item_in_memory(url)?;
+            return Ok(0);
+        }
+        // Stage all matches on the same filesystem before committing either view.
+        // A later move failure restores earlier files instead of leaving a partial deletion.
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let mut counter = 0u64;
+        let staging = loop {
+            let dir = path.join(format!(".basis-remove-{stamp}-{counter}"));
+            match fs::create_dir(&dir) {
+                Ok(()) => break dir,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => counter += 1,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let result = (|| -> Result<()> {
+            for file in &files {
+                let target = staging.join(file.file_name().unwrap());
+                rename(file, &target)
+                    .with_context(|| format!("staging default library {}", file.display()))?;
+                staged.push((file.clone(), target));
+            }
+            // The marker distinguishes committed cleanup remnants from interrupted transactions.
+            fs::write(staging.join("committed"), b"")?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let mut rollback_error = None;
+            for (original, moved) in staged.iter().rev() {
+                if let Err(error) = rename(moved, original) {
+                    rollback_error = Some(error);
                 }
             }
+            if let Some(rollback_error) = rollback_error {
+                // Retain any unrecovered originals for load-time recovery, never delete them.
+                return Err(error).context(format!(
+                    "rollback incomplete: {rollback_error}; recovery retained at {}",
+                    staging.display()
+                ));
+            }
+            let _ = fs::remove_dir(&staging);
+            return Err(error);
         }
         self.remove_item_in_memory(url)?;
-        Ok(removed)
+        // Removal has committed. Cleanup failure leaves only inactive files in a hidden directory;
+        // it must not report failure after the disk and live views have both changed.
+        let _ = fs::remove_dir_all(&staging);
+        Ok(staged.len())
     }
 
     pub fn remove_item_in_memory(&mut self, url: &str) -> Result<usize> {
@@ -157,6 +212,46 @@ impl DefaultLibrary {
         wire.put_bytes(if use_compressed { &compressed } else { &raw });
         Ok(wire.into_vec())
     }
+}
+
+fn recover_removals(path: &Path) -> Result<()> {
+    for item in fs::read_dir(path)? {
+        let item = item?;
+        if !item.file_type()?.is_dir()
+            || !item
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".basis-remove-")
+        {
+            continue;
+        }
+        let staging = item.path();
+        if staging.join("committed").exists() {
+            let _ = fs::remove_dir_all(&staging);
+            continue;
+        }
+        for moved in xml_files(&staging)? {
+            let original = path.join(moved.file_name().unwrap());
+            // Hard links refuse to overwrite an operator file and leave the backup until recovery succeeds.
+            match fs::hard_link(&moved, &original) {
+                Ok(()) => {}
+                Err(error)
+                    if error.kind() == ErrorKind::AlreadyExists
+                        && fs::read(&moved)? == fs::read(&original)? => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "recovering interrupted library removal of {}",
+                            original.display()
+                        )
+                    })
+                }
+            }
+            fs::remove_file(&moved)?;
+        }
+        fs::remove_dir(&staging)?;
+    }
+    Ok(())
 }
 
 fn normalized_entry(mode: u8, url: &str, password: &str) -> Result<DefaultLibraryEntry> {
@@ -313,6 +408,70 @@ mod tests {
         assert!(kept.exists() && dir.0.join("broken.xml").exists());
         assert_eq!(library.entries.len(), 1);
         assert_eq!(library.remove_item(&dir.0, "absent").unwrap(), 0);
+    }
+
+    #[test]
+    fn later_removal_failure_rolls_back_files_and_live_entries() {
+        let dir = TestDir::new();
+        let mut library = DefaultLibrary::default();
+        let first = library
+            .add_item(&dir.0, 0, "https://host/item", "a")
+            .unwrap();
+        let second = library
+            .add_item(&dir.0, 1, "HTTPS://HOST/ITEM", "b")
+            .unwrap();
+        let before = library.entries.clone();
+        let first_xml = fs::read(&first).unwrap();
+        let second_xml = fs::read(&second).unwrap();
+        let mut calls = 0;
+        let result = library.remove_item_with(&dir.0, "https://host/item", |from, to| {
+            calls += 1;
+            if calls == 2 {
+                Err(std::io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "injected later failure",
+                ))
+            } else {
+                fs::rename(from, to)
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(library.entries, before);
+        assert_eq!(fs::read(first).unwrap(), first_xml);
+        assert_eq!(fs::read(second).unwrap(), second_xml);
+        assert_eq!(
+            DefaultLibrary::load_xml_dir(&dir.0).unwrap().entries.len(),
+            before.len()
+        );
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn incomplete_rollback_recovers_original_files_when_reloaded() {
+        let dir = TestDir::new();
+        let mut library = DefaultLibrary::default();
+        library.add_item(&dir.0, 0, "url", "a").unwrap();
+        library.add_item(&dir.0, 1, "url", "b").unwrap();
+        let before = library.entries.clone();
+        let mut calls = 0;
+        assert!(library
+            .remove_item_with(&dir.0, "url", |from, to| {
+                calls += 1;
+                if calls == 2 || calls == 3 {
+                    Err(std::io::Error::new(
+                        ErrorKind::PermissionDenied,
+                        "injected move/rollback failure",
+                    ))
+                } else {
+                    fs::rename(from, to)
+                }
+            })
+            .is_err());
+        assert_eq!(library.entries, before);
+        let reloaded = DefaultLibrary::load_xml_dir(&dir.0).unwrap();
+        assert_eq!(reloaded.entries.len(), 2);
+        assert!(before.iter().all(|entry| reloaded.entries.contains(entry)));
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 2);
     }
 
     fn decode_wire(library: &DefaultLibrary) -> (u16, ServerLibraryMessage) {

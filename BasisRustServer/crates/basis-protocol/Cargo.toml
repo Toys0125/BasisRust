@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bs58 = "0.5"
 base64.workspace = true
 bytes.workspace = true
 ed25519-dalek.workspace = true
