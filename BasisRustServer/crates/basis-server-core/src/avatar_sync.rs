@@ -581,12 +581,21 @@ struct BundleCacheItemIdentity {
     patch_byte: u8,
 }
 
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct BundleCacheLookup {
     flags: u8,
     zstd_level: i32,
     raw_len: usize,
     items: Vec<BundleCacheItemIdentity>,
+    fingerprint: u64,
+}
+
+impl Hash for BundleCacheLookup {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // The map retains its randomized hasher, but only hashes this compact
+        // fingerprint. Full equality still checks every item and codec field.
+        state.write_u64(self.fingerprint);
+    }
 }
 
 struct BundleCacheKey {
@@ -621,6 +630,7 @@ impl BundleCacheLookup {
         let mut channel_counts = [0u8; 256];
         let mut raw_len = 0usize;
         let mut identities = Vec::with_capacity(items.len());
+        let mut fingerprint = rustc_hash::FxHasher::default();
         for item in items {
             let count = &mut channel_counts[item.original_channel as usize];
             if *count == 0 {
@@ -628,13 +638,15 @@ impl BundleCacheLookup {
             }
             *count = if *count == u8::MAX - 1 { 0 } else { *count + 1 };
             raw_len += 2 + item.payload.len(); // Item size and patched payload.
-            identities.push(BundleCacheItemIdentity {
+            let identity = BundleCacheItemIdentity {
                 backing_address: item.payload.as_ptr() as usize,
                 payload_len: item.payload.len(),
                 channel: item.original_channel,
                 patch_offset: item.interval_offset,
                 patch_byte: item.interval_byte,
-            });
+            };
+            identity.hash(&mut fingerprint);
+            identities.push(identity);
         }
         let (flags, zstd_level) = match compression {
             AvatarBundleCompression::Lz4 => (0, 0),
@@ -642,11 +654,16 @@ impl BundleCacheLookup {
                 (1 | (AVATAR_BUNDLE_DICTIONARY_GENERATION << 3), level)
             }
         };
+        flags.hash(&mut fingerprint);
+        zstd_level.hash(&mut fingerprint);
+        raw_len.hash(&mut fingerprint);
+        identities.len().hash(&mut fingerprint);
         Self {
             flags,
             zstd_level,
             raw_len,
             items: identities,
+            fingerprint: fingerprint.finish(),
         }
     }
 
@@ -3316,6 +3333,64 @@ fn advertised_interval_byte(
 mod tests {
     use super::*;
     use basis_protocol::avatar::{decode_avatar_bundle, encode_avatar_bundle, AvatarBundleItem};
+
+    #[test]
+    fn bundle_cache_fingerprint_collisions_preserve_full_identity() {
+        let base = vec![
+            BundleAvatarSend {
+                original_channel: channels::DELTA_AVATAR,
+                payload: Bytes::from_static(&[1, 2, 3, 4]),
+                interval_offset: 1,
+                interval_byte: 20,
+            },
+            BundleAvatarSend {
+                original_channel: channels::DELTA_AVATAR,
+                payload: Bytes::from_static(&[5, 6, 7, 8]),
+                interval_offset: 1,
+                interval_byte: 20,
+            },
+        ];
+        let mut variants = vec![(base.clone(), AvatarBundleCompression::Lz4)];
+        let mut patched = base.clone();
+        patched[0].interval_byte += 1;
+        variants.push((patched, AvatarBundleCompression::Lz4));
+        let mut offset = base.clone();
+        offset[0].interval_offset += 1;
+        variants.push((offset, AvatarBundleCompression::Lz4));
+        let mut channel = base.clone();
+        channel[0].original_channel += 1;
+        variants.push((channel, AvatarBundleCompression::Lz4));
+        let mut reversed = base.clone();
+        reversed.reverse();
+        variants.push((reversed, AvatarBundleCompression::Lz4));
+        let mut backing = base.clone();
+        backing[0].payload = Bytes::from(vec![1, 2, 3, 4]);
+        variants.push((backing, AvatarBundleCompression::Lz4));
+        variants.push((
+            base.clone(),
+            AvatarBundleCompression::ZstdDictionary { level: -2 },
+        ));
+        variants.push((base, AvatarBundleCompression::ZstdDictionary { level: 1 }));
+        let collide = |items: &[BundleAvatarSend], compression| {
+            let mut lookup = BundleCacheLookup::new(items, compression);
+            lookup.fingerprint = 7;
+            lookup
+        };
+        let mut entries = HashMap::new();
+        for (index, (items, compression)) in variants.iter().enumerate() {
+            entries.insert(
+                BundleCacheKey {
+                    lookup: collide(items, *compression),
+                    _owners: items.iter().map(|item| item.payload.clone()).collect(),
+                },
+                index,
+            );
+        }
+        assert_eq!(entries.len(), variants.len());
+        for (index, (items, compression)) in variants.iter().enumerate() {
+            assert_eq!(entries.get(&collide(items, *compression)), Some(&index));
+        }
+    }
 
     #[test]
     fn bundle_cache_preserves_exact_encoded_bytes_and_patch_identity() {
