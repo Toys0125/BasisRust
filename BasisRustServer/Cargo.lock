@@ -185,6 +185,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "bs58",
  "bytes",
  "ed25519-dalek",
  "flate2",
@@ -207,6 +208,8 @@ dependencies = [
  "parking_lot",
  "quick-xml",
  "serde",
+ "time",
+ "tracing",
 ]
 
 [[package]]
@@ -237,17 +240,21 @@ dependencies = [
  "basis-server-resources",
  "basis-server-storage",
  "basis-transport",
+ "bs58",
  "bytemuck",
  "bytes",
  "dashmap",
+ "ed25519-dalek",
  "lz4_flex",
  "parking_lot",
  "pollster",
+ "rand 0.8.6",
  "rayon",
  "rustc-hash",
  "serde_json",
  "tokio",
  "tracing",
+ "unicode-general-category",
  "uuid",
  "wgpu",
  "windows-sys 0.59.0",
@@ -283,8 +290,12 @@ name = "basis-server-resources"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "basis-protocol",
+ "lz4_flex",
  "parking_lot",
+ "quick-xml",
+ "serde",
 ]
 
 [[package]]
@@ -358,6 +369,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
 dependencies = [
  "objc2",
+]
+
+[[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
 ]
 
 [[package]]
@@ -2073,6 +2093,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "tokio"
 version = "1.52.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2199,6 +2225,12 @@ name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
+
+[[package]]
+name = "unicode-general-category"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f"
 
 [[package]]
 name = "unicode-ident"

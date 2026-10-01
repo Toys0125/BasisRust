@@ -30,7 +30,11 @@ pub mod nodes {
     pub const MODERATION_MESSAGE: &str = "basis.moderation.message";
     pub const MODERATION_MESSAGE_ALL: &str = "basis.moderation.messageall";
     pub const MODERATION_TELEPORT: &str = "basis.moderation.teleport";
-    pub const MODERATION_SHOUT: &str = "basis.moderation.shout";
+    pub const MODERATION_ANNOUNCE: &str = "basis.moderation.announce";
+    /// Legacy API name for the permission controlling announce mode.
+    pub const MODERATION_SHOUT: &str = MODERATION_ANNOUNCE;
+    pub const MODERATION_MUTE: &str = "basis.moderation.mute";
+    pub const MODERATION_RENAME: &str = "basis.moderation.rename";
     pub const MODERATION_GLOBAL_LOCK: &str = "basis.moderation.globallock";
     pub const MODERATION_FORCE_AVATAR: &str = "basis.moderation.forceavatar";
     pub const MODERATION_FULL_QUALITY_BROADCAST: &str = "basis.moderation.fullqualitybroadcast";
@@ -74,7 +78,9 @@ pub mod nodes {
         MODERATION_MESSAGE,
         MODERATION_MESSAGE_ALL,
         MODERATION_TELEPORT,
-        MODERATION_SHOUT,
+        MODERATION_ANNOUNCE,
+        MODERATION_MUTE,
+        MODERATION_RENAME,
         MODERATION_GLOBAL_LOCK,
         MODERATION_FORCE_AVATAR,
         MODERATION_FULL_QUALITY_BROADCAST,
@@ -102,3 +108,103 @@ pub const DEFAULT_GROUP_NODES: &[&str] = &[
     nodes::CONTENT_SHARE_DELETE,
     nodes::CONTENT_SHARE_CREATE,
 ];
+
+/// BasisVR's moderator grants. Seed history allows upgrades without restoring removed grants.
+pub const MODERATOR_GROUP_NODES: &[&str] = &[
+    nodes::PLAYER_MODERATION,
+    nodes::MODERATION_BAN,
+    nodes::MODERATION_KICK,
+    nodes::MODERATION_IP_BAN,
+    nodes::MODERATION_UNBAN,
+    nodes::MODERATION_UNBAN_IP,
+    nodes::MODERATION_MESSAGE,
+    nodes::MODERATION_MESSAGE_ALL,
+    nodes::MODERATION_TELEPORT,
+    nodes::MODERATION_ANNOUNCE,
+    nodes::MODERATION_GLOBAL_LOCK,
+    nodes::MODERATION_HEADLESS_AUDIO,
+    nodes::MODERATION_OPUS_BITRATE,
+    nodes::MODERATION_FULL_QUALITY_BROADCAST,
+    nodes::MODERATION_FORCE_AVATAR,
+    nodes::MODERATION_LOCOMOTION,
+    nodes::MODERATION_MUTE,
+    nodes::MODERATION_RENAME,
+    nodes::PERMISSIONS_VIEW,
+    nodes::RESOURCE_LOCK_BYPASS_AVATAR,
+    nodes::RESOURCE_LOCK_BYPASS_PROP,
+    nodes::RESOURCE_LOCK_BYPASS_WORLD,
+    nodes::RESOURCE_LOCK_BYPASS_SERVER,
+    nodes::CHAT_LOCK_BYPASS,
+    nodes::VOICE_LOCK_BYPASS,
+];
+
+/// A stable key for .NET's OrdinalIgnoreCase equivalence classes.
+/// Ordinal casing uses one-to-one uppercase mappings, not full case folding.
+/// ICU .NET excludes dotless i and long s in pal_common.c's InitOrdinalCasingPage:
+/// https://github.com/dotnet/runtime/blob/main/src/native/libs/System.Globalization.Native/pal_common.c
+pub fn ordinal_ignore_case_key(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            let upper = match ch {
+                '\u{0131}' | '\u{017f}' => ch,
+                // UnicodeData simple uppercase differs from full casing for these Greek scalars.
+                '\u{1f80}'..='\u{1f87}' | '\u{1f90}'..='\u{1f97}' | '\u{1fa0}'..='\u{1fa7}' => {
+                    char::from_u32(ch as u32 + 8).unwrap()
+                }
+                '\u{1fb3}' => '\u{1fbc}',
+                '\u{1fc3}' => '\u{1fcc}',
+                '\u{1ff3}' => '\u{1ffc}',
+                _ => {
+                    let mut mapping = ch.to_uppercase();
+                    let first = mapping.next().unwrap();
+                    if mapping.next().is_none() {
+                        first
+                    } else {
+                        ch
+                    }
+                }
+            };
+            // Keep ordinary permission nodes in their conventional lowercase spelling.
+            upper.to_ascii_lowercase()
+        })
+        .collect()
+}
+
+pub fn ordinal_ignore_case_equal(left: &str, right: &str) -> bool {
+    if left.is_ascii() && right.is_ascii() {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        ordinal_ignore_case_key(left) == ordinal_ignore_case_key(right)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinal_casing_preserves_dotnet_equivalence_classes_without_expansions() {
+        for (left, right) in [
+            ("SIGMA.Σ", "sigma.ς"),
+            ("Σ", "σ"),
+            ("\u{1f80}", "\u{1f88}"),
+            ("\u{1fb3}", "\u{1fbc}"),
+            ("\u{10400}", "\u{10428}"),
+            ("µ", "Μ"),
+        ] {
+            assert!(ordinal_ignore_case_equal(left, right), "{left} / {right}");
+        }
+        for (left, right) in [
+            ("ı", "I"),
+            ("ſ", "S"),
+            ("İ", "i"),
+            ("K", "K"),
+            ("ß", "SS"),
+            ("ß", "ẞ"),
+            ("ﬀ", "ff"),
+        ] {
+            assert!(!ordinal_ignore_case_equal(left, right), "{left} / {right}");
+        }
+    }
+}

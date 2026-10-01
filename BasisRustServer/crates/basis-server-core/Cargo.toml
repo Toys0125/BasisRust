@@ -20,6 +20,7 @@ bytes.workspace = true
 bytemuck = { workspace = true, optional = true }
 dashmap.workspace = true
 parking_lot.workspace = true
+rand.workspace = true
 pollster = { workspace = true, optional = true }
 rayon.workspace = true
 rustc-hash.workspace = true
@@ -29,4 +30,9 @@ lz4_flex.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 windows-sys.workspace = true
+unicode-general-category = "1"
 wgpu = { workspace = true, optional = true }
+
+[dev-dependencies]
+bs58 = "0.5"
+ed25519-dalek.workspace = true

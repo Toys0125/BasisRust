@@ -30,7 +30,7 @@ Common commands:
 ```powershell
 cd BasisRustServer
 cargo test
-cargo run -p basis-server-console -- --config config/config.xml
+cargo run -p basis-server-console -- --base-dir . --config config/config.xml
 ```
 
 Drift check command:

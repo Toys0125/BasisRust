@@ -1,4 +1,5 @@
-use anyhow::Result;
+mod default_library;
+
 use basis_protocol::messages::{
     CameraPipPositionMessage, CameraPipStateMessage, ClientCameraPipPositionMessage,
     ClientCameraPipStateMessage, ContentShareCleanupMessage, ContentShareMessage,
@@ -6,11 +7,10 @@ use basis_protocol::messages::{
     ResourceManagementMessage, ServerContentShareCleanupMessage, ServerContentShareMessage,
     SpawnPreloadedMessage, UnloadResource,
 };
+pub use default_library::{DefaultLibrary, DefaultLibraryEntry};
 use parking_lot::RwLock;
 use std::{
     collections::{HashMap, HashSet},
-    fs,
-    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -587,50 +587,6 @@ impl PipState {
 
     pub fn reset(&self) {
         self.states.write().clear();
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DefaultLibrary {
-    pub entries: Vec<ResourceManagementMessage>,
-}
-
-impl DefaultLibrary {
-    pub fn load_xml_dir(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            if entry.path().extension().and_then(|e| e.to_str()) == Some("xml") {
-                let combined_url = fs::read_to_string(entry.path()).unwrap_or_default();
-                entries.push(ResourceManagementMessage {
-                    mode: 0,
-                    loaded_net_id: String::new(),
-                    unlock_password: String::new(),
-                    load_strategy: 0,
-                    combined_url,
-                    uuid_of_creator: String::new(),
-                    is_admin_locked: false,
-                    position_x: 0.0,
-                    position_y: 0.0,
-                    position_z: 0.0,
-                    quaternion_x: 0.0,
-                    quaternion_y: 0.0,
-                    quaternion_z: 0.0,
-                    quaternion_w: 1.0,
-                    scale_x: 1.0,
-                    scale_y: 1.0,
-                    scale_z: 1.0,
-                    persist: false,
-                    static_resource: false,
-                    static_admin_locked: false,
-                    modify_scale: false,
-                });
-            }
-        }
-        Ok(Self { entries })
     }
 }
 

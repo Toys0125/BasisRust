@@ -1,3 +1,4 @@
+mod admin_runtime;
 mod avatar_sync;
 #[cfg(feature = "gpu")]
 mod gpu_distance;
@@ -19,6 +20,7 @@ use basis_protocol::{
     avatar_delta::apply_delta,
     channels,
     config::{BasisUserRestrictionMode, ServerConfig},
+    did::{did_key_verifying_key, DidResponse},
     io::{NetReader, NetWriter},
     messages::{
         core_message_supply, decompress_permission_extras, AdminRequest, AdminRequestMode,
@@ -69,6 +71,52 @@ pub struct ConnectedPeer {
     pub id: PeerId,
     pub metadata: ClientMetaDataMessage,
     pub ready: ReadyMessage,
+}
+
+struct PendingIdentity {
+    ready: ReadyMessage,
+    challenge: Vec<u8>,
+    expires_at: Instant,
+    _timeout_cancel: oneshot::Sender<()>,
+}
+
+fn identity_challenge_ttl(state: &ServerState, configured_ms: i32) -> Duration {
+    let configured_ms = configured_ms.max(0) as u64;
+    let population_extra_ms = (state.transport.peer_snapshots().len() as u64)
+        .saturating_mul(12)
+        .min(45_000);
+    Duration::from_millis(
+        configured_ms
+            .saturating_add(population_extra_ms)
+            .min(i32::MAX as u64),
+    )
+}
+
+fn admission_rejection(state: &ServerState, ready: &ReadyMessage) -> Option<&'static str> {
+    let uuid = &ready.player_meta_data_message.player_uuid;
+    let config = state.config.read();
+    if state.moderation.is_uuid_banned(uuid) {
+        return Some("Banned");
+    }
+    if config.basis_user_restriction_mode == BasisUserRestrictionMode::WhiteList
+        && !state.moderation.is_whitelisted(uuid)
+    {
+        return Some("You are not on the whitelist.");
+    }
+    if config.basis_user_restriction_mode == BasisUserRestrictionMode::BlackList
+        && state.moderation.is_blacklisted(uuid)
+    {
+        return Some("You are on the blacklist.");
+    }
+    if config.basis_user_restriction_mode == BasisUserRestrictionMode::RejoinOnly
+        && !state.admin_runtime.can_rejoin(uuid)
+        && !state
+            .permissions
+            .has(uuid, basis_server_permissions::nodes::CONFIGURATION_EDITOR)
+    {
+        return Some("The server is locked — only players already here may rejoin.");
+    }
+    None
 }
 
 const JOIN_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
@@ -144,6 +192,7 @@ impl JoinBroadcastState {
 
     fn update_peer_ready(&mut self, peer_id: PeerId, ready: ReadyMessage) {
         if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.peer.metadata = ready.player_meta_data_message.clone();
             peer.peer.ready = ready.clone();
             *peer.spawn_record.payload.write() = serialize_server_ready(peer_id, &ready);
             peer.spawn_record.revision.fetch_add(1, Ordering::Release);
@@ -313,7 +362,7 @@ pub struct ServerState {
     pub transport: TransportHandle,
     pub authenticated_peers: Arc<DashMap<PeerId, ConnectedPeer>>,
     join_broadcast: Arc<Mutex<JoinBroadcastState>>,
-    pub pending_identity: Arc<DashMap<PeerId, ReadyMessage>>,
+    pending_identity: Arc<DashMap<PeerId, PendingIdentity>>,
     pub permissions: PermissionManager,
     pub database: PersistentDatabase,
     pub resources: ResourceState,
@@ -331,6 +380,7 @@ pub struct ServerState {
     pub p2p_broker: p2p::P2pBroker,
     pub moderation: ModerationLists,
     pub global_state: Arc<RwLock<GlobalState>>,
+    admin_runtime: Arc<admin_runtime::AdminRuntime>,
     pub statistics: Statistics,
     pending_leaves: Arc<Mutex<Vec<PeerId>>>,
     shutdown: Arc<AtomicBool>,
@@ -341,6 +391,53 @@ impl ServerState {
         config: ServerConfig,
         base_dir: &Path,
     ) -> Result<(Self, oneshot::Sender<()>)> {
+        Self::start_with_config_path(
+            config,
+            base_dir,
+            &base_dir
+                .join(ServerConfig::CONFIG_FOLDER_NAME)
+                .join("config.xml"),
+        )
+        .await
+    }
+
+    pub async fn start_with_config_path(
+        mut config: ServerConfig,
+        base_dir: &Path,
+        config_path: &Path,
+    ) -> Result<(Self, oneshot::Sender<()>)> {
+        // RejoinOnly's captured population is session-only; a restart unlocks it.
+        if config.basis_user_restriction_mode == BasisUserRestrictionMode::RejoinOnly {
+            config.basis_user_restriction_mode = BasisUserRestrictionMode::Normal;
+        }
+        let permissions = PermissionManager::new(
+            base_dir
+                .join(ServerConfig::CONFIG_FOLDER_NAME)
+                .join("permissions.xml"),
+        );
+        permissions.set_file_support(config.has_file_support);
+        permissions.load_from_xml()?;
+        permissions.ensure_defaults();
+        permissions.save_to_xml()?;
+        let _ = permissions.take_changes();
+        let moderation = if config.has_file_support {
+            ModerationLists::file_backed(base_dir.join(ServerConfig::CONFIG_FOLDER_NAME))?
+        } else {
+            ModerationLists::default()
+        };
+        let admin_runtime = admin_runtime::AdminRuntime::load(base_dir, &config)?;
+        let database = if config.has_file_support {
+            let database = PersistentDatabase::file_backed(
+                base_dir
+                    .join(ServerConfig::CONFIG_FOLDER_NAME)
+                    .join("database.json"),
+            );
+            database.load()?;
+            database
+        } else {
+            PersistentDatabase::default()
+        };
+
         let bind_addr = if config.override_auto_discovery_of_ipv {
             SocketAddr::new(
                 config
@@ -361,24 +458,6 @@ impl ServerState {
         )
         .await?;
         info!("server listening on {}", transport.local_addr()?);
-
-        let config_path = base_dir
-            .join(ServerConfig::CONFIG_FOLDER_NAME)
-            .join("config.xml");
-        let permissions_path = base_dir
-            .join(ServerConfig::CONFIG_FOLDER_NAME)
-            .join("permissions.xml");
-        let permissions = PermissionManager::new(permissions_path);
-        let _ = permissions.load_from_xml();
-        permissions.ensure_defaults();
-        let _ = permissions.save_to_xml();
-
-        let database = PersistentDatabase::file_backed(
-            base_dir
-                .join(ServerConfig::CONFIG_FOLDER_NAME)
-                .join("database.json"),
-        );
-        let _ = database.load();
 
         let p2p_broker = p2p::P2pBroker::default();
         let mut avatar_sync = AvatarSyncSystem::new(
@@ -418,12 +497,9 @@ impl ServerState {
         );
         avatar_sync.set_offloaded_pairs(p2p_broker.offloaded_pairs());
 
-        let moderation =
-            ModerationLists::file_backed(base_dir.join(ServerConfig::CONFIG_FOLDER_NAME))?;
-
         let state = Self {
             config: Arc::new(RwLock::new(config.clone())),
-            config_path: Arc::new(config_path),
+            config_path: Arc::new(config_path.to_path_buf()),
             transport,
             authenticated_peers: Arc::new(DashMap::new()),
             join_broadcast: Arc::new(Mutex::new(JoinBroadcastState::default())),
@@ -445,6 +521,7 @@ impl ServerState {
             p2p_broker,
             moderation,
             global_state: Arc::new(RwLock::new(GlobalState::from(&config))),
+            admin_runtime: Arc::new(admin_runtime),
             statistics: Statistics::new(config.health_include_extended_metrics),
             pending_leaves: Arc::new(Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -456,6 +533,7 @@ impl ServerState {
                 move || peers.iter().map(|entry| *entry.key()).collect()
             });
         spawn_leave_broadcast_loop(state.clone());
+        admin_runtime::spawn_permission_updates(state.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         tokio::spawn(event_loop(state.clone(), events, shutdown_rx));
         Ok((state, shutdown_tx))
@@ -568,6 +646,11 @@ impl ServerState {
             .set_enabled(config.health_include_extended_metrics);
 
         let previous_globals = self.global_state.read().clone();
+        admin_runtime::refresh_rejoin_population(
+            self,
+            previous_globals.restriction_mode,
+            config.basis_user_restriction_mode,
+        );
         let mut globals = GlobalState::from(&config);
         globals.headless_audio_off = previous_globals.headless_audio_off;
         globals.opus_packet_loss_percent = previous_globals.opus_packet_loss_percent;
@@ -579,6 +662,7 @@ impl ServerState {
     pub async fn refresh_runtime_config_live(&self) {
         self.refresh_runtime_config();
         broadcast_lock_state(self).await;
+        admin_runtime::broadcast_locomotion_policy(self).await;
     }
 
     pub fn players_text(&self) -> String {
@@ -670,6 +754,7 @@ impl ServerState {
         if self.shutdown.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        let permission_result = self.permissions.flush_pending_save();
         self.transport.shutdown();
         for peer in self.authenticated_peers.iter() {
             let _ = self
@@ -679,9 +764,11 @@ impl ServerState {
         }
         let database_result = self.database.shutdown();
         // Finish persistence and network cleanup before waiting for GPU readback.
-        // Always join the workers, including when database shutdown fails.
+        // Always join the workers, including when persistence fails.
         self.avatar_sync.stop_compute_offload().await;
-        database_result
+        database_result?;
+        permission_result?;
+        Ok(())
     }
 
     pub async fn broadcast(
@@ -1114,43 +1201,71 @@ async fn handle_connection_request(
         return Ok(());
     }
 
-    if state
-        .moderation
-        .is_uuid_banned(&ready.player_meta_data_message.player_uuid)
-    {
-        state.transport.reject(&request, "Banned").await?;
-        return Ok(());
-    }
-
-    if config.basis_user_restriction_mode == BasisUserRestrictionMode::WhiteList
-        && !state
-            .moderation
-            .is_whitelisted(&ready.player_meta_data_message.player_uuid)
-    {
+    if config.use_auth_identity {
+        if let Err(error) = did_key_verifying_key(&ready.player_meta_data_message.player_uuid) {
+            state
+                .transport
+                .reject(&request, &format!("Unsupported identity: {error}"))
+                .await?;
+            return Ok(());
+        }
+    } else if config.basis_user_restriction_mode == BasisUserRestrictionMode::RejoinOnly {
         state
             .transport
-            .reject(&request, "You are not on the whitelist.")
+            .reject(
+                &request,
+                "Rejoin-only mode requires authenticated identity.",
+            )
             .await?;
         return Ok(());
-    }
-    if config.basis_user_restriction_mode == BasisUserRestrictionMode::BlackList
-        && state
-            .moderation
-            .is_blacklisted(&ready.player_meta_data_message.player_uuid)
-    {
-        state
-            .transport
-            .reject(&request, "You are on the blacklist.")
-            .await?;
+    } else if let Some(reason) = admission_rejection(state, &ready) {
+        state.transport.reject(&request, reason).await?;
         return Ok(());
     }
 
     let peer_id = state.transport.accept(&request).await?;
     if config.use_auth_identity {
-        state.pending_identity.insert(peer_id, ready);
-        let challenge = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let challenge_ttl =
+            identity_challenge_ttl(state, config.auth_validation_time_out_miliseconds);
+        let mut challenge = vec![0; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut challenge);
+        let expires_at = Instant::now() + challenge_ttl;
+        let (timeout_cancel, mut timeout_cancelled) = oneshot::channel();
+        state.pending_identity.insert(
+            peer_id,
+            PendingIdentity {
+                ready,
+                challenge: challenge.clone(),
+                expires_at,
+                _timeout_cancel: timeout_cancel,
+            },
+        );
+        let timeout_challenge = challenge.clone();
+        let pending_identity = state.pending_identity.clone();
+        let transport = state.transport.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(challenge_ttl) => {
+                    if pending_identity
+                        .remove_if(&peer_id, |_, pending| {
+                            pending.challenge == timeout_challenge
+                                && pending.expires_at <= Instant::now()
+                        })
+                        .is_some()
+                    {
+                        let _ = transport
+                            .disconnect(peer_id, "Authentication timeout")
+                            .await;
+                    }
+                }
+                _ = &mut timeout_cancelled => {}
+            }
+        });
         let mut writer = NetWriter::new();
-        BytesMessage { data: challenge }.serialize(&mut writer);
+        BytesMessage {
+            data: challenge.clone(),
+        }
+        .serialize(&mut writer);
         state
             .transport
             .send(
@@ -1161,7 +1276,7 @@ async fn handle_connection_request(
             )
             .await?;
     } else {
-        finalize_accept(state, peer_id, ready).await?;
+        finalize_accept(state, peer_id, ready, false).await?;
     }
     Ok(())
 }
@@ -1176,9 +1291,27 @@ fn password_matches(server_password: &str, auth_bytes: &[u8]) -> bool {
     auth_bytes == server_password.as_bytes()
 }
 
-async fn finalize_accept(state: &ServerState, peer_id: PeerId, ready: ReadyMessage) -> Result<()> {
+async fn finalize_accept(
+    state: &ServerState,
+    peer_id: PeerId,
+    ready: ReadyMessage,
+    identity_verified: bool,
+) -> Result<()> {
     let uuid = ready.player_meta_data_message.player_uuid.clone();
     let config = state.config.read().clone();
+    if config.basis_user_restriction_mode == BasisUserRestrictionMode::RejoinOnly
+        && !identity_verified
+    {
+        state
+            .transport
+            .disconnect(peer_id, "Rejoin-only mode requires authenticated identity.")
+            .await?;
+        return Ok(());
+    }
+    if let Some(reason) = admission_rejection(state, &ready) {
+        state.transport.disconnect(peer_id, reason).await?;
+        return Ok(());
+    }
     let metadata = ready.player_meta_data_message.clone();
     let connected = ConnectedPeer {
         id: peer_id,
@@ -1407,9 +1540,13 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
             .unwrap_or_else(|err| warn!("failed to replay PIP state to peer {peer_id}: {err:#}"));
     }
     send_initial_admin_state_to_peer(state, peer_id).await;
+    if let Err(err) = admin_runtime::send_join_state(state, peer_id).await {
+        warn!("failed to replay moderation state to peer {peer_id}: {err:#}");
+    }
 }
 
 async fn handle_disconnect(state: &ServerState, peer: PeerId, reason: DisconnectReason) {
+    state.admin_runtime.remove_peer(peer);
     state.join_broadcast.lock().remove_peer(peer);
     state.p2p_broker.remove_peer(&state.transport, peer).await;
     state.net_ids.remove_peer(peer);
@@ -1635,8 +1772,34 @@ async fn handle_message(
         .fetch_add(1, Ordering::Relaxed);
     match channel {
         channels::AUTH_IDENTITY => {
-            if let Some((_, ready)) = state.pending_identity.remove(&peer) {
-                finalize_accept(state, peer, ready).await?;
+            if let Some((_, pending)) = state.pending_identity.remove(&peer) {
+                if pending.expires_at <= Instant::now() {
+                    state
+                        .transport
+                        .disconnect(peer, "Authentication timeout")
+                        .await?;
+                    return Ok(());
+                }
+                let identity_check = (|| -> Result<()> {
+                    let mut reader = NetReader::new(&payload);
+                    let response = DidResponse::deserialize(&mut reader)
+                        .context("malformed identity response")?;
+                    anyhow::ensure!(
+                        reader.remaining() == 0,
+                        "trailing bytes in identity response"
+                    );
+                    let verifying_key =
+                        did_key_verifying_key(&pending.ready.player_meta_data_message.player_uuid)?;
+                    response.verify(&pending.challenge, &verifying_key)
+                })();
+                if let Err(error) = identity_check {
+                    state
+                        .transport
+                        .disconnect(peer, &format!("Identity verification failed: {error}"))
+                        .await?;
+                    return Ok(());
+                }
+                finalize_accept(state, peer, pending.ready, true).await?;
             }
         }
         channels::PLAYER_AVATAR_HIGH | channels::PLAYER_AVATAR_HIGH_ADDITIONAL => {
@@ -1734,6 +1897,9 @@ async fn handle_message(
             }
         }
         channels::CHAT => {
+            if admin_runtime::is_text_muted(state, peer) {
+                return Ok(());
+            }
             if state.global_state.read().text_chat_locked
                 && !peer_has_permission(
                     state,
@@ -2222,6 +2388,9 @@ async fn handle_message(
             update_voice_recipients_bitfield(state, peer, &payload);
         }
         channels::VOICE | channels::VOICE_LARGE => {
+            if admin_runtime::is_voice_muted(state, peer) {
+                return Ok(());
+            }
             if !state.global_state.read().voice_chat_locked
                 || peer_has_permission(
                     state,
@@ -2233,6 +2402,11 @@ async fn handle_message(
             }
         }
         channels::SHOUT_VOICE => {
+            if admin_runtime::is_voice_muted(state, peer)
+                || !state.admin_runtime.is_announcing(peer)
+            {
+                return Ok(());
+            }
             if !state.global_state.read().voice_chat_locked
                 || peer_has_permission(
                     state,
@@ -2485,6 +2659,9 @@ async fn relay_event(state: &ServerState, peer: PeerId, payload: &[u8]) -> Resul
                 .await;
         }
         channels::EVENT_TYPE_PLAYER_CHAT_TYPING => {
+            if admin_runtime::is_text_muted(state, peer) {
+                return Ok(());
+            }
             let Some(&typing) = rest.first() else {
                 return Ok(());
             };
@@ -2895,21 +3072,15 @@ async fn relay_voice_message(state: &ServerState, peer: PeerId, payload: &[u8]) 
 }
 
 async fn relay_shout_voice_message(state: &ServerState, peer: PeerId, payload: &[u8]) {
-    let large_id = peer > u8::MAX as u16;
-    let channel = if large_id {
-        channels::VOICE_LARGE
-    } else {
-        channels::SHOUT_VOICE
-    };
     let message = ServerAudioSegmentMessage {
         player_id: peer,
         audio_segment: payload.to_vec(),
     };
     let mut writer = NetWriter::new();
-    message.serialize_with_id_size(&mut writer, large_id);
+    message.serialize(&mut writer);
     state
         .broadcast(
-            channel,
+            channels::SHOUT_VOICE,
             DeliveryMethod::Unreliable,
             writer.as_slice(),
             Some(peer),
@@ -3007,12 +3178,26 @@ async fn broadcast_spawn_preloaded(state: &ServerState, spawn: SpawnPreloadedMes
 }
 
 async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8]) -> Result<()> {
+    if !state.authenticated_peers.contains_key(&peer) {
+        return Ok(());
+    }
     let mut reader = NetReader::new(payload);
     let request = AdminRequest::deserialize(&mut reader)?;
     if let Some(required_node) = admin_mode_required_permission(request.mode) {
-        if !peer_has_permission(state, peer, required_node) {
+        let releasing_self = matches!(
+            request.mode,
+            AdminRequestMode::DisableAnnounceMode | AdminRequestMode::DisableShoutMode
+        ) && payload
+            .get(1..3)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            == Some(peer);
+        if !releasing_self && !peer_has_permission(state, peer, required_node) {
+            send_admin_text(state, peer, &format!("No permission: {required_node}")).await?;
             return Ok(());
         }
+    }
+    if admin_runtime::handle_request(state, peer, request.mode, &mut reader).await? {
+        return Ok(());
     }
     match request.mode {
         AdminRequestMode::GlobalToggleAvatars => {
@@ -3436,7 +3621,6 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
                 } else {
                     state.permissions.remove_user_from_group(&uuid, &group);
                 }
-                let _ = state.permissions.save_to_xml();
                 send_admin_text(state, peer, "Permission updated").await?;
             }
         }
@@ -3449,7 +3633,6 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
                 } else {
                     state.permissions.remove_user_node(&uuid, &node);
                 }
-                let _ = state.permissions.save_to_xml();
                 send_admin_text(state, peer, "Permission updated").await?;
             }
         }
@@ -3462,21 +3645,18 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
                 } else {
                     state.permissions.remove_group_node(&group, &node);
                 }
-                let _ = state.permissions.save_to_xml();
                 send_admin_text(state, peer, "Permission updated").await?;
             }
         }
         AdminRequestMode::CreateGroup => {
             if let Ok(group) = reader.get_string() {
                 state.permissions.get_or_create_group(&group);
-                let _ = state.permissions.save_to_xml();
                 send_admin_text(state, peer, "Permission updated").await?;
             }
         }
         AdminRequestMode::DeleteGroup => {
             if let Ok(group) = reader.get_string() {
                 state.permissions.delete_group(&group);
-                let _ = state.permissions.save_to_xml();
                 send_admin_text(state, peer, "Permission updated").await?;
             }
         }
@@ -3489,7 +3669,6 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
                 } else {
                     state.permissions.remove_group_parent(&group, &parent);
                 }
-                let _ = state.permissions.save_to_xml();
                 send_admin_text(state, peer, "Permission updated").await?;
             }
         }
@@ -3544,20 +3723,6 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
                 )
                 .await;
         }
-        AdminRequestMode::EnableShoutMode | AdminRequestMode::DisableShoutMode => {
-            let target = reader.get_u16().unwrap_or(peer);
-            let mut writer = NetWriter::new();
-            request.serialize(&mut writer);
-            writer.put_u16(target);
-            state
-                .broadcast(
-                    channels::ADMIN,
-                    DeliveryMethod::ReliableOrdered,
-                    writer.as_slice(),
-                    None,
-                )
-                .await;
-        }
         AdminRequestMode::SetFullQualityBroadcast => {
             let target = reader.get_u16().unwrap_or(peer);
             let enabled = reader.get_bool().unwrap_or(false);
@@ -3591,70 +3756,11 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
         AdminRequestMode::DeleteAllLogs => {
             delete_all_logs(state, peer).await?;
         }
-        AdminRequestMode::Ban => {
-            if let Ok(uuid) = reader.get_string() {
-                let reason = reader.get_string().unwrap_or_else(|_| "Banned".to_string());
-                state
-                    .moderation
-                    .add_ban_with_details(uuid.clone(), reason.clone(), None)?;
-                if let Some(target) = peer_by_uuid(state, &uuid) {
-                    let _ = state.transport.disconnect(target, &reason).await;
-                }
-            }
-        }
-        AdminRequestMode::Kick => {
-            if let Ok(uuid) = reader.get_string() {
-                if let Some(target) = peer_by_uuid(state, &uuid) {
-                    let reason = reader.get_string().unwrap_or_else(|_| "Kicked".to_string());
-                    let _ = state.transport.disconnect(target, &reason).await;
-                }
-            }
-        }
-        AdminRequestMode::IpAndBan => {
-            if let Ok(uuid) = reader.get_string() {
-                let reason = reader.get_string().unwrap_or_else(|_| "Banned".to_string());
-                let ip = peer_by_uuid(state, &uuid).and_then(|target| {
-                    state
-                        .transport
-                        .peer_snapshots()
-                        .into_iter()
-                        .find(|snapshot| snapshot.id == target)
-                        .map(|snapshot| snapshot.addr.ip().to_string())
-                });
-                state
-                    .moderation
-                    .add_ban_with_details(uuid.clone(), reason.clone(), ip)?;
-                if let Some(target) = peer_by_uuid(state, &uuid) {
-                    let _ = state.transport.disconnect(target, &reason).await;
-                }
-            }
-        }
-        AdminRequestMode::UnBan => {
-            if let Ok(uuid) = reader.get_string() {
-                let _ = state.moderation.remove_ban(&uuid)?;
-            }
-        }
-        AdminRequestMode::UnBanIP => {
-            if let Ok(ip) = reader.get_string() {
-                let _ = state.moderation.remove_ip_ban(&ip)?;
-            }
-        }
         AdminRequestMode::SetServerName => {
-            state.config.write().server_name = reader.get_string().unwrap_or_default();
+            state.config.write().server_name = reader.get_string()?;
         }
         AdminRequestMode::SetServerMotd => {
-            state.config.write().server_motd = reader.get_string().unwrap_or_default();
-        }
-        AdminRequestMode::SetAllowlistMode => {
-            let mode = reader.get_u8().unwrap_or(0);
-            let restriction = match mode {
-                1 => basis_protocol::config::BasisUserRestrictionMode::WhiteList,
-                2 => basis_protocol::config::BasisUserRestrictionMode::BlackList,
-                _ => basis_protocol::config::BasisUserRestrictionMode::None,
-            };
-            state.config.write().basis_user_restriction_mode = restriction;
-            state.global_state.write().restriction_mode = restriction as u8;
-            broadcast_lock_state(state).await;
+            state.config.write().server_motd = reader.get_string()?;
         }
         AdminRequestMode::AddAllowlist => {
             if let Ok(uuid) = reader.get_string() {
@@ -3666,19 +3772,11 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
                 let _ = state.moderation.remove_whitelist(&uuid)?;
             }
         }
-        AdminRequestMode::AddDefaultLibraryItem | AdminRequestMode::RemoveDefaultLibraryItem => {
-            send_admin_text(
-                state,
-                peer,
-                "Default library mutation is accepted by the Rust admin API, but filesystem persistence is handled by server startup library loading.",
-            )
-            .await?;
-        }
         _ => {
             warn!("admin mode {:?} is not accepted from clients", request.mode);
         }
     }
-    if admin_mode_persists_config(request.mode) {
+    if admin_mode_persists_config(request.mode) && state.config.read().has_file_support {
         state.config.read().save(&state.config_path)?;
     }
     Ok(())
@@ -3770,7 +3868,7 @@ async fn handle_locomotion_override(
             send_admin_text(state, moderator, "Player not found").await?;
             return Ok(());
         }
-        if has_protection_permission(state, target) {
+        if target != moderator && has_protection_permission(state, target) {
             send_admin_text(state, moderator, "Target is protected").await?;
             return Ok(());
         }
@@ -4165,6 +4263,7 @@ fn write_lock_state_fields(writer: &mut NetWriter, locks: &GlobalState) {
     writer.put_bool(locks.camera_capture_locked);
     writer.put_bool(locks.prop_grabbing_locked);
     writer.put_bool(locks.safe_display_names_forced);
+    writer.put_bool(locks.gifs_locked);
 }
 
 fn encode_bool_admin_state_payload(mode: AdminRequestMode, value: bool) -> Vec<u8> {
@@ -4493,6 +4592,11 @@ fn admin_mode_required_permission(mode: AdminRequestMode) -> Option<&'static str
     use basis_server_permissions::nodes;
     Some(match mode {
         AdminRequestMode::Ban => nodes::MODERATION_BAN,
+        AdminRequestMode::GetPermissions => nodes::PERMISSIONS_VIEW,
+        AdminRequestMode::SetVoiceMute
+        | AdminRequestMode::SetTextMute
+        | AdminRequestMode::GetMuteState => nodes::MODERATION_MUTE,
+        AdminRequestMode::RenamePlayer => nodes::MODERATION_RENAME,
         AdminRequestMode::Kick => nodes::MODERATION_KICK,
         AdminRequestMode::IpAndBan => nodes::MODERATION_IP_BAN,
         AdminRequestMode::UnBan => nodes::MODERATION_UNBAN,
@@ -4502,9 +4606,10 @@ fn admin_mode_required_permission(mode: AdminRequestMode) -> Option<&'static str
         AdminRequestMode::TeleportAll | AdminRequestMode::TeleportPlayer => {
             nodes::MODERATION_TELEPORT
         }
-        AdminRequestMode::EnableShoutMode | AdminRequestMode::DisableShoutMode => {
-            nodes::MODERATION_SHOUT
-        }
+        AdminRequestMode::EnableAnnounceMode
+        | AdminRequestMode::DisableAnnounceMode
+        | AdminRequestMode::EnableShoutMode
+        | AdminRequestMode::DisableShoutMode => nodes::MODERATION_ANNOUNCE,
         AdminRequestMode::SetFullQualityBroadcast => nodes::MODERATION_FULL_QUALITY_BROADCAST,
         AdminRequestMode::ForceAvatar | AdminRequestMode::ForceAvatarAll => {
             nodes::MODERATION_FORCE_AVATAR
@@ -4513,6 +4618,8 @@ fn admin_mode_required_permission(mode: AdminRequestMode) -> Option<&'static str
             nodes::MODERATION_LOCOMOTION
         }
         AdminRequestMode::GlobalToggleAvatars
+        | AdminRequestMode::GlobalToggleGifs
+        | AdminRequestMode::SetGlobalLocomotionPolicy
         | AdminRequestMode::GlobalToggleProps
         | AdminRequestMode::GlobalToggleWorlds
         | AdminRequestMode::GlobalToggleServers

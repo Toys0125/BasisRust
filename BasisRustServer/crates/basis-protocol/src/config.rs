@@ -3,11 +3,35 @@ use serde::{Deserialize, Serialize};
 use std::{env, fs, path::Path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[repr(u8)]
 pub enum BasisUserRestrictionMode {
     #[default]
-    None,
-    WhiteList,
-    BlackList,
+    #[serde(alias = "None")]
+    Normal = 0,
+    #[serde(alias = "BlackList", alias = "Blacklist")]
+    BanList = 1,
+    #[serde(alias = "WhiteList", alias = "Whitelist")]
+    AllowList = 2,
+    RejoinOnly = 3,
+}
+
+impl BasisUserRestrictionMode {
+    #[allow(non_upper_case_globals)]
+    pub const None: Self = Self::Normal;
+    #[allow(non_upper_case_globals)]
+    pub const WhiteList: Self = Self::AllowList;
+    #[allow(non_upper_case_globals)]
+    pub const BlackList: Self = Self::BanList;
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "normal" | "none" | "0" => Some(Self::Normal),
+            "banlist" | "blacklist" | "1" => Some(Self::BanList),
+            "allowlist" | "whitelist" | "2" => Some(Self::AllowList),
+            "rejoinonly" | "3" => Some(Self::RejoinOnly),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -141,6 +165,13 @@ pub struct ServerConfig {
     pub direct_connect_locked: bool,
     pub cilbox_locked: bool,
     pub images_locked: bool,
+    pub gifs_locked: bool,
+    pub locomotion_policy_fields: u8,
+    pub locomotion_policy_jump_height: f32,
+    pub locomotion_policy_walk_speed: f32,
+    pub locomotion_policy_run_speed: f32,
+    pub locomotion_policy_gravity: f32,
+    pub locomotion_policy_mode: u8,
     #[serde(rename = "EndEffectorIKDisabled", alias = "EndEffectorIkDisabled")]
     pub end_effector_ik_disabled: bool,
     pub text_chat_locked: bool,
@@ -263,6 +294,13 @@ impl Default for ServerConfig {
             direct_connect_locked: false,
             cilbox_locked: false,
             images_locked: false,
+            gifs_locked: false,
+            locomotion_policy_fields: 0,
+            locomotion_policy_jump_height: 1.0,
+            locomotion_policy_walk_speed: 2.5,
+            locomotion_policy_run_speed: 4.0,
+            locomotion_policy_gravity: -9.81,
+            locomotion_policy_mode: 0,
             end_effector_ik_disabled: false,
             text_chat_locked: false,
             voice_chat_locked: false,
@@ -578,6 +616,21 @@ impl ServerConfig {
         override_field!("DirectConnectLocked", direct_connect_locked, bool);
         override_field!("CilboxLocked", cilbox_locked, bool);
         override_field!("ImagesLocked", images_locked, bool);
+        override_field!("GifsLocked", gifs_locked, bool);
+        override_field!("LocomotionPolicyFields", locomotion_policy_fields, u8);
+        override_field!(
+            "LocomotionPolicyJumpHeight",
+            locomotion_policy_jump_height,
+            f32
+        );
+        override_field!(
+            "LocomotionPolicyWalkSpeed",
+            locomotion_policy_walk_speed,
+            f32
+        );
+        override_field!("LocomotionPolicyRunSpeed", locomotion_policy_run_speed, f32);
+        override_field!("LocomotionPolicyGravity", locomotion_policy_gravity, f32);
+        override_field!("LocomotionPolicyMode", locomotion_policy_mode, u8);
         override_field!("EndEffectorIKDisabled", end_effector_ik_disabled, bool);
         override_field!("TextChatLocked", text_chat_locked, bool);
         override_field!("VoiceChatLocked", voice_chat_locked, bool);
@@ -591,11 +644,9 @@ impl ServerConfig {
         override_string!("ApiKey", api_key);
 
         if let Ok(value) = env::var("BasisUserRestrictionMode") {
-            self.basis_user_restriction_mode = match value.as_str() {
-                "WhiteList" | "Whitelist" | "whitelist" => BasisUserRestrictionMode::WhiteList,
-                "BlackList" | "Blacklist" | "blacklist" => BasisUserRestrictionMode::BlackList,
-                _ => BasisUserRestrictionMode::None,
-            };
+            if let Some(mode) = BasisUserRestrictionMode::parse(&value) {
+                self.basis_user_restriction_mode = mode;
+            }
         }
     }
 
@@ -662,20 +713,9 @@ impl ServerConfig {
             serde_json::Value::String(_)
                 if field_name.eq_ignore_ascii_case("BasisUserRestrictionMode") =>
             {
-                let mode = if value.eq_ignore_ascii_case("WhiteList")
-                    || value.eq_ignore_ascii_case("Whitelist")
-                {
-                    "WhiteList"
-                } else if value.eq_ignore_ascii_case("BlackList")
-                    || value.eq_ignore_ascii_case("Blacklist")
-                {
-                    "BlackList"
-                } else if value.eq_ignore_ascii_case("None") {
-                    "None"
-                } else {
-                    anyhow::bail!("invalid BasisUserRestrictionMode {value}");
-                };
-                serde_json::Value::String(mode.to_string())
+                let mode = BasisUserRestrictionMode::parse(value)
+                    .with_context(|| format!("invalid BasisUserRestrictionMode {value}"))?;
+                serde_json::to_value(mode)?
             }
             serde_json::Value::String(_) => serde_json::Value::String(value.to_string()),
             _ => anyhow::bail!("unsupported config field type for {field_name}"),
@@ -688,6 +728,46 @@ impl ServerConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn basisvr_restriction_modes_and_new_policy_fields_roundtrip() {
+        use super::*;
+        for (name, mode, number) in [
+            ("Normal", BasisUserRestrictionMode::Normal, 0),
+            ("BanList", BasisUserRestrictionMode::BanList, 1),
+            ("AllowList", BasisUserRestrictionMode::AllowList, 2),
+            ("RejoinOnly", BasisUserRestrictionMode::RejoinOnly, 3),
+        ] {
+            let xml = format!("<Configuration><BasisUserRestrictionMode>{name}</BasisUserRestrictionMode><GifsLocked>true</GifsLocked><LocomotionPolicyFields>31</LocomotionPolicyFields><LocomotionPolicyWalkSpeed>12.5</LocomotionPolicyWalkSpeed></Configuration>");
+            let config: ServerConfig = quick_xml::de::from_str(&xml).unwrap();
+            assert_eq!(config.basis_user_restriction_mode, mode);
+            assert_eq!(mode as u8, number);
+            assert!(config.gifs_locked);
+            assert_eq!(config.locomotion_policy_fields, 31);
+            assert_eq!(config.locomotion_policy_walk_speed, 12.5);
+            assert_eq!(config.locomotion_policy_run_speed, 4.0);
+            let saved = quick_xml::se::to_string(&config).unwrap();
+            assert!(saved.contains(&format!(
+                "<BasisUserRestrictionMode>{name}</BasisUserRestrictionMode>"
+            )));
+            assert_eq!(
+                quick_xml::de::from_str::<ServerConfig>(&saved).unwrap(),
+                config
+            );
+        }
+        for (legacy, canonical) in [
+            ("None", "Normal"),
+            ("WhiteList", "AllowList"),
+            ("BlackList", "BanList"),
+        ] {
+            let xml = format!("<Configuration><BasisUserRestrictionMode>{legacy}</BasisUserRestrictionMode></Configuration>");
+            let config: ServerConfig = quick_xml::de::from_str(&xml).unwrap();
+            assert_eq!(
+                config.get_field("BasisUserRestrictionMode").unwrap(),
+                canonical
+            );
+        }
+    }
+
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
