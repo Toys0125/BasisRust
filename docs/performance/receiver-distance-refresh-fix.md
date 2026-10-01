@@ -1,5 +1,8 @@
 # Per-receiver distance-cache refresh fix
 
+Capture artifacts are retained locally and are not shipped with this checkout.
+See [artifact availability and how to request the original materials](artifact-availability.md).
+
 Branch: `fix/receiver-distance-cache-refresh`.
 
 The global 500 ms refresh flag only reached the receiver slice selected when it became due. At 32 slices and approximately one-second receiver cycles, some receivers retained stale distance-based quality tiers and intervals for long periods.
@@ -12,7 +15,7 @@ This corrects quality selection. It preserves receiver slicing, distance thresho
 
 - The new per-receiver timing test failed on the old code: High remained cached when Medium was required. It passes with the fix.
 - Tests cover 499/500 ms timing, independent receivers, all four tiers in both directions, recreated receiver state, and every receiver in a 32-slice cycle. The slice regression also checks transmitted quality and advertised intervals.
-- All 37 `basis-server-core` tests pass. Release console build, formatting and whitespace checks pass. [Exact commands and outcomes](../../captures/receiver-distance-refresh-20260930/checks.json).
+- All 37 `basis-server-core` tests pass. Release console build, formatting and whitespace checks pass. Exact commands and outcomes: `captures/receiver-distance-refresh-20260930/checks.json`.
 
 ## 2,000-client moving validation
 
@@ -39,8 +42,6 @@ One 120-second window after a 30-second warmup, using the previous four groups o
 
 The server and separately mapped observer socket had zero sampled UDP drop increases. Filtered-client aggregate drops are not treated as packet-loss measurements. Both load processes and both native CPU samplers exited successfully, and all test processes are stopped.
 
-[Tier trace chart](../../captures/receiver-distance-refresh-20260930/tier-refresh.png) compares the first 120 seconds of both historical moving baselines with this validation. The chart uses five-second diagnostics of pair baseline quality; per-peer applied transition counts above independently verify the observer's received tiers.
+Tier trace chart: `captures/receiver-distance-refresh-20260930/tier-refresh.png` compares the first 120 seconds of both historical moving baselines with this validation. The chart uses five-second diagnostics of pair baseline quality; per-peer applied transition counts above independently verify the observer's received tiers.
 
-[Structured results](../../captures/receiver-distance-refresh-20260930/comparison.json) · [Transition verification](../../captures/receiver-distance-refresh-20260930/verification.json) · [Run manifest](../../captures/receiver-distance-refresh-20260930/01-moving/manifest.json) · [Runner](../../captures/receiver-distance-refresh-20260930/run-validation.py) · [Server patch](../../captures/receiver-distance-refresh-20260930/server-source.patch) · Prior baseline report: local `docs/performance/mixed-quality-2000-profile.md` (not published)
-
-Capture links reference ignored local experiment artifacts and are unavailable in a fresh checkout.
+Structured results: `captures/receiver-distance-refresh-20260930/comparison.json` · Transition verification: `captures/receiver-distance-refresh-20260930/verification.json` · Run manifest: `captures/receiver-distance-refresh-20260930/01-moving/manifest.json` · Runner: `captures/receiver-distance-refresh-20260930/run-validation.py` · Server patch: `captures/receiver-distance-refresh-20260930/server-source.patch` · Prior baseline report: local `docs/performance/mixed-quality-2000-profile.md` (not published)

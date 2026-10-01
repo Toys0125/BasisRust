@@ -1,5 +1,8 @@
 # CPU versus the expanded GPU path at 2,000 clients
 
+Capture artifacts are retained locally and are not shipped with this checkout.
+See [artifact availability and how to request the original materials](artifact-availability.md).
+
 September 30, 2026. Tested server revision: `291d044` on
 `fix/receiver-distance-cache-refresh`.
 
@@ -81,7 +84,7 @@ with socket BPF while retaining control and reliable traffic. It does not
 measure 2,000 rendering Unity clients. Two repeats per mode limit confidence,
 and results may differ at other populations, workloads, or hardware.
 
-## Reproduction and provenance
+## Historical local commands and provenance
 
 Artifacts are in `captures/cpu-vs-gpu-decisions-2000-20260930/`: retained
 binaries, manifests, configurations, commands, observer data, health samples,
@@ -90,6 +93,9 @@ native profiles, source hashes, `comparison.json`, `gpu-metrics.json`, and
 28 captured server source hashes remained unchanged, and normalized configs
 matched after replacing the GPU-enable flag. All load processes and profilers
 exited successfully.
+
+The following commands require the original archive and its dependencies;
+they cannot run in a fresh checkout.
 
 ```sh
 python3 captures/cpu-vs-gpu-decisions-2000-20260930/run-experiment.py

@@ -1,5 +1,8 @@
 # Receiver-build parallelism at 2,000 clients
 
+Capture artifacts are retained locally and are not shipped with this checkout.
+See [artifact availability and how to request the original materials](artifact-availability.md).
+
 Reduced `RECEIVER_BUILD_MIN_BATCH` from 16 to 4 in [avatar_sync.rs](../../BasisRustServer/crates/basis-server-core/src/avatar_sync.rs) on `fix/receiver-distance-cache-refresh`, based on the corrected server at `f45eb2f`.
 
 At 2,000 peers and 32 receiver slices, a full slice has about 63 receivers. Rayon's previous minimum batch size permits only three leaves in the binary split tree (31/16/16). A minimum of four permits more subdivisions, allowing idle workers to take receiver builds. Actual splitting depends on the worker pool and stealing; a particular task count is not guaranteed. Bundle and pose encoding, quality thresholds, distance-cache refresh, receiver selection and interval-gating rules are unchanged.
@@ -41,8 +44,6 @@ This is a latency/throughput improvement using more CPU capacity. Server CPU per
 
 The roughly 0.8-second receiver cycle remains a substantial limit. This experiment establishes one improvement for synthetic headless loopback traffic on one host; two repeats per variant do not establish production, WAN, voice or Unity-rendering capacity, nor the best batch size for every workload.
 
-[Comparison chart](../../captures/perf-receiver-parallelism-20260930/comparison.png) · [Matched results and assertions](../../captures/perf-receiver-parallelism-20260930/matched-comparison.json) · [Experiment runner](../../captures/perf-receiver-parallelism-20260930/run-experiment.py) · [Comparison script](../../captures/perf-receiver-parallelism-20260930/compare.py) · [Candidate patch](../../captures/perf-receiver-parallelism-20260930/candidate-server-source.patch) · [Core test output](../../captures/perf-receiver-parallelism-20260930/core-tests.log)
+Comparison chart: `captures/perf-receiver-parallelism-20260930/comparison.png` · Matched results and assertions: `captures/perf-receiver-parallelism-20260930/matched-comparison.json` · Experiment runner: `captures/perf-receiver-parallelism-20260930/run-experiment.py` · Comparison script: `captures/perf-receiver-parallelism-20260930/compare.py` · Candidate patch: `captures/perf-receiver-parallelism-20260930/candidate-server-source.patch` · Core test output: `captures/perf-receiver-parallelism-20260930/core-tests.log`
 
 Each run retains its command/manifest, health and CPU/RSS samples, applied quality metrics, per-pair diagnostics, and server/client native captures with leaf, inclusive and source-line reports.
-
-Capture links reference ignored local experiment artifacts and are unavailable in a fresh checkout.

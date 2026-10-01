@@ -1,5 +1,8 @@
 # GPU quality and interval decisions with 2,000 clients
 
+Capture artifacts are retained locally and are not shipped with this checkout.
+See [artifact availability and how to request the original materials](artifact-availability.md).
+
 September 30, 2026, branch `fix/receiver-distance-cache-refresh`.
 
 The Rust GPU kernel now computes squared distance, quality tier, and the encoded
@@ -107,10 +110,13 @@ sizes, buffer reuse, quality and interval boundaries, extreme policies, and
 invalid input handling. A separate 40-client smoke test passed all 120 expected
 tier transitions and shut down cleanly. Format and diff checks passed.
 
+Current checkout verification (GPU support now requires the feature flag):
+
 ```sh
-cargo test --manifest-path BasisRustServer/Cargo.toml --offline --workspace
-cargo test --manifest-path BasisRustServer/Cargo.toml --offline \
-  -p basis-server-core hardware_gpu_distance_parity -- --ignored --nocapture
+cargo test --manifest-path BasisRustServer/Cargo.toml --workspace \
+  --features basis-server-core/gpu
+cargo test --manifest-path BasisRustServer/Cargo.toml \
+  -p basis-server-core --features gpu hardware_gpu_distance_parity -- --ignored --nocapture
 ```
 
 Artifacts: `captures/gpu-reduction-decisions-20260930/`, including fixed binaries,

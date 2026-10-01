@@ -1,5 +1,8 @@
 # Bundle-cache fingerprint optimization with 2,000 clients
 
+Capture artifacts are retained locally and are not shipped with this checkout.
+See [artifact availability and how to request the original materials](artifact-availability.md).
+
 September 30, 2026, branch `fix/receiver-distance-cache-refresh`.
 Baseline source: `f5cc329` (server runtime `291d044`). The candidate was built
 from that revision plus `variants/fingerprint.patch` in the capture directory.

@@ -4,6 +4,7 @@
 use std::{borrow::Cow, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
+use basis_protocol::channels::{AVATAR_INTERVAL_EXTENDED_START, AVATAR_INTERVAL_EXTENDED_STEP_MS};
 use parking_lot::Mutex;
 
 use crate::gpu_policy::{ReductionPolicy, DECISION_INVALID_FLAG};
@@ -46,7 +47,7 @@ fn decision(index: u32) -> u32 {
     let base = f32(parameters.base_interval);
     // Once the encoded byte saturates, larger arithmetic has no observable
     // effect. Bound the intermediate operations to avoid shader overflow.
-    let contribution_limit = (base + 854.0) / base + 1.0;
+    let contribution_limit = (base + f32(INTERVAL_SATURATION)) / base + 1.0;
     var contribution = 0.0;
     if parameters.rate > 0.0 {
         if distance > contribution_limit / parameters.rate {
@@ -66,15 +67,19 @@ fn decision(index: u32) -> u32 {
     }
     let relative = max(interval - parameters.base_interval, 0i);
     var encoded = 255u;
-    if relative < 200i { encoded = u32(relative); }
-    else if relative < 854i { encoded = 200u + u32((relative - 200i + 6i) / 12i); }
+    if relative < INTERVAL_EXTENDED_START { encoded = u32(relative); }
+    else if relative < INTERVAL_SATURATION {
+        encoded = u32(INTERVAL_EXTENDED_START)
+            + u32((relative - INTERVAL_EXTENDED_START + INTERVAL_EXTENDED_STEP / 2i)
+                / INTERVAL_EXTENDED_STEP);
+    }
 
     // Integer boundaries above the start of final-byte saturation cannot
     // change an encoded interval. Keep its lower boundary guarded as well.
     let interval_tolerance = abs(base) * abs(parameters.rate) * tolerance
         + 4.0 * epsilon * abs(raw);
     if finite(raw) && raw + interval_tolerance >= base + 1.0
-        && raw - interval_tolerance <= base + 854.0 {
+        && raw - interval_tolerance <= base + f32(INTERVAL_SATURATION) {
         correction = correction || abs(raw - round(raw)) <= interval_tolerance;
     }
     return (quality << 8u) | encoded | select(0u, 0x0400u, correction);
@@ -92,6 +97,18 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     decisions[word] = packed;
 }
 "#;
+
+fn shader_source() -> String {
+    // The shader's encoding and saturation guard share the CPU wire constants.
+    let start = i32::from(AVATAR_INTERVAL_EXTENDED_START);
+    let step = AVATAR_INTERVAL_EXTENDED_STEP_MS;
+    let saturation = start + (i32::from(u8::MAX) - start) * step - (step >> 1);
+    format!(
+        "const INTERVAL_EXTENDED_START: i32 = {start}i;\n\
+         const INTERVAL_EXTENDED_STEP: i32 = {step}i;\n\
+         const INTERVAL_SATURATION: i32 = {saturation}i;\n{SHADER}"
+    )
+}
 
 #[derive(Debug)]
 struct BufferBucket {
@@ -190,7 +207,7 @@ impl GpuDistanceBackend {
         let scopes = error_scopes(&device);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Basis distance and reduction policy"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(shader_source())),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Basis distance and reduction policy"),
@@ -537,6 +554,35 @@ mod tests {
         assert_eq!(dispatch_dimensions(2_000_000, 65_535).unwrap(), (31_250, 1));
         assert_eq!(dispatch_dimensions(9_000_000, 65_535).unwrap(), (65_535, 3));
         assert!(dispatch_dimensions(1_000_000, 2).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a hardware Vulkan, DX12, or Metal GPU"]
+    fn hardware_gpu_interval_protocol_parity() {
+        let mut gpu = GpuDistanceBackend::new("").expect("hardware GPU required");
+        let policy = ReductionPolicy {
+            high_distance_sq: 0.0,
+            medium_distance_sq: 0.0,
+            low_distance_sq: 0.0,
+            increase_rate: 0.05,
+            ..default_policy()
+        };
+        let maximum = basis_protocol::channels::decode_avatar_interval_ms(u8::MAX, 0)
+            + AVATAR_INTERVAL_EXTENDED_STEP_MS;
+        let mut positions = vec![[0.0; 4]];
+        // Fractional intervals avoid worker correction, testing the actual
+        // shader at every integer interval through extended-byte saturation.
+        positions
+            .extend((0..=maximum).map(|relative| [(relative as f32 + 0.25).sqrt(), 0.0, 0.0, 0.0]));
+        let decisions = gpu.compute(0, &positions, &policy).unwrap();
+        for (sender, position) in positions.iter().enumerate().skip(1) {
+            assert_eq!(
+                decisions[sender],
+                policy.cpu_decision(position[0] * position[0]),
+                "interval sample {} must match without CPU repair",
+                sender - 1
+            );
+        }
     }
 
     fn assert_parity(

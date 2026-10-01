@@ -1,5 +1,8 @@
 # Why GPU mode increased update gaps
 
+Capture artifacts are retained locally and are not shipped with this checkout.
+See [artifact availability and how to request the original materials](artifact-availability.md).
+
 Investigation of the September 30, 2026 two-bucket implementation at `9cd2bfc`.
 The evidence identifies CPU-side GPU-result consumption as a contributor. The
 original 4.3% p95 increase also includes run variation and an unprofiled stall;

@@ -1,5 +1,8 @@
 # GPU distance buckets at 2,000 clients
 
+Capture artifacts are retained locally and are not shipped with this checkout.
+See [artifact availability and how to request the original materials](artifact-availability.md).
+
 Tested September 30, 2026 on `fix/receiver-distance-cache-refresh`, using the
 server changes above parent revision `1638c97304e1caff73f01fe86f58bbb7b106b704`.
 Artifacts, exact source hashes, patches, configs, commands, binaries, health
