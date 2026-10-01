@@ -670,7 +670,6 @@ impl ServerState {
         if self.shutdown.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        self.avatar_sync.stop_compute_offload().await;
         self.transport.shutdown();
         for peer in self.authenticated_peers.iter() {
             let _ = self
@@ -678,8 +677,11 @@ impl ServerState {
                 .disconnect(*peer.key(), "Server shutting down")
                 .await;
         }
-        self.database.shutdown()?;
-        Ok(())
+        let database_result = self.database.shutdown();
+        // Finish persistence and network cleanup before waiting for GPU readback.
+        // Always join the workers, including when database shutdown fails.
+        self.avatar_sync.stop_compute_offload().await;
+        database_result
     }
 
     pub async fn broadcast(

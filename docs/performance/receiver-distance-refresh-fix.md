@@ -4,7 +4,7 @@ Branch: `fix/receiver-distance-cache-refresh`.
 
 The global 500 ms refresh flag only reached the receiver slice selected when it became due. At 32 slices and approximately one-second receiver cycles, some receivers retained stale distance-based quality tiers and intervals for long periods.
 
-[Receiver tracking](/home/mgstange/Documents/BasisRust/BasisRustServer/crates/basis-server-core/src/avatar_sync.rs:421) now stores one refresh timestamp per receiver alongside its sender map. Each receiver checks the existing 500 ms interval using the tick's monotonic time when its build runs. An overdue receiver refreshes all eligible sender pairs on that visit. New pairs still initialize from their current positions; disconnecting a receiver removes its timestamp with its tracking state. There is no added timestamp per sender pair and no extra clock read in the loop.
+[Receiver tracking](../../BasisRustServer/crates/basis-server-core/src/avatar_sync.rs) now stores one refresh timestamp per receiver alongside its sender map. Each receiver checks the existing 500 ms interval using the tick's monotonic time when its build runs. An overdue receiver refreshes all eligible sender pairs on that visit. New pairs still initialize from their current positions; disconnecting a receiver removes its timestamp with its tracking state. There is no added timestamp per sender pair and no extra clock read in the loop.
 
 This corrects quality selection. It preserves receiver slicing, distance thresholds, interval encoding, bundle/delta compression and the configured refresh period. Receivers still wait for their scheduled slice; it does not guarantee delivery every 500 ms.
 
@@ -12,7 +12,7 @@ This corrects quality selection. It preserves receiver slicing, distance thresho
 
 - The new per-receiver timing test failed on the old code: High remained cached when Medium was required. It passes with the fix.
 - Tests cover 499/500 ms timing, independent receivers, all four tiers in both directions, recreated receiver state, and every receiver in a 32-slice cycle. The slice regression also checks transmitted quality and advertised intervals.
-- All 37 `basis-server-core` tests pass. Release console build, formatting and whitespace checks pass. [Exact commands and outcomes](/home/mgstange/Documents/BasisRust/captures/receiver-distance-refresh-20260930/checks.json).
+- All 37 `basis-server-core` tests pass. Release console build, formatting and whitespace checks pass. [Exact commands and outcomes](../../captures/receiver-distance-refresh-20260930/checks.json).
 
 ## 2,000-client moving validation
 
@@ -39,6 +39,8 @@ One 120-second window after a 30-second warmup, using the previous four groups o
 
 The server and separately mapped observer socket had zero sampled UDP drop increases. Filtered-client aggregate drops are not treated as packet-loss measurements. Both load processes and both native CPU samplers exited successfully, and all test processes are stopped.
 
-[Tier trace chart](/home/mgstange/Documents/BasisRust/captures/receiver-distance-refresh-20260930/tier-refresh.png) compares the first 120 seconds of both historical moving baselines with this validation. The chart uses five-second diagnostics of pair baseline quality; per-peer applied transition counts above independently verify the observer's received tiers.
+[Tier trace chart](../../captures/receiver-distance-refresh-20260930/tier-refresh.png) compares the first 120 seconds of both historical moving baselines with this validation. The chart uses five-second diagnostics of pair baseline quality; per-peer applied transition counts above independently verify the observer's received tiers.
 
-[Structured results](/home/mgstange/Documents/BasisRust/captures/receiver-distance-refresh-20260930/comparison.json) · [Transition verification](/home/mgstange/Documents/BasisRust/captures/receiver-distance-refresh-20260930/verification.json) · [Run manifest](/home/mgstange/Documents/BasisRust/captures/receiver-distance-refresh-20260930/01-moving/manifest.json) · [Runner](/home/mgstange/Documents/BasisRust/captures/receiver-distance-refresh-20260930/run-validation.py) · [Server patch](/home/mgstange/Documents/BasisRust/captures/receiver-distance-refresh-20260930/server-source.patch) · [Prior baseline report](/home/mgstange/Documents/BasisRust/docs/performance/mixed-quality-2000-profile.md)
+[Structured results](../../captures/receiver-distance-refresh-20260930/comparison.json) · [Transition verification](../../captures/receiver-distance-refresh-20260930/verification.json) · [Run manifest](../../captures/receiver-distance-refresh-20260930/01-moving/manifest.json) · [Runner](../../captures/receiver-distance-refresh-20260930/run-validation.py) · [Server patch](../../captures/receiver-distance-refresh-20260930/server-source.patch) · Prior baseline report: local `docs/performance/mixed-quality-2000-profile.md` (not published)
+
+Capture links reference ignored local experiment artifacts and are unavailable in a fresh checkout.
