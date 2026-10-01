@@ -31,25 +31,31 @@ cargo test
 
 ## GPU distance processing
 
-`EnableComputeOffload` enables hardware GPU computation of the avatar distance
-matrix. `ComputeDevice` accepts an adapter name substring or index; an empty
+`EnableComputeOffload` enables hardware GPU computation of avatar distances,
+quality tiers, and encoded send intervals. `ComputeDevice` accepts an adapter name substring or index; an empty
 value selects an available hardware adapter. Software adapters are rejected.
 An unavailable or failed GPU falls back to CPU distance processing.
 
-Two buckets hold captured peer positions and their distances. The server reads
+Two buckets hold captured peer positions and packed tier/interval decisions. The server reads
 one immutable bucket while a dedicated worker uploads, computes, and reads back
 the other. Completed buckets are published every
 `ComputeDistanceUpdateIntervalTicks` ticks (32 by default). The server tick never
 waits for GPU completion. A late result keeps the previous bucket active; data
 older than two publication periods falls back to CPU processing. New peers and
 reused peer IDs also use CPU processing until their incarnation appears in a
-completed bucket. Tier and interval decisions near floating-point boundaries
-use CPU arithmetic on the captured positions.
+completed bucket. The GPU flags decisions near floating-point boundaries, and
+the worker corrects them using CPU arithmetic on the captured positions before
+publication. Receiver builds read ready decisions without floating-point checks.
+Each pair uses two result bytes. Reduction-policy changes invalidate old buckets
+and cached decisions; unsupported GPU policies use CPU processing.
 
 This deliberately delays distance decisions until bucket publication; packet
 building and transport remain on the CPU. With `HealthIncludeExtendedMetrics`
 enabled, `extended.avatarSync.gpuDistance` reports the adapter, active epoch,
-submissions, swaps, missed swaps, stale fallbacks, and errors. A non-null active
+submissions, swaps, missed swaps, stale fallbacks, and errors. `computedPairs`
+and `correctedPairs` count worker-produced decisions and boundary corrections;
+`lastWorkerMicros` and `maxWorkerMicros` measure complete worker jobs, including
+GPU waits, readback, and correction. A non-null active
 epoch confirms that GPU results are in use. Set `EnableComputeOffload=false`
 to use CPU distance processing exclusively.
 

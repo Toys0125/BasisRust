@@ -81,6 +81,10 @@ pub struct GpuDistanceMetrics {
     pub stale_fallbacks: u64,
     pub active_epoch: Option<u64>,
     pub last_error: Option<String>,
+    pub computed_pairs: u64,
+    pub corrected_pairs: u64,
+    pub last_worker_micros: u64,
+    pub max_worker_micros: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]

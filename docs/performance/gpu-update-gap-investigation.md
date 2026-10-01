@@ -34,7 +34,7 @@ speed ratio. The checked GPU and CPU modes produced matching decision checksums
 at every phase. The original native profiles also sampled `roundf` only in GPU
 mode, at 0.16–0.20% of total server CPU samples.
 
-Reproduce the manual benchmark with:
+Reproduce the original manual benchmark at revision `0ae5273` with:
 
 ```sh
 cargo test --manifest-path BasisRustServer/Cargo.toml --release \
@@ -102,11 +102,16 @@ ended before this event, and no GPU swaps were missed in that original run. Its
 cause remains unknown; it contributed variation beyond the steady consumer cost.
 The original second GPU run had no comparable stall.
 
-The next optimization to test is preparing validated quality and interval data
+The next optimization identified here was preparing validated quality and interval data
 on the bucket worker, then publishing it with the bucket. The tick could read
 ready decisions instead of repeating precision checks and policy arithmetic.
 Policy changes and CPU fallback would need to invalidate those decisions.
 Simply removing precision protection would trade correctness for speed.
+
+The subsequent [GPU reduction-decision implementation and comparison](gpu-reduction-decisions-2000.md)
+moves tier and interval computation onto the GPU and boundary repair onto the
+worker. The current manual benchmark measures prepared decisions, so use the
+revision above to reproduce this investigation's original consumer timings.
 
 Artifacts: `captures/gpu-distance-investigation-20260930/`, including variant
 patches and binaries, manifests, health samples, native profiles, the consumer

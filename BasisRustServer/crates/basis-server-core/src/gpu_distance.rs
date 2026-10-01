@@ -1,5 +1,8 @@
 //! Two immutable distance buckets; GPU waits are confined to a worker thread.
 use crate::gpu_distance_backend::GpuDistanceBackend;
+use crate::gpu_policy::{
+    ReductionDecision, ReductionPolicy, DECISION_CORRECTION_FLAG, DECISION_VALUE_MASK,
+};
 use basis_transport::PeerId;
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
@@ -12,6 +15,7 @@ pub(crate) struct OffloadSettings {
     pub enabled: bool,
     pub device: String,
     pub interval_ticks: u64,
+    pub policy: ReductionPolicy,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -27,27 +31,69 @@ pub(crate) struct DistanceBucket {
     submitted_tick: u64,
     peers: Vec<DistancePeer>,
     indices: Vec<Option<(u64, usize)>>,
-    distances: Vec<f32>,
+    decisions: Vec<u16>,
+    interval_ms: [u64; 256],
+    corrected_pairs: u64,
+    worker_micros: u64,
 }
 
 impl DistanceBucket {
     #[cfg(test)]
-    pub(crate) fn for_test(epoch: u64, peers: Vec<DistancePeer>, distances: Vec<f32>) -> Self {
+    pub(crate) fn for_test(
+        epoch: u64,
+        peers: Vec<DistancePeer>,
+        distances: Vec<f32>,
+        policy: ReductionPolicy,
+    ) -> Self {
+        let decisions = distances
+            .into_iter()
+            .map(|distance| policy.cpu_decision(distance))
+            .collect();
+        Self::for_test_packed(epoch, peers, decisions, policy)
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test_packed(
+        epoch: u64,
+        peers: Vec<DistancePeer>,
+        decisions: Vec<u16>,
+        policy: ReductionPolicy,
+    ) -> Self {
         Self::new(
             Job {
                 bucket: 0,
                 epoch,
                 submitted_tick: 0,
                 peers,
+                policy,
             },
-            distances,
+            decisions,
         )
         .unwrap()
     }
-    fn new(job: Job, distances: Vec<f32>) -> Result<Self, String> {
+    fn new(job: Job, mut decisions: Vec<u16>) -> Result<Self, String> {
         let count = job.peers.len();
-        if count.checked_mul(count) != Some(distances.len()) {
-            return Err("GPU distance matrix has the wrong size".into());
+        if count.checked_mul(count) != Some(decisions.len()) {
+            return Err("GPU decision matrix has the wrong size".into());
+        }
+        if !job.policy.validate() {
+            return Err("GPU reduction policy is unsupported".into());
+        }
+        // Only the worker repairs flagged decisions. Receiver ticks consume
+        // completed bytes and never repeat floating-point boundary checks.
+        let mut corrected_pairs = 0;
+        for (index, decision) in decisions.iter_mut().enumerate() {
+            if *decision & !(DECISION_VALUE_MASK | DECISION_CORRECTION_FLAG) != 0 {
+                return Err("GPU decision matrix contains invalid data".into());
+            }
+            if *decision & DECISION_CORRECTION_FLAG != 0 {
+                corrected_pairs += 1;
+                let receiver = job.peers[index / count].position;
+                let sender = job.peers[index % count].position;
+                let dx = receiver[0] - sender[0];
+                let dy = receiver[1] - sender[1];
+                let dz = receiver[2] - sender[2];
+                *decision = job.policy.cpu_decision(dx * dx + dy * dy + dz * dz);
+            }
         }
         let mut indices = vec![
             None;
@@ -70,7 +116,10 @@ impl DistanceBucket {
             submitted_tick: job.submitted_tick,
             peers: job.peers,
             indices,
-            distances,
+            decisions,
+            interval_ms: job.policy.interval_table(),
+            corrected_pairs,
+            worker_micros: 0,
         })
     }
 
@@ -95,9 +144,12 @@ impl DistanceBucket {
         let width = self.peers.len();
         Some(DistanceRow {
             epoch: self.epoch,
-            distances: &self.distances[index * width..(index + 1) * width],
+            decisions: &self.decisions[index * width..(index + 1) * width],
             sender_indices,
+            interval_ms: &self.interval_ms,
+            #[cfg(test)]
             receiver_position: self.peers[index].position,
+            #[cfg(test)]
             peers: &self.peers,
         })
     }
@@ -106,18 +158,28 @@ impl DistanceBucket {
 #[derive(Clone, Copy)]
 pub(crate) struct DistanceRow<'a> {
     pub epoch: u64,
-    distances: &'a [f32],
+    decisions: &'a [u16],
     sender_indices: &'a [Option<usize>],
+    interval_ms: &'a [u64; 256],
+    #[cfg(test)]
     receiver_position: [f32; 4],
+    #[cfg(test)]
     peers: &'a [DistancePeer],
 }
 
 impl DistanceRow<'_> {
-    pub fn get(&self, sender_index: usize) -> Option<f32> {
+    pub fn get(&self, sender_index: usize) -> Option<ReductionDecision> {
         let index = self.sender_indices.get(sender_index).copied().flatten()?;
-        self.distances.get(index).copied()
+        let packed = *self.decisions.get(index)?;
+        let interval_byte = packed as u8;
+        Some(ReductionDecision {
+            quality: (packed >> 8) as u8,
+            interval_byte,
+            interval_ms: self.interval_ms[interval_byte as usize],
+        })
     }
 
+    #[cfg(test)]
     pub fn exact_snapshot_distance(&self, sender_index: usize) -> Option<f32> {
         let index = self.sender_indices.get(sender_index).copied().flatten()?;
         let sender = self.peers.get(index)?.position;
@@ -139,6 +201,10 @@ pub struct GpuDistanceStats {
     pub stale_fallbacks: u64,
     pub active_epoch: Option<u64>,
     pub last_error: Option<String>,
+    pub computed_pairs: u64,
+    pub corrected_pairs: u64,
+    pub last_worker_micros: u64,
+    pub max_worker_micros: u64,
 }
 
 #[derive(Debug)]
@@ -147,6 +213,7 @@ struct Job {
     epoch: u64,
     submitted_tick: u64,
     peers: Vec<DistancePeer>,
+    policy: ReductionPolicy,
 }
 #[derive(Debug)]
 enum WorkerEvent {
@@ -171,6 +238,7 @@ fn spawn_worker(device: String) -> Result<(WorkerLink, thread::JoinHandle<()>), 
                     .send(WorkerEvent::Initialized(backend.adapter_name().into()))
                     .map_err(|e| e.to_string())?;
                 while let Ok(job) = rx.recv() {
+                    let started = std::time::Instant::now();
                     let bucket = job.bucket;
                     let positions = job
                         .peers
@@ -178,9 +246,13 @@ fn spawn_worker(device: String) -> Result<(WorkerLink, thread::JoinHandle<()>), 
                         .map(|peer| peer.position)
                         .collect::<Vec<_>>();
                     let result = backend
-                        .compute(bucket, &positions)
+                        .compute(bucket, &positions, &job.policy)
                         .map_err(|e| e.to_string())
-                        .and_then(|distances| DistanceBucket::new(job, distances));
+                        .and_then(|decisions| DistanceBucket::new(job, decisions))
+                        .map(|mut result| {
+                            result.worker_micros = started.elapsed().as_micros() as u64;
+                            result
+                        });
                     let failed = result.is_err();
                     if events.send(WorkerEvent::Completed(bucket, result)).is_err() {
                         return Ok(());
@@ -285,6 +357,10 @@ impl DistanceOffload {
         if !settings.enabled || self.failed {
             return None;
         }
+        if !settings.policy.validate() {
+            self.fail("GPU reduction policy is unsupported".into());
+            return None;
+        }
         if self.worker.is_none() && peers.len() > 1 {
             match spawn_worker(settings.device.clone()) {
                 Ok((worker, thread)) => {
@@ -304,6 +380,11 @@ impl DistanceOffload {
                 }
                 Some(Ok(WorkerEvent::Completed(bucket, Ok(result)))) => {
                     if self.pending == Some((bucket, result.epoch, result.submitted_tick)) {
+                        self.stats.computed_pairs += result.decisions.len() as u64;
+                        self.stats.corrected_pairs += result.corrected_pairs;
+                        self.stats.last_worker_micros = result.worker_micros;
+                        self.stats.max_worker_micros =
+                            self.stats.max_worker_micros.max(result.worker_micros);
                         self.buckets[bucket] = Some(Arc::new(result));
                     }
                 }
@@ -336,6 +417,7 @@ impl DistanceOffload {
                 epoch,
                 submitted_tick: self.tick,
                 peers: peers.to_vec(),
+                policy: settings.policy,
             };
             match self
                 .worker
@@ -420,6 +502,7 @@ mod tests {
             enabled: true,
             device: "mock".into(),
             interval_ticks: 32,
+            policy: ReductionPolicy::default(),
         };
         let (jobs, rx) = mpsc::sync_channel(1);
         let (tx, events) = mpsc::channel();
@@ -439,7 +522,9 @@ mod tests {
     }
     fn complete(tx: &mpsc::Sender<WorkerEvent>, job: Job, value: f32) {
         let bucket = job.bucket;
-        let result = DistanceBucket::new(job, vec![0.0, value, value, 0.0]);
+        let packed = job.policy.cpu_decision(value);
+        let zero = job.policy.cpu_decision(0.0);
+        let result = DistanceBucket::new(job, vec![zero, packed, packed, zero]);
         tx.send(WorkerEvent::Completed(bucket, result)).unwrap();
     }
 
@@ -456,7 +541,14 @@ mod tests {
         }
         let held = pipeline.advance(settings.clone(), &peers).unwrap();
         let indices = held.sender_indices(&peers);
-        assert_eq!(held.row(&peers[0], &indices).unwrap().get(1), Some(225.0));
+        assert_eq!(
+            held.row(&peers[0], &indices)
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .quality,
+            2
+        );
         let second = jobs.try_recv().unwrap();
         assert_eq!(second.bucket, 1);
         complete(&tx, second, 900.0);
@@ -468,8 +560,22 @@ mod tests {
         }
         let next = pipeline.advance(settings.clone(), &peers).unwrap();
         assert_ne!(next.epoch, held.epoch);
-        assert_eq!(next.row(&peers[0], &indices).unwrap().get(1), Some(900.0));
-        assert_eq!(held.row(&peers[0], &indices).unwrap().get(1), Some(225.0));
+        assert_eq!(
+            next.row(&peers[0], &indices)
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .quality,
+            1
+        );
+        assert_eq!(
+            held.row(&peers[0], &indices)
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .quality,
+            2
+        );
         let third = jobs.try_recv().unwrap();
         assert_eq!(third.bucket, 0);
         // Reusing a former active bucket must clear its old ready result.
@@ -518,8 +624,9 @@ mod tests {
                 epoch: 1,
                 submitted_tick: 1,
                 peers: peers.clone(),
+                policy: ReductionPolicy::default(),
             },
-            vec![0.0, 225.0, 225.0, 0.0],
+            vec![0x0300, 0x0216, 0x0216, 0x0300],
         )
         .unwrap();
         let mut current = vec![
@@ -534,7 +641,7 @@ mod tests {
         let indices = bucket.sender_indices(&current);
         assert_eq!(indices, vec![Some(1), Some(0), None]);
         let row = bucket.row(&current[1], &indices).unwrap();
-        assert_eq!(row.get(0), Some(225.0));
+        assert_eq!(row.get(0).unwrap().quality, 2);
         assert_eq!(row.get(2), None);
         current[0].incarnation += 1;
         let indices = bucket.sender_indices(&current);
@@ -569,9 +676,10 @@ mod tests {
                 bucket: 0,
                 epoch: 1,
                 submitted_tick: 0,
+                policy: ReductionPolicy::default(),
                 peers: peers()
             },
-            vec![0.0]
+            vec![0]
         )
         .is_err());
         let peer = peers()[0];
@@ -580,11 +688,83 @@ mod tests {
                 bucket: 0,
                 epoch: 1,
                 submitted_tick: 0,
+                policy: ReductionPolicy::default(),
                 peers: vec![peer, peer]
             },
-            vec![0.0; 4]
+            vec![0; 4]
         )
         .is_err());
+    }
+
+    #[test]
+    fn policy_change_invalidates_active_and_inflight_buckets() {
+        let (mut pipeline, mut settings, jobs, tx) = mock();
+        let peers = peers();
+        pipeline.advance(settings.clone(), &peers);
+        complete(&tx, jobs.try_recv().unwrap(), 225.0);
+        let mut held = None;
+        for _ in 2..=32 {
+            held = pipeline.advance(settings.clone(), &peers);
+        }
+        let held = held.unwrap();
+        let _inflight = jobs.try_recv().unwrap();
+        settings.policy.high_distance_sq = 900.0;
+        // No peers prevents a hardware worker from being created in this test.
+        assert!(pipeline.advance(settings, &[]).is_none());
+        assert!(pipeline.pending.is_none());
+        assert!(pipeline.active.is_none());
+        assert!(pipeline.stats.active_epoch.is_none());
+        assert!(tx.send(WorkerEvent::Initialized("retired".into())).is_err());
+        assert!(matches!(
+            jobs.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        let indices = held.sender_indices(&peers);
+        assert_eq!(
+            held.row(&peers[0], &indices)
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .quality,
+            2
+        );
+    }
+
+    #[test]
+    fn unsupported_policy_fallback_is_sticky_even_for_nan() {
+        let (mut pipeline, mut settings, jobs, _tx) = mock();
+        settings.policy.increase_rate = f32::NAN;
+        assert!(pipeline.advance(settings.clone(), &peers()).is_none());
+        assert!(pipeline.failed);
+        assert!(pipeline.worker.is_none());
+        assert!(matches!(
+            jobs.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(pipeline.advance(settings.clone(), &peers()).is_none());
+        assert!(pipeline.failed);
+        assert_eq!(pipeline.tick, 2);
+        settings.enabled = false;
+        assert!(pipeline.advance(settings, &peers()).is_none());
+        assert!(!pipeline.failed);
+        assert!(pipeline.stats.last_error.is_none());
+    }
+
+    #[test]
+    fn invalid_decision_flags_are_rejected_before_publication() {
+        for invalid in [0x0800, 0x1000, 0xffff] {
+            assert!(DistanceBucket::new(
+                Job {
+                    bucket: 0,
+                    epoch: 1,
+                    submitted_tick: 0,
+                    peers: peers(),
+                    policy: ReductionPolicy::default(),
+                },
+                vec![0, invalid, 0, 0]
+            )
+            .is_err());
+        }
     }
 
     #[test]

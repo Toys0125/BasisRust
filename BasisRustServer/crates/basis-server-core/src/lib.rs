@@ -1,6 +1,7 @@
 mod avatar_sync;
 mod gpu_distance;
 mod gpu_distance_backend;
+mod gpu_policy;
 mod p2p;
 
 pub use avatar_sync::BsrProfilerSnapshot;

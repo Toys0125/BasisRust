@@ -32,6 +32,7 @@ use tracing::warn;
 use crate::gpu_distance::{
     DistanceOffload, DistancePeer, DistanceRow, GpuDistanceStats, OffloadSettings,
 };
+use crate::gpu_policy::{ReductionDecision, ReductionPolicy};
 use crate::p2p::pack_pair;
 
 const DISTANCE_UPDATE_INTERVAL_MS: u64 = 500;
@@ -428,6 +429,7 @@ struct ReceiverTrackingState {
     senders: PeerIdMap<ReceiverTracking>,
     last_distance_update_ms: Option<u64>,
     last_gpu_epoch: Option<u64>,
+    last_reduction_policy: Option<ReductionPolicy>,
 }
 
 struct SpatialGrid {
@@ -1733,6 +1735,7 @@ impl AvatarSyncSystem {
                 enabled: config.enable_compute_offload,
                 device: config.compute_device.clone(),
                 interval_ticks: config.compute_distance_update_interval_ticks,
+                policy: reduction_policy(&config),
             },
             &distance_peers,
         );
@@ -2030,13 +2033,16 @@ impl AvatarSyncSystem {
         // global due flag in whichever slice happens to run at the time. A receiver
         // cycle longer than the refresh interval therefore refreshes every visit.
         let gpu_epoch = distance_row.map(|row| row.epoch);
-        let update_distances = gpu_epoch != receiver_tracking.last_gpu_epoch
+        let policy = reduction_policy(config);
+        let update_distances = receiver_tracking.last_reduction_policy != Some(policy)
+            || gpu_epoch != receiver_tracking.last_gpu_epoch
             || receiver_tracking
                 .last_distance_update_ms
                 .is_none_or(|last| now_ms.saturating_sub(last) >= DISTANCE_UPDATE_INTERVAL_MS);
         if update_distances {
             receiver_tracking.last_distance_update_ms = Some(now_ms);
             receiver_tracking.last_gpu_epoch = gpu_epoch;
+            receiver_tracking.last_reduction_policy = Some(policy);
         }
         let mut logical_sends = 0u64;
         let mut bundle_ratio = if config.enable_bundle_compression {
@@ -2067,37 +2073,41 @@ impl AvatarSyncSystem {
             }
             let bypass_reduction =
                 !bypass_empty && self.bypass_reduction_ids.contains_key(&sender_id);
-            let pair_distance = || {
+            let pair_decision = || {
                 distance_row
-                    .and_then(|row| checked_gpu_distance(row, peer_index, config))
+                    .and_then(|row| row.get(peer_index))
                     .unwrap_or_else(|| {
-                        distance_sq_position(receiver_position, sender_state.position)
+                        let distance =
+                            distance_sq_position(receiver_position, sender_state.position);
+                        let (interval_byte, interval_ms) =
+                            calculate_interval_from_distance_sq(distance, config);
+                        ReductionDecision {
+                            quality: quality_from_distance_sq(distance, config),
+                            interval_byte,
+                            interval_ms,
+                        }
                     })
             };
             let tracking = receiver_tracking
                 .senders
                 .entry(sender_id)
                 .or_insert_with(|| {
-                    let dist_sq = pair_distance();
-                    let (interval_byte, interval_ms) =
-                        calculate_interval_from_distance_sq(dist_sq, config);
+                    let decision = pair_decision();
                     ReceiverTracking {
                         last_seen_generation: 0,
                         last_sent_ms: 0,
-                        cached_quality_index: quality_from_distance_sq(dist_sq, config),
-                        cached_interval_byte: interval_byte,
-                        cached_interval_ms: interval_ms,
+                        cached_quality_index: decision.quality,
+                        cached_interval_byte: decision.interval_byte,
+                        cached_interval_ms: decision.interval_ms,
                         baseline_keyframe_generation: 0,
                         baseline_quality: u8::MAX,
                     }
                 });
             if update_distances {
-                let dist_sq = pair_distance();
-                tracking.cached_quality_index = quality_from_distance_sq(dist_sq, config);
-                let (interval_byte, interval_ms) =
-                    calculate_interval_from_distance_sq(dist_sq, config);
-                tracking.cached_interval_byte = interval_byte;
-                tracking.cached_interval_ms = interval_ms;
+                let decision = pair_decision();
+                tracking.cached_quality_index = decision.quality;
+                tracking.cached_interval_byte = decision.interval_byte;
+                tracking.cached_interval_ms = decision.interval_ms;
             }
             let quality_index = if bypass_reduction {
                 BitQuality::High as u8
@@ -3248,33 +3258,14 @@ fn distance_sq_position(receiver: [f32; 3], sender: [f32; 3]) -> f32 {
     dx * dx + dy * dy + dz * dz
 }
 
-fn checked_gpu_distance(
-    row: DistanceRow<'_>,
-    sender_index: usize,
-    config: &AvatarSyncConfig,
-) -> Option<f32> {
-    let distance = row.get(sender_index)?;
-    // GPUs may contract multiply/add or flush subnormals. Around a protocol
-    // decision boundary use the original snapshot's CPU arithmetic, not a newer
-    // live position, so bucket timing stays consistent with the GPU result.
-    let tolerance = 8.0 * f32::EPSILON * distance.max(1.0);
-    let near_quality = [
-        config.high_distance_sq,
-        config.medium_distance_sq,
-        config.low_distance_sq,
-    ]
-    .iter()
-    .any(|threshold| (distance - threshold).abs() <= tolerance);
-    let base = config.default_interval_ms.max(1) as i32 as f32;
-    let raw_interval = base * (config.base_multiplier + distance * config.increase_rate);
-    let interval_tolerance = base.abs() * config.increase_rate.abs() * tolerance
-        + 4.0 * f32::EPSILON * raw_interval.abs();
-    let near_interval =
-        raw_interval > base && (raw_interval - raw_interval.round()).abs() <= interval_tolerance;
-    if near_quality || near_interval {
-        row.exact_snapshot_distance(sender_index)
-    } else {
-        Some(distance)
+fn reduction_policy(config: &AvatarSyncConfig) -> ReductionPolicy {
+    ReductionPolicy {
+        base_interval_ms: config.default_interval_ms.max(1) as i32,
+        base_multiplier: config.base_multiplier,
+        increase_rate: config.increase_rate,
+        high_distance_sq: config.high_distance_sq,
+        medium_distance_sq: config.medium_distance_sq,
+        low_distance_sq: config.low_distance_sq,
     }
 }
 
@@ -3771,8 +3762,18 @@ mod tests {
             .collect::<Vec<_>>();
         let mut first_roster = roster.clone();
         first_roster[1].position[0] = 5.0;
-        let first = DistanceBucket::for_test(1, first_roster, vec![0.0, 25.0, 25.0, 0.0]);
-        let second = DistanceBucket::for_test(2, roster.clone(), vec![0.0, 225.0, 225.0, 0.0]);
+        let first = DistanceBucket::for_test(
+            1,
+            first_roster,
+            vec![0.0, 25.0, 25.0, 0.0],
+            reduction_policy(&config),
+        );
+        let second = DistanceBucket::for_test(
+            2,
+            roster.clone(),
+            vec![0.0, 225.0, 225.0, 0.0],
+            reduction_policy(&config),
+        );
         let build = |bucket: Option<&DistanceBucket>,
                      peers: &[(PeerId, Arc<PlayerAvatarState>)],
                      roster: &[DistancePeer],
@@ -3828,17 +3829,14 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_gpu_decisions_use_captured_positions() {
-        use crate::gpu_distance::DistanceBucket;
+    fn ambiguous_gpu_decisions_are_corrected_before_publication() {
+        use crate::{gpu_distance::DistanceBucket, gpu_policy::DECISION_CORRECTION_FLAG};
         let mut config = receiver_build_test_config();
         config.default_interval_ms = 20;
         config.high_distance_sq = 100.0;
         config.medium_distance_sq = 400.0;
         config.low_distance_sq = 1600.0;
-        for (position, rounded) in [
-            ([6.0, 8.0, 0.0, 0.0], 100.00001),
-            ([30.0, 0.0, 0.0, 0.0], 899.99994),
-        ] {
+        for position in [[6.0, 8.0, 0.0, 0.0], [30.0, 0.0, 0.0, 0.0]] {
             let captured = vec![
                 DistancePeer {
                     id: 1,
@@ -3851,22 +3849,113 @@ mod tests {
                     position,
                 },
             ];
-            let bucket =
-                DistanceBucket::for_test(1, captured.clone(), vec![0.0, rounded, rounded, 0.0]);
-            let mut live = captured.clone();
+            let wrong_gpu_decision = 255 | DECISION_CORRECTION_FLAG;
+            let bucket = DistanceBucket::for_test_packed(
+                1,
+                captured.clone(),
+                vec![0, wrong_gpu_decision, wrong_gpu_decision, 0],
+                reduction_policy(&config),
+            );
+            let mut live = captured;
             live[1].position[0] = 50.0;
             let indices = bucket.sender_indices(&live);
-            let row = bucket.row(&live[0], &indices).unwrap();
+            let decision = bucket.row(&live[0], &indices).unwrap().get(1).unwrap();
             let expected = distance_sq_position([0.0; 3], [position[0], position[1], position[2]]);
-            let actual = checked_gpu_distance(row, 1, &config).unwrap();
-            assert_eq!(actual, expected);
+            let (interval_byte, interval_ms) =
+                calculate_interval_from_distance_sq(expected, &config);
             assert_eq!(
-                quality_from_distance_sq(actual, &config),
+                decision.quality,
                 quality_from_distance_sq(expected, &config)
             );
+            assert_eq!(decision.interval_byte, interval_byte);
+            assert_eq!(decision.interval_ms, interval_ms);
+        }
+    }
+
+    #[test]
+    fn prepared_policy_matches_receiver_cpu_decisions() {
+        let mut config = receiver_build_test_config();
+        config.default_interval_ms = 20;
+        config.high_distance_sq = 100.0;
+        config.medium_distance_sq = 400.0;
+        config.low_distance_sq = 1600.0;
+        for (base, multiplier, rate) in [
+            (1, 1.0, 0.005),
+            (20, 1.0, 0.005),
+            (47, 0.25, 0.017),
+            ((i32::MAX - 2048) as u64, 1.0, 0.0000001),
+        ] {
+            config.default_interval_ms = base;
+            config.base_multiplier = multiplier;
+            config.increase_rate = rate;
+            let policy = reduction_policy(&config);
+            let intervals = policy.interval_table();
+            for distance in [
+                0.0_f32,
+                100.0,
+                400.0,
+                1600.0,
+                1990.0,
+                2000.0,
+                2060.0,
+                2180.0,
+                8540.0,
+                1.0e30,
+                f32::INFINITY,
+            ] {
+                for actual in [
+                    f32::from_bits(distance.to_bits().saturating_sub(1)),
+                    distance,
+                    f32::from_bits(distance.to_bits().saturating_add(1)),
+                ] {
+                    let packed = policy.cpu_decision(actual);
+                    let (byte, milliseconds) = calculate_interval_from_distance_sq(actual, &config);
+                    assert_eq!(
+                        (packed >> 8) as u8,
+                        quality_from_distance_sq(actual, &config)
+                    );
+                    assert_eq!(packed as u8, byte);
+                    assert_eq!(intervals[byte as usize], milliseconds);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_policy_changes_refresh_cached_decisions_immediately() {
+        let mut config = receiver_build_test_config();
+        config.enable_bundle_compression = false;
+        config.high_distance_sq = 100.0;
+        config.medium_distance_sq = 400.0;
+        config.low_distance_sq = 1600.0;
+        let system = AvatarSyncSystem::new(config.clone());
+        let mut peers = receiver_build_test_peers_from_ids([1, 2], &[]);
+        Arc::make_mut(&mut peers[0].1).position = [0.0; 3];
+        Arc::make_mut(&mut peers[1].1).position = [15.0, 0.0, 0.0];
+        for (now_ms, high, quality) in
+            [(0, 100.0, BitQuality::Medium), (1, 900.0, BitQuality::High)]
+        {
+            config.high_distance_sq = high;
+            system.update_config(config.clone());
+            system.build_sends_for_receiver(
+                1,
+                [0.0; 3],
+                AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
+                &peers,
+                None,
+                None,
+                &config,
+                now_ms,
+                1,
+                AVATAR_TICK_INTERVAL_MS,
+                true,
+                true,
+                &AvatarBundleCache::default(),
+                &mut ReceiverBuildScratch::default(),
+            );
             assert_eq!(
-                calculate_interval_from_distance_sq(actual, &config),
-                calculate_interval_from_distance_sq(expected, &config)
+                system.tracking.get(&1).unwrap().senders[&2].cached_quality_index,
+                quality as u8
             );
         }
     }
@@ -3898,8 +3987,9 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let positions = peers.iter().map(|p| p.position).collect::<Vec<_>>();
-            let matrix = backend.compute(0, &positions).unwrap();
-            let bucket = DistanceBucket::for_test(1, peers.clone(), matrix);
+            let policy = reduction_policy(&config);
+            let matrix = backend.compute(0, &positions, &policy).unwrap();
+            let bucket = DistanceBucket::for_test_packed(1, peers.clone(), matrix, policy);
             let indices = bucket.sender_indices(&peers);
             // All modes share the same captured positions, GPU output, policy,
             // roster mapping, and decision count. Timing excludes computation,
@@ -3912,19 +4002,28 @@ mod tests {
                         if receiver_index == sender_index {
                             continue;
                         }
-                        let distance = match mode {
-                            0 => distance_sq_position(
-                                receiver.position[..3].try_into().unwrap(),
-                                sender.position[..3].try_into().unwrap(),
-                            ),
-                            1 => row.get(sender_index).unwrap(),
-                            2 => checked_gpu_distance(row, sender_index, config).unwrap(),
-                            3 => row.exact_snapshot_distance(sender_index).unwrap(),
-                            _ => unreachable!(),
+                        let decision = if mode == 1 {
+                            row.get(sender_index).unwrap()
+                        } else {
+                            let distance = if mode == 0 {
+                                distance_sq_position(
+                                    receiver.position[..3].try_into().unwrap(),
+                                    sender.position[..3].try_into().unwrap(),
+                                )
+                            } else {
+                                row.exact_snapshot_distance(sender_index).unwrap()
+                            };
+                            let (interval_byte, interval_ms) =
+                                calculate_interval_from_distance_sq(distance, config);
+                            ReductionDecision {
+                                quality: quality_from_distance_sq(distance, config),
+                                interval_byte,
+                                interval_ms,
+                            }
                         };
-                        let quality = quality_from_distance_sq(distance, config);
-                        let (byte, interval) =
-                            calculate_interval_from_distance_sq(distance, config);
+                        let quality = decision.quality;
+                        let byte = decision.interval_byte;
+                        let interval = decision.interval_ms;
                         checksum = checksum.wrapping_add(
                             ((quality as u64) << 32) + ((byte as u64) << 24) + interval,
                         );
@@ -3934,17 +4033,13 @@ mod tests {
             };
             let expected = pass(0, &config);
             assert_eq!(pass(2, &config), expected);
-            assert_eq!(pass(3, &config), expected);
+            assert_eq!(pass(1, &config), expected);
             println!(
                 "DISTANCE_PROFILE phase={phase} raw_checksum_matches={}",
                 pass(1, &config) == expected
             );
             for round in 0..8 {
-                let order = if round % 2 == 0 {
-                    [0, 1, 2, 3]
-                } else {
-                    [3, 2, 1, 0]
-                };
+                let order = if round % 2 == 0 { [0, 1, 2] } else { [2, 1, 0] };
                 for mode in order {
                     let started = Instant::now();
                     let checksum = pass(black_box(mode), black_box(&config));
