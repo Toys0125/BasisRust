@@ -1,5 +1,14 @@
 mod admin_runtime;
 mod avatar_sync;
+#[cfg(feature = "gpu")]
+mod gpu_distance;
+#[cfg(not(feature = "gpu"))]
+#[path = "gpu_distance_disabled.rs"]
+mod gpu_distance;
+#[cfg(feature = "gpu")]
+mod gpu_distance_backend;
+mod gpu_distance_types;
+mod gpu_policy;
 mod p2p;
 
 pub use avatar_sync::BsrProfilerSnapshot;
@@ -475,6 +484,11 @@ impl ServerState {
                 tick_budget_ms: avatar_sync::DEFAULT_AVATAR_TICK_BUDGET_MS,
                 receiver_cycle_budget_ms: avatar_sync::DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
                 spatial_cull_enabled: false,
+                enable_compute_offload: config.enable_compute_offload,
+                compute_device: config.compute_device.clone(),
+                compute_distance_update_interval_ticks: config
+                    .compute_distance_update_interval_ticks
+                    .max(1) as u64,
                 enable_bsr_profiling: config.enable_bsrprofiling
                     || config.health_include_bsr_profiling,
                 collect_extended_metrics: config.health_include_extended_metrics,
@@ -612,6 +626,11 @@ impl ServerState {
                 tick_budget_ms: avatar_sync::DEFAULT_AVATAR_TICK_BUDGET_MS,
                 receiver_cycle_budget_ms: avatar_sync::DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
                 spatial_cull_enabled: false,
+                enable_compute_offload: config.enable_compute_offload,
+                compute_device: config.compute_device.clone(),
+                compute_distance_update_interval_ticks: config
+                    .compute_distance_update_interval_ticks
+                    .max(1) as u64,
                 enable_bsr_profiling: config.enable_bsrprofiling
                     || config.health_include_bsr_profiling,
                 collect_extended_metrics: config.health_include_extended_metrics,
@@ -743,7 +762,11 @@ impl ServerState {
                 .disconnect(*peer.key(), "Server shutting down")
                 .await;
         }
-        self.database.shutdown()?;
+        let database_result = self.database.shutdown();
+        // Finish persistence and network cleanup before waiting for GPU readback.
+        // Always join the workers, including when persistence fails.
+        self.avatar_sync.stop_compute_offload().await;
+        database_result?;
         permission_result?;
         Ok(())
     }

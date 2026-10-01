@@ -230,7 +230,7 @@ impl Default for ServerConfig {
             bsrsincrease_rate: 0.005,
             bsrslowest_send_rate: 2.55,
             distance_update_interval_ticks: 125,
-            enable_compute_offload: true,
+            enable_compute_offload: false,
             compute_device: String::new(),
             compute_distance_update_interval_ticks: 32,
             high_quality_distance: 10.0,
@@ -810,6 +810,7 @@ mod tests {
         assert!(xml.contains("<HealthIncludeExtendedMetrics>false</HealthIncludeExtendedMetrics>"));
         assert!(xml.contains("<EnableAvatarBundleZstd>true</EnableAvatarBundleZstd>"));
         assert!(xml.contains("<AvatarBundleZstdLevel>-5</AvatarBundleZstdLevel>"));
+        assert!(xml.contains("<EnableComputeOffload>false</EnableComputeOffload>"));
         let parsed: ServerConfig = quick_xml::de::from_str(&xml).unwrap();
         assert_eq!(parsed, config);
 
@@ -822,18 +823,25 @@ mod tests {
             .replace(
                 "<AvatarBundleZstdLevel>-5</AvatarBundleZstdLevel>",
                 "<AvatarBundleZstdLevel>-2</AvatarBundleZstdLevel>",
+            )
+            .replace(
+                "<EnableComputeOffload>false</EnableComputeOffload>",
+                "<EnableComputeOffload>true</EnableComputeOffload>",
             );
         let explicit: ServerConfig = quick_xml::de::from_str(&explicit).unwrap();
         assert!(!explicit.enable_avatar_bundle_zstd);
         assert_eq!(explicit.avatar_bundle_zstd_level, -2);
+        assert!(explicit.enable_compute_offload);
 
         // Older configs without the fields receive the current defaults.
         let omitted = xml
             .replace("<EnableAvatarBundleZstd>true</EnableAvatarBundleZstd>", "")
-            .replace("<AvatarBundleZstdLevel>-5</AvatarBundleZstdLevel>", "");
+            .replace("<AvatarBundleZstdLevel>-5</AvatarBundleZstdLevel>", "")
+            .replace("<EnableComputeOffload>false</EnableComputeOffload>", "");
         let omitted: ServerConfig = quick_xml::de::from_str(&omitted).unwrap();
         assert!(omitted.enable_avatar_bundle_zstd);
         assert_eq!(omitted.avatar_bundle_zstd_level, -5);
+        assert!(!omitted.enable_compute_offload);
     }
 
     #[test]

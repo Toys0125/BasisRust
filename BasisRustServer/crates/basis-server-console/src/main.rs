@@ -717,6 +717,21 @@ async fn main() -> Result<()> {
                         would_block: transport.raw_send_would_block,
                     },
                     avatar_sync: AvatarSyncMetrics {
+                        gpu_distance: basis_server_health::GpuDistanceMetrics {
+                            enabled: avatar.gpu_distance.enabled,
+                            adapter: avatar.gpu_distance.adapter,
+                            interval_ticks: avatar.gpu_distance.interval_ticks,
+                            submissions: avatar.gpu_distance.submissions,
+                            swaps: avatar.gpu_distance.swaps,
+                            missed_swaps: avatar.gpu_distance.missed_swaps,
+                            stale_fallbacks: avatar.gpu_distance.stale_fallbacks,
+                            active_epoch: avatar.gpu_distance.active_epoch,
+                            last_error: avatar.gpu_distance.last_error,
+                            computed_pairs: avatar.gpu_distance.computed_pairs,
+                            corrected_pairs: avatar.gpu_distance.corrected_pairs,
+                            last_worker_micros: avatar.gpu_distance.last_worker_micros,
+                            max_worker_micros: avatar.gpu_distance.max_worker_micros,
+                        },
                         inbound_updates: avatar.inbound_updates,
                         outbound_messages: avatar.outbound_messages,
                         outbound_logical_avatar_sends: avatar.outbound_logical_avatar_sends,
@@ -816,7 +831,12 @@ async fn main() -> Result<()> {
     request_shutdown(shutdown_tx);
     match tokio::time::timeout(std::time::Duration::from_secs(5), server.shutdown()).await {
         Ok(result) => result?,
-        Err(_) => warn!("server shutdown timed out; exiting process"),
+        Err(_) => {
+            warn!("server shutdown timed out; exiting process");
+            // Started blocking GPU cleanup tasks cannot be cancelled by the
+            // timeout; runtime teardown would otherwise wait for them again.
+            std::process::exit(1);
+        }
     }
     info!("Server shut down successfully.");
     Ok(())
