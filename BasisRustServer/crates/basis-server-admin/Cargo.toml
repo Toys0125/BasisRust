@@ -10,3 +10,5 @@ basis-protocol = { path = "../basis-protocol" }
 parking_lot.workspace = true
 quick-xml.workspace = true
 serde.workspace = true
+
+time.workspace = true

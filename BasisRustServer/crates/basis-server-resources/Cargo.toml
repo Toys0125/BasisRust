@@ -6,5 +6,9 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 basis-protocol = { path = "../basis-protocol" }
+lz4_flex.workspace = true
 parking_lot.workspace = true
+quick-xml.workspace = true
+serde.workspace = true

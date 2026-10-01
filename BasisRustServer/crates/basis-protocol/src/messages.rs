@@ -563,7 +563,7 @@ const PERMISSION_WIRE_NODES: &[&str] = &[
     permissions::nodes::MODERATION_MESSAGE,
     permissions::nodes::MODERATION_MESSAGE_ALL,
     permissions::nodes::MODERATION_TELEPORT,
-    permissions::nodes::MODERATION_SHOUT,
+    permissions::nodes::MODERATION_ANNOUNCE,
     permissions::nodes::PERMISSIONS_VIEW,
     permissions::nodes::PERMISSIONS_EDIT,
     permissions::nodes::MODERATION_HEADLESS_AUDIO,
@@ -2067,8 +2067,8 @@ pub enum AdminRequestMode {
     CreateGroup = 13,
     DeleteGroup = 14,
     SetGroupParent = 15,
-    EnableShoutMode = 16,
-    DisableShoutMode = 17,
+    EnableAnnounceMode = 16,
+    DisableAnnounceMode = 17,
     GlobalToggleAvatars = 18,
     GlobalToggleProps = 19,
     GlobalToggleWorlds = 20,
@@ -2134,7 +2134,39 @@ pub enum AdminRequestMode {
     GlobalGetImageBandwidth = 80,
     SetGlobalPeerLimit = 81,
     GlobalGetPeerLimit = 82,
+    SetVoiceMute = 83,
+    SetTextMute = 84,
+    MuteStateApply = 85,
+    QueryPermission = 86,
+    QueryPermissionResult = 87,
+    EnableShoutMode = 88,
+    DisableShoutMode = 89,
+    SetGlobalLocomotionPolicy = 90,
+    GlobalGetLocomotionPolicy = 91,
+    GlobalToggleGifs = 92,
+    RenamePlayer = 93,
+    GetMuteState = 94,
+    MuteStateResult = 95,
     Unknown = 255,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AdminPermissionQueryKind {
+    Node = 0,
+    Group = 1,
+}
+
+impl TryFrom<u8> for AdminPermissionQueryKind {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Node),
+            1 => Ok(Self::Group),
+            other => Err(other),
+        }
+    }
 }
 
 impl From<u8> for AdminRequestMode {
@@ -2156,8 +2188,8 @@ impl From<u8> for AdminRequestMode {
             13 => Self::CreateGroup,
             14 => Self::DeleteGroup,
             15 => Self::SetGroupParent,
-            16 => Self::EnableShoutMode,
-            17 => Self::DisableShoutMode,
+            16 => Self::EnableAnnounceMode,
+            17 => Self::DisableAnnounceMode,
             18 => Self::GlobalToggleAvatars,
             19 => Self::GlobalToggleProps,
             20 => Self::GlobalToggleWorlds,
@@ -2223,6 +2255,19 @@ impl From<u8> for AdminRequestMode {
             80 => Self::GlobalGetImageBandwidth,
             81 => Self::SetGlobalPeerLimit,
             82 => Self::GlobalGetPeerLimit,
+            83 => Self::SetVoiceMute,
+            84 => Self::SetTextMute,
+            85 => Self::MuteStateApply,
+            86 => Self::QueryPermission,
+            87 => Self::QueryPermissionResult,
+            88 => Self::EnableShoutMode,
+            89 => Self::DisableShoutMode,
+            90 => Self::SetGlobalLocomotionPolicy,
+            91 => Self::GlobalGetLocomotionPolicy,
+            92 => Self::GlobalToggleGifs,
+            93 => Self::RenamePlayer,
+            94 => Self::GetMuteState,
+            95 => Self::MuteStateResult,
             _ => Self::Unknown,
         }
     }
@@ -2754,5 +2799,43 @@ mod tests {
         }
         .serialize(&mut writer);
         assert_eq!(writer.as_slice(), &[44, 1, 5]);
+    }
+}
+
+#[cfg(test)]
+mod admin_parity_tests {
+    use super::*;
+
+    #[test]
+    fn admin_mode_ids_cover_pinned_basisvr_catalog() {
+        for id in 0..=95 {
+            assert_ne!(AdminRequestMode::from(id), AdminRequestMode::Unknown);
+            assert_eq!(AdminRequestMode::from(id) as u8, id);
+        }
+        assert_eq!(AdminRequestMode::EnableAnnounceMode as u8, 16);
+        assert_eq!(AdminRequestMode::DisableAnnounceMode as u8, 17);
+        assert_eq!(AdminRequestMode::SetVoiceMute as u8, 83);
+        assert_eq!(AdminRequestMode::QueryPermission as u8, 86);
+        assert_eq!(AdminRequestMode::EnableShoutMode as u8, 88);
+        assert_eq!(AdminRequestMode::SetGlobalLocomotionPolicy as u8, 90);
+        assert_eq!(AdminRequestMode::MuteStateResult as u8, 95);
+        assert_eq!(AdminRequestMode::from(96), AdminRequestMode::Unknown);
+        assert_eq!(
+            AdminPermissionQueryKind::try_from(0),
+            Ok(AdminPermissionQueryKind::Node)
+        );
+        assert_eq!(
+            AdminPermissionQueryKind::try_from(1),
+            Ok(AdminPermissionQueryKind::Group)
+        );
+        assert!(AdminPermissionQueryKind::try_from(2).is_err());
+    }
+
+    #[test]
+    fn permission_bit_24_is_announce() {
+        assert_eq!(PERMISSION_WIRE_NODES[24], "basis.moderation.announce");
+        let (bits, extras) = encode_permission_wire(&["basis.moderation.announce".to_owned()], &[]);
+        assert_eq!(bits[3] & 1, 1);
+        assert!(extras.is_empty());
     }
 }

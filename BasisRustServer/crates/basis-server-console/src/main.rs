@@ -119,7 +119,7 @@ impl ConsoleHelper {
             values.push(("true".to_string(), "true".to_string()));
             values.push(("false".to_string(), "false".to_string()));
         } else if field.eq_ignore_ascii_case("BasisUserRestrictionMode") {
-            for value in ["None", "WhiteList", "BlackList"] {
+            for value in ["Normal", "BanList", "AllowList", "RejoinOnly"] {
                 values.push((value.to_string(), value.to_string()));
             }
         } else if !ServerConfig::is_secret_field_name(field) && !value.is_empty() {
@@ -625,12 +625,13 @@ async fn main() -> Result<()> {
         .with_env_filter(args.log_level.clone())
         .init();
 
-    let base_dir = args
-        .base_dir
-        .clone()
-        .unwrap_or(std::env::current_dir().context("resolving current directory")?);
-    std::fs::create_dir_all(base_dir.join(ServerConfig::CONFIG_FOLDER_NAME))?;
-    std::fs::create_dir_all(base_dir.join(ServerConfig::LOGS_FOLDER_NAME))?;
+    let base_dir = args.base_dir.clone().unwrap_or(
+        std::env::current_exe()
+            .context("resolving executable directory")?
+            .parent()
+            .context("executable has no parent directory")?
+            .to_path_buf(),
+    );
 
     let config_path = if args.config.is_absolute() {
         args.config.clone()
@@ -652,12 +653,16 @@ async fn main() -> Result<()> {
         config.health_check_port = port;
     }
 
-    migrate_legacy_resource_dirs(&base_dir)?;
-    std::fs::create_dir_all(base_dir.join(ServerConfig::INITIAL_RESOURCES_FOLDER_NAME))?;
-    std::fs::create_dir_all(base_dir.join(ServerConfig::DEFAULT_LIBRARY_FOLDER_NAME))?;
+    if config.has_file_support {
+        migrate_legacy_resource_dirs(&base_dir)?;
+        std::fs::create_dir_all(base_dir.join(ServerConfig::LOGS_FOLDER_NAME))?;
+        std::fs::create_dir_all(base_dir.join(ServerConfig::INITIAL_RESOURCES_FOLDER_NAME))?;
+        std::fs::create_dir_all(base_dir.join(ServerConfig::DEFAULT_LIBRARY_FOLDER_NAME))?;
+    }
 
     info!("Server Booting");
-    let (server, shutdown_tx) = ServerState::start(config.clone(), &base_dir).await?;
+    let (server, shutdown_tx) =
+        ServerState::start_with_config_path(config.clone(), &base_dir, &config_path).await?;
     let _health_addr = start_health_server(HealthState {
         config: server.config.clone(),
         player_count: Arc::new({
@@ -1074,6 +1079,7 @@ fn config_field_requires_restart(field: &str) -> bool {
         "HealthCheckPort",
         "HealthPath",
         "EnableConsole",
+        "HasFileSupport",
     ]
     .iter()
     .any(|candidate| candidate.eq_ignore_ascii_case(field))
@@ -1298,7 +1304,11 @@ fn handle_perm_command(server: &ServerState, args: &[&str]) {
         }
         ["user", "info", uuid] => {
             let snapshot = server.permissions.snapshot();
-            if let Some(user) = snapshot.users.get(*uuid) {
+            if let Some(user) = snapshot
+                .users
+                .values()
+                .find(|user| permission_name_equal(&user.uuid, uuid))
+            {
                 println!("User: {}", user.uuid);
                 println!(
                     "Groups ({}): {}",
@@ -1322,8 +1332,17 @@ fn handle_perm_command(server: &ServerState, args: &[&str]) {
         ["user", "node", "remove", uuid, rest @ ..] if !rest.is_empty() => {
             let node = rest.join(" ");
             let snapshot = server.permissions.snapshot();
-            match snapshot.users.get(*uuid) {
-                Some(user) if user.nodes.contains(&node) => {
+            match snapshot
+                .users
+                .values()
+                .find(|user| permission_name_equal(&user.uuid, uuid))
+            {
+                Some(user)
+                    if user
+                        .nodes
+                        .iter()
+                        .any(|value| permission_name_equal(value, &node)) =>
+                {
                     server.permissions.remove_user_node(uuid, &node);
                     println!("Removed user node: {uuid} -> {node}");
                 }
@@ -1339,8 +1358,17 @@ fn handle_perm_command(server: &ServerState, args: &[&str]) {
         ["user", "group", "remove", uuid, rest @ ..] if !rest.is_empty() => {
             let group = rest.join(" ");
             let snapshot = server.permissions.snapshot();
-            match snapshot.users.get(*uuid) {
-                Some(user) if user.groups.contains(&group) => {
+            match snapshot
+                .users
+                .values()
+                .find(|user| permission_name_equal(&user.uuid, uuid))
+            {
+                Some(user)
+                    if user
+                        .groups
+                        .iter()
+                        .any(|value| permission_name_equal(value, &group)) =>
+                {
                     server.permissions.remove_user_from_group(uuid, &group);
                     println!("Removed user from group: {uuid} -> {group}");
                 }
@@ -1376,7 +1404,11 @@ fn handle_perm_command(server: &ServerState, args: &[&str]) {
         ["group", "info", rest @ ..] if !rest.is_empty() => {
             let group = rest.join(" ");
             let snapshot = server.permissions.snapshot();
-            if let Some(group_info) = snapshot.groups.get(&group) {
+            if let Some(group_info) = snapshot
+                .groups
+                .values()
+                .find(|value| permission_name_equal(&value.name, &group))
+            {
                 println!("Group: {}", group_info.name);
                 println!(
                     "Parents ({}): {}",
@@ -1423,6 +1455,10 @@ where
     let mut keys: Vec<_> = keys.collect();
     keys.sort_by_key(|key| key.to_ascii_lowercase());
     keys
+}
+
+fn permission_name_equal(a: &str, b: &str) -> bool {
+    basis_protocol::permissions::ordinal_ignore_case_equal(a, b)
 }
 
 fn sorted_values(values: &std::collections::HashSet<String>) -> String {

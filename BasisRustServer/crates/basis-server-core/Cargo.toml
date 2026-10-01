@@ -22,3 +22,4 @@ lz4_flex.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 windows-sys.workspace = true
+unicode-general-category = "1"
