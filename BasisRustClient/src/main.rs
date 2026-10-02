@@ -6350,6 +6350,28 @@ printf 'out_time=00:00:02.000000\nspeed=2x\nprogress=end\n'
     #[cfg(unix)]
     #[tokio::test]
     async fn voice_reencode_reports_final_progress_for_short_clips() {
+        // Tracing callsite registration in concurrent tests can suppress captured events.
+        // Isolate this logging assertion while keeping the subscriber scoped to the test.
+        const ISOLATED: &str = "BASIS_VOICE_PROGRESS_TEST_ISOLATED";
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::voice_reencode_reports_final_progress_for_short_clips",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         #[derive(Clone)]
         struct CapturedLog(Arc<StdMutex<Vec<u8>>>);
 
@@ -6374,8 +6396,9 @@ printf 'out_time=00:00:02.000000\nspeed=2x\nprogress=end\n'
             .without_time()
             .with_writer(move || log_writer.clone())
             .finish();
-        // A global subscriber keeps callsite interest stable while other tests run in parallel.
-        tracing::subscriber::set_global_default(subscriber).unwrap();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        // Other tests may register these callsites without a subscriber before this test runs.
+        tracing::callsite::rebuild_interest_cache();
         let shutdown = Arc::new(AtomicBool::new(false));
         let packets = OggOpusPackets::load_reencoded(input, 20, &shutdown, &encoder.executable)
             .await
