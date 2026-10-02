@@ -422,6 +422,7 @@ struct ProcessedAvatarUpdate {
 
 #[derive(Debug, Clone)]
 struct ReceiverTracking {
+    incarnation: u64,
     last_seen_generation: u64,
     last_sent_ms: u64,
     cached_quality_index: u8,
@@ -573,6 +574,8 @@ struct BundleAvatarSend {
 
 #[derive(Default)]
 struct ReceiverBuildScratch {
+    live_senders: Vec<bool>,
+    sent_senders: Vec<(PeerId, u64)>,
     bundle: Vec<BundleAvatarSend>,
 }
 
@@ -940,7 +943,7 @@ impl AvatarSyncDiagnostics {
     fn maybe_emit(
         &self,
         states: &DashMap<PeerId, Arc<PlayerAvatarState>>,
-        tracking: &DashMap<PeerId, ReceiverTrackingState>,
+        tracking: &DashMap<PeerId, Arc<parking_lot::Mutex<ReceiverTrackingState>>>,
     ) {
         let now = Instant::now();
         let mut window = self.state.lock();
@@ -990,7 +993,10 @@ impl AvatarSyncDiagnostics {
         window.last_sample_elapsed_ms = elapsed_ms;
         self.write_global_sample(elapsed_ms);
         let counts = std::mem::take(&mut window.pair_counts);
-        let receiver_tracking = tracking.get(&self.observer_id);
+        let receiver_tracking = tracking
+            .get(&self.observer_id)
+            .map(|row| Arc::clone(row.value()));
+        let receiver_tracking = receiver_tracking.as_ref().map(|row| row.lock());
         let mut rows = String::with_capacity(states.len().saturating_mul(160));
         for entry in states.iter() {
             let sender_id = *entry.key();
@@ -1464,12 +1470,13 @@ pub struct AvatarSyncSystem {
     memory_reclaim: Arc<parking_lot::RwLock<Option<crate::memory_reclaim::MemoryReclaimEpoch>>>,
     distance_offload: Arc<parking_lot::Mutex<DistanceOffload>>,
     config: Arc<parking_lot::RwLock<AvatarSyncConfig>>,
-    // Read guards cover state/tracking commits; disconnect takes the write guard.
+    // Read guards cover admission/state commits and tracking row attachment.
+    // Receiver locks serialize sender teardown without holding this gate.
     // Tokens reject work drained or snapshotted before a peer ID is reused.
     live_players: Arc<parking_lot::RwLock<HashMap<PeerId, u64>>>,
     states: Arc<DashMap<PeerId, Arc<PlayerAvatarState>>>,
     pending: Arc<DashMap<PeerId, PendingAvatarUpdate>>,
-    tracking: Arc<DashMap<PeerId, ReceiverTrackingState>>,
+    tracking: Arc<DashMap<PeerId, Arc<parking_lot::Mutex<ReceiverTrackingState>>>>,
     bundle_ratios: Arc<DashMap<PeerId, f32>>,
     generation: Arc<AtomicU64>,
     monotonic_origin: Instant,
@@ -1627,18 +1634,31 @@ impl AvatarSyncSystem {
         self.monotonic_origin.elapsed().as_millis() as u64
     }
 
+    fn tracking_rows(&self) -> Vec<Arc<parking_lot::Mutex<ReceiverTrackingState>>> {
+        self.tracking
+            .iter()
+            .map(|row| Arc::clone(row.value()))
+            .collect()
+    }
+
     pub fn set_bypass_reduction(&self, sender_id: PeerId, enabled: bool) {
-        let live = self.live_players.read();
-        if !live.contains_key(&sender_id) {
-            return;
-        }
-        if enabled {
-            self.bypass_reduction_ids.insert(sender_id, ());
-        } else {
-            self.bypass_reduction_ids.remove(&sender_id);
-        }
-        for mut receiver in self.tracking.iter_mut() {
-            if let Some(tracking) = receiver.value_mut().senders.get_mut(&sender_id) {
+        let incarnation = {
+            let live = self.live_players.read();
+            let Some(&incarnation) = live.get(&sender_id) else {
+                return;
+            };
+            if enabled {
+                self.bypass_reduction_ids.insert(sender_id, ());
+            } else {
+                self.bypass_reduction_ids.remove(&sender_id);
+            }
+            incarnation
+        };
+        for receiver in self.tracking_rows() {
+            if let Some(tracking) = receiver.lock().senders.get_mut(&sender_id) {
+                if tracking.incarnation != incarnation {
+                    continue;
+                }
                 tracking.baseline_keyframe_generation = 0;
                 tracking.baseline_quality = u8::MAX;
                 tracking.last_seen_generation = 0;
@@ -1648,53 +1668,83 @@ impl AvatarSyncSystem {
     }
 
     pub fn request_keyframe(&self, sender_id: PeerId, receiver_id: PeerId) {
-        let live = self.live_players.read();
-        if !live.contains_key(&sender_id) || !live.contains_key(&receiver_id) {
-            return;
-        }
-        if let Some(mut receiver) = self.tracking.get_mut(&receiver_id) {
-            if let Some(tracking) = receiver.senders.get_mut(&sender_id) {
-                tracking.baseline_keyframe_generation = 0;
-                tracking.baseline_quality = u8::MAX;
-                tracking.last_seen_generation = 0;
-                tracking.last_sent_ms = 0;
+        let (incarnation, receiver) = {
+            let live = self.live_players.read();
+            let Some(&incarnation) = live.get(&sender_id) else {
+                return;
+            };
+            if !live.contains_key(&receiver_id) {
+                return;
             }
-        }
+            let Some(receiver) = self
+                .tracking
+                .get(&receiver_id)
+                .map(|row| Arc::clone(row.value()))
+            else {
+                return;
+            };
+            (incarnation, receiver)
+        };
+        if let Some(tracking) = receiver.lock().senders.get_mut(&sender_id) {
+            if tracking.incarnation != incarnation {
+                return;
+            }
+            tracking.baseline_keyframe_generation = 0;
+            tracking.baseline_quality = u8::MAX;
+            tracking.last_seen_generation = 0;
+            tracking.last_sent_ms = 0;
+        };
     }
 
     pub fn remove_player(&self, peer_id: PeerId) {
-        let mut live = self.live_players.write();
-        live.remove(&peer_id);
-        self.states.remove(&peer_id);
-        if let Some((_, pending)) = self.pending.remove(&peer_id) {
-            self.payload_pool.put(pending.payload);
-        }
-        self.tracking.remove(&peer_id);
-        self.bundle_ratios.remove(&peer_id);
-        self.bypass_reduction_ids.remove(&peer_id);
-        for mut entry in self.tracking.iter_mut() {
-            entry.value_mut().senders.remove(&peer_id);
+        let incarnation = {
+            let mut live = self.live_players.write();
+            let incarnation = live.remove(&peer_id);
+            self.states.remove(&peer_id);
+            if let Some((_, pending)) = self.pending.remove(&peer_id) {
+                self.payload_pool.put(pending.payload);
+            }
+            // Rows have independent ownership: removal never waits for encoding
+            // while holding the admission lock. In-flight rows cannot reattach.
+            self.tracking.remove(&peer_id);
+            self.bundle_ratios.remove(&peer_id);
+            self.bypass_reduction_ids.remove(&peer_id);
+            incarnation
+        };
+        if let Some(incarnation) = incarnation {
+            for row in self.tracking_rows() {
+                let mut row = row.lock();
+                if row
+                    .senders
+                    .get(&peer_id)
+                    .is_some_and(|sender| sender.incarnation == incarnation)
+                {
+                    row.senders.remove(&peer_id);
+                }
+            }
         }
     }
 
     /// Release capacities accumulated during a large session after population settles.
     /// Active avatar frames and receiver baselines remain intact.
     pub fn reclaim_idle_capacity(&self) {
-        let mut live = self.live_players.write();
-        live.shrink_to_fit();
-        for mut row in self.tracking.iter_mut() {
-            row.senders.shrink_to_fit();
+        {
+            let mut live = self.live_players.write();
+            live.shrink_to_fit();
+            self.states.shrink_to_fit();
+            self.pending.shrink_to_fit();
+            self.tracking.shrink_to_fit();
+            self.bundle_ratios.shrink_to_fit();
+            self.bypass_reduction_ids.shrink_to_fit();
+            self.slice_state.lock().cycle = None;
+            for shard in &self.payload_pool.shards {
+                let mut buffers = shard.lock();
+                buffers.clear();
+                buffers.shrink_to_fit();
+            }
         }
-        self.states.shrink_to_fit();
-        self.pending.shrink_to_fit();
-        self.tracking.shrink_to_fit();
-        self.bundle_ratios.shrink_to_fit();
-        self.bypass_reduction_ids.shrink_to_fit();
-        self.slice_state.lock().cycle = None;
-        for shard in &self.payload_pool.shards {
-            let mut buffers = shard.lock();
-            buffers.clear();
-            buffers.shrink_to_fit();
+        for row in self.tracking_rows() {
+            row.lock().senders.shrink_to_fit();
         }
     }
 
@@ -2102,15 +2152,34 @@ impl AvatarSyncSystem {
         bundle_cache: &AvatarBundleCache,
         scratch: &mut ReceiverBuildScratch,
     ) -> Option<OutboundAvatarBatch<'a>> {
-        let live = self.live_players.read();
         let receiver_incarnation = peer_states
             .iter()
             .find(|(id, _)| *id == receiver_id)?
             .1
             .incarnation;
-        if live.get(&receiver_id) != Some(&receiver_incarnation) {
-            return None;
+        let row = {
+            let live = self.live_players.read();
+            if live.get(&receiver_id) != Some(&receiver_incarnation) {
+                return None;
+            }
+            Arc::clone(self.tracking.entry(receiver_id).or_default().value())
+        };
+        // Never hold the admission lock while waiting on a receiver or encoding.
+        let mut receiver_tracking = row.lock();
+        {
+            let live = self.live_players.read();
+            if live.get(&receiver_id) != Some(&receiver_incarnation) {
+                return None;
+            }
+            scratch.live_senders.clear();
+            scratch.live_senders.extend(
+                peer_states
+                    .iter()
+                    .map(|(id, state)| live.get(id) == Some(&state.incarnation)),
+            );
         }
+        // Sender teardown waits on this row outside the admission lock. Its
+        // incarnation check preserves replacements admitted during old teardown.
         let peer_count = peer_states.len();
         let mut spatial_candidates: Option<Vec<usize>> = None;
         if let Some(grid) = spatial_grid {
@@ -2137,7 +2206,6 @@ impl AvatarSyncSystem {
             // folder instead of allocating a new vector for every receiver in that folder.
             bundle.reserve_exact(initial_send_capacity);
         }
-        let mut receiver_tracking = self.tracking.entry(receiver_id).or_default();
         // Refresh on this receiver's first eligible build, rather than consuming a
         // global due flag in whichever slice happens to run at the time. A receiver
         // cycle longer than the refresh interval therefore refreshes every visit.
@@ -2153,6 +2221,7 @@ impl AvatarSyncSystem {
             receiver_tracking.last_gpu_epoch = gpu_epoch;
             receiver_tracking.last_reduction_policy = Some(policy);
         }
+        scratch.sent_senders.clear();
         let mut logical_sends = 0u64;
         let mut bundle_ratio = if config.enable_bundle_compression {
             self.bundle_ratios
@@ -2170,7 +2239,7 @@ impl AvatarSyncSystem {
             };
             let (sender_id, sender_state) = &peer_states[peer_index];
             let sender_id = *sender_id;
-            if sender_id == receiver_id || live.get(&sender_id) != Some(&sender_state.incarnation) {
+            if sender_id == receiver_id || !scratch.live_senders[peer_index] {
                 continue;
             }
             if !offloaded_empty
@@ -2203,6 +2272,7 @@ impl AvatarSyncSystem {
                 .or_insert_with(|| {
                     let decision = pair_decision();
                     ReceiverTracking {
+                        incarnation: sender_state.incarnation,
                         last_seen_generation: 0,
                         last_sent_ms: 0,
                         cached_quality_index: decision.quality,
@@ -2212,6 +2282,19 @@ impl AvatarSyncSystem {
                         baseline_quality: u8::MAX,
                     }
                 });
+            if tracking.incarnation != sender_state.incarnation {
+                let decision = pair_decision();
+                *tracking = ReceiverTracking {
+                    incarnation: sender_state.incarnation,
+                    last_seen_generation: 0,
+                    last_sent_ms: 0,
+                    cached_quality_index: decision.quality,
+                    cached_interval_byte: decision.interval_byte,
+                    cached_interval_ms: decision.interval_ms,
+                    baseline_keyframe_generation: 0,
+                    baseline_quality: u8::MAX,
+                };
+            }
             if update_distances {
                 let decision = pair_decision();
                 tracking.cached_quality_index = decision.quality;
@@ -2325,6 +2408,9 @@ impl AvatarSyncSystem {
                 }
             };
             logical_sends += 1;
+            scratch
+                .sent_senders
+                .push((sender_id, sender_state.incarnation));
             if diagnostic_active {
                 diagnostic_items.push((sender_id, quality_index, send_delta));
             }
@@ -2345,6 +2431,7 @@ impl AvatarSyncSystem {
             }
         }
 
+        drop(receiver_tracking);
         if config.enable_bundle_compression {
             emit_greedy_avatar_bundles(
                 &mut direct,
@@ -2355,6 +2442,30 @@ impl AvatarSyncSystem {
                 bundle_cache,
                 bundle_wire_budget,
             );
+        }
+        bundle.clear();
+        let live = self.live_players.read();
+        if live.get(&receiver_id) != Some(&receiver_incarnation) {
+            return None;
+        }
+        if scratch
+            .sent_senders
+            .iter()
+            .any(|(id, incarnation)| live.get(id) != Some(incarnation))
+        {
+            drop(live);
+            // Encoding raced a sender departure/reuse. Do not emit its old
+            // frame, and retry still-live frames on the next receiver visit.
+            // Never wait on a receiver while holding the admission gate.
+            for sender in row.lock().senders.values_mut() {
+                sender.last_seen_generation = 0;
+                sender.last_sent_ms = 0;
+                sender.baseline_keyframe_generation = 0;
+                sender.baseline_quality = u8::MAX;
+            }
+            return None;
+        }
+        if config.enable_bundle_compression {
             self.bundle_ratios.insert(receiver_id, bundle_ratio);
         }
         self.profiler.add_sends(logical_sends);
@@ -3814,8 +3925,235 @@ mod tests {
         assert!(!build(2));
         let _ = build(1);
         assert!(!system.tracking.contains_key(&2));
-        assert!(!system.tracking.get(&1).unwrap().senders.contains_key(&2));
-        assert!(system.tracking.get(&1).unwrap().senders.contains_key(&3));
+        assert!(!system
+            .tracking
+            .get(&1)
+            .unwrap()
+            .lock()
+            .senders
+            .contains_key(&2));
+        assert!(system
+            .tracking
+            .get(&1)
+            .unwrap()
+            .lock()
+            .senders
+            .contains_key(&3));
+    }
+
+    fn assert_disconnect_during_blocked_encoding(departing_id: PeerId) {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let mut config = receiver_build_test_config();
+        config.high_distance_sq = 1.0;
+        let system = AvatarSyncSystem::new(config.clone());
+        let payload = vec![0; 1 + BitQuality::High.payload_len()];
+        for id in [1, 2, 3] {
+            system.register_player(id);
+            system
+                .upsert_from_channel_payload(id, channels::PLAYER_AVATAR_HIGH, &payload)
+                .unwrap();
+        }
+        system.process_pending_updates(&config);
+        let mut peers = system
+            .states
+            .iter()
+            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+            .collect::<Vec<_>>();
+        Arc::make_mut(&mut peers.iter_mut().find(|(id, _)| *id == 2).unwrap().1).position =
+            [100.0, 0.0, 0.0];
+        let frame = Arc::clone(
+            peers
+                .iter()
+                .find(|(id, _)| *id == 2)
+                .unwrap()
+                .1
+                .lazy_current
+                .as_ref()
+                .unwrap(),
+        );
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        // Hold an actual lazy quality initialization while the receiver waits on it.
+        let encoder = std::thread::spawn(move || {
+            frame.qualities[BitQuality::Medium as usize].get_or_init(|| {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(Some(pre_serialize(
+                    frame.peer_id,
+                    frame.outbound_sequence,
+                    BitQuality::Medium,
+                    &vec![0; BitQuality::Medium.payload_len()],
+                    &[],
+                )))
+            });
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let row = Arc::clone(system.tracking.entry(1).or_default().value());
+        let builder_system = system.clone();
+        let builder = std::thread::spawn(move || {
+            let sent = builder_system
+                .build_sends_for_receiver(
+                    1,
+                    [0.0; 3],
+                    AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
+                    &peers,
+                    None,
+                    None,
+                    &config,
+                    1000,
+                    1,
+                    AVATAR_TICK_INTERVAL_MS,
+                    true,
+                    true,
+                    &AvatarBundleCache::default(),
+                    &mut ReceiverBuildScratch::default(),
+                )
+                .is_some();
+            (sent, peers, config)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while row.try_lock().is_some() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let building = row.try_lock().is_none();
+        let disconnect_system = system.clone();
+        let disconnect = std::thread::spawn(move || disconnect_system.remove_player(departing_id));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let admission_closed = loop {
+            if system
+                .live_players
+                .try_read()
+                .is_some_and(|live| !live.contains_key(&departing_id))
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        let registration_system = system.clone();
+        let registration = std::thread::spawn(move || {
+            registration_system.register_player(departing_id);
+            done_tx.send(()).unwrap();
+        });
+        let progressed_while_encoding = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        // Always unblock the encoder before asserting, including on regression.
+        release_tx.send(()).unwrap();
+        encoder.join().unwrap();
+        let (sent, peers, config) = builder.join().unwrap();
+        disconnect.join().unwrap();
+        registration.join().unwrap();
+        assert!(building, "receiver did not reach lazy encoding");
+        assert!(admission_closed, "encoding blocked closure of admission");
+        assert!(
+            progressed_while_encoding,
+            "encoding blocked disconnect/new admission"
+        );
+        assert!(!sent, "departed/reused snapshot escaped after encoding");
+        assert!(system.is_player_registered(departing_id));
+        if departing_id == 1 {
+            assert!(!system.tracking.contains_key(&1));
+            assert!(!system.bundle_ratios.contains_key(&1));
+        } else {
+            assert!(!system
+                .tracking
+                .get(&1)
+                .unwrap()
+                .lock()
+                .senders
+                .contains_key(&departing_id));
+            // Sender 3 has not changed. It must be retried after cancelling the
+            // raced batch instead of being suppressed by an unsent baseline.
+            assert!(system
+                .build_sends_for_receiver(
+                    1,
+                    [0.0; 3],
+                    AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
+                    &peers,
+                    None,
+                    None,
+                    &config,
+                    1001,
+                    1,
+                    AVATAR_TICK_INTERVAL_MS,
+                    true,
+                    true,
+                    &AvatarBundleCache::default(),
+                    &mut ReceiverBuildScratch::default()
+                )
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn blocked_avatar_encoding_does_not_block_disconnect_or_registration() {
+        assert_disconnect_during_blocked_encoding(1);
+    }
+
+    #[test]
+    fn sender_reuse_during_encoding_cancels_and_retries_live_frames() {
+        assert_disconnect_during_blocked_encoding(2);
+    }
+
+    #[test]
+    fn delayed_sender_teardown_preserves_reused_incarnation_tracking() {
+        use std::time::Duration;
+        let config = receiver_build_test_config();
+        let system = AvatarSyncSystem::new(config.clone());
+        let peers = receiver_build_test_peers_from_ids([1, 2], &[]);
+        register_test_peers(&system, &peers);
+        let _ = system.build_sends_for_receiver(
+            1,
+            [0.0; 3],
+            AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
+            &peers,
+            None,
+            None,
+            &config,
+            1000,
+            1,
+            AVATAR_TICK_INTERVAL_MS,
+            true,
+            true,
+            &AvatarBundleCache::default(),
+            &mut ReceiverBuildScratch::default(),
+        );
+        let row = Arc::clone(system.tracking.get(&1).unwrap().value());
+        let mut held = row.lock();
+        let disconnect_system = system.clone();
+        let disconnect = std::thread::spawn(move || disconnect_system.remove_player(2));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let closed = loop {
+            if system
+                .live_players
+                .try_read()
+                .is_some_and(|live| !live.contains_key(&2))
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        if closed {
+            system.register_player(2);
+            held.senders.get_mut(&2).unwrap().incarnation = system.live_players.read()[&2];
+        }
+        drop(held);
+        disconnect.join().unwrap();
+        assert!(
+            closed,
+            "teardown held admission while waiting for a receiver"
+        );
+        assert_eq!(
+            row.lock().senders[&2].incarnation,
+            system.live_players.read()[&2]
+        );
     }
 
     #[test]
@@ -3855,7 +4193,7 @@ mod tests {
         );
         system.remove_player(2);
         let frame = Arc::clone(system.states.get(&3).unwrap().value());
-        let baseline = system.tracking.get(&1).unwrap().senders[&3].clone();
+        let baseline = system.tracking.get(&1).unwrap().lock().senders[&3].clone();
         let mut newer = payload.clone();
         newer[0] = 1;
         system
@@ -3864,7 +4202,8 @@ mod tests {
         system.reclaim_idle_capacity();
         assert_eq!(system.states.len(), 2);
         assert!(Arc::ptr_eq(&frame, system.states.get(&3).unwrap().value()));
-        let row = system.tracking.get(&1).unwrap();
+        let row_handle = Arc::clone(system.tracking.get(&1).unwrap().value());
+        let row = row_handle.lock();
         assert_eq!(
             row.senders[&3].last_seen_generation,
             baseline.last_seen_generation
@@ -3929,7 +4268,8 @@ mod tests {
             );
         };
         let assert_cached = |receiver, distance: f32, quality| {
-            let tracking = system.tracking.get(&receiver).unwrap();
+            let row = Arc::clone(system.tracking.get(&receiver).unwrap().value());
+            let tracking = row.lock();
             let pair = tracking.senders.get(&3).unwrap();
             assert_eq!(pair.cached_quality_index, quality as u8);
             let (byte, millis) = calculate_interval_from_distance_sq(distance * distance, &config);
@@ -4035,7 +4375,8 @@ mod tests {
                             channels::quality_from_channel(send.channel()),
                             quality as u8
                         );
-                        let tracking = system.tracking.get(receiver_id).unwrap();
+                        let row = Arc::clone(system.tracking.get(receiver_id).unwrap().value());
+                        let tracking = row.lock();
                         let pair = tracking.senders.get(&sender_id).unwrap();
                         assert_eq!(pair.cached_quality_index, quality as u8);
                         let (byte, millis) =
@@ -4122,18 +4463,18 @@ mod tests {
         };
         build(Some(&first), &peers, &roster, 0);
         assert_eq!(
-            system.tracking.get(&1).unwrap().senders[&2].cached_quality_index,
+            system.tracking.get(&1).unwrap().lock().senders[&2].cached_quality_index,
             BitQuality::High as u8
         );
         build(Some(&second), &peers, &roster, 1);
         assert_eq!(
-            system.tracking.get(&1).unwrap().senders[&2].cached_quality_index,
+            system.tracking.get(&1).unwrap().lock().senders[&2].cached_quality_index,
             BitQuality::Medium as u8
         );
         Arc::make_mut(&mut peers[1].1).position[0] = 30.0;
         build(None, &peers, &roster, 2);
         assert_eq!(
-            system.tracking.get(&1).unwrap().senders[&2].cached_quality_index,
+            system.tracking.get(&1).unwrap().lock().senders[&2].cached_quality_index,
             BitQuality::Low as u8
         );
         system.remove_player(2);
@@ -4144,7 +4485,7 @@ mod tests {
         register_test_peers(&system, &peers);
         build(Some(&second), &peers, &reused, 3);
         assert_eq!(
-            system.tracking.get(&1).unwrap().senders[&2].cached_quality_index,
+            system.tracking.get(&1).unwrap().lock().senders[&2].cached_quality_index,
             BitQuality::VeryLow as u8
         );
     }
@@ -4277,7 +4618,7 @@ mod tests {
                 &mut ReceiverBuildScratch::default(),
             );
             assert_eq!(
-                system.tracking.get(&1).unwrap().senders[&2].cached_quality_index,
+                system.tracking.get(&1).unwrap().lock().senders[&2].cached_quality_index,
                 quality as u8
             );
         }

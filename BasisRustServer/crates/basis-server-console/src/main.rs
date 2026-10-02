@@ -1037,6 +1037,7 @@ async fn run_idle_memory_reclaim(
             requested_epoch,
         )
         .await;
+        policy.complete_pass(server.player_count());
         info!(
             peak_players = peak,
             current_players = players,

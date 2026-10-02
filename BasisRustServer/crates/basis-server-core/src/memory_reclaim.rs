@@ -131,12 +131,16 @@ impl IdleMemoryReclaimPolicy {
         }
 
         let peak = self.peak_since_pass;
-        if players == 0 {
-            self.peak_since_pass = 0;
-        }
         self.eligible_since = None;
         self.last_pass = Some(now);
         Some(peak)
+    }
+
+    /// Mark a requested pass complete and rebase the next population window.
+    /// Call only after cache pruning and owner-thread collection have returned.
+    pub fn complete_pass(&mut self, players: usize) {
+        self.peak_since_pass = players;
+        self.eligible_since = None;
     }
 
     pub fn peak_since_pass(&self) -> usize {
@@ -162,6 +166,8 @@ mod tests {
         assert_eq!(policy.observe(at(base, 2), true, 8, 30, 8), None);
         assert_eq!(policy.observe(at(base, 3), true, 2, 30, 8), None);
         assert_eq!(policy.observe(at(base, 33), true, 2, 30, 8), Some(8));
+        policy.complete_pass(2);
+        assert_eq!(policy.peak_since_pass(), 2);
     }
 
     #[test]
@@ -176,10 +182,43 @@ mod tests {
         policy.observe(at(base, 7), true, 5, 5, 8);
         assert_eq!(policy.observe(at(base, 11), true, 5, 5, 8), None);
         assert_eq!(policy.observe(at(base, 12), true, 5, 5, 8), Some(20));
+        policy.complete_pass(5);
+        assert_eq!(policy.peak_since_pass(), 5);
     }
 
     #[test]
-    fn nonempty_pass_preserves_peak_but_empty_pass_rebases_it() {
+    fn stable_residual_population_does_not_reclaim_again_without_a_new_peak() {
+        let mut policy = IdleMemoryReclaimPolicy::default();
+        let base = Instant::now();
+        policy.observe(at(base, 0), true, 40, 1, 8);
+        policy.observe(at(base, 1), true, 10, 1, 8);
+        assert_eq!(policy.observe(at(base, 2), true, 10, 1, 8), Some(40));
+        policy.complete_pass(10);
+        assert_eq!(policy.peak_since_pass(), 10);
+
+        assert_eq!(policy.observe(at(base, 123), true, 10, 1, 8), None);
+        assert_eq!(policy.peak_since_pass(), 10);
+    }
+
+    #[test]
+    fn a_new_peak_and_drop_reclaim_again_after_cooldown() {
+        let mut policy = IdleMemoryReclaimPolicy::default();
+        let base = Instant::now();
+        policy.observe(at(base, 0), true, 40, 1, 8);
+        policy.observe(at(base, 1), true, 10, 1, 8);
+        assert_eq!(policy.observe(at(base, 2), true, 10, 1, 8), Some(40));
+        policy.complete_pass(10);
+
+        assert_eq!(policy.observe(at(base, 10), true, 40, 1, 8), None);
+        assert_eq!(policy.observe(at(base, 11), true, 10, 1, 8), None);
+        assert_eq!(policy.observe(at(base, 121), true, 10, 1, 8), None);
+        assert_eq!(policy.observe(at(base, 122), true, 10, 1, 8), Some(40));
+        policy.complete_pass(10);
+        assert_eq!(policy.peak_since_pass(), 10);
+    }
+
+    #[test]
+    fn uncompleted_pass_retries_after_cooldown() {
         let mut policy = IdleMemoryReclaimPolicy::default();
         let base = Instant::now();
         policy.observe(at(base, 0), true, 40, 1, 8);
@@ -187,9 +226,28 @@ mod tests {
         assert_eq!(policy.observe(at(base, 2), true, 10, 1, 8), Some(40));
         assert_eq!(policy.peak_since_pass(), 40);
 
-        policy.observe(at(base, 123), true, 0, 1, 8);
-        assert_eq!(policy.observe(at(base, 124), true, 0, 1, 8), Some(40));
+        assert_eq!(policy.observe(at(base, 121), true, 10, 1, 8), None);
+        assert_eq!(policy.observe(at(base, 122), true, 10, 1, 8), Some(40));
+        policy.complete_pass(10);
+        assert_eq!(policy.peak_since_pass(), 10);
+    }
+
+    #[test]
+    fn empty_reclaim_rebases_peak_to_zero() {
+        let mut policy = IdleMemoryReclaimPolicy::default();
+        let base = Instant::now();
+        policy.observe(at(base, 0), true, 40, 1, 8);
+        policy.observe(at(base, 1), true, 0, 1, 8);
+        assert_eq!(policy.observe(at(base, 2), true, 0, 1, 8), Some(40));
+        policy.complete_pass(0);
         assert_eq!(policy.peak_since_pass(), 0);
+
+        assert_eq!(policy.observe(at(base, 122), true, 30, 1, 8), None);
+        assert_eq!(policy.peak_since_pass(), 30);
+        assert_eq!(policy.observe(at(base, 123), true, 7, 1, 8), None);
+        assert_eq!(policy.observe(at(base, 124), true, 7, 1, 8), Some(30));
+        policy.complete_pass(7);
+        assert_eq!(policy.peak_since_pass(), 7);
     }
 
     #[test]
