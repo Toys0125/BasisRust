@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use basis_protocol::{
     avatar::AVATAR_BUNDLE_DICTIONARY_GENERATION, config::ServerConfig, permissions::nodes,
 };
+use basis_server_core::memory_reclaim::{IdleMemoryReclaimPolicy, MemoryReclaimEpoch};
 use basis_server_core::{migrate_legacy_resource_dirs, BsrProfilerSnapshot, ServerState};
 use basis_server_health::{
     format_system_time, start_health_server, AppMessageMetrics, AvatarSyncMetrics,
@@ -26,14 +27,16 @@ use rustyline::{
     CompletionType, Config as LineEditorConfig, Context as LineEditorContext, Editor, Helper,
 };
 use std::{
+    cell::Cell,
     collections::HashMap,
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     thread,
+    time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
 use tracing::{info, warn};
@@ -526,9 +529,97 @@ fn filter_pairs<const N: usize>(current: &str, values: [(&str, &str); N]) -> Vec
         .collect()
 }
 
-// Tokio's worker threads otherwise retain glibc per-thread arenas after burst churn.
+// Use mimalloc for burst allocation; idle reclamation runs on each heap owner.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+extern "C" {
+    fn mi_collect(force: bool);
+}
+
+thread_local! {
+    static TOKIO_WORKER_ID: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+fn current_tokio_worker_id(worker_count: usize, next_worker_id: &AtomicUsize) -> Option<usize> {
+    TOKIO_WORKER_ID.with(|id| {
+        let current = id.get();
+        if current != usize::MAX {
+            return (current < worker_count).then_some(current);
+        }
+        let assigned = next_worker_id.fetch_add(1, Ordering::Relaxed);
+        id.set(assigned);
+        (assigned < worker_count).then_some(assigned)
+    })
+}
+
+fn poll_tokio_reclaim(
+    epoch: &MemoryReclaimEpoch,
+    worker_epochs: &[AtomicU64],
+    next_worker_id: &AtomicUsize,
+    worker_count: usize,
+) {
+    let worker_id = current_tokio_worker_id(worker_count, next_worker_id);
+    if epoch.poll_current_thread() {
+        if let Some(worker_epoch) = worker_id.and_then(|id| worker_epochs.get(id)) {
+            worker_epoch.store(epoch.requested_epoch(), Ordering::Release);
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    tracing_subscriber::fmt()
+        .with_env_filter(args.log_level.clone())
+        .init();
+
+    let worker_count = if let Ok(value) = std::env::var("TOKIO_WORKER_THREADS") {
+        let count = value
+            .parse::<usize>()
+            .context("parsing TOKIO_WORKER_THREADS")?;
+        anyhow::ensure!(count > 0, "TOKIO_WORKER_THREADS must be greater than zero");
+        count
+    } else {
+        thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .max(1)
+    };
+    let next_worker_id = Arc::new(AtomicUsize::new(0));
+    let worker_epochs = Arc::new(
+        (0..worker_count)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>(),
+    );
+    let epoch = MemoryReclaimEpoch::new(Arc::new(|| unsafe {
+        mi_collect(true);
+    }));
+
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
+        .worker_threads(worker_count)
+        .enable_all()
+        .on_thread_park({
+            let epoch = epoch.clone();
+            let worker_epochs = Arc::clone(&worker_epochs);
+            let next_worker_id = Arc::clone(&next_worker_id);
+            move || poll_tokio_reclaim(&epoch, &worker_epochs, &next_worker_id, worker_count)
+        })
+        .on_thread_unpark({
+            let epoch = epoch.clone();
+            let worker_epochs = Arc::clone(&worker_epochs);
+            let next_worker_id = Arc::clone(&next_worker_id);
+            move || poll_tokio_reclaim(&epoch, &worker_epochs, &next_worker_id, worker_count)
+        });
+    let runtime = builder.build().context("building Tokio runtime")?;
+    runtime.block_on(async_main(
+        args,
+        epoch,
+        worker_epochs,
+        next_worker_id,
+        worker_count,
+    ))
+}
 
 fn bsr_window_metrics(snapshot: BsrProfilerSnapshot) -> BsrWindowMetrics {
     let ticks = snapshot.ticks.max(1) as f64;
@@ -643,13 +734,13 @@ fn configure_windows_cpu_workers() -> Result<()> {
     Ok(())
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-    tracing_subscriber::fmt()
-        .with_env_filter(args.log_level.clone())
-        .init();
-
+async fn async_main(
+    args: Args,
+    memory_reclaim_epoch: MemoryReclaimEpoch,
+    worker_epochs: Arc<Vec<AtomicU64>>,
+    next_worker_id: Arc<AtomicUsize>,
+    worker_count: usize,
+) -> Result<()> {
     #[cfg(windows)]
     configure_windows_cpu_workers()?;
 
@@ -691,6 +782,9 @@ async fn main() -> Result<()> {
     info!("Server Booting");
     let (server, shutdown_tx) =
         ServerState::start_with_config_path(config.clone(), &base_dir, &config_path).await?;
+    server
+        .avatar_sync
+        .set_memory_reclaim_epoch(memory_reclaim_epoch.clone());
     let _health_addr = start_health_server(HealthState {
         config: server.config.clone(),
         player_count: Arc::new({
@@ -820,6 +914,14 @@ async fn main() -> Result<()> {
     .await?;
 
     let running = Arc::new(AtomicBool::new(true));
+    let reclaim_task = tokio::spawn(run_idle_memory_reclaim(
+        server.clone(),
+        running.clone(),
+        memory_reclaim_epoch.clone(),
+        Arc::clone(&worker_epochs),
+        Arc::clone(&next_worker_id),
+        worker_count,
+    ));
     let console_running = running.clone();
     if config.enable_console {
         start_console_listener(server.clone(), config_path.clone(), console_running);
@@ -849,6 +951,7 @@ async fn main() -> Result<()> {
                 break;
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                memory_reclaim_epoch.poll_current_thread();
                 if !running.load(Ordering::Relaxed) {
                     break;
                 }
@@ -856,6 +959,7 @@ async fn main() -> Result<()> {
         }
     }
     info!("Shutting down server...");
+    reclaim_task.abort();
     request_shutdown(shutdown_tx);
     match tokio::time::timeout(std::time::Duration::from_secs(5), server.shutdown()).await {
         Ok(result) => result?,
@@ -868,6 +972,168 @@ async fn main() -> Result<()> {
     }
     info!("Server shut down successfully.");
     Ok(())
+}
+
+async fn run_idle_memory_reclaim(
+    server: ServerState,
+    running: Arc<AtomicBool>,
+    epoch: MemoryReclaimEpoch,
+    worker_epochs: Arc<Vec<AtomicU64>>,
+    next_worker_id: Arc<AtomicUsize>,
+    worker_count: usize,
+) {
+    let mut policy = IdleMemoryReclaimPolicy::default();
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    while running.load(Ordering::Relaxed) {
+        interval.tick().await;
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let config = server.config.read().clone();
+        let players = server.player_count();
+        let Some(peak) = policy.observe(
+            Instant::now(),
+            config.idle_memory_reclaim_enabled,
+            players,
+            config.idle_memory_reclaim_settle_seconds,
+            config.idle_memory_reclaim_minimum_peak,
+        ) else {
+            continue;
+        };
+
+        // Rayon broadcast is synchronous, so keep its wait off a Tokio worker.
+        // The blocking-pool owner participates after the broadcast as well.
+        let server_for_reclaim = server.clone();
+        let epoch_for_reclaim = epoch.clone();
+        let Ok((requested_epoch, rayon_workers, rayon_worker_count, blocking_owner_collected)) =
+            tokio::task::spawn_blocking(move || {
+                server_for_reclaim.avatar_sync.reclaim_idle_capacity();
+                let requested_epoch = epoch_for_reclaim.request_reclaim();
+                let rayon_results =
+                    rayon::broadcast(|_| usize::from(epoch_for_reclaim.poll_current_thread()));
+                let rayon_worker_count = rayon_results.len();
+                let rayon_workers = rayon_results.into_iter().sum::<usize>();
+                let blocking_owner_collected = epoch_for_reclaim.poll_current_thread();
+                (
+                    requested_epoch,
+                    rayon_workers,
+                    rayon_worker_count,
+                    blocking_owner_collected,
+                )
+            })
+            .await
+        else {
+            warn!("idle memory reclaim cache/worker pass failed to join");
+            continue;
+        };
+        let tokio_workers = collect_tokio_workers(
+            epoch.clone(),
+            Arc::clone(&worker_epochs),
+            Arc::clone(&next_worker_id),
+            worker_count,
+            requested_epoch,
+        )
+        .await;
+        info!(
+            peak_players = peak,
+            current_players = players,
+            epoch = requested_epoch,
+            rayon_workers,
+            expected_rayon_workers = rayon_worker_count,
+            tokio_workers,
+            expected_tokio_workers = worker_count,
+            blocking_owner_collected,
+            "idle memory reclaim completed"
+        );
+        if tokio_workers < worker_count {
+            warn!(
+                reached_tokio_workers = tokio_workers,
+                expected_tokio_workers = worker_count,
+                "idle memory reclaim did not reach every Tokio worker; remaining workers will collect on a later park or unpark"
+            );
+        }
+        if rayon_workers < rayon_worker_count {
+            warn!(
+                reached_rayon_workers = rayon_workers,
+                expected_rayon_workers = rayon_worker_count,
+                "idle memory reclaim did not reach every Rayon worker"
+            );
+        }
+    }
+}
+
+async fn collect_tokio_workers(
+    epoch: MemoryReclaimEpoch,
+    worker_epochs: Arc<Vec<AtomicU64>>,
+    next_worker_id: Arc<AtomicUsize>,
+    worker_count: usize,
+    requested_epoch: u64,
+) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut reached = 0;
+    let handle = tokio::runtime::Handle::current();
+    for _ in 0..16 {
+        reached = worker_epochs
+            .iter()
+            .filter(|seen| seen.load(Ordering::Acquire) >= requested_epoch)
+            .count();
+        if reached == worker_count || Instant::now() >= deadline {
+            break;
+        }
+
+        // Inject from outside the runtime worker so Tokio uses its global
+        // queue and wakes idle workers, rather than filling one worker's LIFO
+        // local queue with tasks that can all run on that same hot worker.
+        let epoch_for_wave = epoch.clone();
+        let worker_epochs_for_wave = Arc::clone(&worker_epochs);
+        let next_worker_id_for_wave = Arc::clone(&next_worker_id);
+        let handle_for_wave = handle.clone();
+        let wave = tokio::task::spawn_blocking(move || {
+            (0..worker_count.saturating_mul(64).max(64))
+                .map(|_| {
+                    let epoch = epoch_for_wave.clone();
+                    let worker_epochs = Arc::clone(&worker_epochs_for_wave);
+                    let next_worker_id = Arc::clone(&next_worker_id_for_wave);
+                    handle_for_wave.spawn(async move {
+                        // Timer expiry gives the I/O driver local work too. It can
+                        // otherwise remain inside Tokio's park loop while other
+                        // workers consume every task from the injection queue.
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        for _ in 0..8 {
+                            poll_tokio_reclaim(
+                                &epoch,
+                                &worker_epochs,
+                                &next_worker_id,
+                                worker_count,
+                            );
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        let Ok(Ok(tasks)) =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), wave).await
+        else {
+            break;
+        };
+        for task in tasks {
+            if tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), task)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+    worker_epochs
+        .iter()
+        .filter(|seen| seen.load(Ordering::Acquire) >= requested_epoch)
+        .count()
+        .max(reached.min(worker_count))
 }
 
 fn request_shutdown(shutdown_tx: oneshot::Sender<()>) {
@@ -1524,5 +1790,57 @@ fn display_list(values: &[String]) -> String {
         "(none)".to_string()
     } else {
         values.join(", ")
+    }
+}
+
+#[cfg(test)]
+mod memory_reclaim_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_sweep_reaches_each_tokio_worker() {
+        let collected = Arc::new(AtomicUsize::new(0));
+        let collected_by_owner = Arc::clone(&collected);
+        let epoch = MemoryReclaimEpoch::new(Arc::new(move || {
+            collected_by_owner.fetch_add(1, Ordering::Relaxed);
+        }));
+        let worker_count = 16;
+        let workers = Arc::new(
+            (0..worker_count)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>(),
+        );
+        let next_worker_id = Arc::new(AtomicUsize::new(0));
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.worker_threads(worker_count).enable_all();
+        builder.on_thread_park({
+            let epoch = epoch.clone();
+            let workers = Arc::clone(&workers);
+            let next_worker_id = Arc::clone(&next_worker_id);
+            move || poll_tokio_reclaim(&epoch, &workers, &next_worker_id, worker_count)
+        });
+        builder.on_thread_unpark({
+            let epoch = epoch.clone();
+            let workers = Arc::clone(&workers);
+            let next_worker_id = Arc::clone(&next_worker_id);
+            move || poll_tokio_reclaim(&epoch, &workers, &next_worker_id, worker_count)
+        });
+        let runtime = builder.build().unwrap();
+        runtime.block_on(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let requested = epoch.request_reclaim();
+            let reached = collect_tokio_workers(
+                epoch.clone(),
+                Arc::clone(&workers),
+                Arc::clone(&next_worker_id),
+                worker_count,
+                requested,
+            )
+            .await;
+
+            assert_eq!(reached, worker_count);
+            assert_eq!(collected.load(Ordering::Relaxed), worker_count);
+            assert!(next_worker_id.load(Ordering::Relaxed) <= worker_count);
+        });
     }
 }

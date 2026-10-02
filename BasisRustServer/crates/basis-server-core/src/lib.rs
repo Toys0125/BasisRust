@@ -9,6 +9,7 @@ mod gpu_distance;
 mod gpu_distance_backend;
 mod gpu_distance_types;
 mod gpu_policy;
+pub mod memory_reclaim;
 mod p2p;
 
 pub use avatar_sync::BsrProfilerSnapshot;
@@ -1322,6 +1323,7 @@ async fn finalize_accept(
         .join_broadcast
         .lock()
         .register_peer(connected.clone(), serialize_server_ready(peer_id, &ready));
+    state.avatar_sync.register_player(peer_id);
     state.authenticated_peers.insert(peer_id, connected);
     info!("peer connected: {peer_id}");
 
@@ -1546,6 +1548,8 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
 }
 
 async fn handle_disconnect(state: &ServerState, peer: PeerId, reason: DisconnectReason) {
+    // Close avatar admission before any asynchronous disconnect cleanup.
+    state.avatar_sync.remove_player(peer);
     state.admin_runtime.remove_peer(peer);
     state.join_broadcast.lock().remove_peer(peer);
     state.p2p_broker.remove_peer(&state.transport, peer).await;
@@ -1564,7 +1568,6 @@ async fn handle_disconnect(state: &ServerState, peer: PeerId, reason: Disconnect
     if !departed_uuid.is_empty() {
         state.error_report_hashes.remove(&departed_uuid);
     }
-    state.avatar_sync.remove_player(peer);
     for removed in state.ownership.remove_player(peer) {
         let mut writer = NetWriter::new();
         removed.serialize(&mut writer);
@@ -1770,6 +1773,12 @@ async fn handle_message(
         .statistics
         .inbound_packets
         .fetch_add(1, Ordering::Relaxed);
+    if (channels::PLAYER_AVATAR_QUALITY_CHANNELS.contains(&channel)
+        || channel == channels::DELTA_AVATAR)
+        && !state.avatar_sync.is_player_registered(peer)
+    {
+        return Ok(());
+    }
     match channel {
         channels::AUTH_IDENTITY => {
             if let Some((_, pending)) = state.pending_identity.remove(&peer) {

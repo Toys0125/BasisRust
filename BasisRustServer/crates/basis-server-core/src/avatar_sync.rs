@@ -404,12 +404,14 @@ struct PlayerAvatarState {
 
 #[derive(Debug, Clone)]
 struct PendingAvatarUpdate {
+    incarnation: u64,
     channel: u8,
     payload: Vec<u8>,
 }
 
 #[derive(Debug)]
 struct ProcessedAvatarUpdate {
+    incarnation: u64,
     peer_id: PeerId,
     inbound_sequence: u8,
     position: [f32; 3],
@@ -1459,8 +1461,12 @@ impl BytePool {
 
 #[derive(Debug, Clone)]
 pub struct AvatarSyncSystem {
+    memory_reclaim: Arc<parking_lot::RwLock<Option<crate::memory_reclaim::MemoryReclaimEpoch>>>,
     distance_offload: Arc<parking_lot::Mutex<DistanceOffload>>,
     config: Arc<parking_lot::RwLock<AvatarSyncConfig>>,
+    // Read guards cover state/tracking commits; disconnect takes the write guard.
+    // Tokens reject work drained or snapshotted before a peer ID is reused.
+    live_players: Arc<parking_lot::RwLock<HashMap<PeerId, u64>>>,
     states: Arc<DashMap<PeerId, Arc<PlayerAvatarState>>>,
     pending: Arc<DashMap<PeerId, PendingAvatarUpdate>>,
     tracking: Arc<DashMap<PeerId, ReceiverTrackingState>>,
@@ -1484,8 +1490,10 @@ impl AvatarSyncSystem {
         let counters = Arc::new(AvatarSyncCounters::default());
         let diagnostics = AvatarSyncDiagnostics::from_env(Arc::clone(&counters));
         Self {
+            memory_reclaim: Arc::new(parking_lot::RwLock::new(None)),
             distance_offload: Arc::new(parking_lot::Mutex::new(DistanceOffload::default())),
             config: Arc::new(parking_lot::RwLock::new(config)),
+            live_players: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             states: Arc::new(DashMap::new()),
             pending: Arc::new(DashMap::new()),
             tracking: Arc::new(DashMap::new()),
@@ -1505,6 +1513,10 @@ impl AvatarSyncSystem {
             bypass_reduction_ids: Arc::new(DashMap::new()),
             diagnostics,
         }
+    }
+
+    pub fn set_memory_reclaim_epoch(&self, epoch: crate::memory_reclaim::MemoryReclaimEpoch) {
+        *self.memory_reclaim.write() = Some(epoch);
     }
 
     pub fn set_offloaded_pairs(&mut self, offloaded_pairs: Arc<DashMap<u64, ()>>) {
@@ -1540,12 +1552,30 @@ impl AvatarSyncSystem {
         self.collect_extended_metrics.load(Ordering::Relaxed) || self.diagnostics.is_some()
     }
 
+    /// Called once admission succeeds, before accepting avatar updates.
+    pub fn register_player(&self, peer_id: PeerId) {
+        let mut live = self.live_players.write();
+        if live.contains_key(&peer_id) {
+            return;
+        }
+        let incarnation = self.generation.fetch_add(1, Ordering::Relaxed);
+        live.insert(peer_id, incarnation);
+    }
+
+    pub fn is_player_registered(&self, peer_id: PeerId) -> bool {
+        self.live_players.read().contains_key(&peer_id)
+    }
+
     pub fn upsert_from_channel_payload(
         &self,
         peer_id: PeerId,
         channel: u8,
         payload: &[u8],
     ) -> Result<()> {
+        let live = self.live_players.read();
+        let Some(&incarnation) = live.get(&peer_id) else {
+            return Ok(());
+        };
         if payload.is_empty() {
             return Ok(());
         }
@@ -1582,6 +1612,7 @@ impl AvatarSyncSystem {
         if let Some(old) = self.pending.insert(
             peer_id,
             PendingAvatarUpdate {
+                incarnation,
                 channel,
                 payload: pooled,
             },
@@ -1597,6 +1628,10 @@ impl AvatarSyncSystem {
     }
 
     pub fn set_bypass_reduction(&self, sender_id: PeerId, enabled: bool) {
+        let live = self.live_players.read();
+        if !live.contains_key(&sender_id) {
+            return;
+        }
         if enabled {
             self.bypass_reduction_ids.insert(sender_id, ());
         } else {
@@ -1613,6 +1648,10 @@ impl AvatarSyncSystem {
     }
 
     pub fn request_keyframe(&self, sender_id: PeerId, receiver_id: PeerId) {
+        let live = self.live_players.read();
+        if !live.contains_key(&sender_id) || !live.contains_key(&receiver_id) {
+            return;
+        }
         if let Some(mut receiver) = self.tracking.get_mut(&receiver_id) {
             if let Some(tracking) = receiver.senders.get_mut(&sender_id) {
                 tracking.baseline_keyframe_generation = 0;
@@ -1624,6 +1663,8 @@ impl AvatarSyncSystem {
     }
 
     pub fn remove_player(&self, peer_id: PeerId) {
+        let mut live = self.live_players.write();
+        live.remove(&peer_id);
         self.states.remove(&peer_id);
         if let Some((_, pending)) = self.pending.remove(&peer_id) {
             self.payload_pool.put(pending.payload);
@@ -1633,6 +1674,27 @@ impl AvatarSyncSystem {
         self.bypass_reduction_ids.remove(&peer_id);
         for mut entry in self.tracking.iter_mut() {
             entry.value_mut().senders.remove(&peer_id);
+        }
+    }
+
+    /// Release capacities accumulated during a large session after population settles.
+    /// Active avatar frames and receiver baselines remain intact.
+    pub fn reclaim_idle_capacity(&self) {
+        let mut live = self.live_players.write();
+        live.shrink_to_fit();
+        for mut row in self.tracking.iter_mut() {
+            row.senders.shrink_to_fit();
+        }
+        self.states.shrink_to_fit();
+        self.pending.shrink_to_fit();
+        self.tracking.shrink_to_fit();
+        self.bundle_ratios.shrink_to_fit();
+        self.bypass_reduction_ids.shrink_to_fit();
+        self.slice_state.lock().cycle = None;
+        for shard in &self.payload_pool.shards {
+            let mut buffers = shard.lock();
+            buffers.clear();
+            buffers.shrink_to_fit();
         }
     }
 
@@ -1703,6 +1765,9 @@ impl AvatarSyncSystem {
                 let tick = Duration::from_millis(AVATAR_TICK_INTERVAL_MS);
                 let spin_reserve = Duration::from_micros(TICK_SPIN_RESERVE_MICROS);
                 while !shutdown.load(Ordering::Relaxed) {
+                    if let Some(epoch) = system.memory_reclaim.read().as_ref() {
+                        epoch.poll_current_thread();
+                    }
                     let started = Instant::now();
                     if let Err(err) =
                         runtime.block_on(system.flush_tick(&transport, &peer_snapshot))
@@ -1914,7 +1979,25 @@ impl AvatarSyncSystem {
             .map(|(peer_id, update)| process_pending_update(peer_id, update))
             .collect::<Vec<_>>();
 
+        self.commit_processed_updates(processed, config);
+        self.profiler.add_phase_micros(
+            BsrPhase::Process,
+            process_start.elapsed().as_micros() as u64,
+        );
+        update_count
+    }
+
+    fn commit_processed_updates(
+        &self,
+        processed: Vec<ProcessedAvatarUpdate>,
+        config: &AvatarSyncConfig,
+    ) {
         for update in processed {
+            let live = self.live_players.read();
+            if live.get(&update.peer_id) != Some(&update.incarnation) {
+                self.payload_pool.put(update.payload);
+                continue;
+            }
             let generation = self.generation.fetch_add(1, Ordering::Relaxed);
             let avatar_payload = &update.payload[1..1 + update.payload_len];
             let additional_data = &update.payload[1 + update.payload_len..];
@@ -1974,7 +2057,7 @@ impl AvatarSyncSystem {
                     Arc::new(PlayerAvatarState {
                         #[cfg(test)]
                         peer_id: update.peer_id,
-                        incarnation: generation,
+                        incarnation: update.incarnation,
                         small_id: update.peer_id <= u8::MAX as u16,
                         position: update.position,
                         generation,
@@ -1999,11 +2082,6 @@ impl AvatarSyncSystem {
             }
             self.payload_pool.put(update.payload);
         }
-        self.profiler.add_phase_micros(
-            BsrPhase::Process,
-            process_start.elapsed().as_micros() as u64,
-        );
-        update_count
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2024,6 +2102,15 @@ impl AvatarSyncSystem {
         bundle_cache: &AvatarBundleCache,
         scratch: &mut ReceiverBuildScratch,
     ) -> Option<OutboundAvatarBatch<'a>> {
+        let live = self.live_players.read();
+        let receiver_incarnation = peer_states
+            .iter()
+            .find(|(id, _)| *id == receiver_id)?
+            .1
+            .incarnation;
+        if live.get(&receiver_id) != Some(&receiver_incarnation) {
+            return None;
+        }
         let peer_count = peer_states.len();
         let mut spatial_candidates: Option<Vec<usize>> = None;
         if let Some(grid) = spatial_grid {
@@ -2083,7 +2170,7 @@ impl AvatarSyncSystem {
             };
             let (sender_id, sender_state) = &peer_states[peer_index];
             let sender_id = *sender_id;
-            if sender_id == receiver_id {
+            if sender_id == receiver_id || live.get(&sender_id) != Some(&sender_state.incarnation) {
                 continue;
             }
             if !offloaded_empty
@@ -2808,6 +2895,7 @@ fn process_pending_update(peer_id: PeerId, update: PendingAvatarUpdate) -> Proce
     let avatar_payload = &update.payload[1..1 + payload_len];
     let position = read_position(avatar_payload).unwrap_or([0.0, 0.0, 0.0]);
     ProcessedAvatarUpdate {
+        incarnation: update.incarnation,
         peer_id,
         inbound_sequence,
         position,
@@ -3649,6 +3737,153 @@ mod tests {
         }
     }
 
+    fn register_test_peers(system: &AvatarSyncSystem, peers: &[(PeerId, Arc<PlayerAvatarState>)]) {
+        let mut live = system.live_players.write();
+        for (id, state) in peers {
+            live.insert(*id, state.incarnation);
+            system
+                .generation
+                .fetch_max(state.incarnation + 1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn drained_update_cannot_recreate_disconnected_or_reused_peer() {
+        let config = receiver_build_test_config();
+        let system = AvatarSyncSystem::new(config.clone());
+        let peer = 7;
+        system.register_player(peer);
+        let payload = vec![0; 1 + BitQuality::High.payload_len()];
+        system
+            .upsert_from_channel_payload(peer, channels::PLAYER_AVATAR_HIGH, &payload)
+            .unwrap();
+        let (_, pending) = system.pending.remove(&peer).unwrap();
+        let old_incarnation = pending.incarnation;
+        let update = process_pending_update(peer, pending);
+        system.remove_player(peer);
+        system.register_player(peer);
+        assert_ne!(system.live_players.read()[&peer], old_incarnation);
+        system.commit_processed_updates(vec![update], &config);
+        assert!(!system.states.contains_key(&peer));
+        system
+            .upsert_from_channel_payload(peer, channels::PLAYER_AVATAR_HIGH, &payload)
+            .unwrap();
+        system.process_pending_updates(&config);
+        assert_eq!(
+            system.states.get(&peer).unwrap().incarnation,
+            system.live_players.read()[&peer]
+        );
+        system.remove_player(peer);
+        system
+            .upsert_from_channel_payload(peer, channels::PLAYER_AVATAR_HIGH, &payload)
+            .unwrap();
+        assert!(system.pending.is_empty());
+    }
+
+    #[test]
+    fn stale_receiver_and_sender_snapshots_cannot_recreate_tracking() {
+        let config = receiver_build_test_config();
+        let system = AvatarSyncSystem::new(config.clone());
+        let peers = receiver_build_test_peers_from_ids([1, 2, 3], &[]);
+        register_test_peers(&system, &peers);
+        let build = |receiver| {
+            let mut scratch = ReceiverBuildScratch::default();
+            let cache = AvatarBundleCache::default();
+            system
+                .build_sends_for_receiver(
+                    receiver,
+                    [0.0; 3],
+                    AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
+                    &peers,
+                    None,
+                    None,
+                    &config,
+                    1000,
+                    1,
+                    AVATAR_TICK_INTERVAL_MS,
+                    true,
+                    true,
+                    &cache,
+                    &mut scratch,
+                )
+                .is_some()
+        };
+        assert!(build(1));
+        system.remove_player(2);
+        system.register_player(2);
+        assert!(!build(2));
+        let _ = build(1);
+        assert!(!system.tracking.contains_key(&2));
+        assert!(!system.tracking.get(&1).unwrap().senders.contains_key(&2));
+        assert!(system.tracking.get(&1).unwrap().senders.contains_key(&3));
+    }
+
+    #[test]
+    fn idle_reclaim_preserves_live_frames_pending_updates_and_receiver_baselines() {
+        let config = receiver_build_test_config();
+        let system = AvatarSyncSystem::new(config.clone());
+        let payload = vec![0; 1 + BitQuality::High.payload_len()];
+        for id in [1, 2, 3] {
+            system.register_player(id);
+            system
+                .upsert_from_channel_payload(id, channels::PLAYER_AVATAR_HIGH, &payload)
+                .unwrap();
+        }
+        system.process_pending_updates(&config);
+        let peers = system
+            .states
+            .iter()
+            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+            .collect::<Vec<_>>();
+        let cache = AvatarBundleCache::default();
+        let mut scratch = ReceiverBuildScratch::default();
+        let _ = system.build_sends_for_receiver(
+            1,
+            [0.0; 3],
+            AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
+            &peers,
+            None,
+            None,
+            &config,
+            1000,
+            1,
+            AVATAR_TICK_INTERVAL_MS,
+            true,
+            true,
+            &cache,
+            &mut scratch,
+        );
+        system.remove_player(2);
+        let frame = Arc::clone(system.states.get(&3).unwrap().value());
+        let baseline = system.tracking.get(&1).unwrap().senders[&3].clone();
+        let mut newer = payload.clone();
+        newer[0] = 1;
+        system
+            .upsert_from_channel_payload(3, channels::PLAYER_AVATAR_HIGH, &newer)
+            .unwrap();
+        system.reclaim_idle_capacity();
+        assert_eq!(system.states.len(), 2);
+        assert!(Arc::ptr_eq(&frame, system.states.get(&3).unwrap().value()));
+        let row = system.tracking.get(&1).unwrap();
+        assert_eq!(
+            row.senders[&3].last_seen_generation,
+            baseline.last_seen_generation
+        );
+        assert_eq!(
+            row.senders[&3].baseline_keyframe_generation,
+            baseline.baseline_keyframe_generation
+        );
+        drop(row);
+        assert!(system
+            .payload_pool
+            .shards
+            .iter()
+            .all(|shard| shard.lock().is_empty()));
+        assert!(system.pending.contains_key(&3));
+        system.process_pending_updates(&config);
+        assert_eq!(system.states.get(&3).unwrap().last_inbound_sequence, 1);
+    }
+
     fn generation_map(states: &[(PeerId, u64)]) -> PeerIdMap<(usize, u64)> {
         let mut map = PeerIdMap::with_capacity_and_hasher(states.len(), Default::default());
         for (index, (peer_id, incarnation)) in states.iter().enumerate() {
@@ -3667,6 +3902,7 @@ mod tests {
         config.enable_bundle_compression = false;
         let system = AvatarSyncSystem::new(config.clone());
         let mut peers = receiver_build_test_peers(&[]);
+        register_test_peers(&system, &peers);
         peers.retain(|(id, _)| *id <= 3);
         for (_, state) in &mut peers {
             Arc::make_mut(state).position = [0.0; 3];
@@ -3725,6 +3961,7 @@ mod tests {
         system.remove_player(2);
         assert!(!system.tracking.contains_key(&2));
         Arc::make_mut(&mut peers[2].1).position[0] = 45.0;
+        register_test_peers(&system, &peers);
         build(2, &peers, 2_002);
         assert_cached(2, 45.0, BitQuality::VeryLow);
     }
@@ -3742,6 +3979,7 @@ mod tests {
         let system = AvatarSyncSystem::new(config.clone());
         let sender_id = 63;
         let mut peers = receiver_build_test_peers_from_ids(0..=sender_id, &[]);
+        register_test_peers(&system, &peers);
         for (_, state) in &mut peers {
             Arc::make_mut(state).position = [0.0; 3];
         }
@@ -3831,6 +4069,7 @@ mod tests {
         config.enable_bundle_compression = false;
         let system = AvatarSyncSystem::new(config.clone());
         let mut peers = receiver_build_test_peers_from_ids([1, 2], &[]);
+        register_test_peers(&system, &peers);
         Arc::make_mut(&mut peers[0].1).position = [0.0; 3];
         Arc::make_mut(&mut peers[1].1).position = [15.0, 0.0, 0.0];
         let roster = peers
@@ -3902,6 +4141,7 @@ mod tests {
         Arc::make_mut(&mut peers[1].1).incarnation += 1;
         let mut reused = roster.clone();
         reused[1].incarnation += 1;
+        register_test_peers(&system, &peers);
         build(Some(&second), &peers, &reused, 3);
         assert_eq!(
             system.tracking.get(&1).unwrap().senders[&2].cached_quality_index,
@@ -4012,6 +4252,7 @@ mod tests {
         config.low_distance_sq = 1600.0;
         let system = AvatarSyncSystem::new(config.clone());
         let mut peers = receiver_build_test_peers_from_ids([1, 2], &[]);
+        register_test_peers(&system, &peers);
         Arc::make_mut(&mut peers[0].1).position = [0.0; 3];
         Arc::make_mut(&mut peers[1].1).position = [15.0, 0.0, 0.0];
         for (now_ms, high, quality) in
@@ -4244,7 +4485,7 @@ mod tests {
                     peer_id,
                     Arc::new(PlayerAvatarState {
                         peer_id,
-                        incarnation: generation,
+                        incarnation: 1,
                         small_id: peer_id <= u8::MAX as PeerId,
                         position: [peer_id as f32, 0.0, 0.0],
                         generation,
@@ -4363,6 +4604,8 @@ mod tests {
         let reused_system = AvatarSyncSystem::new(config.clone());
         let mut scratch = ReceiverBuildScratch::default();
         let base = receiver_build_test_peers(&[]);
+        register_test_peers(&fresh_system, &base);
+        register_test_peers(&reused_system, &base);
 
         // Populate for one receiver, then another. Keep the first owned result alive while
         // later calls clear and refill scratch; it must remain unchanged.
