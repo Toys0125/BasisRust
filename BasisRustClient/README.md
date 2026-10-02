@@ -44,6 +44,11 @@ The client re-encodes each input file through `ffmpeg` into 48 kHz mono Opus wit
 clients send to peers within the configured hearing distance, which defaults to
 25 meters.
 
+Audio loading runs up to eight conversions in parallel, limited by the available
+CPU count. The console shows each file's encoded audio time and speed, plus the
+completed/total file count. One Ctrl+C cancels all active conversions, removes
+their temporary outputs, and stops queued files from starting before shutdown.
+
 While running, the console accepts these commands:
 
 ```text

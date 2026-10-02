@@ -4,7 +4,7 @@ use std::{
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
-    process::Command,
+    process::Stdio,
     sync::{
         atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex as StdMutex,
@@ -46,9 +46,11 @@ use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
-    io::{self, AsyncBufReadExt, BufReader},
+    io::{self, AsyncBufReadExt, AsyncReadExt, BufReader},
     net::UdpSocket,
+    process::Command,
     sync::{mpsc, Mutex, Notify},
+    task::JoinSet,
     time,
 };
 use tracing::{debug, error, info, trace, warn};
@@ -2859,7 +2861,31 @@ struct VoiceClip {
 }
 
 impl VoiceLibrary {
-    fn load(folder: &str, reencode: bool, frame_duration_ms: u64) -> Result<Option<Self>> {
+    async fn load(
+        folder: &str,
+        reencode: bool,
+        frame_duration_ms: u64,
+        shutdown: &Arc<AtomicBool>,
+    ) -> Result<Option<Self>> {
+        Self::load_with_options(
+            folder,
+            reencode,
+            frame_duration_ms,
+            shutdown,
+            Path::new("ffmpeg"),
+            num_cpus::get().clamp(1, 8),
+        )
+        .await
+    }
+
+    async fn load_with_options(
+        folder: &str,
+        reencode: bool,
+        frame_duration_ms: u64,
+        shutdown: &Arc<AtomicBool>,
+        ffmpeg: &Path,
+        parallelism: usize,
+    ) -> Result<Option<Self>> {
         let folder = PathBuf::from(folder);
         let folder = if folder.is_absolute() {
             folder
@@ -2880,35 +2906,80 @@ impl VoiceLibrary {
             return Ok(None);
         }
 
-        let mut clips = Vec::new();
+        let mut paths = Vec::new();
         for entry in std::fs::read_dir(&folder)
             .with_context(|| format!("reading voice audio folder {}", folder.display()))?
         {
             let entry = entry?;
             let path = entry.path();
             if path.is_file() && is_ogg_opus_path(&path) {
-                let load_result = if reencode {
-                    OggOpusPackets::load_reencoded(&path, frame_duration_ms)
-                } else {
-                    OggOpusPackets::load(&path)
-                };
-                match load_result {
-                    Ok(packets) => clips.push(VoiceClip {
-                        path,
-                        packets: Arc::new(packets),
-                    }),
-                    Err(err) => warn!(
-                        "excluding unusable voice audio file {}: {err:#}",
-                        path.display()
-                    ),
-                }
+                paths.push(path);
             }
         }
-        clips.sort_by(|a, b| a.path.cmp(&b.path));
-
-        if clips.is_empty() {
+        paths.sort();
+        if paths.is_empty() {
             warn!(
                 "voice audio folder contains no .opus or .ogg files: {}",
+                folder.display()
+            );
+            return Ok(None);
+        }
+
+        let total = paths.len();
+        let parallelism = parallelism.max(1).min(total);
+        info!("loading {total} voice audio file(s), parallel_jobs={parallelism}");
+        let mut pending = paths.into_iter();
+        let mut jobs = JoinSet::new();
+        let mut clips = Vec::new();
+        let mut completed = 0;
+        loop {
+            while jobs.len() < parallelism && !shutdown.load(Ordering::Relaxed) {
+                let Some(path) = pending.next() else { break };
+                let shutdown = shutdown.clone();
+                let ffmpeg = ffmpeg.to_owned();
+                jobs.spawn(async move {
+                    let result = if reencode {
+                        OggOpusPackets::load_reencoded(&path, frame_duration_ms, &shutdown, &ffmpeg)
+                            .await
+                    } else {
+                        OggOpusPackets::load(&path, &shutdown).await
+                    };
+                    (path, result)
+                });
+            }
+            let Some(result) = jobs.join_next().await else {
+                break;
+            };
+            let (path, result) = result.context("voice audio loading task failed")?;
+            if shutdown.load(Ordering::Relaxed) {
+                // Drain all jobs so every running FFmpeg is killed and reaped before returning.
+                continue;
+            }
+            completed += 1;
+            match result {
+                Ok(packets) => clips.push(VoiceClip {
+                    path: path.clone(),
+                    packets: Arc::new(packets),
+                }),
+                Err(err) => warn!(
+                    "excluding unusable voice audio file {}: {err:#}",
+                    path.display()
+                ),
+            }
+            info!(
+                "voice audio progress {completed}/{total}: {} ({} usable)",
+                path.display(),
+                clips.len()
+            );
+        }
+        if shutdown.load(Ordering::Relaxed) {
+            info!("voice audio loading cancelled; stopped all re-encoding jobs");
+            return Ok(None);
+        }
+        clips.sort_by(|a, b| a.path.cmp(&b.path));
+        if clips.is_empty() {
+            warn!(
+                "voice audio folder contains no usable Ogg Opus files: {}",
                 folder.display()
             );
             return Ok(None);
@@ -2948,20 +3019,56 @@ struct OpusPacket {
     duration_ms: u64,
 }
 
+// Clean up output on success, conversion failure, and cancellation.
+struct ReencodedVoiceFile(PathBuf);
+
+impl Drop for ReencodedVoiceFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 impl OggOpusPackets {
-    fn load(path: &Path) -> Result<Self> {
-        let bytes =
-            std::fs::read(path).with_context(|| format!("reading Opus file {}", path.display()))?;
-        Self::parse(&bytes).with_context(|| format!("parsing Ogg Opus file {}", path.display()))
+    async fn load(path: &Path, shutdown: &Arc<AtomicBool>) -> Result<Self> {
+        let path = path.to_owned();
+        let shutdown = shutdown.clone();
+        tokio::task::spawn_blocking(move || {
+            if shutdown.load(Ordering::Relaxed) {
+                return Err(anyhow!("voice audio loading cancelled"));
+            }
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("reading Opus file {}", path.display()))?;
+            Self::parse_cancellable(&bytes, &shutdown)
+                .with_context(|| format!("parsing Ogg Opus file {}", path.display()))
+        })
+        .await
+        .context("Opus file loading task failed")?
     }
 
-    fn load_reencoded(path: &Path, frame_duration_ms: u64) -> Result<Self> {
-        let output_path =
-            std::env::temp_dir().join(format!("basis-rust-client-voice-{}.opus", Uuid::new_v4()));
-        let output = Command::new("ffmpeg")
+    async fn load_reencoded(
+        path: &Path,
+        frame_duration_ms: u64,
+        shutdown: &Arc<AtomicBool>,
+        ffmpeg: &Path,
+    ) -> Result<Self> {
+        if shutdown.load(Ordering::Relaxed) {
+            return Err(anyhow!("voice audio loading cancelled"));
+        }
+        let output_path = ReencodedVoiceFile(
+            std::env::temp_dir().join(format!("basis-rust-client-voice-{}.opus", Uuid::new_v4())),
+        );
+        info!(
+            "re-encoding voice audio {} to 48kHz mono Opus",
+            path.display()
+        );
+        let mut child = Command::new(ffmpeg)
             .arg("-hide_banner")
             .arg("-loglevel")
             .arg("error")
+            .arg("-nostdin")
+            .arg("-nostats")
+            .arg("-progress")
+            .arg("pipe:1")
             .arg("-y")
             .arg("-i")
             .arg(path)
@@ -2972,14 +3079,20 @@ impl OggOpusPackets {
             .arg("48000")
             .arg("-c:a")
             .arg("libopus")
+            .arg("-threads")
+            .arg("1")
             .arg("-b:a")
             .arg("32000")
             .arg("-application")
             .arg("audio")
             .arg("-frame_duration")
             .arg(frame_duration_ms.to_string())
-            .arg(&output_path)
-            .output()
+            .arg(&output_path.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
             .with_context(|| {
                 format!(
                     "running ffmpeg to re-encode {} to 48kHz mono Opus",
@@ -2987,9 +3100,69 @@ impl OggOpusPackets {
                 )
             })?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let _ = std::fs::remove_file(&output_path);
+        let mut progress =
+            BufReader::new(child.stdout.take().expect("piped ffmpeg stdout")).lines();
+        let mut stderr = child.stderr.take().expect("piped ffmpeg stderr");
+        let stderr_output = async move {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).await?;
+            io::Result::Ok(bytes)
+        };
+        tokio::pin!(stderr_output);
+        let mut stderr_bytes = None;
+        let mut progress_open = true;
+        let mut encoded_time = String::new();
+        let mut speed = String::new();
+        let mut exit_status = None;
+        let mut cancellation_check = time::interval(Duration::from_millis(50));
+        let status = loop {
+            if !progress_open {
+                if let Some(status) = exit_status {
+                    break status;
+                }
+            }
+            tokio::select! {
+                biased;
+                _ = cancellation_check.tick() => {
+                    if shutdown.load(Ordering::Relaxed) {
+                        // kill() also waits, so cleanup cannot race a still-writing FFmpeg.
+                        if exit_status.is_none() {
+                            child.kill().await.context("stopping voice re-encoding process")?;
+                        }
+                        return Err(anyhow!("voice audio loading cancelled"));
+                    }
+                }
+                result = &mut stderr_output, if stderr_bytes.is_none() => {
+                    stderr_bytes = Some(result.context("reading ffmpeg errors")?);
+                }
+                line = progress.next_line(), if progress_open => {
+                    match line.context("reading ffmpeg progress")? {
+                        Some(line) => {
+                            if let Some(value) = line.strip_prefix("out_time=") {
+                                encoded_time = value.to_owned();
+                            } else if let Some(value) = line.strip_prefix("speed=") {
+                                speed = value.to_owned();
+                            } else if line.starts_with("progress=") {
+                                info!("voice re-encoding progress {}: audio_time={} speed={}",
+                                    path.display(), encoded_time, speed);
+                            }
+                        }
+                        None => progress_open = false,
+                    }
+                }
+                result = child.wait(), if exit_status.is_none() => {
+                    // Drain stdout to EOF even if the process exits before its final progress
+                    // lines become ready on the async pipe.
+                    exit_status = Some(result.context("waiting for ffmpeg")?);
+                }
+            }
+        };
+        let stderr_bytes = match stderr_bytes {
+            Some(bytes) => bytes,
+            None => stderr_output.await.context("reading ffmpeg errors")?,
+        };
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
             return Err(anyhow!(
                 "ffmpeg failed to re-encode {}: {}",
                 path.display(),
@@ -2997,22 +3170,28 @@ impl OggOpusPackets {
             ));
         }
 
-        let result = Self::load(&output_path).with_context(|| {
+        Self::load(&output_path.0, shutdown).await.with_context(|| {
             format!(
                 "reading ffmpeg re-encoded Opus output for {}",
                 path.display()
             )
-        });
-        let _ = std::fs::remove_file(&output_path);
-        result
+        })
     }
 
+    #[cfg(test)]
     fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::parse_cancellable(bytes, &AtomicBool::new(false))
+    }
+
+    fn parse_cancellable(bytes: &[u8], shutdown: &AtomicBool) -> Result<Self> {
         let mut pos = 0;
         let mut current_packet = Vec::new();
         let mut packets = Vec::new();
 
         while pos < bytes.len() {
+            if shutdown.load(Ordering::Relaxed) {
+                return Err(anyhow!("voice audio loading cancelled"));
+            }
             if bytes.len() - pos < 27 {
                 return Err(anyhow!("truncated Ogg page header at byte {pos}"));
             }
@@ -5011,6 +5190,27 @@ async fn async_main(worker_threads: usize) -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let signal_shutdown = shutdown.clone();
+    let (signal_ready_tx, signal_ready_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = tokio::select! {
+            biased;
+            result = tokio::signal::ctrl_c() => result,
+            // The first branch registers the listener before this branch signals readiness.
+            _ = async {
+                let _ = signal_ready_tx.send(());
+                std::future::pending::<()>().await;
+            } => unreachable!(),
+        };
+        if let Err(err) = result {
+            warn!("failed to listen for Ctrl+C: {err}");
+            return;
+        }
+        info!("shutdown requested");
+        signal_shutdown.store(true, Ordering::SeqCst);
+    });
+    let _ = signal_ready_rx.await;
     info!("tokio runtime workers={worker_threads}");
     let config_path = args.config.clone();
     let mut config = Config::load_or_create(&config_path)?;
@@ -5101,7 +5301,10 @@ async fn async_main(worker_threads: usize) -> Result<()> {
             &config.voice_audio_folder,
             voice_reencode,
             config.voice_frame_duration_ms,
-        ) {
+            &shutdown,
+        )
+        .await
+        {
             Ok(Some(library)) => Some(Arc::new(library)),
             Ok(None) => None,
             Err(err) => {
@@ -5112,6 +5315,9 @@ async fn async_main(worker_threads: usize) -> Result<()> {
     } else {
         None
     };
+    if shutdown.load(Ordering::Relaxed) {
+        return Ok(());
+    }
 
     info!(
         "starting {} clients against {}:{}",
@@ -5129,17 +5335,6 @@ async fn async_main(worker_threads: usize) -> Result<()> {
             args.spawn_group_size, args.spawn_group_spacing, args.fixed_spawn_positions
         );
     }
-
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let signal_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            warn!("failed to listen for Ctrl+C: {err}");
-            return;
-        }
-        info!("shutdown requested");
-        signal_shutdown.store(true, Ordering::SeqCst);
-    });
 
     let shared_maintenance_enabled = std::env::var("BASIS_CLIENT_SHARED_MAINTENANCE")
         .map(|value| !matches!(value.as_str(), "0" | "false" | "False" | "FALSE"))
@@ -5322,7 +5517,8 @@ async fn async_main(worker_threads: usize) -> Result<()> {
                                 &config.voice_audio_folder,
                                 voice_reencode,
                                 config.voice_frame_duration_ms,
-                            ) {
+                                &shutdown,
+                            ).await {
                                 Ok(Some(library)) => {
                                     info!("voice simulation enabled from console");
                                     tokio::spawn(voice_workers(
@@ -5334,6 +5530,7 @@ async fn async_main(worker_threads: usize) -> Result<()> {
                                     ));
                                     voice_running = true;
                                 }
+                                Ok(None) if shutdown.load(Ordering::Relaxed) => {},
                                 Ok(None) => warn!("voice command ignored: no usable audio files found"),
                                 Err(err) => warn!("voice command failed: {err:#}"),
                             }
@@ -5954,6 +6151,265 @@ mod tests {
         ]));
         let packets = OggOpusPackets::parse(&bytes).unwrap();
         assert_eq!(packets.packets[0].data, b"abc".to_vec());
+    }
+
+    #[cfg(unix)]
+    struct FakeVoiceEncoder {
+        root: PathBuf,
+        audio: PathBuf,
+        executable: PathBuf,
+        inputs: Vec<PathBuf>,
+    }
+
+    #[cfg(unix)]
+    impl FakeVoiceEncoder {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let root = std::env::temp_dir().join(format!("basis-voice-test-{}", Uuid::new_v4()));
+            let audio = root.join("audio");
+            std::fs::create_dir_all(&audio).unwrap();
+            let executable = root.join("ffmpeg");
+            // Record each process and output for cancellation checks, and gate completion.
+            std::fs::write(
+                &executable,
+                r#"#!/bin/sh
+want_input=0
+for argument do
+    if [ "$want_input" = 1 ]; then input="$argument"; want_input=0; fi
+    if [ "$argument" = '-i' ]; then want_input=1; fi
+    output="$argument"
+done
+: > "$output"
+printf '%s\n%s\n' "$$" "$output" > "$input.started"
+printf 'out_time=00:00:01.000000\nspeed=1x\nprogress=continue\n'
+while [ ! -f "$input.release" ]; do sleep 0.01; done
+cat "$input" > "$output"
+printf 'out_time=00:00:02.000000\nspeed=2x\nprogress=end\n'
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let inputs = (0..5)
+                .map(|index| {
+                    let input = audio.join(format!("{index}.opus"));
+                    std::fs::write(&input, build_ogg_page(&[&[0x08, index]])).unwrap();
+                    input
+                })
+                .collect();
+            Self {
+                root,
+                audio,
+                executable,
+                inputs,
+            }
+        }
+
+        fn started(&self) -> Vec<(i32, PathBuf)> {
+            self.inputs
+                .iter()
+                .filter_map(|input| {
+                    let marker =
+                        std::fs::read_to_string(input.with_extension("opus.started")).ok()?;
+                    let mut lines = marker.lines();
+                    Some((lines.next()?.parse().ok()?, PathBuf::from(lines.next()?)))
+                })
+                .collect()
+        }
+
+        async fn wait_for_parallel_jobs(&self) {
+            time::timeout(Duration::from_secs(3), async {
+                while self.started().len() < 2 {
+                    time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("two encoders should start before either finishes");
+            assert_eq!(
+                self.started().len(),
+                2,
+                "parallel job limit must be respected"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeVoiceEncoder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn voice_reencode_runs_in_parallel_and_loads_all_clips() {
+        let encoder = FakeVoiceEncoder::new();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let load = VoiceLibrary::load_with_options(
+            encoder.audio.to_str().unwrap(),
+            true,
+            20,
+            &shutdown,
+            &encoder.executable,
+            2,
+        );
+        let release = async {
+            encoder.wait_for_parallel_jobs().await;
+            for input in &encoder.inputs {
+                std::fs::write(input.with_extension("opus.release"), b"").unwrap();
+            }
+        };
+        let (library, ()) = time::timeout(Duration::from_secs(5), async {
+            tokio::join!(load, release)
+        })
+        .await
+        .unwrap();
+        let library = library.unwrap().unwrap();
+        assert_eq!(library.clips.len(), encoder.inputs.len());
+        for (clip, input) in library.clips.iter().zip(&encoder.inputs) {
+            assert_eq!(&clip.path, input);
+            assert_eq!(clip.packets.packets.len(), 1);
+        }
+        assert_eq!(encoder.started().len(), encoder.inputs.len());
+        assert!(encoder.started().iter().all(|(_, output)| !output.exists()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn voice_reencode_cancellation_kills_active_jobs_and_skips_queue() {
+        let encoder = FakeVoiceEncoder::new();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let load = VoiceLibrary::load_with_options(
+            encoder.audio.to_str().unwrap(),
+            true,
+            20,
+            &shutdown,
+            &encoder.executable,
+            2,
+        );
+        let cancel = async {
+            encoder.wait_for_parallel_jobs().await;
+            shutdown.store(true, Ordering::SeqCst);
+        };
+        let (library, ()) =
+            time::timeout(Duration::from_secs(5), async { tokio::join!(load, cancel) })
+                .await
+                .unwrap();
+        assert!(library.unwrap().is_none());
+        let started = encoder.started();
+        assert_eq!(
+            started.len(),
+            2,
+            "queued files must not start after cancellation"
+        );
+        for (pid, output) in started {
+            assert!(!output.exists(), "cancelled output should be removed");
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "encoder must be reaped");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn voice_file_loading_keeps_shutdown_responsive_on_one_worker() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let encoder = FakeVoiceEncoder::new();
+        let fifo = encoder.root.join("blocked.opus");
+        let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let writer_shutdown = shutdown.clone();
+        let ready = Arc::new(Notify::new());
+        let writer_ready = ready.clone();
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+            writer_ready.notify_one();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while !writer_shutdown.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Always release the reader, including if a regression blocks the async worker.
+            file.write_all(&build_ogg_page(&[&[0x08]])).unwrap();
+        });
+        let fifo = encoder.root.join("blocked.opus");
+        let load = OggOpusPackets::load(&fifo, &shutdown);
+        let cancel = async {
+            ready.notified().await;
+            shutdown.store(true, Ordering::SeqCst);
+        };
+        let (result, ()) = tokio::join!(load, cancel);
+        writer.join().unwrap();
+        assert!(format!("{:#}", result.unwrap_err()).contains("voice audio loading cancelled"));
+        assert!(shutdown.load(Ordering::Relaxed));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn voice_reencode_reports_final_progress_for_short_clips() {
+        // Tracing callsite registration in concurrent tests can suppress captured events.
+        // Isolate this logging assertion while keeping the subscriber scoped to the test.
+        const ISOLATED: &str = "BASIS_VOICE_PROGRESS_TEST_ISOLATED";
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::voice_reencode_reports_final_progress_for_short_clips",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        #[derive(Clone)]
+        struct CapturedLog(Arc<StdMutex<Vec<u8>>>);
+
+        impl Write for CapturedLog {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let encoder = FakeVoiceEncoder::new();
+        let input = &encoder.inputs[0];
+        std::fs::write(input.with_extension("opus.release"), b"").unwrap();
+        let captured = CapturedLog(Arc::new(StdMutex::new(Vec::new())));
+        let log_writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || log_writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        // Other tests may register these callsites without a subscriber before this test runs.
+        tracing::callsite::rebuild_interest_cache();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let packets = OggOpusPackets::load_reencoded(input, 20, &shutdown, &encoder.executable)
+            .await
+            .unwrap();
+        assert_eq!(packets.packets.len(), 1);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let expected = format!(
+            "voice re-encoding progress {}: audio_time=00:00:02.000000 speed=2x",
+            input.display()
+        );
+        assert!(log.contains(&expected), "{log}");
     }
 
     #[test]
