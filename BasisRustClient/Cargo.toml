@@ -3,6 +3,11 @@ name = "basis-rust-client"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["windows-mimalloc"]
+# Match the Windows server allocator; Linux keeps its existing allocator.
+windows-mimalloc = ["dep:mimalloc"]
+
 [dependencies]
 anyhow = "1"
 basis-protocol = { path = "../BasisRustServer/crates/basis-protocol" }
@@ -21,3 +26,6 @@ tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt-m
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "fast-rng"] }
+
+[target.'cfg(windows)'.dependencies]
+mimalloc = { version = "0.1.52", optional = true }

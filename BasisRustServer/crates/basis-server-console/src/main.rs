@@ -618,12 +618,40 @@ fn bsr_window_metrics(snapshot: BsrProfilerSnapshot) -> BsrWindowMetrics {
     }
 }
 
+#[cfg(windows)]
+fn configure_windows_cpu_workers() -> Result<()> {
+    let builder = rayon::ThreadPoolBuilder::new();
+    let builder = if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+        // Preserve Rayon's normal explicit override, including zero/auto.
+        builder
+    } else {
+        // More concurrent Winsock flushes can spend CPU contending in the
+        // kernel instead of delivering sooner. Leave cores for transport and
+        // use the measured eight-worker ceiling unless explicitly overridden.
+        let workers = std::thread::available_parallelism()
+            .map(|count| count.get().min(8))
+            .unwrap_or(1);
+        builder.num_threads(workers)
+    };
+    builder
+        .build_global()
+        .context("initializing Windows CPU worker pool")?;
+    info!(
+        workers = rayon::current_num_threads(),
+        "Windows CPU worker pool configured"
+    );
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
     tracing_subscriber::fmt()
         .with_env_filter(args.log_level.clone())
         .init();
+
+    #[cfg(windows)]
+    configure_windows_cpu_workers()?;
 
     let base_dir = args.base_dir.clone().unwrap_or(
         std::env::current_exe()

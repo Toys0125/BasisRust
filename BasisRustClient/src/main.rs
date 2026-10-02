@@ -7,7 +7,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering},
-        Arc, Mutex as StdMutex, Weak,
+        Arc, Mutex as StdMutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -15,7 +15,7 @@ use std::{
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, RawFd};
 #[cfg(target_os = "linux")]
-use std::sync::mpsc as std_mpsc;
+use std::sync::{mpsc as std_mpsc, Weak};
 
 use anyhow::{anyhow, Context, Result};
 #[cfg(test)]
@@ -54,10 +54,15 @@ use tokio::{
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
+#[cfg(all(windows, feature = "windows-mimalloc"))]
+#[global_allocator]
+// Default Windows allocator, matching the server; Linux keeps its existing path.
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const DEFAULT_WINDOW_SIZE: usize = 128;
 const MAX_SEQUENCE: u16 = 32768;
 const LITENETLIB_INITIAL_MTU: usize = 1024;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows, test))]
 const LITENETLIB_MAX_MTU: usize = 1432;
 const LITENETLIB_CHANNELED_HEADER_SIZE: usize = 4;
 const LITENETLIB_FRAGMENT_HEADER_SIZE: usize = 6;
@@ -2403,6 +2408,12 @@ impl BasisClient {
                 }
             }
             PacketProperty::Pong => {}
+            #[cfg(windows)]
+            PacketProperty::MtuCheck => {
+                if let Some(reply) = windows_mtu_probe_reply(bytes, self.connection_number) {
+                    self.socket.send(&reply).await?;
+                }
+            }
             PacketProperty::Ack => {
                 if let Some(sequence) = packet.sequence {
                     if let Some(channel_id) = packet.channel_id {
@@ -3196,6 +3207,27 @@ fn any_local_addr(remote: SocketAddr) -> SocketAddr {
         SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
     }
+}
+
+#[cfg(any(windows, test))]
+fn windows_mtu_probe_reply(packet: &[u8], connection_number: u8) -> Option<Vec<u8>> {
+    // Match Linux's shared receiver: only echo a complete LiteNetLib probe so
+    // the server can safely increase its per-peer datagram packing limit.
+    if !(LITENETLIB_INITIAL_MTU..=LITENETLIB_MAX_MTU).contains(&packet.len())
+        || packet[0] != (PacketProperty::MtuCheck as u8 | (connection_number << 5))
+    {
+        return None;
+    }
+    let mtu = i32::from_le_bytes(packet[1..5].try_into().ok()?);
+    if usize::try_from(mtu).ok() != Some(packet.len())
+        || packet[13..packet.len() - 4].iter().any(|&byte| byte != 0)
+        || packet[packet.len() - 4..] != packet[1..5]
+    {
+        return None;
+    }
+    let mut reply = packet.to_vec();
+    reply[0] = (reply[0] & 0xe0) | PacketProperty::MtuOk as u8;
+    Some(reply)
 }
 
 fn bind_udp_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
@@ -5870,17 +5902,21 @@ mod tests {
 
     #[test]
     fn relative_voice_audio_folder_resolves_from_config_directory() {
-        let resolved = resolve_relative_to_config(
-            Path::new("/work/BasisRustClient/Config.xml"),
-            DEFAULT_VOICE_AUDIO_FOLDER,
-        );
-        assert!(resolved.ends_with("BasisRustClient/audio"));
+        let config_path = if cfg!(windows) {
+            Path::new(r"C:\work\BasisRustClient\Config.xml")
+        } else {
+            Path::new("/work/BasisRustClient/Config.xml")
+        };
+        let resolved = resolve_relative_to_config(config_path, DEFAULT_VOICE_AUDIO_FOLDER);
+        assert!(Path::new(&resolved).ends_with(Path::new("BasisRustClient").join("audio")));
 
-        let absolute = resolve_relative_to_config(
-            Path::new("/work/BasisRustClient/Config.xml"),
-            "/samples/voice",
-        );
-        assert_eq!(absolute, "/samples/voice");
+        let voice_path = if cfg!(windows) {
+            r"C:\samples\voice"
+        } else {
+            "/samples/voice"
+        };
+        let absolute = resolve_relative_to_config(config_path, voice_path);
+        assert_eq!(absolute, voice_path);
     }
 
     #[test]
@@ -6742,6 +6778,81 @@ mod tests {
         shutdown.store(true, Ordering::Relaxed);
         refresh.notify_one();
         let _ = time::timeout(Duration::from_secs(1), task).await;
+    }
+
+    fn mtu_probe_fixture(mtu: usize, connection_number: u8) -> Vec<u8> {
+        let mut packet = vec![0u8; mtu];
+        packet[0] = PacketProperty::MtuCheck as u8 | (connection_number << 5);
+        packet[1..5].copy_from_slice(&(mtu as i32).to_le_bytes());
+        packet[5..13].copy_from_slice(&0x0123_4567_89ab_cdefu64.to_le_bytes());
+        packet[mtu - 4..].copy_from_slice(&(mtu as i32).to_le_bytes());
+        packet
+    }
+
+    #[test]
+    fn windows_mtu_reply_validates_probe_and_preserves_all_bytes_except_property() {
+        for mtu in [1024, 1164, 1392, 1404, 1424, 1432] {
+            let probe = mtu_probe_fixture(mtu, 2);
+            let mut expected = probe.clone();
+            expected[0] = PacketProperty::MtuOk as u8 | (2 << 5);
+            assert_eq!(windows_mtu_probe_reply(&probe, 2), Some(expected));
+            assert_eq!(probe[0], PacketProperty::MtuCheck as u8 | (2 << 5));
+        }
+        let probe = mtu_probe_fixture(1164, 2);
+        for offset in [1, 13, probe.len() - 1] {
+            let mut invalid = probe.clone();
+            invalid[offset] ^= 1;
+            assert!(windows_mtu_probe_reply(&invalid, 2).is_none());
+        }
+        assert!(windows_mtu_probe_reply(&probe, 1).is_none());
+        for length in [0, 1, 13, 1023, 1433] {
+            assert!(windows_mtu_probe_reply(&vec![0; length], 2).is_none());
+        }
+        for mtu in [1023, 1433] {
+            assert!(windows_mtu_probe_reply(&mtu_probe_fixture(mtu, 2), 2).is_none());
+        }
+        for property in [
+            PacketProperty::MtuOk as u8,
+            PacketProperty::MtuCheck as u8 | 0x80,
+        ] {
+            let mut invalid = probe.clone();
+            invalid[0] = property | (2 << 5);
+            assert!(windows_mtu_probe_reply(&invalid, 2).is_none());
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_receive_handler_echoes_valid_mtu_probe_to_connected_server() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut client = test_client(1, server.local_addr().unwrap()).await;
+        Arc::get_mut(&mut client).unwrap().connection_number = 2;
+        let mut received = [0u8; 2048];
+        let mut invalid = mtu_probe_fixture(1164, 2);
+        invalid[13] = 1;
+        client.handle_packet(&invalid).await.unwrap();
+        client
+            .handle_packet(&mtu_probe_fixture(1164, 1))
+            .await
+            .unwrap();
+        assert!(
+            time::timeout(Duration::from_millis(50), server.recv(&mut received))
+                .await
+                .is_err()
+        );
+        for mtu in [1024, 1164, 1392, 1404, 1424, 1432] {
+            let probe = mtu_probe_fixture(mtu, 2);
+            client.handle_packet(&probe).await.unwrap();
+            let len = time::timeout(Duration::from_secs(1), server.recv(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(len, mtu);
+            assert_eq!(
+                &received[..len],
+                windows_mtu_probe_reply(&probe, 2).unwrap()
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

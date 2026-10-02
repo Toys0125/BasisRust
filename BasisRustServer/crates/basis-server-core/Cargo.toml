@@ -2,6 +2,7 @@
 name = "basis-server-core"
 version.workspace = true
 edition.workspace = true
+rust-version = "1.95"
 license.workspace = true
 
 [features]
