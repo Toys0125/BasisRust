@@ -17,6 +17,7 @@ This is a headless client implementation that mimics the behavior of the Basis V
 - Opt-in voice simulation from Ogg Opus files
 - Interactive console controls for voice, client scaling, and graceful shutdown
 - Automatic reconnection
+- Validated MTU-probe replies on Windows and the Linux shared receiver
 
 ## Running
 
@@ -74,6 +75,14 @@ Voice settings include `VoiceEnabled`, `VoiceAudioFolder`, `VoiceSpeakerPercent`
 ```powershell
 cargo build --release
 ```
+
+Windows uses mimalloc by default; opt out with
+`cargo build --release --no-default-features`. Linux retains its allocator.
+
+At 1,000 clients, sampled peak working set fell from 85-86 MiB to 29-32 MiB;
+no overall speedup was established. Windows also replies to validated MTU
+probes to reduce packet-processing cost. See the
+[performance summary](../docs/performance/windows-improvements.md) for results.
 
 ## Dependencies
 

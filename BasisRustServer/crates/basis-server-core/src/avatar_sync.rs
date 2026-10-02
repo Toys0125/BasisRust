@@ -51,6 +51,11 @@ const AVATAR_BUNDLE_MIN_RATIO: f32 = 0.05;
 const AVATAR_BUNDLE_MAX_RATIO: f32 = 0.95;
 const SMALL_HIGH_DELTA_BYTES: usize = 40;
 const SMALL_DELTA_STREAK_TO_STRETCH: u8 = 4;
+// Windows socket flushes cost more than Linux's receive/send path. A larger
+// work budget avoids cutting receiver cadence while the machine has capacity.
+#[cfg(windows)]
+pub(crate) const DEFAULT_AVATAR_TICK_BUDGET_MS: f64 = 6.0;
+#[cfg(not(windows))]
 pub(crate) const DEFAULT_AVATAR_TICK_BUDGET_MS: f64 = 3.0;
 pub(crate) const DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS: f64 = 180.0;
 
@@ -757,14 +762,14 @@ impl AvatarBundleCache {
         }
         let charge = lookup.admission_charge();
         self.reserved_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(charge)
                     .filter(|total| *total <= self.byte_limit)
             })
             .ok()?;
         if self
             .reserved_entries
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 (count < self.entry_limit).then_some(count + 1)
             })
             .is_err()
@@ -5438,7 +5443,7 @@ mod tests {
             bundle_min_bytes: 128,
             min_receiver_slices: 1,
             max_receiver_slices: 32,
-            tick_budget_ms: DEFAULT_AVATAR_TICK_BUDGET_MS,
+            tick_budget_ms: 3.0,
             receiver_cycle_budget_ms: DEFAULT_AVATAR_RECEIVER_CYCLE_BUDGET_MS,
             spatial_cull_enabled: false,
             enable_compute_offload: false,
@@ -5464,6 +5469,37 @@ mod tests {
         });
         system.adapt_slice_count(4_000, &config);
         assert_eq!(system.slice_state.lock().slice_count, 2);
+    }
+
+    #[test]
+    fn platform_default_budget_preserves_headroom_and_adapts_to_load() {
+        let config = receiver_build_test_config();
+        // Windows keeps a 4-6 ms tick unsliced; the unchanged non-Windows
+        // default subdivides it. Both still adapt above budget and recover.
+        let intermediate_target = if cfg!(windows) { 1 } else { 2 };
+        for (initial_slices, elapsed_micros, expected_slices) in [
+            (1, 4_000, intermediate_target),
+            (1, 6_000, intermediate_target),
+            (1, 7_000, 2),
+            (2, 1_000, 1),
+        ] {
+            let system = AvatarSyncSystem::new(config.clone());
+            {
+                let mut state = system.slice_state.lock();
+                state.slice_count = initial_slices;
+                state.cycle = Some(ReceiverCycle {
+                    roster: (0..4).map(|id| (id, id as u64)).collect(),
+                    cursor: 4,
+                    slice_count: initial_slices,
+                });
+            }
+            system.adapt_slice_count(elapsed_micros, &config);
+            assert_eq!(
+                system.slice_state.lock().slice_count,
+                expected_slices,
+                "initial_slices={initial_slices}, elapsed_micros={elapsed_micros}"
+            );
+        }
     }
 
     #[test]

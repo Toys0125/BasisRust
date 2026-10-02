@@ -9,6 +9,8 @@ moderation and admin permissions, console commands, and source drift detection.
 
 ## Run
 
+Requires Rust 1.95 or later; use `rustup update stable` to update.
+
 ```powershell
 cargo run -p basis-server-console -- --base-dir . --config config/config.xml
 ```

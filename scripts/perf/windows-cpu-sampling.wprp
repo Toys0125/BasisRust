@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WindowsPerformanceRecorder Version="1.0" Author="BasisRust" Company="BasisRust">
+  <Profiles>
+    <SystemCollector Id="BasisCpuCollector" Name="BasisRust CPU Sampling">
+      <BufferSize Value="1024" />
+      <Buffers Value="256" />
+    </SystemCollector>
+    <EventCollector Id="BasisClrCollector" Name="Basis CLR metadata">
+      <BufferSize Value="1024" />
+      <Buffers Value="128" />
+    </EventCollector>
+    <SystemProvider Id="BasisCpuProvider">
+      <Keywords>
+        <Keyword Value="ProcessThread" />
+        <Keyword Value="Loader" />
+        <Keyword Value="SampledProfile" />
+      </Keywords>
+      <Stacks>
+        <Stack Value="SampledProfile" />
+      </Stacks>
+    </SystemProvider>
+    <EventProvider Id="BasisClrProvider" Name="Microsoft-Windows-DotNETRuntime" Level="5">
+      <Keywords><Keyword Value="0x18" /></Keywords>
+      <CaptureStateOnSave><Keyword Value="0x70138" /></CaptureStateOnSave>
+    </EventProvider>
+    <EventProvider Id="BasisClrRundownProvider" Name="Microsoft-Windows-DotNETRuntimeRundown" Level="5">
+      <CaptureStateOnSave><Keyword Value="0x70138" /></CaptureStateOnSave>
+    </EventProvider>
+    <Profile Id="BasisCpu.Verbose.File" Name="BasisCpu" Description="Native CPU sampling with process and image metadata" LoggingMode="File" DetailLevel="Verbose">
+      <Collectors>
+        <SystemCollectorId Value="BasisCpuCollector">
+          <SystemProviderId Value="BasisCpuProvider" />
+        </SystemCollectorId>
+      </Collectors>
+    </Profile>
+    <Profile Id="BasisCpuClr.Verbose.File" Name="BasisCpuClr" Description="Native CPU samples plus CLR loader/JIT metadata and rundown" LoggingMode="File" DetailLevel="Verbose">
+      <Collectors>
+        <SystemCollectorId Value="BasisCpuCollector">
+          <SystemProviderId Value="BasisCpuProvider" />
+        </SystemCollectorId>
+        <EventCollectorId Value="BasisClrCollector">
+          <EventProviders>
+            <EventProviderId Value="BasisClrProvider" />
+            <EventProviderId Value="BasisClrRundownProvider" />
+          </EventProviders>
+        </EventCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>

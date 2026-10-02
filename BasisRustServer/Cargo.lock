@@ -223,6 +223,7 @@ dependencies = [
  "clap",
  "crossterm",
  "mimalloc",
+ "rayon",
  "rustyline",
  "tokio",
  "tracing",
