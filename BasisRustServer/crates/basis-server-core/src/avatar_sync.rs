@@ -142,6 +142,8 @@ struct LazyQualityFrame {
     qualities: [OnceLock<Result<Option<PreSerializedQuality>, String>>; 4],
     #[cfg(test)]
     init_counts: [AtomicU64; 4],
+    #[cfg(test)]
+    request_counts: [AtomicU64; 4],
 }
 
 impl LazyQualityFrame {
@@ -203,6 +205,8 @@ impl LazyQualityFrame {
             qualities,
             #[cfg(test)]
             init_counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            #[cfg(test)]
+            request_counts: std::array::from_fn(|_| AtomicU64::new(0)),
         }))
     }
 
@@ -212,6 +216,8 @@ impl LazyQualityFrame {
         profiler: &BsrProfiler,
         quality: BitQuality,
     ) -> Result<Option<&PreSerializedQuality>> {
+        #[cfg(test)]
+        self.request_counts[quality as usize].fetch_add(1, Ordering::Relaxed);
         let slot = &self.qualities[quality as usize];
         let result = slot.get_or_init(|| {
             #[cfg(test)]
@@ -1474,6 +1480,7 @@ pub struct AvatarSyncSystem {
     // Receiver locks serialize sender teardown without holding this gate.
     // Tokens reject work drained or snapshotted before a peer ID is reused.
     live_players: Arc<parking_lot::RwLock<HashMap<PeerId, u64>>>,
+    membership_generation: Arc<AtomicU64>,
     states: Arc<DashMap<PeerId, Arc<PlayerAvatarState>>>,
     pending: Arc<DashMap<PeerId, PendingAvatarUpdate>>,
     tracking: Arc<DashMap<PeerId, Arc<parking_lot::Mutex<ReceiverTrackingState>>>>,
@@ -1501,6 +1508,7 @@ impl AvatarSyncSystem {
             distance_offload: Arc::new(parking_lot::Mutex::new(DistanceOffload::default())),
             config: Arc::new(parking_lot::RwLock::new(config)),
             live_players: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            membership_generation: Arc::new(AtomicU64::new(0)),
             states: Arc::new(DashMap::new()),
             pending: Arc::new(DashMap::new()),
             tracking: Arc::new(DashMap::new()),
@@ -1567,6 +1575,7 @@ impl AvatarSyncSystem {
         }
         let incarnation = self.generation.fetch_add(1, Ordering::Relaxed);
         live.insert(peer_id, incarnation);
+        self.membership_generation.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn is_player_registered(&self, peer_id: PeerId) -> bool {
@@ -1700,6 +1709,9 @@ impl AvatarSyncSystem {
         let incarnation = {
             let mut live = self.live_players.write();
             let incarnation = live.remove(&peer_id);
+            if incarnation.is_some() {
+                self.membership_generation.fetch_add(1, Ordering::Relaxed);
+            }
             self.states.remove(&peer_id);
             if let Some((_, pending)) = self.pending.remove(&peer_id) {
                 self.payload_pool.put(pending.payload);
@@ -2166,7 +2178,7 @@ impl AvatarSyncSystem {
         };
         // Never hold the admission lock while waiting on a receiver or encoding.
         let mut receiver_tracking = row.lock();
-        {
+        let membership_generation = {
             let live = self.live_players.read();
             if live.get(&receiver_id) != Some(&receiver_incarnation) {
                 return None;
@@ -2177,7 +2189,8 @@ impl AvatarSyncSystem {
                     .iter()
                     .map(|(id, state)| live.get(id) == Some(&state.incarnation)),
             );
-        }
+            self.membership_generation.load(Ordering::Relaxed)
+        };
         // Sender teardown waits on this row outside the admission lock. Its
         // incarnation check preserves replacements admitted during old teardown.
         let peer_count = peer_states.len();
@@ -2448,10 +2461,13 @@ impl AvatarSyncSystem {
         if live.get(&receiver_id) != Some(&receiver_incarnation) {
             return None;
         }
-        if scratch
-            .sent_senders
-            .iter()
-            .any(|(id, incarnation)| live.get(id) != Some(incarnation))
+        // Both generation reads are under the admission lock. An unchanged
+        // generation proves every snapshotted sender still has its incarnation.
+        if self.membership_generation.load(Ordering::Relaxed) != membership_generation
+            && scratch
+                .sent_senders
+                .iter()
+                .any(|(id, incarnation)| live.get(id) != Some(incarnation))
         {
             drop(live);
             // Encoding raced a sender departure/reuse. Do not emit its old
@@ -3850,6 +3866,7 @@ mod tests {
 
     fn register_test_peers(system: &AvatarSyncSystem, peers: &[(PeerId, Arc<PlayerAvatarState>)]) {
         let mut live = system.live_players.write();
+        system.membership_generation.fetch_add(1, Ordering::Relaxed);
         for (id, state) in peers {
             live.insert(*id, state.incarnation);
             system
@@ -3976,13 +3993,15 @@ mod tests {
         let (ready_tx, ready_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         // Hold an actual lazy quality initialization while the receiver waits on it.
+        let encoding_frame = Arc::clone(&frame);
+        let encoder_frame = Arc::clone(&frame);
         let encoder = std::thread::spawn(move || {
-            frame.qualities[BitQuality::Medium as usize].get_or_init(|| {
+            encoding_frame.qualities[BitQuality::Medium as usize].get_or_init(|| {
                 ready_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 Ok(Some(pre_serialize(
-                    frame.peer_id,
-                    frame.outbound_sequence,
+                    encoder_frame.peer_id,
+                    encoder_frame.outbound_sequence,
                     BitQuality::Medium,
                     &vec![0; BitQuality::Medium.payload_len()],
                     &[],
@@ -3990,7 +4009,6 @@ mod tests {
             });
         });
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let row = Arc::clone(system.tracking.entry(1).or_default().value());
         let builder_system = system.clone();
         let builder = std::thread::spawn(move || {
             let sent = builder_system
@@ -4014,10 +4032,13 @@ mod tests {
             (sent, peers, config)
         });
         let deadline = Instant::now() + Duration::from_secs(2);
-        while row.try_lock().is_some() && Instant::now() < deadline {
+        while frame.request_counts[BitQuality::Medium as usize].load(Ordering::Relaxed) == 0
+            && Instant::now() < deadline
+        {
             std::thread::yield_now();
         }
-        let building = row.try_lock().is_none();
+        let building =
+            frame.request_counts[BitQuality::Medium as usize].load(Ordering::Relaxed) > 0;
         let disconnect_system = system.clone();
         let disconnect = std::thread::spawn(move || disconnect_system.remove_player(departing_id));
         let deadline = Instant::now() + Duration::from_secs(2);
