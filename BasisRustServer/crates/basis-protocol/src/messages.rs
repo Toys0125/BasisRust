@@ -2038,8 +2038,7 @@ pub struct ConsoleData {
 impl BasisSerialize for ConsoleData {
     fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u8(self.message_index);
-        writer.put_u16(self.array.len() as u16);
-        writer.put_bytes(&self.array);
+        writer.put_bytes_with_length(&self.array)?;
         Ok(())
     }
 }
@@ -2066,8 +2065,7 @@ impl BasisSerialize for AvatarLoadDataMessage {
     fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u8(self.message_index);
         writer.put_u16(self.who_sent_us_this);
-        writer.put_u16(self.payload.len() as u16);
-        writer.put_bytes(&self.payload);
+        writer.put_bytes_with_length(&self.payload)?;
         Ok(())
     }
 }
@@ -2498,6 +2496,67 @@ fn read_database_value(reader: &mut NetReader<'_>, marker: u8) -> ReadResult<Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_data_checks_byte_length_and_preserves_valid_wire_bytes() {
+        for length in [0, 3, 65535, 65536] {
+            let message = ConsoleData {
+                message_index: 7,
+                array: vec![0x42; length],
+            };
+            let mut writer = NetWriter::new();
+            let result = message.serialize(&mut writer);
+            if length > usize::from(u16::MAX) {
+                assert_eq!(
+                    result,
+                    Err(crate::io::NetWriteError::LengthOverflow { length, max: 65535 })
+                );
+                // Only the preceding message header is written on failure.
+                assert_eq!(writer.as_slice(), &[7]);
+            } else {
+                result.unwrap();
+                let mut expected = vec![7];
+                expected.extend_from_slice(&(length as u16).to_le_bytes());
+                expected.extend_from_slice(&message.array);
+                assert_eq!(writer.as_slice(), expected);
+                let mut reader = NetReader::new(writer.as_slice());
+                assert_eq!(ConsoleData::deserialize(&mut reader).unwrap(), message);
+                assert_eq!(reader.remaining(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn avatar_load_data_checks_byte_length_and_preserves_valid_wire_bytes() {
+        for length in [0, 3, 65535, 65536] {
+            let message = AvatarLoadDataMessage {
+                message_index: 7,
+                who_sent_us_this: 0x1234,
+                payload: vec![0x42; length],
+            };
+            let mut writer = NetWriter::new();
+            let result = message.serialize(&mut writer);
+            if length > usize::from(u16::MAX) {
+                assert_eq!(
+                    result,
+                    Err(crate::io::NetWriteError::LengthOverflow { length, max: 65535 })
+                );
+                assert_eq!(writer.as_slice(), &[7, 0x34, 0x12]);
+            } else {
+                result.unwrap();
+                let mut expected = vec![7, 0x34, 0x12];
+                expected.extend_from_slice(&(length as u16).to_le_bytes());
+                expected.extend_from_slice(&message.payload);
+                assert_eq!(writer.as_slice(), expected);
+                let mut reader = NetReader::new(writer.as_slice());
+                assert_eq!(
+                    AvatarLoadDataMessage::deserialize(&mut reader).unwrap(),
+                    message
+                );
+                assert_eq!(reader.remaining(), 0);
+            }
+        }
+    }
 
     #[test]
     fn oversized_bytes_message_propagates_error_without_writing() {

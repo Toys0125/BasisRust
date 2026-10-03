@@ -884,19 +884,18 @@ fn serialize_server_ready(peer_id: PeerId, ready: &ReadyMessage) -> Result<Vec<u
     Ok(writer.into_vec())
 }
 
-fn frame_join_records(records: &[Arc<JoinBroadcastRecord>]) -> Vec<u8> {
+fn frame_join_records(records: &[Arc<JoinBroadcastRecord>]) -> Result<Vec<u8>> {
     let count = u16::try_from(records.len()).expect("join batch count fits u16");
     let mut payload = Vec::new();
     for record in records {
         payload.extend_from_slice(&record.payload.read());
     }
     let mut writer = NetWriter::with_capacity(payload.len() + 32);
-    writer.put_u16(count);
-    writer.put_bytes(&payload);
-    writer.into_vec()
+    ServerReadyBatchMessage { count, payload }.serialize(&mut writer)?;
+    Ok(writer.into_vec())
 }
 
-async fn flush_join_batches(state: &ServerState) {
+async fn flush_join_batches(state: &ServerState) -> Result<()> {
     let targets = state.join_broadcast.lock().ready_targets();
     let mut framed_by_batch = HashMap::<Vec<(u64, u64)>, Vec<u8>>::new();
     for peer_id in targets {
@@ -912,9 +911,12 @@ async fn flush_join_batches(state: &ServerState) {
                 .iter()
                 .map(|record| (record.sequence, record.revision.load(Ordering::Acquire)))
                 .collect::<Vec<_>>();
-            let framed = framed_by_batch
-                .entry(key)
-                .or_insert_with(|| frame_join_records(&records));
+            let framed = match framed_by_batch.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(frame_join_records(&records)?)
+                }
+            };
             if state
                 .transport
                 .send(
@@ -933,6 +935,7 @@ async fn flush_join_batches(state: &ServerState) {
             }
         }
     }
+    Ok(())
 }
 
 async fn event_loop(
@@ -950,7 +953,9 @@ async fn event_loop(
     loop {
         tokio::select! {
             _ = join_flush.tick() => {
-                flush_join_batches(&state).await;
+                if let Err(err) = flush_join_batches(&state).await {
+                    error!("join batch serialization failed: {err:#}");
+                }
             }
             _ = &mut shutdown => {
                 break;
@@ -4814,6 +4819,48 @@ mod tests {
             id: peer_id,
             metadata: test_ready_message().player_meta_data_message,
             ready: test_ready_message(),
+        }
+    }
+
+    #[test]
+    fn join_records_use_server_ready_batch_framing() {
+        for padding in [0, 1024] {
+            let mut ready = test_ready_message();
+            ready
+                .player_meta_data_message
+                .player_display_name
+                .push_str(&"x".repeat(padding));
+            let payload = serialize_server_ready(2, &ready).unwrap();
+            let record = Arc::new(JoinBroadcastRecord {
+                sequence: 1,
+                peer_id: 2,
+                revision: AtomicU64::new(0),
+                payload: RwLock::new(payload.clone()),
+            });
+            let framed = frame_join_records(&[record]).unwrap();
+            assert_eq!(&framed[..2], &[1, 0]);
+            assert_eq!(framed[2], u8::from(padding != 0));
+            if padding == 0 {
+                assert_eq!(&framed[3..7], &(payload.len() as i32).to_le_bytes());
+                assert_eq!(&framed[7..], payload);
+            }
+            let mut reader = NetReader::new(&framed);
+            let batch = ServerReadyBatchMessage::deserialize(&mut reader).unwrap();
+            assert_eq!(reader.remaining(), 0);
+            assert_eq!(batch.count, 1);
+            assert_eq!(batch.payload, payload);
+            let mut records = NetReader::new(&batch.payload);
+            assert_eq!(records.get_u16().unwrap(), 2);
+            let decoded = ReadyMessage::deserialize(&mut records).unwrap();
+            assert_eq!(
+                decoded.player_meta_data_message,
+                ready.player_meta_data_message
+            );
+            assert_eq!(
+                decoded.local_avatar_sync_message,
+                ready.local_avatar_sync_message
+            );
+            assert_eq!(records.remaining(), 0);
         }
     }
 

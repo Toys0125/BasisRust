@@ -5586,8 +5586,10 @@ mod tests {
 
     #[test]
     fn connection_payload_propagates_oversized_login_password() {
-        let mut config = Config::default();
-        config.password = "p".repeat(65536);
+        let config = Config {
+            password: "p".repeat(65536),
+            ..Config::default()
+        };
         let ready = ReadyMessage::new(&config, [0.0; 3]).unwrap();
         let error = build_connection_payload(&config, &ready).unwrap_err();
         assert_eq!(
