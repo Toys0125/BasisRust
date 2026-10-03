@@ -1,4 +1,4 @@
-use crate::io::{NetReader, NetWriter, Result as ReadResult};
+use crate::io::{NetReader, NetWriter, Result as ReadResult, WriteResult};
 
 pub const SERVER_INFO_QUERY_MAGIC: u32 = 0xBA51_5101;
 pub const SERVER_INFO_RESPONSE_MAGIC: u32 = 0xBA51_5102;
@@ -17,16 +17,16 @@ pub struct ServerInfoResponse {
 }
 
 impl ServerInfoResponse {
-    pub fn serialize(&self) -> Vec<u8> {
+    pub fn serialize(&self) -> WriteResult<Vec<u8>> {
         let mut writer = NetWriter::new();
         writer.put_u32(SERVER_INFO_RESPONSE_MAGIC);
         writer.put_u16(SERVER_INFO_PROTOCOL_VERSION);
         writer.put_u16(self.nonce);
         writer.put_u16(self.online);
         writer.put_u16(self.max);
-        writer.put_string(trim_to_bytes(&self.name, SERVER_INFO_NAME_MAX_LENGTH));
-        writer.put_string(trim_to_bytes(&self.motd, SERVER_INFO_MOTD_MAX_LENGTH));
-        writer.into_vec()
+        writer.put_string(trim_to_bytes(&self.name, SERVER_INFO_NAME_MAX_LENGTH))?;
+        writer.put_string(trim_to_bytes(&self.motd, SERVER_INFO_MOTD_MAX_LENGTH))?;
+        Ok(writer.into_vec())
     }
 
     pub fn deserialize(bytes: &[u8]) -> ReadResult<Self> {
@@ -84,7 +84,7 @@ mod tests {
             max: 42,
             nonce: 0xBEEF,
         };
-        let bytes = response.serialize();
+        let bytes = response.serialize().unwrap();
         assert_eq!(&bytes[0..4], &SERVER_INFO_RESPONSE_MAGIC.to_le_bytes());
         assert_eq!(&bytes[4..6], &SERVER_INFO_PROTOCOL_VERSION.to_le_bytes());
         assert_eq!(&bytes[6..8], &0xBEEFu16.to_le_bytes());

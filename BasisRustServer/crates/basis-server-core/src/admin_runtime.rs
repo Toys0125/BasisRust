@@ -170,7 +170,7 @@ async fn send_permission_metadata(state: &ServerState, peer: PeerId) -> Result<(
         image_pickup_range_meters: config.image_pickup_range_meters.max(0.0),
     };
     let mut writer = NetWriter::new();
-    message.serialize(&mut writer);
+    message.serialize(&mut writer)?;
     state
         .transport
         .send(
@@ -235,17 +235,14 @@ pub(super) async fn send_join_state(state: &ServerState, peer: PeerId) -> Result
 
 fn policy_payload(policy: &LocomotionPolicy) -> Vec<u8> {
     let mut writer = NetWriter::new();
-    AdminRequest {
-        mode: AdminRequestMode::GlobalGetLocomotionPolicy,
-    }
-    .serialize(&mut writer);
+    writer.put_u8(AdminRequestMode::GlobalGetLocomotionPolicy as u8);
     policy.serialize(&mut writer);
     writer.into_vec()
 }
 
 fn mode_payload(mode: AdminRequestMode, target: PeerId, initiator: PeerId) -> Vec<u8> {
     let mut writer = NetWriter::new();
-    AdminRequest { mode }.serialize(&mut writer);
+    writer.put_u8(mode as u8);
     writer.put_u16(target);
     writer.put_u16(initiator);
     writer.into_vec()
@@ -471,7 +468,7 @@ async fn send_mute_to_target(state: &ServerState, uuid: &str) -> Result<()> {
         AdminRequest {
             mode: AdminRequestMode::MuteStateApply,
         }
-        .serialize(&mut writer);
+        .serialize(&mut writer)?;
         writer.put_bool(voice);
         writer.put_bool(text);
         send_admin_payload_to_peer(state, target, writer.into_vec()).await?;
@@ -485,8 +482,8 @@ async fn send_mute_result(state: &ServerState, peer: PeerId, uuid: &str) -> Resu
     AdminRequest {
         mode: AdminRequestMode::MuteStateResult,
     }
-    .serialize(&mut writer);
-    writer.put_string(uuid);
+    .serialize(&mut writer)?;
+    writer.put_string(uuid)?;
     writer.put_bool(voice);
     writer.put_bool(text);
     send_admin_payload_to_peer(state, peer, writer.into_vec()).await
@@ -524,10 +521,10 @@ async fn handle_query(state: &ServerState, peer: PeerId, reader: &mut NetReader<
     AdminRequest {
         mode: AdminRequestMode::QueryPermissionResult,
     }
-    .serialize(&mut writer);
+    .serialize(&mut writer)?;
     writer.put_u16(target);
     writer.put_u8(kind);
-    writer.put_string(if valid { &value } else { "" });
+    writer.put_string(if valid { &value } else { "" })?;
     writer.put_bool(held);
     writer.put_bool(found);
     send_admin_payload_to_peer(state, peer, writer.into_vec()).await
@@ -575,15 +572,15 @@ async fn handle_rename(
             state
                 .join_broadcast
                 .lock()
-                .update_peer_ready(target, target_peer.ready.clone());
+                .update_peer_ready(target, target_peer.ready.clone())?;
         }
         let mut writer = NetWriter::new();
         AdminRequest {
             mode: AdminRequestMode::RenamePlayer,
         }
-        .serialize(&mut writer);
+        .serialize(&mut writer)?;
         writer.put_u16(target);
-        writer.put_string(&name);
+        writer.put_string(&name)?;
         writer.put_u16(peer);
         broadcast_admin_payload(state, writer.into_vec()).await;
         send_admin_text(
@@ -773,7 +770,7 @@ mod tests {
         payload: impl FnOnce(&mut NetWriter),
     ) {
         let mut writer = NetWriter::new();
-        AdminRequest { mode }.serialize(&mut writer);
+        AdminRequest { mode }.serialize(&mut writer).unwrap();
         payload(&mut writer);
         handle_admin_message(state, peer, writer.as_slice())
             .await
@@ -888,14 +885,14 @@ mod tests {
         request(&state, 1, AdminRequestMode::GlobalToggleGifs, |_| {}).await;
         assert!(!state.global_state.read().gifs_locked);
         request(&state, 1, AdminRequestMode::SetVoiceMute, |w| {
-            w.put_string("staff");
+            w.put_string("staff").unwrap();
             w.put_bool(true);
         })
         .await;
         assert_eq!(state.moderation.mute_state("staff"), (false, false));
         request(&state, 1, AdminRequestMode::RenamePlayer, |w| {
             w.put_u16(2);
-            w.put_string("Unauthorized");
+            w.put_string("Unauthorized").unwrap();
         })
         .await;
         assert_eq!(
@@ -909,26 +906,26 @@ mod tests {
         );
         for mode in [AdminRequestMode::Ban, AdminRequestMode::IpAndBan] {
             request(&state, 2, mode, |w| {
-                w.put_string("protected");
-                w.put_string("reason");
+                w.put_string("protected").unwrap();
+                w.put_string("reason").unwrap();
             })
             .await;
             assert!(!state.moderation.is_uuid_banned("protected"));
         }
         request(&state, 2, AdminRequestMode::Ban, |w| {
-            w.put_string("absent");
-            w.put_string("reason");
+            w.put_string("absent").unwrap();
+            w.put_string("reason").unwrap();
         })
         .await;
         assert!(!state.moderation.is_uuid_banned("absent"));
         request(&state, 2, AdminRequestMode::Ban, |w| {
-            w.put_string("ordinary");
-            w.put_string("");
+            w.put_string("ordinary").unwrap();
+            w.put_string("").unwrap();
         })
         .await;
         assert!(!state.moderation.is_uuid_banned("ordinary"));
         request(&state, 2, AdminRequestMode::SetTextMute, |w| {
-            w.put_string("protected");
+            w.put_string("protected").unwrap();
             w.put_bool(true);
         })
         .await;
@@ -948,25 +945,25 @@ mod tests {
         add_peer(&state, 2, "target");
         state.permissions.add_user_to_group("staff", "moderator");
         request(&state, 1, AdminRequestMode::SetVoiceMute, |w| {
-            w.put_string("target");
+            w.put_string("target").unwrap();
             w.put_bool(true);
         })
         .await;
         request(&state, 1, AdminRequestMode::SetTextMute, |w| {
-            w.put_string("target");
+            w.put_string("target").unwrap();
             w.put_bool(true);
         })
         .await;
         assert!(is_voice_muted(&state, 2) && is_text_muted(&state, 2));
         request(&state, 1, AdminRequestMode::SetVoiceMute, |w| {
-            w.put_string("target");
+            w.put_string("target").unwrap();
             w.put_bool(false);
         })
         .await;
         assert!(!is_voice_muted(&state, 2) && is_text_muted(&state, 2));
         request(&state, 1, AdminRequestMode::RenamePlayer, |w| {
             w.put_u16(2);
-            w.put_string("  Updated\u{200b}  ");
+            w.put_string("  Updated\u{200b}  ").unwrap();
         })
         .await;
         let target = state.authenticated_peers.get(&2).unwrap().clone();
@@ -1080,11 +1077,11 @@ mod tests {
         add_peer(&state, 1, "admin");
         state.permissions.add_user_to_group("admin", "admin");
         request(&state, 1, AdminRequestMode::SetServerName, |w| {
-            w.put_string("Existing server")
+            w.put_string("Existing server").unwrap()
         })
         .await;
         request(&state, 1, AdminRequestMode::SetServerMotd, |w| {
-            w.put_string("Existing MOTD")
+            w.put_string("Existing MOTD").unwrap()
         })
         .await;
         let config_path = dir.join("config/config.xml");
@@ -1094,7 +1091,7 @@ mod tests {
             AdminRequestMode::SetServerMotd,
         ] {
             let mut malformed = NetWriter::new();
-            AdminRequest { mode }.serialize(&mut malformed);
+            AdminRequest { mode }.serialize(&mut malformed).unwrap();
             malformed.put_u16(50); // Advertised string bytes never arrive.
             assert!(handle_admin_message(&state, 1, malformed.as_slice())
                 .await
@@ -1105,7 +1102,7 @@ mod tests {
         }
         // An explicitly supplied empty value remains a valid, deliberate edit.
         request(&state, 1, AdminRequestMode::SetServerMotd, |w| {
-            w.put_string("")
+            w.put_string("").unwrap()
         })
         .await;
         assert!(ServerConfig::load_or_create(&config_path)
@@ -1145,7 +1142,7 @@ mod tests {
         state.permissions.add_user_to_group("admin", "admin");
         for i in 0..2 {
             request(&state, 1, AdminRequestMode::RemoveDefaultLibraryItem, |w| {
-                w.put_string(&library.entries[i].url);
+                w.put_string(&library.entries[i].url).unwrap();
             })
             .await;
             assert_eq!(
@@ -1182,12 +1179,12 @@ mod tests {
         request(&state, 1, AdminRequestMode::GlobalToggleGifs, |_| {}).await;
         request(&state, 1, AdminRequestMode::AddDefaultLibraryItem, |w| {
             w.put_u8(1);
-            w.put_string("https://example/world#c2VjcmV0");
-            w.put_string("");
+            w.put_string("https://example/world#c2VjcmV0").unwrap();
+            w.put_string("").unwrap();
         })
         .await;
         request(&state, 1, AdminRequestMode::SetVoiceMute, |w| {
-            w.put_string("offline");
+            w.put_string("offline").unwrap();
             w.put_bool(true);
         })
         .await;
@@ -1203,8 +1200,8 @@ mod tests {
         // Reject an oversized broadcast before changing the files or live library.
         request(&state, 1, AdminRequestMode::AddDefaultLibraryItem, |w| {
             w.put_u8(1);
-            w.put_string(&"x".repeat(60_000));
-            w.put_string(&"p".repeat(10_000));
+            w.put_string(&"x".repeat(60_000)).unwrap();
+            w.put_string(&"p".repeat(10_000)).unwrap();
         })
         .await;
         assert_eq!(state.admin_runtime.library.read().entries.len(), 1);
@@ -1222,7 +1219,7 @@ mod tests {
             (true, false)
         );
         request(&state, 1, AdminRequestMode::RemoveDefaultLibraryItem, |w| {
-            w.put_string("https://example/world")
+            w.put_string("https://example/world").unwrap()
         })
         .await;
         assert!(DefaultLibrary::load_xml_dir(&dir.join("defaultlibrary"))

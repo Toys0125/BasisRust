@@ -10,6 +10,14 @@ pub enum NetReadError {
 
 pub type Result<T> = std::result::Result<T, NetReadError>;
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum NetWriteError {
+    #[error("length-prefixed payload has {length} bytes, maximum is {max}")]
+    LengthOverflow { length: usize, max: usize },
+}
+
+pub type WriteResult<T> = std::result::Result<T, NetWriteError>;
+
 #[derive(Debug, Clone, Default)]
 pub struct NetWriter {
     data: Vec<u8>,
@@ -86,25 +94,40 @@ impl NetWriter {
         self.data.extend_from_slice(value);
     }
 
-    pub fn put_string(&mut self, value: &str) {
+    /// Writes LiteNetLib's UTF-8 byte length plus one (without a terminator byte).
+    /// Empty strings use a zero prefix. An oversized value leaves the writer unchanged.
+    pub fn put_string(&mut self, value: &str) -> WriteResult<()> {
         if value.is_empty() {
             self.put_u16(0);
-            return;
+            return Ok(());
         }
         let bytes = value.as_bytes();
-        self.put_u16((bytes.len() + 1) as u16);
+        let length = u16::try_from(bytes.len())
+            .ok()
+            .and_then(|length| length.checked_add(1))
+            .ok_or(NetWriteError::LengthOverflow {
+                length: bytes.len(),
+                max: usize::from(u16::MAX) - 1,
+            })?;
+        self.put_u16(length);
         self.put_bytes(bytes);
+        Ok(())
     }
 
-    pub fn put_raw_len_string(&mut self, value: &str) {
-        let bytes = value.as_bytes();
-        self.put_u16(bytes.len() as u16);
-        self.put_bytes(bytes);
+    /// Writes a UTF-8 byte length and payload, leaving the writer unchanged on overflow.
+    pub fn put_raw_len_string(&mut self, value: &str) -> WriteResult<()> {
+        self.put_bytes_with_length(value.as_bytes())
     }
 
-    pub fn put_bytes_with_length(&mut self, value: &[u8]) {
-        self.put_u16(value.len() as u16);
+    /// Writes a byte length and payload, leaving the writer unchanged on overflow.
+    pub fn put_bytes_with_length(&mut self, value: &[u8]) -> WriteResult<()> {
+        let length = u16::try_from(value.len()).map_err(|_| NetWriteError::LengthOverflow {
+            length: value.len(),
+            max: usize::from(u16::MAX),
+        })?;
+        self.put_u16(length);
         self.put_bytes(value);
+        Ok(())
     }
 
     pub fn into_vec(self) -> Vec<u8> {
@@ -258,14 +281,130 @@ mod tests {
     #[test]
     fn basis_strings_use_len_plus_one() {
         let mut writer = NetWriter::new();
-        writer.put_string("");
-        writer.put_string("abc");
+        writer.put_string("").unwrap();
+        writer.put_string("abc").unwrap();
         let bytes = writer.into_vec();
         assert_eq!(&bytes, &[0, 0, 4, 0, b'a', b'b', b'c']);
 
         let mut reader = NetReader::new(&bytes);
         assert_eq!(reader.get_string().unwrap(), "");
         assert_eq!(reader.get_string().unwrap(), "abc");
+    }
+
+    #[test]
+    fn length_prefixed_writes_match_pinned_csharp_golden_vectors() {
+        // Generated with the verbatim LiteNetLib NetDataWriter/FastBitConverter at
+        // BasisVR 81f190b217c11c2b39231e0bc9db330fd4a2803c, using .NET 8.
+        // C# null and empty strings/buffers both produce a zero prefix; Rust uses empty slices.
+        let mut strings = NetWriter::new();
+        for value in ["", "", "abc", "Aé😀\0"] {
+            strings.put_string(value).unwrap();
+        }
+        assert_eq!(
+            strings.as_slice(),
+            &[
+                0, 0, 0, 0, 4, 0, 0x61, 0x62, 0x63, 9, 0, 0x41, 0xc3, 0xa9, 0xf0, 0x9f, 0x98, 0x80,
+                0,
+            ]
+        );
+
+        let mut bytes = NetWriter::new();
+        for value in [&[][..], &[][..], &[0, 1, 0xff][..]] {
+            bytes.put_bytes_with_length(value).unwrap();
+        }
+        assert_eq!(bytes.as_slice(), &[0, 0, 0, 0, 3, 0, 0, 1, 0xff]);
+
+        let mut raw = NetWriter::new();
+        raw.put_raw_len_string("").unwrap();
+        raw.put_raw_len_string("Aé😀\0").unwrap();
+        assert_eq!(
+            raw.as_slice(),
+            &[0, 0, 8, 0, 0x41, 0xc3, 0xa9, 0xf0, 0x9f, 0x98, 0x80, 0,]
+        );
+    }
+
+    #[test]
+    fn string_byte_length_boundary_preserves_writer_on_overflow() {
+        let max = usize::from(u16::MAX) - 1;
+        // Both ASCII and multi-byte UTF-8 must be measured in bytes, not characters.
+        for valid in ["a".repeat(max), "é".repeat(max / 2)] {
+            let mut writer = NetWriter::new();
+            writer.put_string(&valid).unwrap();
+            assert_eq!(&writer.as_slice()[..2], &[0xff, 0xff]);
+            assert_eq!(&writer.as_slice()[2..], valid.as_bytes());
+            assert_eq!(
+                NetReader::new(writer.as_slice()).get_string().unwrap(),
+                valid
+            );
+
+            let before = writer.as_slice().to_vec();
+            let invalid = valid + "a";
+            assert_eq!(
+                writer.put_string(&invalid),
+                Err(NetWriteError::LengthOverflow {
+                    length: max + 1,
+                    max
+                })
+            );
+            assert_eq!(writer.as_slice(), before);
+            writer.put_string("ok").unwrap();
+            assert_eq!(&writer.as_slice()[before.len()..], &[3, 0, b'o', b'k']);
+        }
+    }
+
+    #[test]
+    fn raw_string_byte_length_boundary_preserves_writer_on_overflow() {
+        let max = usize::from(u16::MAX);
+        for valid in ["a".repeat(max), "é".repeat(max / 2) + "a"] {
+            let mut writer = NetWriter::new();
+            writer.put_raw_len_string(&valid).unwrap();
+            assert_eq!(&writer.as_slice()[..2], &[0xff, 0xff]);
+            assert_eq!(&writer.as_slice()[2..], valid.as_bytes());
+            assert_eq!(
+                NetReader::new(writer.as_slice())
+                    .get_raw_len_string()
+                    .unwrap(),
+                valid
+            );
+
+            let before = writer.as_slice().to_vec();
+            let invalid = valid + "a";
+            assert_eq!(
+                writer.put_raw_len_string(&invalid),
+                Err(NetWriteError::LengthOverflow {
+                    length: max + 1,
+                    max
+                })
+            );
+            assert_eq!(writer.as_slice(), before);
+        }
+    }
+
+    #[test]
+    fn byte_buffer_length_boundary_preserves_writer_on_overflow() {
+        let max = usize::from(u16::MAX);
+        let mut value = vec![0xa5; max];
+        let mut writer = NetWriter::new();
+        writer.put_bytes_with_length(&value).unwrap();
+        assert_eq!(&writer.as_slice()[..2], &[0xff, 0xff]);
+        assert_eq!(&writer.as_slice()[2..], value);
+        assert_eq!(
+            NetReader::new(writer.as_slice())
+                .get_bytes_with_length()
+                .unwrap(),
+            value
+        );
+
+        let before = writer.as_slice().to_vec();
+        value.push(0xa5);
+        assert_eq!(
+            writer.put_bytes_with_length(&value),
+            Err(NetWriteError::LengthOverflow {
+                length: max + 1,
+                max
+            })
+        );
+        assert_eq!(writer.as_slice(), before);
     }
 
     #[test]
