@@ -171,7 +171,7 @@ async fn poisoned_reliable_state_deactivates_without_ack_or_repeat_panic() {
 }
 
 #[tokio::test]
-async fn poisoned_metadata_is_discarded_and_can_be_refreshed() {
+async fn poisoned_metadata_deactivates_and_replacement_can_refresh() {
     let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let client = tests::test_client(1, server.local_addr().unwrap()).await;
     client
@@ -182,16 +182,26 @@ async fn poisoned_metadata_is_discarded_and_can_be_refreshed() {
     assert!(!client.server_avatar_metadata.is_poisoned());
     assert!(!client.shared_receive_eligible.load(Ordering::Relaxed));
     assert!(client.force_avatar_keyframe.load(Ordering::Relaxed));
-    *client.metadata_state() = Some(ServerAvatarMetadata {
+    assert!(!client.connected.load(Ordering::Acquire));
+    assert!(!client.in_use.load(Ordering::Acquire));
+    let replacement = tests::test_client(1, server.local_addr().unwrap()).await;
+    *replacement.metadata_state() = Some(ServerAvatarMetadata {
         sync_interval_ms: 20,
         base_multiplier: 1.0,
         increase_rate: 1.0,
         slowest_send_rate_secs: 5.0,
         uplink_delta_enabled: true,
     });
-    client.refresh_shared_receive_eligibility();
-    assert!(client.metadata_state().is_some());
-    assert!(client.shared_receive_eligible.load(Ordering::Acquire));
+    replacement.refresh_shared_receive_eligibility();
+    assert!(replacement.metadata_state().is_some());
+    assert!(replacement.shared_receive_eligible.load(Ordering::Acquire));
+    let metadata = replacement.metadata_state().unwrap();
+    assert!(replacement
+        .pose
+        .lock()
+        .await
+        .write_unity_avatar_datagram(1.0, 0.0, metadata, true, 0.0)
+        .is_some());
 }
 
 #[test]
@@ -252,7 +262,7 @@ async fn observer_failover_survives_reconnect_without_mixing_cadence_gaps() {
 
 #[test]
 fn observer_ambiguous_half_range_and_complete_wrap_require_full_resync() {
-    for next in [10u8, 11, 138, 150] {
+    for next in [10u8, 138, 150] {
         let mut observer = AvatarObserver::new(40.0, 1, None, Duration::from_secs(60));
         let start = std::time::Instant::now();
         let baseline = vec![0; ProtocolBitQuality::High.payload_len()];
@@ -445,4 +455,91 @@ async fn observer_candidates_are_bounded_and_reconnect_uses_same_session() {
         assert_eq!(client.connection_number, 0);
         client.deactivate();
     }
+}
+
+#[test]
+fn observer_handoff_segments_nearby_peers_for_different_positions() {
+    let mut observer = AvatarObserver::new(40.0, 1, None, Duration::from_secs(60));
+    let start = std::time::Instant::now();
+    let baseline = vec![0; ProtocolBitQuality::High.payload_len()];
+    for sequence in [1, 2] {
+        let (channel, full) = tests::observer_full_frame(7, sequence, &baseline);
+        observer.observe_channel(
+            channel,
+            &full,
+            [0.0; 3],
+            start + Duration::from_millis(sequence as u64 * 100),
+        );
+    }
+    observer.mark_discontinuity(start + Duration::from_millis(300));
+    let (channel, full) = tests::observer_full_frame(7, 3, &baseline);
+    observer.observe_channel(
+        channel,
+        &full,
+        [1000.0, 0.0, 0.0],
+        start + Duration::from_millis(400),
+    );
+    let (summary, csv) = observer.summary_and_csv(start + Duration::from_millis(500));
+    assert!(
+        summary.contains("near_peers=0 expected=1 missing=1"),
+        "{summary}"
+    );
+    assert_eq!(observer.peers[&7].near_update_count, 0);
+    assert!(!observer.peers[&7].was_near);
+    assert!(observer.peers[&7].near_gaps_micros.is_empty());
+    assert!(csv.contains("near_metrics_scope,current_segment"));
+    assert!(csv.contains("near_segment,1"));
+    assert!(csv.contains("completed_observer_segment,peer_id,updates"));
+    assert!(csv.contains("0,7,2,100.00,100.00,100,false"), "{csv}");
+}
+
+#[test]
+fn observer_applies_every_five_second_idle_full_heartbeat() {
+    let mut observer = AvatarObserver::new(40.0, 1, None, Duration::from_secs(60));
+    let start = std::time::Instant::now();
+    let baseline = vec![0; ProtocolBitQuality::High.payload_len()];
+    for sequence in 1..=5 {
+        let (channel, full) = tests::observer_full_frame(7, sequence, &baseline);
+        observer.observe_channel(
+            channel,
+            &full,
+            [0.0; 3],
+            start + Duration::from_secs((sequence - 1) as u64 * 5),
+        );
+    }
+    assert_eq!(observer.applied_full_items, 5);
+    assert_eq!(observer.sequence_resyncs, 0);
+    assert_eq!(observer.discontinuities, 0);
+    assert_eq!(observer.sequence_order_unknown_gaps, 4);
+    assert_eq!(observer.peers[&7].near_gaps_micros, vec![5_000_000; 4]);
+    assert!(observer
+        .summary_and_csv(start + Duration::from_secs(20))
+        .1
+        .contains("sequence_order_unknown_gaps,4"));
+}
+
+#[test]
+fn full_frame_after_long_gap_invalidates_other_quality_delta_baselines() {
+    let mut observer = AvatarObserver::new(40.0, 1, None, Duration::from_secs(60));
+    let start = std::time::Instant::now();
+    let low = vec![0; ProtocolBitQuality::VeryLow.payload_len()];
+    let mut full = vec![7, 0, 1];
+    full.extend_from_slice(&low);
+    observer.observe_channel(channels::PLAYER_AVATAR_VERY_LOW, &full, [0.0; 3], start);
+    assert!(observer.peers[&7].baselines[0].is_some());
+    let high = vec![0; ProtocolBitQuality::High.payload_len()];
+    let (channel, full) = tests::observer_full_frame(7, 2, &high);
+    observer.observe_channel(channel, &full, [0.0; 3], start + Duration::from_secs(5));
+    assert!(observer.peers[&7].baselines[0].is_none());
+    let mut delta = vec![0, 7, 0, 3, 1];
+    delta.extend_from_slice(&build_delta(&low, &low, ProtocolBitQuality::VeryLow).unwrap());
+    observer.observe_channel(
+        channels::DELTA_AVATAR,
+        &delta,
+        [0.0; 3],
+        start + Duration::from_millis(5100),
+    );
+    assert_eq!(observer.unapplied_deltas, 1);
+    assert_eq!(observer.applied_delta_items, 0);
+    assert_eq!(observer.peers[&7].last_sequence, Some(2));
 }

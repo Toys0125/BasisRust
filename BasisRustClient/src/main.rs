@@ -1354,6 +1354,9 @@ struct AvatarObserver {
     discontinuities: u64,
     sequence_ambiguities: u64,
     sequence_resyncs: u64,
+    sequence_order_unknown_gaps: u64,
+    completed_near_segments: Vec<String>,
+    near_segment_started_at: Option<std::time::Instant>,
     start_marker_path: Option<PathBuf>,
     window_duration: Duration,
     window_started_at: Option<std::time::Instant>,
@@ -1389,6 +1392,9 @@ impl AvatarObserver {
             discontinuities: 0,
             sequence_ambiguities: 0,
             sequence_resyncs: 0,
+            sequence_order_unknown_gaps: 0,
+            completed_near_segments: Vec::new(),
+            near_segment_started_at: None,
             start_marker_path,
             window_duration,
             window_started_at: None,
@@ -1401,6 +1407,18 @@ impl AvatarObserver {
             .is_some_and(|start| now.saturating_duration_since(start) <= self.window_duration);
         if tracking {
             self.discontinuities = self.discontinuities.saturating_add(1);
+            let segment = self.completed_near_segments.len();
+            let mut rows = String::new();
+            for (peer_id, peer) in &self.peers {
+                if peer.was_near {
+                    rows.push_str(&format!(
+                        "{segment},{}",
+                        observer_peer_csv(*peer_id, peer, now)
+                    ));
+                }
+            }
+            self.completed_near_segments.push(rows);
+            self.near_segment_started_at = Some(now);
         }
         for peer in self.peers.values_mut() {
             peer.baselines = Default::default();
@@ -1408,6 +1426,9 @@ impl AvatarObserver {
             peer.sequence_tracker = ObserverSequence::default();
             if tracking {
                 peer.last_near_update = None;
+                peer.near_update_count = 0;
+                peer.near_gaps_micros.clear();
+                peer.was_near = false;
             }
             peer.last_position = None;
         }
@@ -1427,6 +1448,17 @@ impl AvatarObserver {
             .consider(sequence, state.last_sequence, full, now)
         {
             SequenceDecision::Apply => true,
+            SequenceDecision::ApplyAfterGap => {
+                // An advancing full frame is independently decodable. Keep its arrival
+                // cadence, but discard other-quality baselines that may alias after a wrap.
+                state.baselines = Default::default();
+                if tracking {
+                    self.sequence_order_unknown_gaps =
+                        self.sequence_order_unknown_gaps.saturating_add(1);
+                }
+                debug!(peer_id, "avatar observer retained advancing full frame after long gap; byte sequence ordering across gap unknown");
+                true
+            }
             SequenceDecision::Resynced => {
                 if tracking {
                     self.sequence_resyncs = self.sequence_resyncs.saturating_add(1);
@@ -1462,6 +1494,8 @@ impl AvatarObserver {
 
     fn begin_window(&mut self, observer_position: [f32; 3], now: std::time::Instant) {
         self.window_started_at = Some(now);
+        self.near_segment_started_at = Some(now);
+        self.completed_near_segments.clear();
         self.decode_errors = 0;
         self.unapplied_deltas = 0;
         self.accepted_avatar_items = 0;
@@ -1474,6 +1508,7 @@ impl AvatarObserver {
         self.discontinuities = 0;
         self.sequence_ambiguities = 0;
         self.sequence_resyncs = 0;
+        self.sequence_order_unknown_gaps = 0;
         self.observed_channels.clear();
         for peer in self.peers.values_mut() {
             peer.near_gaps_micros.clear();
@@ -1693,6 +1728,10 @@ impl AvatarObserver {
             .window_started_at
             .map(|start| report_time.saturating_duration_since(start).as_millis())
             .unwrap_or(0);
+        let near_segment_ms = self
+            .near_segment_started_at
+            .map(|start| report_time.saturating_duration_since(start).as_millis())
+            .unwrap_or(0);
         let near = self
             .peers
             .iter()
@@ -1714,7 +1753,7 @@ impl AvatarObserver {
             .count();
         let missing = self.expected_near_peers.saturating_sub(near.len());
         let summary = format!(
-            "avatar observer: window_started={} window_ms={} near_peers={} expected={} missing={} stale_500ms={} applied_gaps={} p50_ms={:.2} p95_ms={:.2} applied_full={} applied_delta={} malformed={} decode_errors={} unapplied_deltas={} non_newer_sequences={} ignored_channels={} discontinuities={} sequence_ambiguities={} sequence_resyncs={}",
+            "avatar observer: window_started={} window_ms={} near_peers={} expected={} missing={} stale_500ms={} applied_gaps={} p50_ms={:.2} p95_ms={:.2} applied_full={} applied_delta={} malformed={} decode_errors={} unapplied_deltas={} non_newer_sequences={} ignored_channels={} discontinuities={} sequence_ambiguities={} sequence_resyncs={} near_segment={} near_segment_ms={} sequence_order_unknown_gaps={}",
             self.window_started_at.is_some(),
             observed_ms,
             near.len(),
@@ -1734,6 +1773,9 @@ impl AvatarObserver {
             self.discontinuities,
             self.sequence_ambiguities,
             self.sequence_resyncs,
+            self.completed_near_segments.len(),
+            near_segment_ms,
+            self.sequence_order_unknown_gaps,
         );
         let mut csv = String::from("metric,value\n");
         let summary_values = format!(
@@ -1789,6 +1831,15 @@ impl AvatarObserver {
             "discontinuities,{}\nsequence_ambiguities,{}\nsequence_resyncs,{}\n",
             self.discontinuities, self.sequence_ambiguities, self.sequence_resyncs
         ));
+        csv.push_str(&format!(
+            "near_metrics_scope,current_segment\nnear_segment,{}\nnear_segment_ms,{}\n",
+            self.completed_near_segments.len(),
+            near_segment_ms
+        ));
+        csv.push_str(&format!(
+            "sequence_order_unknown_gaps,{}\n",
+            self.sequence_order_unknown_gaps
+        ));
         csv.push_str("observed_channel,packets\n");
         let mut observed_channels = self.observed_channels.iter().collect::<Vec<_>>();
         observed_channels.sort_unstable_by_key(|(channel, _)| **channel);
@@ -1797,23 +1848,36 @@ impl AvatarObserver {
         }
         csv.push_str("peer_id,updates,p50_gap_ms,p95_gap_ms,last_near_age_ms,stale_500ms\n");
         for (peer_id, peer) in near {
-            let last_age = peer
-                .last_near_update
-                .map(|last| report_time.saturating_duration_since(last).as_millis())
-                .unwrap_or(u128::MAX);
-            let peer_p50 = avatar_gap_percentile(&mut peer.near_gaps_micros.clone(), 0.50);
-            let peer_p95 = avatar_gap_percentile(&mut peer.near_gaps_micros.clone(), 0.95);
-            let peer_stale = last_age > Self::STALE_AFTER.as_millis();
-            csv.push_str(&format!(
-                "{peer_id},{},{:.2},{:.2},{last_age},{}\n",
-                peer.near_update_count,
-                peer_p50 as f64 / 1000.0,
-                peer_p95 as f64 / 1000.0,
-                peer_stale,
-            ));
+            csv.push_str(&observer_peer_csv(*peer_id, peer, report_time));
+        }
+        if !self.completed_near_segments.is_empty() {
+            csv.push_str("completed_observer_segment,peer_id,updates,p50_gap_ms,p95_gap_ms,last_near_age_ms,stale_500ms\n");
+            for rows in &self.completed_near_segments {
+                csv.push_str(rows);
+            }
         }
         (summary, csv)
     }
+}
+
+fn observer_peer_csv(
+    peer_id: u16,
+    peer: &ObservedAvatarPeer,
+    report_time: std::time::Instant,
+) -> String {
+    let last_age = peer
+        .last_near_update
+        .map(|last| report_time.saturating_duration_since(last).as_millis())
+        .unwrap_or(u128::MAX);
+    let p50 = avatar_gap_percentile(&mut peer.near_gaps_micros.clone(), 0.50);
+    let p95 = avatar_gap_percentile(&mut peer.near_gaps_micros.clone(), 0.95);
+    format!(
+        "{peer_id},{},{:.2},{:.2},{last_age},{}\n",
+        peer.near_update_count,
+        p50 as f64 / 1000.0,
+        p95 as f64 / 1000.0,
+        last_age > AvatarObserver::STALE_AFTER.as_millis()
+    )
 }
 
 fn record_observer_near_update(
@@ -2483,6 +2547,11 @@ impl BasisClient {
             }
         };
         trace!("client {} received {:?}", self.index, packet.property);
+        if self.connected.load(Ordering::Acquire) && self.in_use.load(Ordering::Acquire) {
+            if let Some(session) = &self.avatar_observer {
+                session.note_packet((self.index, self.connect_time), std::time::Instant::now());
+            }
+        }
         match packet.property {
             PacketProperty::ConnectAccept
                 if bytes.len() == 15
@@ -2662,17 +2731,15 @@ impl BasisClient {
         }
         let observer_position = self.pose.lock().await.position();
         if let Some(mut state) = session.lock() {
+            let now = std::time::Instant::now();
             // Check after locking: a deactivated/replaced client must not reclaim ownership.
             if self.connected.load(Ordering::Acquire)
                 && self.in_use.load(Ordering::Acquire)
-                && session.claim(&mut state, (self.index, self.connect_time))
+                && session.claim(&mut state, (self.index, self.connect_time), now)
             {
-                state.observer.observe_channel(
-                    channel,
-                    payload,
-                    observer_position,
-                    std::time::Instant::now(),
-                );
+                state
+                    .observer
+                    .observe_channel(channel, payload, observer_position, now);
             }
         }
     }
@@ -2688,8 +2755,11 @@ impl BasisClient {
                 self.force_avatar_keyframe.store(true, Ordering::Release);
                 warn!(
                     client = self.index,
-                    "server metadata mutex poisoned; discarded metadata, awaiting refresh"
+                    "server metadata mutex poisoned; discarded metadata, deactivating for reconnect"
                 );
+                // Metadata is sent during startup, not periodically. A fresh connection
+                // must obtain it again rather than leaving Unity avatar generation stalled.
+                self.deactivate();
                 state
             }
         }
