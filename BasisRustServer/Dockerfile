@@ -45,7 +45,8 @@ ARG ARTIFACT_DIR=
 
 RUN set -eux; \
     mkdir -p /out; \
-    if [ -n "${ARTIFACT_DIR}" ] && [ -x "/src/${ARTIFACT_DIR}/basis-server-console" ]; then \
+    if [ -n "${ARTIFACT_DIR}" ]; then \
+        test -x "/src/${ARTIFACT_DIR}/basis-server-console"; \
         echo "Staging prebuilt server binary from ${ARTIFACT_DIR}"; \
         cp "/src/${ARTIFACT_DIR}/basis-server-console" /out/basis-server-console; \
     else \
@@ -57,13 +58,15 @@ RUN set -eux; \
     # The runtime base has no glibc at all, so a dynamically linked binary would fail at
     # exec with no useful message. Fail here instead. readelf is the authoritative check:
     # musl's own ldd prints a loader path even for a static-pie binary.
-    if readelf -l /out/basis-server-console 2>/dev/null | grep -q INTERP; then \
+    readelf -l /out/basis-server-console > /tmp/server-program-headers; \
+    readelf -d /out/basis-server-console > /tmp/server-dynamic-section; \
+    if grep -q INTERP /tmp/server-program-headers; then \
         echo "::error::staged binary is dynamically linked; the alpine runtime needs a static musl build"; \
         exit 1; \
     fi; \
-    if readelf -d /out/basis-server-console 2>/dev/null | grep -q NEEDED; then \
+    if grep -q NEEDED /tmp/server-dynamic-section; then \
         echo "::error::staged binary has shared library dependencies:"; \
-        readelf -d /out/basis-server-console | grep NEEDED; \
+        grep NEEDED /tmp/server-dynamic-section; \
         exit 1; \
     fi; \
     echo "Static check passed: no PT_INTERP, no DT_NEEDED"

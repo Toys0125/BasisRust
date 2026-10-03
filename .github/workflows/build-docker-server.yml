@@ -107,14 +107,12 @@ jobs:
             fi
           done
 
-          # Prereleases must never become "latest". `inputs.latest` is an empty string
-          # on a release event, which is why this is normalised here instead of being
-          # compared inline in an expression.
-          promote_latest=true
-          if [ "$prerelease" = "true" ]; then
-            promote_latest=false
+          # A caller's latest=true must never override the prerelease restriction.
+          promote_latest=false
+          if [ "$prerelease" != "true" ]; then
+            promote_latest=true
           fi
-          if [ -n "$INPUT_LATEST" ]; then
+          if [ "$prerelease" != "true" ] && [ -n "$INPUT_LATEST" ]; then
             promote_latest="$INPUT_LATEST"
           fi
 
@@ -129,7 +127,7 @@ jobs:
           echo "version_tag=$version_tag bare_tag=$bare_tag prerelease=$prerelease promote_latest=$promote_latest"
 
   build:
-    name: Build & push ${{ matrix.arch_suffix }} image
+    name: Build & validate ${{ matrix.arch_suffix }} image
     needs: resolve
     env:
       IMAGE_NAME: ${{ needs.resolve.outputs.image_name }}
@@ -152,7 +150,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Verify the release has the expected asset
         env:
@@ -183,10 +181,10 @@ jobs:
           file BasisRustServer/.docker-artifacts/basis-server-console
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -194,24 +192,22 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ needs.resolve.outputs.version_tag }}-${{ matrix.arch_suffix }}
-            type=raw,value=${{ needs.resolve.outputs.bare_tag }}-${{ matrix.arch_suffix }}
-            type=raw,value=latest-${{ matrix.arch_suffix }},enable=${{ needs.resolve.outputs.promote_latest == 'true' }}
-            type=sha,prefix=,suffix=-${{ matrix.arch_suffix }}
+            type=raw,value=${{ needs.resolve.outputs.version_tag }}
 
-      - name: Build and push ${{ matrix.docker_platform }} image
-        uses: docker/build-push-action@v6
+      # Upload only by digest. Public version/latest tags are assigned after BOTH
+      # native architecture smoke tests pass in this matrix.
+      - name: Build and push untagged ${{ matrix.docker_platform }} image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         id: build
         with:
           context: ./BasisRustServer
           # Native runner, so a single platform and no QEMU.
           platforms: ${{ matrix.docker_platform }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=server-${{ matrix.arch_suffix }}
           cache-to: type=gha,mode=max,scope=server-${{ matrix.arch_suffix }}
@@ -221,69 +217,14 @@ jobs:
             VCS_REF=${{ github.sha }}
             BUILD_DATE=${{ github.event.release.published_at || '' }}
 
-      - name: Record image digest
+      - name: Smoke test on the native runner
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: echo "Pushed ${{ matrix.docker_platform }} digest ${DIGEST}"
-
-  manifest:
-    name: Publish multi-arch manifest
-    needs: [resolve, build]
-    env:
-      IMAGE_NAME: ${{ needs.resolve.outputs.image_name }}
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=${{ needs.resolve.outputs.version_tag }}
-            type=raw,value=${{ needs.resolve.outputs.bare_tag }}
-            type=raw,value=latest,enable=${{ needs.resolve.outputs.promote_latest == 'true' }}
-            type=sha,prefix=
-
-      - name: Create multi-arch manifest
         shell: bash
         run: |
           set -euo pipefail
-          while IFS= read -r tag; do
-            [ -n "$tag" ] || continue
-            echo "Creating $tag from amd64 + arm64"
-            docker buildx imagetools create \
-              --tag "$tag" \
-              "${tag}-amd64" \
-              "${tag}-arm64"
-          done <<< "${{ steps.meta.outputs.tags }}"
-
-      # Catches the failure mode that matters most here: an image that builds and pushes
-      # cleanly but whose runtime base does not satisfy the binary's glibc floor. That
-      # shows up as a dynamic-loader error on every start rather than as a build failure,
-      # so nothing upstream would otherwise catch it. Uses the image's own HEALTHCHECK
-      # instead of a published port, which also validates the HEALTHCHECK instruction and
-      # does not depend on host port-forwarding behaviour.
-      - name: Smoke test the published image
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="${REGISTRY}/${IMAGE_NAME}:${{ needs.resolve.outputs.version_tag }}"
-          echo "Pulling $image"
-          docker pull --platform linux/amd64 "$image"
-
+          image="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          docker pull --platform "${{ matrix.docker_platform }}" "$image"
           cid="$(docker create "$image")"
           trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
           docker start "$cid" >/dev/null
@@ -293,10 +234,9 @@ jobs:
             health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$cid")"
             case "$health" in
               healthy)
-                echo "Container reported healthy after ${attempt}s"
+                docker exec "$cid" sh -c 'test "$(id -u)" = 10001'
                 docker exec "$cid" curl -fsS http://127.0.0.1:10666/health
                 echo ""
-                echo "--- container logs ---"
                 docker logs "$cid" 2>&1 | tail -n 20
                 exit 0
                 ;;
@@ -317,6 +257,82 @@ jobs:
           echo "::error::Container never reported healthy"
           docker logs "$cid" 2>&1 | tail -n 50
           exit 1
+
+      - name: Record validated image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p digests
+          printf '%s' "$DIGEST" > "digests/${{ matrix.arch_suffix }}"
+
+      - name: Upload validated digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: server-digest-${{ matrix.arch_suffix }}
+          path: digests/${{ matrix.arch_suffix }}
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: Publish multi-arch manifest
+    needs: [resolve, build]
+    env:
+      IMAGE_NAME: ${{ needs.resolve.outputs.image_name }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download validated digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: server-digest-*
+          path: digests
+          merge-multiple: true
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.resolve.outputs.version_tag }}
+            type=raw,value=${{ needs.resolve.outputs.bare_tag }}
+            type=raw,value=latest,enable=${{ needs.resolve.outputs.promote_latest == 'true' }}
+            type=sha,prefix=
+
+      - name: Create multi-arch manifest
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${IMAGE_NAME}"
+          amd64="$(cat digests/amd64)"
+          arm64="$(cat digests/arm64)"
+          for digest in "$amd64" "$arm64"; do
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+          done
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "Creating $tag from amd64 + arm64"
+            docker buildx imagetools create \
+              --tag "$tag" \
+              "$image@$amd64" \
+              "$image@$arm64"
+            docker buildx imagetools create --prefer-index=false --tag "${tag}-amd64" "$image@$amd64"
+            docker buildx imagetools create --prefer-index=false --tag "${tag}-arm64" "$image@$arm64"
+          done <<< "$TAGS"
 
       - name: Summarise published tags
         run: |

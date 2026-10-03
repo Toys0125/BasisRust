@@ -79,7 +79,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install musl toolchain
-        if: matrix.musl == 'true'
+        if: matrix.musl == true
         # musl-tools supplies the arch-correct musl-gcc on both runners
         # (x86_64-linux-musl-gcc / aarch64-linux-musl-gcc). Rust finds it automatically, so
         # no linker override is needed. The target's std/core component is installed by the
@@ -101,7 +101,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} --manifest-path BasisRustServer/Cargo.toml -p basis-server-console
 
       - name: Build client
-        if: matrix.server_only != 'true'
+        if: matrix.server_only != true
         run: cargo build --release --target ${{ matrix.target }} --manifest-path BasisRustClient/Cargo.toml
 
       - name: Stage package
