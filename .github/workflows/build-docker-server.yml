@@ -18,9 +18,18 @@ name: Docker; Build & Push Server Image
 # The image definition itself lives in BasisRustServer/Dockerfile.
 
 on:
-  release:
-    types:
-      - published
+  # release.yml calls this only after uploading the release assets.
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to publish
+        required: true
+        type: string
+      latest:
+        description: Also move the "latest" tag to this image
+        required: false
+        default: true
+        type: boolean
   workflow_dispatch:
     inputs:
       tag:
@@ -49,6 +58,7 @@ jobs:
     name: Resolve release
     runs-on: ubuntu-24.04
     outputs:
+      image_name: ${{ steps.release.outputs.image_name }}
       tag: ${{ steps.release.outputs.tag }}
       version_tag: ${{ steps.release.outputs.version_tag }}
       bare_tag: ${{ steps.release.outputs.bare_tag }}
@@ -64,6 +74,9 @@ jobs:
           INPUT_LATEST: ${{ inputs.latest }}
         run: |
           set -euo pipefail
+
+          # Registry repository names must be lowercase, including the owner.
+          echo "image_name=$(tr '[:upper:]' '[:lower:]' <<<"$IMAGE_NAME")" >> "$GITHUB_OUTPUT"
 
           tag="${INPUT_TAG:-${EVENT_TAG:-}}"
           if [ -z "$tag" ]; then
@@ -118,6 +131,8 @@ jobs:
   build:
     name: Build & push ${{ matrix.arch_suffix }} image
     needs: resolve
+    env:
+      IMAGE_NAME: ${{ needs.resolve.outputs.image_name }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -156,16 +171,16 @@ jobs:
           ASSET: ${{ matrix.asset }}
         run: |
           set -euo pipefail
-          mkdir -p download unpacked .docker-artifacts
+          mkdir -p download unpacked BasisRustServer/.docker-artifacts
           gh release download "$RELEASE_TAG" --pattern "$ASSET" --dir download --clobber
           # build.yml stages the release archive as ./server/basis-server-console, but the
           # Dockerfile expects the binary directly inside ARTIFACT_DIR. Copying the
           # directory contents explicitly keeps this working regardless of how the local
           # tar treats --strip-components.
           tar -xzf "download/$ASSET" -C unpacked
-          cp -a unpacked/server/. .docker-artifacts/
-          test -x .docker-artifacts/basis-server-console
-          file .docker-artifacts/basis-server-console
+          cp -a unpacked/server/. BasisRustServer/.docker-artifacts/
+          test -x BasisRustServer/.docker-artifacts/basis-server-console
+          file BasisRustServer/.docker-artifacts/basis-server-console
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -214,6 +229,8 @@ jobs:
   manifest:
     name: Publish multi-arch manifest
     needs: [resolve, build]
+    env:
+      IMAGE_NAME: ${{ needs.resolve.outputs.image_name }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
