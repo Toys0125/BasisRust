@@ -123,3 +123,11 @@ two-second portable-runner smoke completed with the documented binary/CLI paths
 and all documented artifacts present; observer and server diagnostic CSVs had
 rows. This is a command/output smoke check, not a performance measurement or
 historical reproduction. Raw smoke outputs remain ignored under `captures/`.
+
+PR review follow-up: excluded the tracked top-level server `Config.xml` from the
+Docker build context as well, so operator edits to that sample cannot enter the
+builder through `COPY . .`. The server binary does not need this file to build;
+operators provide runtime config through the documented mount or environment.
+The first GPU CI run failed in the unchanged baseline memory-reclaim sweep test
+(15 of 16 workers before its deadline); required formatting/server/client jobs
+passed. This deployment patch does not alter that scheduler or test.
