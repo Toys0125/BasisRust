@@ -10,6 +10,19 @@ permissions:
   contents: read
 
 jobs:
+  storage-windows:
+    name: Storage persistence (Windows)
+    runs-on: windows-latest
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Test atomic database replacement and failure recovery
+        run: cargo test --locked --manifest-path BasisRustServer/Cargo.toml -p basis-server-storage
+
   format:
     name: Rust format
     runs-on: ubuntu-24.04
