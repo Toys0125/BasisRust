@@ -595,6 +595,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn net_id_namespace_exhausts_gracefully_and_preserves_live_names_until_reset() {
+        let state = NetIdState::default();
+        for id in 0..=u16::MAX {
+            assert_eq!(
+                state.add_or_find_for_peer(&format!("name-{id}"), 1, 65536),
+                Some((id, false))
+            );
+        }
+        assert_eq!(state.add_or_find_for_peer("overflow", 2, 1), None);
+        assert_eq!(
+            state.add_or_find_for_peer("name-65535", 2, 0),
+            Some((u16::MAX, true))
+        );
+        state.remove_peer(1);
+        assert_eq!(state.find("name-0"), Some(0));
+        assert_eq!(state.add_or_find_for_peer("still-overflow", 2, 1), None);
+        state.reset();
+        assert_eq!(state.find("name-0"), None);
+        assert_eq!(
+            state.add_or_find_for_peer("new-session", 2, 1),
+            Some((0, false))
+        );
+        assert_eq!(state.add_or_find_for_peer("peer-quota", 2, 1), None);
+    }
+
+    #[test]
     fn ownership_removes_player_owned_objects() {
         let state = OwnershipState::default();
         state.switch_ownership("a", 7);
