@@ -278,11 +278,12 @@ mod tests {
         let path = directory.path().join("database.json");
         fs::write(&path, b"[]").unwrap();
         let ready = std::sync::Barrier::new(2);
-        std::thread::scope(|scope| {
+        let outcomes = std::thread::scope(|scope| {
+            let mut saves = Vec::new();
             for name in ["first", "second"] {
                 let path = &path;
                 let ready = &ready;
-                scope.spawn(move || {
+                saves.push(scope.spawn(move || {
                     let bytes = serde_json::to_vec_pretty(&vec![value(name, json!(name))]).unwrap();
                     atomic_write_with(
                         path,
@@ -294,10 +295,27 @@ mod tests {
                         },
                         sync_directory,
                     )
-                    .unwrap();
-                });
+                }));
             }
+            saves
+                .into_iter()
+                .map(|save| save.join().unwrap())
+                .collect::<Vec<_>>()
         });
+        assert!(outcomes.iter().any(Result::is_ok));
+        for outcome in outcomes {
+            #[cfg(windows)]
+            if let Err(error) = outcome {
+                // Concurrent Windows replacements may return ACCESS_DENIED or
+                // SHARING_VIOLATION. Propagate these instead of deleting/retrying
+                // the target; a successful save must still leave complete JSON.
+                assert!(error.to_string().contains("replacing database"));
+                let code = error.downcast_ref::<io::Error>().unwrap().raw_os_error();
+                assert!(matches!(code, Some(5 | 32)), "{error:#}");
+            }
+            #[cfg(not(windows))]
+            outcome.unwrap();
+        }
         let entries: Vec<BasisData> = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(entries.len(), 1);
         assert!(["first", "second"].contains(&entries[0].name.as_str()));
