@@ -270,6 +270,7 @@ dependencies = [
  "basis-protocol",
  "parking_lot",
  "serde",
+ "serde_json",
  "time",
  "tokio",
  "tracing",

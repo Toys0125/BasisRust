@@ -246,6 +246,8 @@ pub struct TransportStatsSnapshot {
     pub raw_bytes_received: u64,
     pub raw_bytes_sent: u64,
     pub raw_send_would_block: u64,
+    /// Non-reliable datagrams discarded after a nonblocking send returned WouldBlock.
+    pub non_reliable_dropped_datagrams: u64,
     pub reliable_window_fills: u64,
     pub reliable_retransmits: u64,
     pub reliable_dispatch_passes: u64,
@@ -254,6 +256,16 @@ pub struct TransportStatsSnapshot {
     pub reliable_acks_released: u64,
     pub reliable_acks_unknown_channel: u64,
     pub reliable_window_stalls: u64,
+}
+
+/// Instantaneous totals over currently connected transport peers. Payload/fragment counts
+/// and datagram counts have different units and may overlap; do not sum them as a backlog.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransportDepthSnapshot {
+    pub peers: usize,
+    pub reliable_pending: usize,
+    pub reliable_queued: usize,
+    pub pending_datagrams: usize,
 }
 
 #[derive(Debug)]
@@ -265,6 +277,7 @@ struct TransportStats {
     raw_bytes_received: AtomicU64,
     raw_bytes_sent: AtomicU64,
     raw_send_would_block: AtomicU64,
+    non_reliable_dropped_datagrams: AtomicU64,
     /// Reliable messages promoted from the outgoing queue into the send window, and
     /// retransmissions emitted, so reliable throughput can be verified from the outside.
     reliable_window_fills: AtomicU64,
@@ -292,6 +305,7 @@ impl TransportStats {
             raw_bytes_received: AtomicU64::new(0),
             raw_bytes_sent: AtomicU64::new(0),
             raw_send_would_block: AtomicU64::new(0),
+            non_reliable_dropped_datagrams: AtomicU64::new(0),
             reliable_window_fills: AtomicU64::new(0),
             reliable_retransmits: AtomicU64::new(0),
             reliable_dispatch_passes: AtomicU64::new(0),
@@ -309,6 +323,8 @@ impl TransportStats {
         self.raw_bytes_received.store(0, Ordering::Relaxed);
         self.raw_bytes_sent.store(0, Ordering::Relaxed);
         self.raw_send_would_block.store(0, Ordering::Relaxed);
+        self.non_reliable_dropped_datagrams
+            .store(0, Ordering::Relaxed);
     }
 
     fn reset_extended(&self) {
@@ -606,6 +622,19 @@ impl TransportHandle {
         self.peers.iter().map(|peer| peer.total_queued()).sum()
     }
 
+    /// Samples actual Rust queues, taking one queue lock at a time. Concurrent sends/ACKs
+    /// can change them during sampling, so this is not an atomic cross-queue snapshot.
+    pub fn depths_snapshot(&self) -> TransportDepthSnapshot {
+        let mut snapshot = TransportDepthSnapshot::default();
+        for peer in self.peers.iter() {
+            snapshot.peers += 1;
+            snapshot.reliable_pending += peer.total_pending();
+            snapshot.reliable_queued += peer.total_queued();
+            snapshot.pending_datagrams += peer.pending_datagrams.lock().len();
+        }
+        snapshot
+    }
+
     pub fn set_statistics_enabled(&self, enabled: bool) {
         let was_enabled = self.stats.enabled.load(Ordering::Relaxed);
         if enabled && !was_enabled {
@@ -661,6 +690,13 @@ impl TransportHandle {
             },
             raw_send_would_block: if statistics_enabled {
                 self.stats.raw_send_would_block.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            non_reliable_dropped_datagrams: if statistics_enabled {
+                self.stats
+                    .non_reliable_dropped_datagrams
+                    .load(Ordering::Relaxed)
             } else {
                 0
             },
@@ -750,6 +786,18 @@ impl TransportHandle {
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// These callers discard a refused datagram. Reliable/ACK/MTU callers use
+    /// try_send_raw_to directly and must not be counted as non-reliable drops.
+    fn try_send_non_reliable_raw_to(&self, bytes: &[u8], addr: SocketAddr) -> Result<bool> {
+        let sent = self.try_send_raw_to(bytes, addr)?;
+        if !sent && self.statistics_enabled() {
+            self.stats
+                .non_reliable_dropped_datagrams
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(sent)
     }
 
     pub fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
@@ -932,7 +980,7 @@ impl TransportHandle {
 
         let mut sent = 0usize;
         for packet in build_merged_datagrams(state.connection_number, outbound) {
-            if self.try_send_raw_to(&packet, state.addr)? {
+            if self.try_send_non_reliable_raw_to(&packet, state.addr)? {
                 sent += 1;
             }
         }
@@ -965,7 +1013,9 @@ impl TransportHandle {
             packet.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
             packet.push(packets[0].channel());
             extend_payload_with_patch(&mut packet, payload, packets[0].interval_patch());
-            return self.try_send_raw_to(&packet, state.addr).map(usize::from);
+            return self
+                .try_send_non_reliable_raw_to(&packet, state.addr)
+                .map(usize::from);
         }
 
         let mut sent = 0usize;
@@ -979,7 +1029,7 @@ impl TransportHandle {
             let packet_len = payload.len() + 2;
             let framed_len = packet_len + 2;
             if current_count > 0 && current.len() + framed_len > mtu {
-                if self.try_send_raw_to(&current, state.addr)? {
+                if self.try_send_non_reliable_raw_to(&current, state.addr)? {
                     sent += 1;
                 }
                 current.clear();
@@ -992,7 +1042,7 @@ impl TransportHandle {
                 oversized.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
                 oversized.push(packet.channel());
                 extend_payload_with_patch(&mut oversized, payload, packet.interval_patch());
-                if self.try_send_raw_to(&oversized, state.addr)? {
+                if self.try_send_non_reliable_raw_to(&oversized, state.addr)? {
                     sent += 1;
                 }
                 continue;
@@ -1005,7 +1055,7 @@ impl TransportHandle {
             current_count += 1;
         }
 
-        if current_count > 0 && self.try_send_raw_to(&current, state.addr)? {
+        if current_count > 0 && self.try_send_non_reliable_raw_to(&current, state.addr)? {
             sent += 1;
         }
         Ok(sent)
@@ -4178,6 +4228,132 @@ mod tests {
             confirmed_mtu: AtomicUsize::new(MAX_MERGED_PACKET_SIZE),
             mtu_probe: parking_lot::Mutex::new(MtuProbeState::new(Instant::now())),
         })
+    }
+
+    #[tokio::test]
+    async fn transport_depths_track_actual_queues_and_disconnection() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        // Keep this queue-assembly test independent of the background dispatch timing.
+        handle.shutdown();
+        assert_eq!(handle.depths_snapshot(), TransportDepthSnapshot::default());
+        let peer = test_peer_state(0);
+        handle.peers.insert(peer.id, peer.clone());
+        enqueue_reliable_payload(&peer, channels::CHAT, DeliveryMethod::ReliableOrdered, &[1]);
+        let built =
+            build_outbound_packet(&peer, channels::CHAT, DeliveryMethod::ReliableOrdered, &[2]);
+        let (channel_id, sequence) = built.reliable_key.unwrap();
+        record_pending_reliable(&peer, channel_id, sequence, built.bytes.clone(), None);
+        peer.pending_datagrams.lock().push_back(built.bytes);
+        assert_eq!(
+            handle.depths_snapshot(),
+            TransportDepthSnapshot {
+                peers: 1,
+                reliable_pending: 1,
+                reliable_queued: 1,
+                pending_datagrams: 1,
+            }
+        );
+
+        handle.disconnect(peer.id, "test").await.unwrap();
+        // A retained Arc to old peer queues must not count as a live transport depth.
+        assert_eq!(peer.total_pending(), 1);
+        assert_eq!(handle.depths_snapshot(), TransportDepthSnapshot::default());
+    }
+
+    #[tokio::test]
+    async fn non_reliable_drop_counter_excludes_retries_and_respects_statistics_toggle() {
+        let (handle, _events) =
+            TransportHandle::bind_with_statistics_options(loopback_addr(0), true, false)
+                .await
+                .unwrap();
+        handle.shutdown();
+        let peer = test_peer_state(0);
+        handle.peers.insert(peer.id, peer.clone());
+        handle.test_blocked_send_addrs.write().insert(peer.addr);
+
+        // Retained reliable/ACK datagrams and MTU probes use this raw path.
+        assert!(!handle.try_send_raw_to(&[1], peer.addr).unwrap());
+        assert_eq!(handle.stats_snapshot().raw_send_would_block, 1);
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 0);
+
+        let single = [(channels::AVATAR, Bytes::from_static(&[1]))];
+        assert_eq!(
+            handle
+                .try_send_many_unreliable_bytes(peer.id, &single)
+                .unwrap(),
+            0
+        );
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 1);
+
+        let merged = [single[0].clone(), single[0].clone()];
+        assert_eq!(
+            handle
+                .try_send_many_unreliable_bytes(peer.id, &merged)
+                .unwrap(),
+            0
+        );
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 2);
+
+        // Exercise the flush, oversized, and trailing-merged branches (three datagrams).
+        let split = [
+            single[0].clone(),
+            (channels::AVATAR, Bytes::from(vec![1; 1300])),
+            single[0].clone(),
+        ];
+        assert_eq!(
+            handle
+                .try_send_many_unreliable_bytes(peer.id, &split)
+                .unwrap(),
+            0
+        );
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 5);
+
+        let mixed = [
+            (
+                channels::AVATAR,
+                DeliveryMethod::Unreliable,
+                Bytes::from_static(&[1]),
+            ),
+            (
+                channels::AVATAR,
+                DeliveryMethod::Sequenced,
+                Bytes::from_static(&[2]),
+            ),
+            (
+                channels::CHAT,
+                DeliveryMethod::ReliableOrdered,
+                Bytes::from_static(&[3]),
+            ),
+        ];
+        assert_eq!(handle.try_send_many_bytes(peer.id, &mixed).unwrap(), 0);
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 6);
+        assert_eq!(handle.queued_reliable_count(), 1);
+        assert_eq!(handle.stats_snapshot().raw_send_would_block, 7);
+
+        handle.set_statistics_enabled(false);
+        handle
+            .try_send_many_unreliable_bytes(peer.id, &single)
+            .unwrap();
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 0);
+        assert_eq!(
+            handle
+                .stats
+                .non_reliable_dropped_datagrams
+                .load(Ordering::Relaxed),
+            6
+        );
+        handle.set_statistics_enabled(true);
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 0);
+        handle
+            .try_send_many_unreliable_bytes(peer.id, &single)
+            .unwrap();
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 1);
+
+        handle.disconnect(peer.id, "test").await.unwrap();
+        handle
+            .try_send_many_unreliable_bytes(peer.id, &single)
+            .unwrap();
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 1);
     }
 
     #[test]
