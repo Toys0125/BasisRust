@@ -21,6 +21,95 @@ pub struct HealthStatistics {
     pub dropped_voice: u64,
     pub queue_per_peer: usize,
     pub voice_queue_per_peer: usize,
+    pub transport: RustTransportMetrics,
+}
+
+/// Counts over transport peers (including peers awaiting application authentication).
+/// Reliable counts are payloads/fragments; pending_datagrams includes reliable/ACK
+/// datagrams retained for socket retry and can overlap reliable_pending.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RustTransportMetrics {
+    pub peers: usize,
+    pub reliable_pending: usize,
+    pub reliable_queued: Option<usize>,
+    pub pending_datagrams: Option<usize>,
+    pub udp_send_would_block: u64,
+    pub non_reliable_dropped_datagrams: u64,
+}
+
+impl Default for RustTransportMetrics {
+    fn default() -> Self {
+        Self {
+            peers: 0,
+            reliable_pending: 0,
+            reliable_queued: Some(0),
+            pending_datagrams: Some(0),
+            udp_send_would_block: 0,
+            non_reliable_dropped_datagrams: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MetricAvailability {
+    Measured,
+    Partial,
+    Mapped,
+    Unsupported,
+    Disabled,
+}
+
+/// Additive metadata distinguishes compatibility placeholders from measured zeroes.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatisticsCapabilities {
+    pub enabled: bool,
+    pub sent: MetricAvailability,
+    pub recv: MetricAvailability,
+    pub packets_sent: MetricAvailability,
+    pub packets_recv: MetricAvailability,
+    pub dropped_unreliable: MetricAvailability,
+    pub dropped_voice: MetricAvailability,
+    pub queue_per_peer: MetricAvailability,
+    pub voice_queue_per_peer: MetricAvailability,
+    pub transport: MetricAvailability,
+}
+
+impl StatisticsCapabilities {
+    fn new(statistics: Option<HealthStatistics>) -> Self {
+        let enabled = statistics.is_some();
+        let measured = if enabled {
+            MetricAvailability::Measured
+        } else {
+            MetricAvailability::Disabled
+        };
+        Self {
+            enabled,
+            sent: measured,
+            recv: measured,
+            packets_sent: measured,
+            packets_recv: measured,
+            dropped_unreliable: if enabled {
+                MetricAvailability::Mapped
+            } else {
+                MetricAvailability::Disabled
+            },
+            dropped_voice: MetricAvailability::Unsupported,
+            queue_per_peer: MetricAvailability::Unsupported,
+            voice_queue_per_peer: MetricAvailability::Unsupported,
+            transport: match statistics {
+                Some(stats)
+                    if stats.transport.reliable_queued.is_none()
+                        || stats.transport.pending_datagrams.is_none() =>
+                {
+                    MetricAvailability::Partial
+                }
+                _ => measured,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -275,6 +364,10 @@ pub struct HealthResponse {
     pub queue_per_peer: Option<usize>,
     #[serde(rename = "voiceQueuePerPeer", skip_serializing_if = "Option::is_none")]
     pub voice_queue_per_peer: Option<usize>,
+    #[serde(rename = "statisticsCapabilities")]
+    pub statistics_capabilities: StatisticsCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<RustTransportMetrics>,
     pub gc: GcMetrics,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bsr: Option<BsrHealthMetrics>,
@@ -344,6 +437,8 @@ fn build_health_response(state: &HealthRuntimeState) -> HealthResponse {
         dropped_voice: statistics.map(|stats| stats.dropped_voice),
         queue_per_peer: statistics.map(|stats| stats.queue_per_peer),
         voice_queue_per_peer: statistics.map(|stats| stats.voice_queue_per_peer),
+        statistics_capabilities: StatisticsCapabilities::new(statistics),
+        transport: statistics.map(|stats| stats.transport),
         gc: GcMetrics::default(),
         bsr,
         extended,
@@ -386,9 +481,17 @@ mod tests {
                         packets_sent: 3,
                         packets_recv: 4,
                         dropped_unreliable: 5,
-                        dropped_voice: 6,
-                        queue_per_peer: 7,
-                        voice_queue_per_peer: 8,
+                        dropped_voice: 0,
+                        queue_per_peer: 0,
+                        voice_queue_per_peer: 0,
+                        transport: RustTransportMetrics {
+                            peers: 8,
+                            reliable_pending: 9,
+                            reliable_queued: Some(10),
+                            pending_datagrams: Some(11),
+                            udp_send_would_block: 5,
+                            non_reliable_dropped_datagrams: 2,
+                        },
                     }),
                     extended_metrics: Arc::new(move || {
                         calls.fetch_add(1, Ordering::Relaxed);
@@ -442,8 +545,118 @@ mod tests {
         assert_eq!(response.packets_sent, Some(3));
         assert_eq!(response.packets_recv, Some(4));
         assert_eq!(response.dropped_unreliable, Some(5));
-        assert_eq!(response.dropped_voice, Some(6));
-        assert_eq!(response.queue_per_peer, Some(7));
-        assert_eq!(response.voice_queue_per_peer, Some(8));
+        assert_eq!(response.dropped_voice, Some(0));
+        assert_eq!(response.queue_per_peer, Some(0));
+        assert_eq!(response.voice_queue_per_peer, Some(0));
+
+        let json = serde_json::to_value(response).unwrap();
+        for name in ["droppedVoice", "queuePerPeer", "voiceQueuePerPeer"] {
+            assert!(json[name].is_u64(), "legacy {name} must remain an integer");
+            assert_eq!(json["statisticsCapabilities"][name], "unsupported");
+        }
+        assert_eq!(json["statisticsCapabilities"]["enabled"], true);
+        assert_eq!(json["statisticsCapabilities"]["sent"], "measured");
+        assert_eq!(
+            json["statisticsCapabilities"]["droppedUnreliable"],
+            "mapped"
+        );
+        assert_eq!(json["transport"]["peers"], 8);
+        assert_eq!(json["transport"]["reliablePending"], 9);
+        assert_eq!(json["transport"]["reliableQueued"], 10);
+        assert_eq!(json["transport"]["pendingDatagrams"], 11);
+        assert_eq!(json["transport"]["udpSendWouldBlock"], 5);
+        assert_eq!(json["transport"]["nonReliableDroppedDatagrams"], 2);
+    }
+
+    #[test]
+    fn disconnected_zeroes_are_measured_only_for_supported_metrics() {
+        let (mut state, _) = state_with_config(ServerConfig::default());
+        state.state.player_count = Arc::new(|| 0);
+        state.state.statistics = Arc::new(HealthStatistics::default);
+        let json = serde_json::to_value(build_health_response(&state)).unwrap();
+
+        assert_eq!(json["visitors"], 0);
+        assert_eq!(json["sent"], 0);
+        assert_eq!(json["statisticsCapabilities"]["sent"], "measured");
+        assert_eq!(json["transport"]["peers"], 0);
+        assert_eq!(json["transport"]["reliablePending"], 0);
+        assert_eq!(json["transport"]["reliableQueued"], 0);
+        assert_eq!(json["transport"]["pendingDatagrams"], 0);
+        assert_eq!(json["transport"]["nonReliableDroppedDatagrams"], 0);
+        assert_eq!(json["statisticsCapabilities"]["transport"], "measured");
+        assert_eq!(
+            json["statisticsCapabilities"]["droppedVoice"],
+            "unsupported"
+        );
+    }
+
+    #[test]
+    fn contended_depths_are_null_and_transport_availability_is_partial() {
+        let (mut state, _) = state_with_config(ServerConfig::default());
+        for (queued, datagrams) in [(None, Some(2)), (Some(3), None), (None, None)] {
+            state.state.statistics = Arc::new(move || HealthStatistics {
+                transport: RustTransportMetrics {
+                    peers: 1,
+                    reliable_pending: 4,
+                    reliable_queued: queued,
+                    pending_datagrams: datagrams,
+                    ..RustTransportMetrics::default()
+                },
+                ..HealthStatistics::default()
+            });
+            let json = serde_json::to_value(build_health_response(&state)).unwrap();
+            assert_eq!(json["statisticsCapabilities"]["transport"], "partial");
+            assert_eq!(json["transport"]["peers"], 1);
+            assert_eq!(json["transport"]["reliablePending"], 4);
+            assert_eq!(
+                json["transport"]["reliableQueued"],
+                serde_json::to_value(queued).unwrap()
+            );
+            assert_eq!(
+                json["transport"]["pendingDatagrams"],
+                serde_json::to_value(datagrams).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_statistics_are_omitted_and_not_sampled_even_with_extended_enabled() {
+        let config = ServerConfig {
+            enable_statistics: false,
+            health_include_extended_metrics: true,
+            ..ServerConfig::default()
+        };
+        let (mut state, calls) = state_with_config(config);
+        state.state.statistics = Arc::new(|| panic!("disabled statistics must not be sampled"));
+        let json = serde_json::to_value(build_health_response(&state)).unwrap();
+
+        for name in [
+            "visitors",
+            "capacity",
+            "sent",
+            "recv",
+            "packetsSent",
+            "packetsRecv",
+            "droppedUnreliable",
+            "droppedVoice",
+            "queuePerPeer",
+            "voiceQueuePerPeer",
+            "transport",
+        ] {
+            assert!(json.get(name).is_none(), "disabled {name} must be absent");
+        }
+        assert_eq!(json["statisticsCapabilities"]["enabled"], false);
+        assert_eq!(json["statisticsCapabilities"]["sent"], "disabled");
+        assert_eq!(
+            json["statisticsCapabilities"]["droppedUnreliable"],
+            "disabled"
+        );
+        assert_eq!(json["statisticsCapabilities"]["transport"], "disabled");
+        for name in ["droppedVoice", "queuePerPeer", "voiceQueuePerPeer"] {
+            assert_eq!(json["statisticsCapabilities"][name], "unsupported");
+        }
+        assert!(json.get("gc").is_some());
+        assert!(json.get("extended").is_some());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }

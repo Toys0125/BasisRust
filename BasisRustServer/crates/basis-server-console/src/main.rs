@@ -12,7 +12,7 @@ use basis_server_health::{
     format_system_time, start_health_server, AppMessageMetrics, AvatarSyncMetrics,
     AvatarTimingMetrics, BsrBundleMetrics, BsrHealthMetrics, BsrLoadMetrics, BsrMsPerTickMetrics,
     BsrWindowMetrics, BsrZstdMetrics, ExtendedHealthMetrics, HealthState, HealthStatistics,
-    RawUdpMetrics, ReliableMetrics,
+    RawUdpMetrics, ReliableMetrics, RustTransportMetrics,
 };
 use clap::Parser;
 use crossterm::{
@@ -824,6 +824,7 @@ async fn async_main(
             let server = server.clone();
             move || {
                 let transport = server.transport.stats_snapshot();
+                let depths = server.transport.depths_snapshot();
                 HealthStatistics {
                     sent: transport.raw_bytes_sent,
                     recv: transport.raw_bytes_received,
@@ -833,6 +834,14 @@ async fn async_main(
                     dropped_voice: 0,
                     queue_per_peer: 0,
                     voice_queue_per_peer: 0,
+                    transport: RustTransportMetrics {
+                        peers: depths.peers,
+                        reliable_pending: depths.reliable_pending,
+                        reliable_queued: depths.reliable_queued,
+                        pending_datagrams: depths.pending_datagrams,
+                        udp_send_would_block: transport.raw_send_would_block,
+                        non_reliable_dropped_datagrams: transport.non_reliable_dropped_datagrams,
+                    },
                 }
             }
         }),
