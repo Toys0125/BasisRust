@@ -1,6 +1,7 @@
 //! Ingress budgets apply before parsing/copying requests or generating replies.
 use std::{
     collections::HashMap,
+    hash::{BuildHasher, RandomState},
     net::IpAddr,
     time::{Duration, Instant},
 };
@@ -8,6 +9,9 @@ use std::{
 pub(crate) const MAX_PENDING_REQUESTS: usize = 4096;
 pub(crate) const REQUEST_TTL: Duration = Duration::from_secs(10);
 const MAX_IPS: usize = 4096;
+// Untracked addresses share bounded token buckets once the exact-IP table fills.
+// Sharing can only make a bucket stricter; it cannot grant fresh per-IP budgets.
+const OVERFLOW_BUCKETS: usize = 256;
 const IP_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
@@ -31,6 +35,7 @@ impl Kind {
     }
 }
 
+#[derive(Clone)]
 struct Entry {
     tokens: [f64; 3],
     updated: [Instant; 3],
@@ -39,6 +44,8 @@ struct Entry {
 
 pub(crate) struct Limiter {
     entries: HashMap<IpAddr, Entry>,
+    overflow: Vec<Option<Entry>>,
+    overflow_hash: RandomState,
     last_cleanup: Instant,
     global_tokens: [f64; 3],
     global_updated: [Instant; 3],
@@ -49,6 +56,8 @@ impl Default for Limiter {
         let now = Instant::now();
         Self {
             entries: HashMap::new(),
+            overflow: (0..OVERFLOW_BUCKETS).map(|_| None).collect(),
+            overflow_hash: RandomState::new(),
             last_cleanup: now,
             global_tokens: [4096.0, 200.0, 256.0],
             global_updated: [now; 3],
@@ -61,8 +70,20 @@ impl Limiter {
         if now.duration_since(self.last_cleanup) >= Duration::from_secs(1) {
             self.entries
                 .retain(|_, entry| now.duration_since(entry.last_allowed) < IP_TTL);
+            for entry in &mut self.overflow {
+                if entry
+                    .as_ref()
+                    .is_some_and(|entry| now.duration_since(entry.last_allowed) >= IP_TTL)
+                {
+                    *entry = None;
+                }
+            }
             self.last_cleanup = now;
         }
+    }
+
+    fn overflow_bucket(&self, ip: IpAddr) -> usize {
+        self.overflow_hash.hash_one(ip) as usize % OVERFLOW_BUCKETS
     }
 
     pub(crate) fn allow(&mut self, ip: IpAddr, kind: Kind, now: Instant) -> bool {
@@ -90,14 +111,23 @@ impl Limiter {
                 .unwrap_or(IpAddr::V6(ip)),
             ip => ip,
         };
-        if !self.entries.contains_key(&ip) && self.entries.len() >= MAX_IPS {
-            return false;
-        }
-        let entry = self.entries.entry(ip).or_insert_with(|| Entry {
-            tokens: [4096.0, 1.0, 32.0],
-            updated: [now; 3],
-            last_allowed: now,
-        });
+        let bucket = self.overflow_bucket(ip);
+        let entry = if self.entries.contains_key(&ip) {
+            self.entries.get_mut(&ip).expect("entry checked above")
+        } else if self.entries.len() < MAX_IPS {
+            let seeded = self.overflow[bucket].clone().unwrap_or(Entry {
+                tokens: [4096.0, 1.0, 32.0],
+                updated: [now; 3],
+                last_allowed: now,
+            });
+            self.entries.entry(ip).or_insert(seeded)
+        } else {
+            self.overflow[bucket].get_or_insert(Entry {
+                tokens: [4096.0, 1.0, 32.0],
+                updated: [now; 3],
+                last_allowed: now,
+            })
+        };
         let (burst, rate) = kind.budget();
         entry.tokens[index] = (entry.tokens[index]
             + now
@@ -143,18 +173,87 @@ mod tests {
     }
 
     #[test]
-    fn table_is_bounded_and_idle_entries_expire() {
+    fn table_is_bounded_and_overflow_bucket_expires() {
         let mut limiter = Limiter::default();
         let now = Instant::now();
         for n in 0..MAX_IPS as u32 {
             assert!(limiter.allow(Ipv4Addr::from(n).into(), Kind::Connection, now));
         }
         let new_ip = Ipv4Addr::from(MAX_IPS as u32).into();
-        assert!(!limiter.allow(new_ip, Kind::Nat, now));
+        assert!(limiter.allow(new_ip, Kind::Nat, now));
         assert_eq!(limiter.entries.len(), MAX_IPS);
+        assert_eq!(limiter.overflow.iter().flatten().count(), 1);
         limiter.cleanup(now + IP_TTL);
         assert!(limiter.entries.is_empty());
+        assert!(limiter.overflow.iter().all(Option::is_none));
         assert!(limiter.allow(new_ip, Kind::Info, now + IP_TTL));
+    }
+
+    #[test]
+    fn overflow_addresses_share_a_budget_instead_of_resetting_it() {
+        let mut limiter = Limiter::default();
+        let now = Instant::now();
+        for n in 0..MAX_IPS as u32 {
+            assert!(limiter.allow(Ipv4Addr::from(n).into(), Kind::Connection, now));
+        }
+
+        // Pigeonhole bound guarantees a collision regardless of the random seed.
+        let mut seen = HashMap::new();
+        let mut pair = None;
+        for n in MAX_IPS as u32..(MAX_IPS + OVERFLOW_BUCKETS + 1) as u32 {
+            let candidate = Ipv4Addr::from(n);
+            let bucket = limiter.overflow_bucket(candidate.into());
+            if let Some(first) = seen.insert(bucket, candidate) {
+                pair = Some((first, candidate));
+                break;
+            }
+        }
+        let (first, colliding) = pair.expect("more sources than overflow buckets");
+
+        assert!(limiter.allow(first.into(), Kind::Info, now));
+        assert!(!limiter.allow(first.into(), Kind::Info, now));
+        assert!(!limiter.allow(colliding.into(), Kind::Info, now));
+        assert_eq!(limiter.entries.len(), MAX_IPS);
+        assert_eq!(limiter.overflow.iter().flatten().count(), 1);
+    }
+
+    #[test]
+    fn promoting_overflow_ip_keeps_its_live_budget() {
+        let mut limiter = Limiter::default();
+        let start = Instant::now();
+        for n in 0..MAX_IPS as u32 {
+            assert!(limiter.allow(Ipv4Addr::from(n).into(), Kind::Connection, start));
+        }
+
+        let overflow_ip = IpAddr::V4(Ipv4Addr::from(MAX_IPS as u32));
+        limiter.cleanup(start + Duration::from_secs(59));
+        let first = start + Duration::from_millis(59_800);
+        assert!(limiter.allow(overflow_ip, Kind::Info, first));
+
+        // The exact entries expire at 60 seconds, while the overflow bucket
+        // was refreshed 300 ms ago and must seed the newly available exact slot.
+        let promoted = start + Duration::from_millis(60_100);
+        assert!(!limiter.allow(overflow_ip, Kind::Info, promoted));
+        assert!(limiter.entries.contains_key(&overflow_ip));
+    }
+
+    #[test]
+    fn new_connection_ip_progresses_after_global_refill_at_capacity() {
+        let mut limiter = Limiter::default();
+        let now = Instant::now();
+        for n in 0..MAX_IPS as u32 {
+            let ip = Ipv4Addr::from(n);
+            assert!(limiter.allow(ip.into(), Kind::Connection, now));
+        }
+        // The initial batch spends the whole global burst, but each existing
+        // IP still has per-IP tokens and can remain active while the table is full.
+        assert!(!limiter.allow(Ipv4Addr::from(MAX_IPS as u32).into(), Kind::Connection, now));
+        assert!(limiter.allow(
+            Ipv4Addr::from(MAX_IPS as u32).into(),
+            Kind::Connection,
+            now + Duration::from_millis(10)
+        ));
+        assert_eq!(limiter.entries.len(), MAX_IPS);
     }
     #[test]
     fn global_reply_budget_bounds_spoofed_sources() {

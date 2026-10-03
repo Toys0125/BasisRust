@@ -1096,9 +1096,15 @@ impl TransportHandle {
     }
 
     pub async fn disconnect(&self, peer: PeerId, reason: &str) -> Result<()> {
-        if let Some((_, state)) = self.peers.remove(&peer) {
-            self.by_addr.remove(&state.addr);
-            self.retire_peer_id(peer);
+        let state = {
+            let _allocation = self.peer_allocation.lock();
+            self.peers.remove(&peer).map(|(_, state)| {
+                self.by_addr.remove(&state.addr);
+                self.retire_peer_id(peer);
+                state
+            })
+        };
+        if let Some(state) = state {
             let mut payload = NetWriter::new();
             payload.put_string(reason);
             let mut writer = NetWriter::with_capacity(payload.len() + 9);
@@ -1519,19 +1525,6 @@ async fn process_packet(
                                 return Ok(());
                             }
                         }
-                        if let Some((_, old_peer)) = handle.peers.remove(&existing_peer_id) {
-                            handle.by_addr.remove(&old_peer.addr);
-                            handle.retire_peer_id(existing_peer_id);
-                            enqueue_event(
-                                tx,
-                                ServerEvent::PeerDisconnected {
-                                    peer: existing_peer_id,
-                                    reason: DisconnectReason::Remote,
-                                },
-                            )
-                            .await
-                            .map_err(|_| TransportError::EventChannelClosed)?;
-                        }
                     }
                     let request = ConnectionRequest {
                         remote_addr,
@@ -1541,6 +1534,18 @@ async fn process_packet(
                         local_peer_id: parsed.local_peer_id,
                     };
                     {
+                        // Commit replacement teardown only once both admission and event
+                        // capacity are reserved. Serialize against concurrent accepts.
+                        let _allocation = handle.peer_allocation.lock();
+                        let old_peer_id = handle.by_addr.get(&remote_addr).map(|p| *p);
+                        if old_peer_id.is_some_and(|id| {
+                            handle
+                                .peers
+                                .get(&id)
+                                .is_some_and(|peer| parsed.connect_time <= peer.connect_time)
+                        }) {
+                            return Ok(());
+                        }
                         let now = Instant::now();
                         let mut pending = handle.pending_requests.lock();
                         pending.retain(|_, request| request.expires_at > now);
@@ -1551,6 +1556,10 @@ async fn process_packet(
                         {
                             return Ok(());
                         }
+                        let event_count = if old_peer_id.is_some() { 2 } else { 1 };
+                        let Some(mut permits) = reserve_pre_auth_events(tx, event_count)? else {
+                            return Ok(());
+                        };
                         pending.insert(
                             remote_addr,
                             PendingRequestInfo {
@@ -1559,11 +1568,20 @@ async fn process_packet(
                                 expires_at: now + pre_auth::REQUEST_TTL,
                             },
                         );
-                    }
-                    if !enqueue_pre_auth_event(tx, ServerEvent::ConnectionRequest(request.clone()))
-                        .await?
-                    {
-                        handle.remove_pending_request(&request);
+                        if let Some(id) = old_peer_id {
+                            if let Some((_, old_peer)) = handle.peers.remove(&id) {
+                                handle.by_addr.remove(&old_peer.addr);
+                                handle.retire_peer_id(id);
+                                permits.next().unwrap().send(ServerEvent::PeerDisconnected {
+                                    peer: id,
+                                    reason: DisconnectReason::Remote,
+                                });
+                            }
+                        }
+                        permits
+                            .next()
+                            .unwrap()
+                            .send(ServerEvent::ConnectionRequest(request));
                     }
                 }
                 ConnectRequestParse::InvalidProtocol => {
@@ -1574,27 +1592,41 @@ async fn process_packet(
             }
         }
         PacketProperty::Disconnect => {
-            if let Some(peer_id) = handle.by_addr.remove(&remote_addr).map(|p| p.1) {
-                let Some((_, peer)) = handle.peers.remove(&peer_id) else {
-                    return Ok(());
-                };
-                if !disconnect_matches(&peer, bytes, connection_number) {
-                    handle.by_addr.insert(remote_addr, peer_id);
-                    handle.peers.insert(peer_id, peer);
-                    return Ok(());
-                }
-                handle.retire_peer_id(peer_id);
-                send_simple_property(handle, remote_addr, PacketProperty::ShutdownOk).await?;
-                enqueue_event(
-                    tx,
-                    ServerEvent::PeerDisconnected {
-                        peer: peer_id,
-                        reason: DisconnectReason::Remote,
-                    },
-                )
+            let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) else {
+                return Ok(());
+            };
+            if !handle
+                .peers
+                .get(&peer_id)
+                .is_some_and(|peer| disconnect_matches(&peer, bytes, connection_number))
+            {
+                return Ok(());
+            }
+            // Reserve outside the lock, then publish removal and its event together.
+            // A concurrent replacement must not overtake this disconnect event.
+            let permit = tx
+                .reserve()
                 .await
                 .map_err(|_| TransportError::EventChannelClosed)?;
+            {
+                let _allocation = handle.peer_allocation.lock();
+                if handle.by_addr.get(&remote_addr).map(|p| *p) != Some(peer_id)
+                    || !handle
+                        .peers
+                        .get(&peer_id)
+                        .is_some_and(|peer| disconnect_matches(&peer, bytes, connection_number))
+                {
+                    return Ok(());
+                }
+                handle.peers.remove(&peer_id);
+                handle.by_addr.remove(&remote_addr);
+                handle.retire_peer_id(peer_id);
+                permit.send(ServerEvent::PeerDisconnected {
+                    peer: peer_id,
+                    reason: DisconnectReason::Remote,
+                });
             }
+            send_simple_property(handle, remote_addr, PacketProperty::ShutdownOk).await?;
         }
         PacketProperty::Ping => {
             if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
@@ -1766,18 +1798,28 @@ async fn enqueue_pre_auth_event(
     tx: &mpsc::Sender<ServerEvent>,
     event: ServerEvent,
 ) -> Result<bool> {
-    match tx.try_reserve() {
-        Ok(permit) => {
+    let Some(mut permits) = reserve_pre_auth_events(tx, 1)? else {
+        return Ok(false);
+    };
+    permits.next().unwrap().send(event);
+    Ok(true)
+}
+
+fn reserve_pre_auth_events(
+    tx: &mpsc::Sender<ServerEvent>,
+    count: usize,
+) -> Result<Option<mpsc::PermitIterator<'_, ServerEvent>>> {
+    match tx.try_reserve_many(count) {
+        Ok(permits) => {
             if tx.capacity()
                 < tx.max_capacity()
                     .saturating_sub(pre_auth::MAX_PENDING_REQUESTS)
             {
-                return Ok(false);
+                return Ok(None);
             }
-            permit.send(event);
-            Ok(true)
+            Ok(Some(permits))
         }
-        Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+        Err(mpsc::error::TrySendError::Full(_)) => Ok(None),
         Err(mpsc::error::TrySendError::Closed(_)) => Err(TransportError::EventChannelClosed),
     }
 }
@@ -2488,15 +2530,24 @@ async fn timeout_loop(handle: TransportHandle, tx: mpsc::Sender<ServerEvent>) {
             })
             .collect();
         for peer_id in timed_out {
+            let Ok(permit) = tx.reserve().await else {
+                return;
+            };
+            let _allocation = handle.peer_allocation.lock();
+            // Queue backpressure may have delayed this timeout. Recheck liveness
+            // and generation (a recycled ID has a fresh timestamp) before removal.
+            if !handle.peers.get(&peer_id).is_some_and(|peer| {
+                Instant::now().duration_since(*peer.last_seen.lock()) > Duration::from_secs(30)
+            }) {
+                continue;
+            }
             if let Some((_, peer)) = handle.peers.remove(&peer_id) {
                 handle.by_addr.remove(&peer.addr);
                 handle.retire_peer_id(peer_id);
-                let _ = tx
-                    .send(ServerEvent::PeerDisconnected {
-                        peer: peer_id,
-                        reason: DisconnectReason::Timeout,
-                    })
-                    .await;
+                permit.send(ServerEvent::PeerDisconnected {
+                    peer: peer_id,
+                    reason: DisconnectReason::Timeout,
+                });
             }
         }
     }
@@ -4422,6 +4473,142 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(handle.pending_requests.lock().len(), 1);
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn replacement_preserves_live_peer_until_admission_capacity_is_reserved() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let addr = loopback_addr(5000);
+        let request = ConnectionRequest {
+            remote_addr: addr,
+            payload: Bytes::new(),
+            connection_number: 0,
+            connect_time: 1,
+            local_peer_id: 0,
+        };
+        let peer = handle.accept(&request).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(8192);
+        {
+            let mut pending = handle.pending_requests.lock();
+            for port in 1..=pre_auth::MAX_PENDING_REQUESTS as u16 {
+                pending.insert(
+                    loopback_addr(port),
+                    PendingRequestInfo {
+                        connect_time: 1,
+                        connection_number: 0,
+                        expires_at: Instant::now() + pre_auth::REQUEST_TTL,
+                    },
+                );
+            }
+        }
+        process_packet(&handle, &tx, addr, &admission_packet(2))
+            .await
+            .unwrap();
+        assert_eq!(*handle.by_addr.get(&addr).unwrap(), peer);
+        assert!(handle.peers.contains_key(&peer));
+        assert!(!handle.retired_peer_ids.lock().contains(&peer));
+        assert!(rx.try_recv().is_err());
+        handle.pending_requests.lock().clear();
+
+        // Pending capacity alone is insufficient: both events must fit in the
+        // pre-auth prefix before tearing down the working connection.
+        for _ in 0..pre_auth::MAX_PENDING_REQUESTS - 1 {
+            tx.try_send(ServerEvent::PeerConnected(peer)).unwrap();
+        }
+        process_packet(&handle, &tx, addr, &admission_packet(2))
+            .await
+            .unwrap();
+        assert_eq!(*handle.by_addr.get(&addr).unwrap(), peer);
+        assert!(handle.peers.contains_key(&peer));
+        assert!(!handle.pending_requests.lock().contains_key(&addr));
+        assert_eq!(rx.len(), pre_auth::MAX_PENDING_REQUESTS - 1);
+        while rx.try_recv().is_ok() {}
+        let (closed_tx, closed_rx) = mpsc::channel(8);
+        drop(closed_rx);
+        assert!(matches!(
+            process_packet(&handle, &closed_tx, addr, &admission_packet(2)).await,
+            Err(TransportError::EventChannelClosed)
+        ));
+        assert_eq!(*handle.by_addr.get(&addr).unwrap(), peer);
+        assert!(handle.peers.contains_key(&peer));
+        assert!(!handle.pending_requests.lock().contains_key(&addr));
+
+        process_packet(&handle, &tx, addr, &admission_packet(2))
+            .await
+            .unwrap();
+        assert!(!handle.peers.contains_key(&peer));
+        assert!(!handle.by_addr.contains_key(&addr));
+        assert!(handle.retired_peer_ids.lock().contains(&peer));
+        assert!(
+            matches!(rx.recv().await.unwrap(), ServerEvent::PeerDisconnected {
+            peer: disconnected,
+            reason: DisconnectReason::Remote,
+        } if disconnected == peer)
+        );
+        let replacement = match rx.recv().await.unwrap() {
+            ServerEvent::ConnectionRequest(request) => request,
+            _ => panic!("replacement must follow disconnect"),
+        };
+        assert!(handle.is_pending_request(&replacement));
+        let replacement_peer = handle.accept(&replacement).await.unwrap();
+        assert_ne!(replacement_peer, peer);
+        assert_eq!(handle.peers.get(&replacement_peer).unwrap().connect_time, 2);
+        handle.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_disconnect_and_replacement_publish_disconnect_first() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(8192);
+        for port in 5000..5032 {
+            let addr = loopback_addr(port);
+            let old_peer = handle
+                .accept(&ConnectionRequest {
+                    remote_addr: addr,
+                    payload: Bytes::new(),
+                    connection_number: 0,
+                    connect_time: 1,
+                    local_peer_id: 0,
+                })
+                .await
+                .unwrap();
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let mut tasks = tokio::task::JoinSet::new();
+            for replacement in [false, true] {
+                let handle = handle.clone();
+                let tx = tx.clone();
+                let barrier = barrier.clone();
+                tasks.spawn(async move {
+                    barrier.wait().await;
+                    let packet = if replacement {
+                        admission_packet(2)
+                    } else {
+                        let mut packet = vec![PacketProperty::Disconnect as u8];
+                        packet.extend_from_slice(&1i64.to_le_bytes());
+                        packet
+                    };
+                    process_packet(&handle, &tx, addr, &packet).await.unwrap();
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+            assert!(
+                matches!(rx.recv().await.unwrap(), ServerEvent::PeerDisconnected {
+                peer, reason: DisconnectReason::Remote,
+            } if peer == old_peer)
+            );
+            let request = match rx.recv().await.unwrap() {
+                ServerEvent::ConnectionRequest(request) => request,
+                _ => panic!("replacement must follow the old peer's disconnect"),
+            };
+            assert!(rx.try_recv().is_err());
+            assert!(handle.is_pending_request(&request));
+            assert!(!handle.peers.contains_key(&old_peer));
+            assert!(!handle.by_addr.contains_key(&addr));
+            assert!(handle.retired_peer_ids.lock().contains(&old_peer));
+        }
         handle.shutdown();
     }
 
