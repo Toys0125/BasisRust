@@ -1,0 +1,6 @@
+# Keep operator files and previous outputs out of the build context.
+config/
+logs/
+captures/
+target/
+*.rs.bk

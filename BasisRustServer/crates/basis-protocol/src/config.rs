@@ -358,10 +358,17 @@ impl ServerConfig {
         Ok(())
     }
 
-    pub fn process_environment_overrides(&mut self) {
+    pub fn process_environment_overrides(&mut self) -> Result<()> {
+        self.process_environment_overrides_with(|name| env::var(name))
+    }
+
+    fn process_environment_overrides_with(
+        &mut self,
+        read_env: impl Fn(&str) -> std::result::Result<String, env::VarError>,
+    ) -> Result<()> {
         macro_rules! override_field {
             ($env_name:literal, $field:ident, $ty:ty) => {
-                if let Ok(value) = env::var($env_name) {
+                if let Ok(value) = read_env($env_name) {
                     if let Ok(parsed) = value.parse::<$ty>() {
                         self.$field = parsed;
                     }
@@ -370,7 +377,7 @@ impl ServerConfig {
         }
         macro_rules! override_string {
             ($env_name:literal, $field:ident) => {
-                if let Ok(value) = env::var($env_name) {
+                if let Ok(value) = read_env($env_name) {
                     self.$field = value;
                 }
             };
@@ -429,7 +436,6 @@ impl ServerConfig {
         );
         override_string!("IPv4Address", ipv4_address);
         override_string!("IPv6Address", ipv6_address);
-        override_string!("Password", password);
         override_field!("UseAuth", use_auth, bool);
         override_field!("UseAuthIdentity", use_auth_identity, bool);
         override_field!(
@@ -643,11 +649,28 @@ impl ServerConfig {
         override_field!("ApiPort", api_port, u16);
         override_string!("ApiKey", api_key);
 
-        if let Ok(value) = env::var("BasisUserRestrictionMode") {
+        if let Ok(value) = read_env("BasisUserRestrictionMode") {
             if let Some(mode) = BasisUserRestrictionMode::parse(&value) {
                 self.basis_user_restriction_mode = mode;
             }
         }
+        // Prefer the explicit deployment override over the legacy PascalCase name.
+        // Never format VarError: NotUnicode contains the supplied secret value.
+        let password = match read_env("BASIS_SERVER_PASSWORD") {
+            Err(env::VarError::NotPresent) => read_env("Password"),
+            value => value,
+        };
+        match password {
+            Ok(value) if value.is_empty() => {
+                anyhow::bail!("server password environment override must not be empty");
+            }
+            Ok(value) => self.password = value,
+            Err(env::VarError::NotPresent) => {}
+            Err(env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("server password environment override must be valid Unicode");
+            }
+        }
+        Ok(())
     }
 
     pub fn is_secret_field_name(name: &str) -> bool {
@@ -770,6 +793,72 @@ mod tests {
 
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn password_environment_precedence_and_rejection() {
+        let mut config = ServerConfig {
+            password: "xml-password".to_string(),
+            ..ServerConfig::default()
+        };
+        let apply = |config: &mut ServerConfig, legacy: Option<&str>, explicit: Option<&str>| {
+            config.process_environment_overrides_with(|name| {
+                let value = match name {
+                    "Password" => legacy,
+                    "BASIS_SERVER_PASSWORD" => explicit,
+                    _ => None,
+                };
+                value.map(str::to_owned).ok_or(env::VarError::NotPresent)
+            })
+        };
+        apply(&mut config, None, None).unwrap();
+        assert_eq!(config.password, "xml-password");
+        apply(&mut config, Some("legacy-password"), None).unwrap();
+        assert_eq!(config.password, "legacy-password");
+        apply(
+            &mut config,
+            Some("legacy-password"),
+            Some(" explicit-password "),
+        )
+        .unwrap();
+        assert_eq!(config.password, " explicit-password ");
+        for (legacy, explicit) in [(Some(""), None), (None, Some(""))] {
+            let error = apply(&mut config, legacy, explicit).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "server password environment override must not be empty"
+            );
+            assert_eq!(config.password, " explicit-password ");
+        }
+        // A higher-precedence empty override fails rather than falling back.
+        assert!(apply(&mut config, Some("legacy-password"), Some("")).is_err());
+        apply(&mut config, Some(""), Some("explicit-password")).unwrap();
+        assert_eq!(config.password, "explicit-password");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_password_environment_error_is_redacted() {
+        use std::os::unix::ffi::OsStringExt;
+        for field in ["Password", "BASIS_SERVER_PASSWORD"] {
+            let mut config = ServerConfig::default();
+            let error = config
+                .process_environment_overrides_with(|name| {
+                    if name == field {
+                        Err(env::VarError::NotUnicode(std::ffi::OsString::from_vec(
+                            b"private-value\xff".to_vec(),
+                        )))
+                    } else {
+                        Err(env::VarError::NotPresent)
+                    }
+                })
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "server password environment override must be valid Unicode"
+            );
+            assert_eq!(config.password, "default_password");
+        }
+    }
 
     #[test]
     fn rust_server_defaults_are_sane() {
