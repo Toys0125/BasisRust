@@ -22,6 +22,20 @@ impl Client {
     }
 
     async fn connect_pending(state: &ServerState, uuid: &str) -> Self {
+        Self::connect_pending_with_auth(state, uuid, &[]).await
+    }
+
+    async fn connect_pending_with_auth(state: &ServerState, uuid: &str, auth: &[u8]) -> Self {
+        Self::connect_pending_with_contract(state, uuid, auth, SERVER_VERSION, None).await
+    }
+
+    async fn connect_pending_with_contract(
+        state: &ServerState,
+        uuid: &str,
+        auth: &[u8],
+        version: u16,
+        application: Option<(&str, &str)>,
+    ) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket
             .connect(state.transport.local_addr().unwrap())
@@ -34,10 +48,15 @@ impl Client {
         writer.put_i32(0);
         writer.put_u8(16);
         writer.put_bytes(&[0; 16]);
-        writer.put_u16(SERVER_VERSION);
+        writer.put_u16(version);
         let config = state.config.read().clone();
-        NetworkApplication::write(&mut writer, &config.company_name, &config.product_name);
-        BytesMessage { data: Vec::new() }.serialize(&mut writer);
+        let (company, product) =
+            application.unwrap_or((&config.company_name, &config.product_name));
+        NetworkApplication::write(&mut writer, company, product);
+        BytesMessage {
+            data: auth.to_vec(),
+        }
+        .serialize(&mut writer);
         super::tests::ready_message(uuid).serialize(&mut writer);
         socket.send(writer.as_slice()).await.unwrap();
         Self {
@@ -336,6 +355,202 @@ fn client_did(key: &SigningKey) -> String {
     multicodec[1] = 0x01;
     multicodec[2..].copy_from_slice(&key.verifying_key().to_bytes());
     format!("did:key:z{}", bs58::encode(multicodec).into_string())
+}
+
+#[tokio::test]
+async fn admission_capacity_preserves_large_batches_and_releases_ip_and_global_slots() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let first = "127.0.0.1".parse().unwrap();
+    let second = "127.0.0.2".parse().unwrap();
+    let mut slots = (0..2000)
+        .map(|_| reserve_admission(&state, first).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        state.admission_slots.available_permits(),
+        MAX_PENDING_ADMISSIONS - 2000
+    );
+    for _ in 2000..MAX_PENDING_PER_IP {
+        slots.push(reserve_admission(&state, first).unwrap());
+    }
+    assert!(reserve_admission(&state, first).is_none());
+    assert!(reserve_admission(&state, "::ffff:127.0.0.1".parse().unwrap()).is_none());
+    for _ in 0..MAX_PENDING_PER_IP {
+        slots.push(reserve_admission(&state, second).unwrap());
+    }
+    assert!(reserve_admission(&state, "127.0.0.3".parse().unwrap()).is_none());
+    drop(slots);
+    assert!(state.admissions_per_ip.lock().is_empty());
+    assert_eq!(
+        state.admission_slots.available_permits(),
+        MAX_PENDING_ADMISSIONS
+    );
+    assert!(reserve_admission(&state, first).is_some());
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn password_rejection_creates_no_challenge_and_valid_identity_keeps_wire_flow() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let key = SigningKey::from_bytes(&[91; 32]);
+    let did = client_did(&key);
+    {
+        let mut config = state.config.write();
+        config.use_auth = true;
+        config.use_auth_identity = true;
+    }
+    for auth in [&b""[..], &b"wrong_password"[..]] {
+        let mut rejected = Client::connect_pending_with_auth(&state, &did, auth).await;
+        rejected.receive_disconnect().await;
+        assert!(state.pending_identity.is_empty());
+        assert_eq!(state.transport.connected_peers_count(), 0);
+        assert_eq!(
+            state.admission_slots.available_permits(),
+            MAX_PENDING_ADMISSIONS
+        );
+    }
+    for (version, application) in [
+        (SERVER_VERSION - 1, None),
+        (SERVER_VERSION, Some(("wrong-company", "wrong-product"))),
+    ] {
+        let mut rejected = Client::connect_pending_with_contract(
+            &state,
+            &did,
+            b"default_password",
+            version,
+            application,
+        )
+        .await;
+        rejected.receive_disconnect().await;
+        assert!(state.pending_identity.is_empty());
+        assert_eq!(state.transport.connected_peers_count(), 0);
+    }
+    let mut valid = Client::connect_pending_with_auth(&state, &did, b"default_password").await;
+    let challenge = valid.answer_identity(&key).await;
+    assert_eq!(challenge.len(), 32);
+    valid
+        .receive(|channel, _| channel == channels::META_DATA)
+        .await;
+    assert!(peer_by_uuid(&state, &did).is_some());
+    assert!(state.pending_identity.is_empty());
+    assert_eq!(
+        state.admission_slots.available_permits(),
+        MAX_PENDING_ADMISSIONS
+    );
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn pending_capacity_rejection_is_clean_and_timeout_allows_reconnect() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let key = SigningKey::from_bytes(&[92; 32]);
+    let did = client_did(&key);
+    {
+        let mut config = state.config.write();
+        config.use_auth_identity = true;
+        config.auth_validation_time_out_miliseconds = 50;
+    }
+    let reserved = state
+        .admission_slots
+        .clone()
+        .acquire_many_owned(MAX_PENDING_ADMISSIONS as u32)
+        .await
+        .unwrap();
+    let mut rejected = Client::connect_pending(&state, &did).await;
+    let rejection = rejected.receive_disconnect().await;
+    let mut reader = NetReader::new(&rejection[9..]);
+    assert_eq!(reader.get_u32().unwrap(), channels::REJECT_MAGIC);
+    assert_eq!(reader.get_u8().unwrap(), channels::REJECT_KIND_SERVER_FULL);
+    assert!(state.pending_identity.is_empty());
+    assert_eq!(state.transport.connected_peers_count(), 0);
+    drop(reserved);
+    let mut silent = Client::connect_pending(&state, &did).await;
+    silent.receive_identity_challenge().await;
+    silent.receive_disconnect().await;
+    // Timeout cancellation releases its capacity even without another raw packet.
+    assert!(state.pending_identity.is_empty());
+    assert_eq!(
+        state.admission_slots.available_permits(),
+        MAX_PENDING_ADMISSIONS
+    );
+    state.config.write().auth_validation_time_out_miliseconds = 5000;
+    let mut reconnected = Client::connect_pending(&state, &did).await;
+    reconnected.answer_identity(&key).await;
+    reconnected
+        .receive(|channel, _| channel == channels::META_DATA)
+        .await;
+    assert!(peer_by_uuid(&state, &did).is_some());
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn legitimate_identity_batch_completes_and_releases_capacity() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    state.config.write().use_auth_identity = true;
+    let key = SigningKey::from_bytes(&[93; 32]);
+    let did = client_did(&key);
+    let mut clients = Vec::new();
+    for _ in 0..64 {
+        let mut client = Client::connect_pending(&state, &did).await;
+        let challenge = client.receive_identity_challenge().await;
+        clients.push((client, challenge));
+    }
+    assert_eq!(state.pending_identity.len(), 64);
+    for (client, challenge) in &mut clients {
+        client
+            .send_identity_response(key.sign(challenge).to_bytes().to_vec())
+            .await;
+    }
+    for (client, _) in &mut clients {
+        client
+            .receive(|channel, _| channel == channels::META_DATA)
+            .await;
+    }
+    assert_eq!(state.player_count(), 64);
+    assert!(state.pending_identity.is_empty());
+    assert_eq!(
+        state.admission_slots.available_permits(),
+        MAX_PENDING_ADMISSIONS
+    );
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn authenticated_peer_limit_is_rechecked_after_pending_identity_verification() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    {
+        let mut config = state.config.write();
+        config.use_auth_identity = true;
+        config.peer_limit = 1;
+    }
+    let key = SigningKey::from_bytes(&[94; 32]);
+    let did = client_did(&key);
+    let mut first = Client::connect_pending(&state, &did).await;
+    let first_challenge = first.receive_identity_challenge().await;
+    let mut second = Client::connect_pending(&state, &did).await;
+    let second_challenge = second.receive_identity_challenge().await;
+    assert_eq!(state.pending_identity.len(), 2);
+    first
+        .send_identity_response(key.sign(&first_challenge).to_bytes().to_vec())
+        .await;
+    first
+        .receive(|channel, _| channel == channels::META_DATA)
+        .await;
+    second
+        .send_identity_response(key.sign(&second_challenge).to_bytes().to_vec())
+        .await;
+    second.receive_disconnect().await;
+    assert_eq!(state.player_count(), 1);
+    assert!(state.pending_identity.is_empty());
+    assert_eq!(
+        state.admission_slots.available_permits(),
+        MAX_PENDING_ADMISSIONS
+    );
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
 }
 
 #[tokio::test]
