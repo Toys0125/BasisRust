@@ -1,0 +1,303 @@
+name: Docker; Build & Push Server Image
+
+# Publishes ghcr.io/toys0125/basisrust-server from the binaries already attached to a
+# GitHub release, so no toolchain is needed to produce the image.
+#
+# Mirrors the shape of BasisVR/Basis .github/workflows/build-docker-server.yml (per-arch
+# image, then a merged manifest) but exploits something that reference cannot: the
+# Linux binaries are already cross-compiled per architecture by build.yml, and GitHub
+# offers native arm64 runners. Each architecture is therefore built on its own native
+# runner and no QEMU emulation is required.
+#
+# The image definition itself lives in BasisRustServer/Dockerfile.
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (leave blank to use the newest release)
+        required: false
+        type: string
+      latest:
+        description: Also move the "latest" tag to this image
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: docker-server-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/basisrust-server
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve release
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version_tag: ${{ steps.release.outputs.version_tag }}
+      bare_tag: ${{ steps.release.outputs.bare_tag }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      promote_latest: ${{ steps.release.outputs.promote_latest }}
+    steps:
+      - name: Resolve release tag and image tags
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_LATEST: ${{ inputs.latest }}
+        run: |
+          set -euo pipefail
+
+          tag="${INPUT_TAG:-${EVENT_TAG:-}}"
+          if [ -z "$tag" ]; then
+            echo "No tag given; falling back to the newest published release."
+            # /releases/latest already excludes drafts and prereleases.
+            tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          fi
+          echo "Resolved release tag: $tag"
+
+          meta="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$tag")"
+          draft="$(jq -r .draft <<<"$meta")"
+          prerelease="$(jq -r .prerelease <<<"$meta")"
+
+          if [ "$draft" = "true" ]; then
+            echo "::error::Release '$tag' is still a draft; a draft cannot be published."
+            exit 1
+          fi
+
+          # Docker tags must be lowercase. This repo's release tags are inconsistent
+          # (both 'V55_0.2.2' and 'v55_0.2.0' exist), so normalise rather than assume.
+          version_tag="$(tr '[:upper:]' '[:lower:]' <<<"$tag")"
+          bare_tag="${version_tag#v}"
+
+          for candidate in "$version_tag" "$bare_tag"; do
+            if ! printf '%s' "$candidate" | grep -Eq '^[a-z0-9_][a-z0-9._-]{0,127}$'; then
+              echo "::error::Release tag '$tag' does not yield a usable Docker tag ('$candidate')."
+              exit 1
+            fi
+          done
+
+          # Prereleases must never become "latest". `inputs.latest` is an empty string
+          # on a release event, which is why this is normalised here instead of being
+          # compared inline in an expression.
+          promote_latest=true
+          if [ "$prerelease" = "true" ]; then
+            promote_latest=false
+          fi
+          if [ -n "$INPUT_LATEST" ]; then
+            promote_latest="$INPUT_LATEST"
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "version_tag=$version_tag"
+            echo "bare_tag=$bare_tag"
+            echo "prerelease=$prerelease"
+            echo "promote_latest=$promote_latest"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "version_tag=$version_tag bare_tag=$bare_tag prerelease=$prerelease promote_latest=$promote_latest"
+
+  build:
+    name: Build & push ${{ matrix.arch_suffix }} image
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_suffix: amd64
+            runner: ubuntu-24.04
+            docker_platform: linux/amd64
+            asset: BasisRust-linux-x64.tar.gz
+          - arch_suffix: arm64
+            runner: ubuntu-24.04-arm
+            docker_platform: linux/arm64
+            asset: BasisRust-linux-arm64.tar.gz
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify the release has the expected asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --json assets --jq \
+            '.assets[].name' | tee /dev/stderr | grep -qx "$ASSET"
+
+      - name: Download and unpack release payload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          mkdir -p download unpacked .docker-artifacts
+          gh release download "$RELEASE_TAG" --pattern "$ASSET" --dir download --clobber
+          # build.yml stages the release archive as ./server/basis-server-console, but the
+          # Dockerfile expects the binary directly inside ARTIFACT_DIR. Copying the
+          # directory contents explicitly keeps this working regardless of how the local
+          # tar treats --strip-components.
+          tar -xzf "download/$ASSET" -C unpacked
+          cp -a unpacked/server/. .docker-artifacts/
+          test -x .docker-artifacts/basis-server-console
+          file .docker-artifacts/basis-server-console
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.resolve.outputs.version_tag }}-${{ matrix.arch_suffix }}
+            type=raw,value=${{ needs.resolve.outputs.bare_tag }}-${{ matrix.arch_suffix }}
+            type=raw,value=latest-${{ matrix.arch_suffix }},enable=${{ needs.resolve.outputs.promote_latest == 'true' }}
+            type=sha,prefix=,suffix=-${{ matrix.arch_suffix }}
+
+      - name: Build and push ${{ matrix.docker_platform }} image
+        uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: ./BasisRustServer
+          # Native runner, so a single platform and no QEMU.
+          platforms: ${{ matrix.docker_platform }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=server-${{ matrix.arch_suffix }}
+          cache-to: type=gha,mode=max,scope=server-${{ matrix.arch_suffix }}
+          build-args: |
+            ARTIFACT_DIR=.docker-artifacts
+            BUILD_VERSION=${{ needs.resolve.outputs.version_tag }}
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ github.event.release.published_at || '' }}
+
+      - name: Record image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: echo "Pushed ${{ matrix.docker_platform }} digest ${DIGEST}"
+
+  manifest:
+    name: Publish multi-arch manifest
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.resolve.outputs.version_tag }}
+            type=raw,value=${{ needs.resolve.outputs.bare_tag }}
+            type=raw,value=latest,enable=${{ needs.resolve.outputs.promote_latest == 'true' }}
+            type=sha,prefix=
+
+      - name: Create multi-arch manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "Creating $tag from amd64 + arm64"
+            docker buildx imagetools create \
+              --tag "$tag" \
+              "${tag}-amd64" \
+              "${tag}-arm64"
+          done <<< "${{ steps.meta.outputs.tags }}"
+
+      # Catches the failure mode that matters most here: an image that builds and pushes
+      # cleanly but whose runtime base does not satisfy the binary's glibc floor. That
+      # shows up as a dynamic-loader error on every start rather than as a build failure,
+      # so nothing upstream would otherwise catch it. Uses the image's own HEALTHCHECK
+      # instead of a published port, which also validates the HEALTHCHECK instruction and
+      # does not depend on host port-forwarding behaviour.
+      - name: Smoke test the published image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${IMAGE_NAME}:${{ needs.resolve.outputs.version_tag }}"
+          echo "Pulling $image"
+          docker pull --platform linux/amd64 "$image"
+
+          cid="$(docker create "$image")"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          docker start "$cid" >/dev/null
+
+          for attempt in $(seq 1 45); do
+            state="$(docker inspect --format '{{.State.Status}}' "$cid")"
+            health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$cid")"
+            case "$health" in
+              healthy)
+                echo "Container reported healthy after ${attempt}s"
+                docker exec "$cid" curl -fsS http://127.0.0.1:10666/health
+                echo ""
+                echo "--- container logs ---"
+                docker logs "$cid" 2>&1 | tail -n 20
+                exit 0
+                ;;
+              unhealthy)
+                echo "::error::Container became unhealthy"
+                docker logs "$cid" 2>&1 | tail -n 50
+                exit 1
+                ;;
+            esac
+            if [ "$state" = "exited" ]; then
+              echo "::error::Container exited before becoming healthy"
+              docker logs "$cid" 2>&1 | tail -n 50
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "::error::Container never reported healthy"
+          docker logs "$cid" 2>&1 | tail -n 50
+          exit 1
+
+      - name: Summarise published tags
+        run: |
+          echo "Published to ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:"
+          echo "  ${{ needs.resolve.outputs.version_tag }} (release ${{ needs.resolve.outputs.tag }})"
+          echo "  ${{ needs.resolve.outputs.bare_tag }}"
+          [ "${{ needs.resolve.outputs.promote_latest }}" = "true" ] && echo "  latest" || echo "  latest (skipped: prerelease)"

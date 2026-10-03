@@ -2,3 +2,5 @@
 **/*.rs.bk
 config/
 logs/
+/captures/
+/.docker-artifacts*/
