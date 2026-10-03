@@ -1,3 +1,12 @@
+mod observer_sequence;
+mod observer_session;
+mod packet_diagnostics;
+mod strict_config;
+
+use observer_sequence::{ObserverSequence, SequenceDecision};
+use observer_session::ObserverSession;
+use packet_diagnostics::{DropReason, PacketDiagnostics};
+
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
@@ -86,6 +95,8 @@ const PING_INTERVAL_TICKS: usize = 100;
 /// now that it ticks at 15 ms rather than 100 ms.
 const SHARED_SNAPSHOT_REFRESH_TICKS: usize = 64;
 const INITIAL_START_ATTEMPTS: usize = 3;
+/// One observer and two standby clients retain avatar traffic; the rest remain load sinks.
+const OBSERVER_CANDIDATE_COUNT: usize = 3;
 const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 const SOCKET_TTL: u32 = 255;
 const DEFAULT_VOICE_AUDIO_FOLDER: &str = "audio";
@@ -106,6 +117,9 @@ static SHARED_RECEIVE_ACTIVE: AtomicBool = AtomicBool::new(false);
 struct Args {
     #[arg(long, default_value = "Config.xml")]
     config: PathBuf,
+    /// Reject malformed XML and invalid supplied scalar fields instead of using defaults.
+    #[arg(long)]
+    strict_config: bool,
     #[arg(long)]
     ip: Option<String>,
     #[arg(long)]
@@ -179,7 +193,7 @@ struct Args {
     voice_frame_duration_ms: Option<u64>,
     #[arg(long)]
     no_voice_reencode: bool,
-    /// Enable applied-avatar interval metrics for the first client and write them at shutdown.
+    /// Enable applied-avatar metrics with failover among the first three clients; write at shutdown.
     #[arg(long)]
     observe_avatar_csv: Option<PathBuf>,
     /// Radius around the observing client's current position used to select nearby senders.
@@ -223,6 +237,8 @@ struct Config {
     observe_avatar_start_file: Option<PathBuf>,
     #[serde(skip)]
     observe_avatar_window: Duration,
+    #[serde(skip)]
+    observer_session: Option<Arc<ObserverSession>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -266,12 +282,13 @@ impl Default for Config {
             avatar_observe_expected_peers: 9,
             observe_avatar_start_file: None,
             observe_avatar_window: Duration::from_secs(60),
+            observer_session: None,
         }
     }
 }
 
 impl Config {
-    fn load_or_create(path: &Path) -> Result<Self> {
+    fn load_or_create(path: &Path, strict: bool) -> Result<Self> {
         if !path.exists() {
             let config = Self::default();
             let xml = config.to_pretty_xml();
@@ -282,10 +299,26 @@ impl Config {
 
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        match quick_xml::de::from_str::<RawConfig>(&text) {
-            Ok(raw) => Ok(Self::from_raw(raw)),
+        Self::from_xml(&text, path, strict)
+    }
+
+    fn from_xml(text: &str, path: &Path, strict: bool) -> Result<Self> {
+        if strict {
+            strict_config::validate_xml(text, path)?;
+        }
+        match quick_xml::de::from_str::<RawConfig>(text) {
+            Ok(raw) => {
+                if strict {
+                    strict_config::validate_scalars(&raw, path)?;
+                }
+                Ok(Self::from_raw(raw))
+            }
+            Err(err) if strict => Err(anyhow!("config {}: malformed XML: {err}", path.display())),
             Err(err) => {
-                warn!("failed to parse config, using defaults: {err}");
+                warn!(
+                    "failed to parse config {}, using defaults: {err}",
+                    path.display()
+                );
                 Ok(Self::default())
             }
         }
@@ -346,6 +379,7 @@ impl Config {
             avatar_observe_expected_peers: defaults.avatar_observe_expected_peers,
             observe_avatar_start_file: defaults.observe_avatar_start_file,
             observe_avatar_window: defaults.observe_avatar_window,
+            observer_session: None,
         }
     }
 
@@ -1294,6 +1328,7 @@ struct AvatarObservationBaseline {
 struct ObservedAvatarPeer {
     baselines: [Option<AvatarObservationBaseline>; 4],
     last_sequence: Option<u8>,
+    sequence_tracker: ObserverSequence,
     last_near_update: Option<std::time::Instant>,
     near_update_count: u64,
     near_gaps_micros: Vec<u64>,
@@ -1316,6 +1351,12 @@ struct AvatarObserver {
     ignored_channels: u64,
     non_newer_sequences: u64,
     decoded_delta_items: u64,
+    discontinuities: u64,
+    sequence_ambiguities: u64,
+    sequence_resyncs: u64,
+    sequence_order_unknown_gaps: u64,
+    completed_near_segments: Vec<String>,
+    near_segment_started_at: Option<std::time::Instant>,
     start_marker_path: Option<PathBuf>,
     window_duration: Duration,
     window_started_at: Option<std::time::Instant>,
@@ -1348,14 +1389,113 @@ impl AvatarObserver {
             ignored_channels: 0,
             non_newer_sequences: 0,
             decoded_delta_items: 0,
+            discontinuities: 0,
+            sequence_ambiguities: 0,
+            sequence_resyncs: 0,
+            sequence_order_unknown_gaps: 0,
+            completed_near_segments: Vec::new(),
+            near_segment_started_at: None,
             start_marker_path,
             window_duration,
             window_started_at: None,
         }
     }
 
+    fn mark_discontinuity(&mut self, now: std::time::Instant) {
+        let tracking = self
+            .window_started_at
+            .is_some_and(|start| now.saturating_duration_since(start) <= self.window_duration);
+        if tracking {
+            self.discontinuities = self.discontinuities.saturating_add(1);
+            let segment = self.completed_near_segments.len();
+            let mut rows = String::new();
+            for (peer_id, peer) in &self.peers {
+                if peer.was_near {
+                    rows.push_str(&format!(
+                        "{segment},{}",
+                        observer_peer_csv(*peer_id, peer, now)
+                    ));
+                }
+            }
+            self.completed_near_segments.push(rows);
+            self.near_segment_started_at = Some(now);
+        }
+        for peer in self.peers.values_mut() {
+            peer.baselines = Default::default();
+            peer.last_sequence = None;
+            peer.sequence_tracker = ObserverSequence::default();
+            if tracking {
+                peer.last_near_update = None;
+                peer.near_update_count = 0;
+                peer.near_gaps_micros.clear();
+                peer.was_near = false;
+            }
+            peer.last_position = None;
+        }
+    }
+
+    fn accept_sequence(
+        &mut self,
+        peer_id: u16,
+        sequence: u8,
+        full: bool,
+        now: std::time::Instant,
+        tracking: bool,
+    ) -> bool {
+        let state = self.peers.entry(peer_id).or_default();
+        match state
+            .sequence_tracker
+            .consider(sequence, state.last_sequence, full, now)
+        {
+            SequenceDecision::Apply => true,
+            SequenceDecision::ApplyAfterGap => {
+                // An advancing full frame is independently decodable. Keep its arrival
+                // cadence, but discard other-quality baselines that may alias after a wrap.
+                state.baselines = Default::default();
+                if tracking {
+                    self.sequence_order_unknown_gaps =
+                        self.sequence_order_unknown_gaps.saturating_add(1);
+                }
+                debug!(peer_id, "avatar observer retained advancing full frame after long gap; byte sequence ordering across gap unknown");
+                true
+            }
+            SequenceDecision::Resynced => {
+                if tracking {
+                    self.sequence_resyncs = self.sequence_resyncs.saturating_add(1);
+                }
+                debug!(peer_id, "avatar observer sequence baseline resynchronized; ordering across silence unknown");
+                true
+            }
+            SequenceDecision::Pending { began } => {
+                if began {
+                    state.baselines = Default::default();
+                    if tracking {
+                        state.last_near_update = None;
+                        self.discontinuities = self.discontinuities.saturating_add(1);
+                    }
+                    debug!(peer_id, "avatar observer sequence ambiguous after silence; awaiting advancing full frames");
+                }
+                if !full && tracking {
+                    self.unapplied_deltas = self.unapplied_deltas.saturating_add(1);
+                }
+                false
+            }
+            decision => {
+                if tracking {
+                    self.non_newer_sequences = self.non_newer_sequences.saturating_add(1);
+                    if decision == SequenceDecision::Ambiguous {
+                        self.sequence_ambiguities = self.sequence_ambiguities.saturating_add(1);
+                    }
+                }
+                false
+            }
+        }
+    }
+
     fn begin_window(&mut self, observer_position: [f32; 3], now: std::time::Instant) {
         self.window_started_at = Some(now);
+        self.near_segment_started_at = Some(now);
+        self.completed_near_segments.clear();
         self.decode_errors = 0;
         self.unapplied_deltas = 0;
         self.accepted_avatar_items = 0;
@@ -1365,6 +1505,10 @@ impl AvatarObserver {
         self.ignored_channels = 0;
         self.non_newer_sequences = 0;
         self.decoded_delta_items = 0;
+        self.discontinuities = 0;
+        self.sequence_ambiguities = 0;
+        self.sequence_resyncs = 0;
+        self.sequence_order_unknown_gaps = 0;
         self.observed_channels.clear();
         for peer in self.peers.values_mut() {
             peer.near_gaps_micros.clear();
@@ -1486,14 +1630,12 @@ impl AvatarObserver {
         let Some(position) = read_position(avatar_payload) else {
             return false;
         };
-        let state = self.peers.entry(peer_id).or_default();
-        if !observer_sequence_is_newer(sequence, state.last_sequence) {
-            if tracking {
-                self.non_newer_sequences = self.non_newer_sequences.saturating_add(1);
-            }
+        if !self.accept_sequence(peer_id, sequence, true, now, tracking) {
             return true;
         }
+        let state = self.peers.entry(peer_id).or_default();
         state.last_sequence = Some(sequence);
+        state.sequence_tracker.applied(now);
         state.baselines[quality_index as usize] = Some(AvatarObservationBaseline {
             sequence,
             payload: avatar_payload.to_vec(),
@@ -1545,13 +1687,10 @@ impl AvatarObserver {
         };
         let sequence = payload[sequence_offset];
         let base_sequence = payload[base_offset];
-        let state = self.peers.entry(peer_id).or_default();
-        if !observer_sequence_is_newer(sequence, state.last_sequence) {
-            if tracking {
-                self.non_newer_sequences = self.non_newer_sequences.saturating_add(1);
-            }
+        if !self.accept_sequence(peer_id, sequence, false, now, tracking) {
             return true;
         }
+        let state = self.peers.entry(peer_id).or_default();
         let Some(baseline) = state.baselines[quality_index as usize]
             .as_ref()
             .filter(|baseline| baseline.sequence == base_sequence)
@@ -1568,6 +1707,7 @@ impl AvatarObserver {
             return false;
         };
         state.last_sequence = Some(sequence);
+        state.sequence_tracker.applied(now);
         state.last_position = Some(position);
         if tracking {
             self.accepted_avatar_items = self.accepted_avatar_items.saturating_add(1);
@@ -1586,6 +1726,10 @@ impl AvatarObserver {
             .unwrap_or(now);
         let observed_ms = self
             .window_started_at
+            .map(|start| report_time.saturating_duration_since(start).as_millis())
+            .unwrap_or(0);
+        let near_segment_ms = self
+            .near_segment_started_at
             .map(|start| report_time.saturating_duration_since(start).as_millis())
             .unwrap_or(0);
         let near = self
@@ -1609,7 +1753,7 @@ impl AvatarObserver {
             .count();
         let missing = self.expected_near_peers.saturating_sub(near.len());
         let summary = format!(
-            "avatar observer: window_started={} window_ms={} near_peers={} expected={} missing={} stale_500ms={} applied_gaps={} p50_ms={:.2} p95_ms={:.2} applied_full={} applied_delta={} malformed={} decode_errors={} unapplied_deltas={} non_newer_sequences={} ignored_channels={}",
+            "avatar observer: window_started={} window_ms={} near_peers={} expected={} missing={} stale_500ms={} applied_gaps={} p50_ms={:.2} p95_ms={:.2} applied_full={} applied_delta={} malformed={} decode_errors={} unapplied_deltas={} non_newer_sequences={} ignored_channels={} discontinuities={} sequence_ambiguities={} sequence_resyncs={} near_segment={} near_segment_ms={} sequence_order_unknown_gaps={}",
             self.window_started_at.is_some(),
             observed_ms,
             near.len(),
@@ -1626,6 +1770,12 @@ impl AvatarObserver {
             self.unapplied_deltas,
             self.non_newer_sequences,
             self.ignored_channels,
+            self.discontinuities,
+            self.sequence_ambiguities,
+            self.sequence_resyncs,
+            self.completed_near_segments.len(),
+            near_segment_ms,
+            self.sequence_order_unknown_gaps,
         );
         let mut csv = String::from("metric,value\n");
         let summary_values = format!(
@@ -1677,6 +1827,19 @@ impl AvatarObserver {
             csv.push_str(value);
             csv.push('\n');
         }
+        csv.push_str(&format!(
+            "discontinuities,{}\nsequence_ambiguities,{}\nsequence_resyncs,{}\n",
+            self.discontinuities, self.sequence_ambiguities, self.sequence_resyncs
+        ));
+        csv.push_str(&format!(
+            "near_metrics_scope,current_segment\nnear_segment,{}\nnear_segment_ms,{}\n",
+            self.completed_near_segments.len(),
+            near_segment_ms
+        ));
+        csv.push_str(&format!(
+            "sequence_order_unknown_gaps,{}\n",
+            self.sequence_order_unknown_gaps
+        ));
         csv.push_str("observed_channel,packets\n");
         let mut observed_channels = self.observed_channels.iter().collect::<Vec<_>>();
         observed_channels.sort_unstable_by_key(|(channel, _)| **channel);
@@ -1685,23 +1848,36 @@ impl AvatarObserver {
         }
         csv.push_str("peer_id,updates,p50_gap_ms,p95_gap_ms,last_near_age_ms,stale_500ms\n");
         for (peer_id, peer) in near {
-            let last_age = peer
-                .last_near_update
-                .map(|last| report_time.saturating_duration_since(last).as_millis())
-                .unwrap_or(u128::MAX);
-            let peer_p50 = avatar_gap_percentile(&mut peer.near_gaps_micros.clone(), 0.50);
-            let peer_p95 = avatar_gap_percentile(&mut peer.near_gaps_micros.clone(), 0.95);
-            let peer_stale = last_age > Self::STALE_AFTER.as_millis();
-            csv.push_str(&format!(
-                "{peer_id},{},{:.2},{:.2},{last_age},{}\n",
-                peer.near_update_count,
-                peer_p50 as f64 / 1000.0,
-                peer_p95 as f64 / 1000.0,
-                peer_stale,
-            ));
+            csv.push_str(&observer_peer_csv(*peer_id, peer, report_time));
+        }
+        if !self.completed_near_segments.is_empty() {
+            csv.push_str("completed_observer_segment,peer_id,updates,p50_gap_ms,p95_gap_ms,last_near_age_ms,stale_500ms\n");
+            for rows in &self.completed_near_segments {
+                csv.push_str(rows);
+            }
         }
         (summary, csv)
     }
+}
+
+fn observer_peer_csv(
+    peer_id: u16,
+    peer: &ObservedAvatarPeer,
+    report_time: std::time::Instant,
+) -> String {
+    let last_age = peer
+        .last_near_update
+        .map(|last| report_time.saturating_duration_since(last).as_millis())
+        .unwrap_or(u128::MAX);
+    let p50 = avatar_gap_percentile(&mut peer.near_gaps_micros.clone(), 0.50);
+    let p95 = avatar_gap_percentile(&mut peer.near_gaps_micros.clone(), 0.95);
+    format!(
+        "{peer_id},{},{:.2},{:.2},{last_age},{}\n",
+        peer.near_update_count,
+        p50 as f64 / 1000.0,
+        p95 as f64 / 1000.0,
+        last_age > AvatarObserver::STALE_AFTER.as_millis()
+    )
 }
 
 fn record_observer_near_update(
@@ -1739,14 +1915,6 @@ fn observer_quality(index: u8) -> Option<ProtocolBitQuality> {
         3 => Some(ProtocolBitQuality::High),
         _ => None,
     }
-}
-
-fn observer_sequence_is_newer(sequence: u8, last: Option<u8>) -> bool {
-    last.map(|last| {
-        let delta = sequence.wrapping_sub(last);
-        delta != 0 && delta < 128
-    })
-    .unwrap_or(true)
 }
 
 fn avatar_gap_percentile(gaps_micros: &mut [u64], percentile: f64) -> u64 {
@@ -1789,7 +1957,8 @@ struct BasisClient {
     server_avatar_metadata: StdMutex<Option<ServerAvatarMetadata>>,
     force_avatar_keyframe: AtomicBool,
     pose: Mutex<PoseState>,
-    avatar_observer: Option<StdMutex<AvatarObserver>>,
+    avatar_observer: Option<Arc<ObserverSession>>,
+    packet_diagnostics: PacketDiagnostics,
     avatar_diagnostics: Option<Arc<ClientAvatarDiagnostics>>,
     identity: Identity,
 }
@@ -2042,14 +2211,10 @@ impl BasisClient {
             server_avatar_metadata: StdMutex::new(None),
             force_avatar_keyframe: AtomicBool::new(false),
             pose: Mutex::new(PoseState::new_at(spawn_base)),
-            avatar_observer: (index == 0 && config.observe_avatar_csv.is_some()).then(|| {
-                StdMutex::new(AvatarObserver::new(
-                    config.avatar_observe_radius,
-                    config.avatar_observe_expected_peers,
-                    config.observe_avatar_start_file.clone(),
-                    config.observe_avatar_window,
-                ))
-            }),
+            avatar_observer: (index < OBSERVER_CANDIDATE_COUNT)
+                .then(|| config.observer_session.clone())
+                .flatten(),
+            packet_diagnostics: PacketDiagnostics::default(),
             avatar_diagnostics: ClientAvatarDiagnostics::enabled_from_env()
                 .then(|| Arc::new(ClientAvatarDiagnostics::default())),
             identity,
@@ -2085,8 +2250,9 @@ impl BasisClient {
         let client = self.clone();
         tokio::spawn(async move {
             let index = client.index;
-            if let Err(err) = client.receive_loop().await {
+            if let Err(err) = client.clone().receive_loop().await {
                 debug!("client {index} receive loop ended: {err}");
+                client.deactivate();
             }
         });
 
@@ -2127,6 +2293,13 @@ impl BasisClient {
     fn deactivate(&self) {
         self.in_use.store(false, Ordering::SeqCst);
         self.connected.store(false, Ordering::SeqCst);
+        if let Some(session) = &self.avatar_observer {
+            session.release((self.index, self.connect_time));
+        }
+        let drops = self.packet_diagnostics.snapshot();
+        if drops.iter().any(|count| *count != 0) {
+            debug!(client = self.index, ?drops, "packet drop counts: empty, unknown_property, short_header, invalid_ack_size, invalid_merged");
+        }
         self.stop_receive_loop();
     }
 
@@ -2354,12 +2527,31 @@ impl BasisClient {
         Ok(())
     }
 
+    fn record_unparsed_packet(&self, bytes: &[u8]) {
+        let reason = match bytes.first().copied() {
+            None => DropReason::Empty,
+            Some(first) if PacketProperty::from_byte(first).is_none() => {
+                DropReason::UnknownProperty
+            }
+            _ => DropReason::ShortHeader,
+        };
+        self.packet_diagnostics.record(self.index, reason);
+    }
+
     async fn handle_packet(&self, bytes: &[u8]) -> Result<()> {
         let packet = match parse_packet(bytes) {
             Some(packet) => packet,
-            None => return Ok(()),
+            None => {
+                self.record_unparsed_packet(bytes);
+                return Ok(());
+            }
         };
         trace!("client {} received {:?}", self.index, packet.property);
+        if self.connected.load(Ordering::Acquire) && self.in_use.load(Ordering::Acquire) {
+            if let Some(session) = &self.avatar_observer {
+                session.note_packet((self.index, self.connect_time), std::time::Instant::now());
+            }
+        }
         match packet.property {
             PacketProperty::ConnectAccept
                 if bytes.len() == 15
@@ -2367,7 +2559,7 @@ impl BasisClient {
             {
                 let remote_peer = i32::from_le_bytes(bytes[11..15].try_into().unwrap());
                 *self.remote_peer_id.lock().await = Some(remote_peer);
-                if self.index != 0 {
+                if self.index != 0 && self.avatar_observer.is_none() {
                     if let Err(err) = configure_load_sink_socket(&self.socket) {
                         warn!(
                             "client {} failed to enable load-sink receive filter: {err}",
@@ -2441,10 +2633,16 @@ impl BasisClient {
                     let size = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
                     pos += 2;
                     if size == 0 || pos + size > bytes.len() {
-                        break;
+                        self.packet_diagnostics
+                            .record(self.index, DropReason::InvalidMerged);
+                        return Ok(());
                     }
                     Box::pin(self.handle_packet(&bytes[pos..pos + size])).await?;
                     pos += size;
+                }
+                if pos != bytes.len() {
+                    self.packet_diagnostics
+                        .record(self.index, DropReason::InvalidMerged);
                 }
             }
             PacketProperty::CompactMerged => {
@@ -2455,23 +2653,31 @@ impl BasisClient {
                 let mut pos = 1usize;
                 while pos < bytes.len() {
                     if bytes.len() - pos < 2 {
-                        break;
+                        self.packet_diagnostics
+                            .record(self.index, DropReason::InvalidMerged);
+                        return Ok(());
                     }
                     let tag = bytes[pos];
                     pos += 1;
                     let is_raw = tag & RAW_PACKET_FLAG != 0;
                     let channel = tag & CHANNEL_MASK;
                     if is_raw && channel != 0 {
-                        break;
+                        self.packet_diagnostics
+                            .record(self.index, DropReason::InvalidMerged);
+                        return Ok(());
                     }
                     let payload_len = if tag & LONG_LENGTH_FLAG != 0 {
                         if bytes.len() - pos < 2 {
-                            break;
+                            self.packet_diagnostics
+                                .record(self.index, DropReason::InvalidMerged);
+                            return Ok(());
                         }
                         let len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
                         pos += 2;
                         if len <= u8::MAX as usize {
-                            break;
+                            self.packet_diagnostics
+                                .record(self.index, DropReason::InvalidMerged);
+                            return Ok(());
                         }
                         len
                     } else {
@@ -2480,20 +2686,26 @@ impl BasisClient {
                         len
                     };
                     if payload_len > bytes.len() - pos {
-                        break;
+                        self.packet_diagnostics
+                            .record(self.index, DropReason::InvalidMerged);
+                        return Ok(());
                     }
                     let payload = &bytes[pos..pos + payload_len];
                     pos += payload_len;
                     if is_raw {
                         if payload_len < 4 {
-                            break;
+                            self.packet_diagnostics
+                                .record(self.index, DropReason::InvalidMerged);
+                            return Ok(());
                         }
                         let property = PacketProperty::from_byte(payload[0]);
                         if !matches!(
                             property,
                             Some(PacketProperty::Ack | PacketProperty::Channeled)
                         ) {
-                            break;
+                            self.packet_diagnostics
+                                .record(self.index, DropReason::InvalidMerged);
+                            return Ok(());
                         }
                         Box::pin(self.handle_packet(payload)).await?;
                     } else {
@@ -2511,27 +2723,69 @@ impl BasisClient {
     }
 
     async fn observe_avatar_channel(&self, channel: u8, payload: &[u8]) {
-        let Some(observer) = &self.avatar_observer else {
+        let Some(session) = &self.avatar_observer else {
             return;
         };
+        if !session.could_own(self.index) {
+            return;
+        }
         let observer_position = self.pose.lock().await.position();
-        observer
-            .lock()
-            .expect("avatar observer mutex poisoned")
-            .observe_channel(
-                channel,
-                payload,
-                observer_position,
-                std::time::Instant::now(),
-            );
+        if let Some(mut state) = session.lock() {
+            let now = std::time::Instant::now();
+            // Check after locking: a deactivated/replaced client must not reclaim ownership.
+            if self.connected.load(Ordering::Acquire)
+                && self.in_use.load(Ordering::Acquire)
+                && session.claim(&mut state, (self.index, self.connect_time), now)
+            {
+                state
+                    .observer
+                    .observe_channel(channel, payload, observer_position, now);
+            }
+        }
+    }
+
+    fn metadata_state(&self) -> std::sync::MutexGuard<'_, Option<ServerAvatarMetadata>> {
+        match self.server_avatar_metadata.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                *state = None;
+                self.server_avatar_metadata.clear_poison();
+                self.shared_receive_eligible.store(false, Ordering::Release);
+                self.force_avatar_keyframe.store(true, Ordering::Release);
+                warn!(
+                    client = self.index,
+                    "server metadata mutex poisoned; discarded metadata, deactivating for reconnect"
+                );
+                // Metadata is sent during startup, not periodically. A fresh connection
+                // must obtain it again rather than leaving Unity avatar generation stalled.
+                self.deactivate();
+                state
+            }
+        }
+    }
+
+    fn reliable_receive_state(&self) -> Option<std::sync::MutexGuard<'_, ReliableReceiveState>> {
+        match self.received_reliable.lock() {
+            Ok(state) => Some(state),
+            Err(_) => {
+                // Resetting an ACK/replay window could acknowledge lost data or replay auth.
+                // Fail this connection closed; a replacement has fresh protocol state.
+                if self.in_use.load(Ordering::Acquire) {
+                    warn!(
+                        client = self.index,
+                        "reliable receive mutex poisoned; deactivating connection without ACK"
+                    );
+                    self.deactivate();
+                }
+                self.ack_pending.store(false, Ordering::Relaxed);
+                None
+            }
+        }
     }
 
     fn refresh_shared_receive_eligibility(&self) {
-        let metadata_ready = self
-            .server_avatar_metadata
-            .lock()
-            .expect("server metadata mutex poisoned")
-            .is_some();
+        let metadata_ready = self.metadata_state().is_some();
         if shared_receive_handoff_ready(self.connected.load(Ordering::Acquire), metadata_ready) {
             self.shared_receive_eligible.store(true, Ordering::Release);
         }
@@ -2549,11 +2803,12 @@ impl BasisClient {
             // `mark_new` also arms the channel's dirty flag -- for duplicates too, which is
             // what lets a lost ACK recover -- and the flush sends one datagram per armed
             // channel rather than one per received packet.
-            let is_new = self
-                .received_reliable
-                .lock()
-                .expect("reliable receive state mutex poisoned")
-                .mark_new(channel_id, sequence);
+            let Some(is_new) = self
+                .reliable_receive_state()
+                .map(|mut state| state.mark_new(channel_id, sequence))
+            else {
+                return Ok(());
+            };
             self.ack_pending.store(true, Ordering::Relaxed);
             if !is_new {
                 trace!(
@@ -2587,10 +2842,7 @@ impl BasisClient {
                             metadata.uplink_delta_enabled,
                         );
                     }
-                    *self
-                        .server_avatar_metadata
-                        .lock()
-                        .expect("server metadata mutex poisoned") = Some(metadata);
+                    *self.metadata_state() = Some(metadata);
                     self.refresh_shared_receive_eligibility();
                 }
                 Err(err) => warn!(
@@ -2641,10 +2893,9 @@ impl BasisClient {
     /// blocks packet reception.
     async fn flush_acks(&self) -> Result<()> {
         let pending = {
-            let mut received = self
-                .received_reliable
-                .lock()
-                .expect("reliable receive state mutex poisoned");
+            let Some(mut received) = self.reliable_receive_state() else {
+                return Ok(());
+            };
             received
                 .take_dirty_channels()
                 .into_iter()
@@ -2694,6 +2945,8 @@ impl BasisClient {
         ack_bits: &[u8],
     ) -> Result<()> {
         if ack_bits.len() != (DEFAULT_WINDOW_SIZE - 1) / 8 + 2 {
+            self.packet_diagnostics
+                .record(self.index, DropReason::InvalidAckSize);
             return Ok(());
         }
         let mut pending = self.pending_reliable.lock().await;
@@ -3738,10 +3991,7 @@ async fn movement_workers(
                                     .movement_frame_visits
                                     .fetch_add(1, Ordering::Relaxed);
                             }
-                            let metadata = *client
-                                .server_avatar_metadata
-                                .lock()
-                                .expect("server metadata mutex poisoned");
+                            let metadata = *client.metadata_state();
                             if let Some(metadata) = metadata {
                                 let force = client.force_avatar_keyframe.load(Ordering::Acquire);
                                 let mut pose = client.pose.lock().await;
@@ -4396,9 +4646,11 @@ fn shared_receive_registration_matches(
 
 #[cfg(target_os = "linux")]
 fn shared_receiver_mark_reliable(client: &BasisClient, bytes: &[u8]) {
-    if bytes.len() < LITENETLIB_CHANNELED_HEADER_SIZE
-        || bytes[0] & 0x1f != PacketProperty::Channeled as u8
-    {
+    if bytes.len() < LITENETLIB_CHANNELED_HEADER_SIZE {
+        client.record_unparsed_packet(bytes);
+        return;
+    }
+    if bytes[0] & 0x1f != PacketProperty::Channeled as u8 {
         return;
     }
     let sequence = u16::from_le_bytes([bytes[1], bytes[2]]);
@@ -4406,11 +4658,11 @@ fn shared_receiver_mark_reliable(client: &BasisClient, bytes: &[u8]) {
     if !matches!(channel_id % 4, 0 | 2) {
         return;
     }
-    let _ = client
-        .received_reliable
-        .lock()
-        .expect("reliable receive state mutex poisoned")
-        .mark_new(channel_id, sequence);
+    let Some(()) = client.reliable_receive_state().map(|mut state| {
+        state.mark_new(channel_id, sequence);
+    }) else {
+        return;
+    };
     // Duplicates re-arm the same persistent ACK window. Invalid/too-old packets leave no dirty
     // channel, so the maintenance flush remains a cheap no-op for them.
     client.ack_pending.store(true, Ordering::Relaxed);
@@ -4454,10 +4706,25 @@ fn shared_receiver_process_merged(client: &BasisClient, fd: RawFd, bytes: &[u8])
         let size = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
         pos += 2;
         if size == 0 || pos + size > bytes.len() {
-            break;
+            client
+                .packet_diagnostics
+                .record(client.index, DropReason::InvalidMerged);
+            return;
         }
         let packet = &bytes[pos..pos + size];
         let property = packet.first().copied().unwrap_or_default() & 0x1f;
+        match parse_packet(packet) {
+            None => client.record_unparsed_packet(packet),
+            Some(packet)
+                if packet.property == PacketProperty::Ack
+                    && packet.payload.len() != (DEFAULT_WINDOW_SIZE - 1) / 8 + 2 =>
+            {
+                client
+                    .packet_diagnostics
+                    .record(client.index, DropReason::InvalidAckSize);
+            }
+            _ => {}
+        }
         match property {
             p if p == PacketProperty::Channeled as u8 && packet.len() >= 4 => {
                 shared_receiver_mark_reliable(client, packet);
@@ -4469,6 +4736,11 @@ fn shared_receiver_process_merged(client: &BasisClient, fd: RawFd, bytes: &[u8])
             _ => {}
         }
         pos += size;
+    }
+    if pos != bytes.len() {
+        client
+            .packet_diagnostics
+            .record(client.index, DropReason::InvalidMerged);
     }
 }
 
@@ -4592,6 +4864,8 @@ fn run_shared_epoll_receiver(
                             if len >= 3 {
                                 let sequence = u16::from_le_bytes([buffer[1], buffer[2]]);
                                 shared_receiver_send_pong(fd, buffer[0], sequence);
+                            } else {
+                                client.record_unparsed_packet(&buffer[..len]);
                             }
                             continue;
                         }
@@ -4606,6 +4880,9 @@ fn run_shared_epoll_receiver(
                         p if p == PacketProperty::Pong as u8
                             || p == PacketProperty::MtuOk as u8 =>
                         {
+                            if property == PacketProperty::Pong as u8 && len < 11 {
+                                client.record_unparsed_packet(&buffer[..len]);
+                            }
                             continue;
                         }
                         _ => {}
@@ -4623,6 +4900,7 @@ fn run_shared_epoll_receiver(
                     continue;
                 }
                 if len == 0 {
+                    client.record_unparsed_packet(&[]);
                     break;
                 }
                 let err = std::io::Error::last_os_error();
@@ -4718,7 +4996,8 @@ async fn shared_receive_loop(
                     registered_clients.resize(snapshot.len(), Weak::new());
                 }
                 for (index, client) in snapshot.iter().enumerate().skip(1) {
-                    if !client.in_use.load(Ordering::Relaxed)
+                    if client.avatar_observer.is_some()
+                        || !client.in_use.load(Ordering::Relaxed)
                         || !client.shared_receive_eligible.load(Ordering::Acquire)
                     {
                         continue;
@@ -5213,7 +5492,7 @@ async fn async_main(worker_threads: usize) -> Result<()> {
     let _ = signal_ready_rx.await;
     info!("tokio runtime workers={worker_threads}");
     let config_path = args.config.clone();
-    let mut config = Config::load_or_create(&config_path)?;
+    let mut config = Config::load_or_create(&config_path, args.strict_config)?;
     if let Some(ip) = args.ip {
         config.ip = ip;
     }
@@ -5250,6 +5529,14 @@ async fn async_main(worker_threads: usize) -> Result<()> {
     config.avatar_observe_expected_peers = args.avatar_observe_expected_peers;
     config.observe_avatar_start_file = args.observe_avatar_start_file.clone();
     config.observe_avatar_window = Duration::from_secs(args.observe_avatar_window_secs.max(1));
+    config.observer_session = config.observe_avatar_csv.as_ref().map(|_| {
+        Arc::new(ObserverSession::new(AvatarObserver::new(
+            config.avatar_observe_radius,
+            config.avatar_observe_expected_peers,
+            config.observe_avatar_start_file.clone(),
+            config.observe_avatar_window,
+        )))
+    });
     if args.unity_avatar_policy && !args.no_spread && !args.fixed_spawn_positions {
         return Err(anyhow!(
             "--unity-avatar-policy requires --no-spread or --fixed-spawn-positions"
@@ -5589,20 +5876,17 @@ async fn async_main(worker_threads: usize) -> Result<()> {
             Err(error) => warn!("avatar sender diagnostic task failed: {error}"),
         }
     }
-    if let Some(path) = &config.observe_avatar_csv {
-        let observer_client = managed_clients.lock().await.first().cloned();
-        if let Some(observer_client) = observer_client {
-            if let Some(observer) = &observer_client.avatar_observer {
-                let now = std::time::Instant::now();
-                let observer = observer.lock().expect("avatar observer mutex poisoned");
-                let (summary, csv) = observer.summary_and_csv(now);
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(path, csv)
-                    .with_context(|| format!("writing avatar observer CSV {}", path.display()))?;
-                info!("{summary}; csv={}", path.display());
+    if let (Some(path), Some(session)) = (&config.observe_avatar_csv, &config.observer_session) {
+        if let Some(state) = session.lock() {
+            let (summary, csv) = state.observer.summary_and_csv(std::time::Instant::now());
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
             }
+            std::fs::write(path, csv)
+                .with_context(|| format!("writing avatar observer CSV {}", path.display()))?;
+            info!("{summary}; csv={}", path.display());
+        } else {
+            warn!("avatar observer measurement unavailable; no CSV written");
         }
     }
     info!(
@@ -5613,6 +5897,9 @@ async fn async_main(worker_threads: usize) -> Result<()> {
     disconnect_clients_in_batches(&managed_clients, quit_batch_size, quit_batch_delay).await;
     Ok(())
 }
+
+#[cfg(test)]
+mod resilience_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5708,7 +5995,12 @@ mod tests {
         assert!(summary.contains("decode_errors=0 unapplied_deltas=0"));
     }
 
-    fn server_fanout_delta(peer_id: u16, sequence: u8, base_sequence: u8, body: &[u8]) -> Vec<u8> {
+    pub(super) fn server_fanout_delta(
+        peer_id: u16,
+        sequence: u8,
+        base_sequence: u8,
+        body: &[u8],
+    ) -> Vec<u8> {
         // BasisServerCore::pre_serialize_delta layout: flags, ID, interval, sequence, base, body.
         let large = peer_id > u8::MAX as u16;
         let mut payload = vec![
@@ -5729,7 +6021,7 @@ mod tests {
         payload
     }
 
-    fn observer_full_frame(peer_id: u16, sequence: u8, payload: &[u8]) -> (u8, Vec<u8>) {
+    pub(super) fn observer_full_frame(peer_id: u16, sequence: u8, payload: &[u8]) -> (u8, Vec<u8>) {
         let large = peer_id > u8::MAX as u16;
         let mut full = Vec::with_capacity(payload.len() + if large { 5 } else { 4 });
         if large {
@@ -5982,7 +6274,7 @@ mod tests {
         );
     }
 
-    async fn test_client(index: usize, server_addr: SocketAddr) -> Arc<BasisClient> {
+    pub(super) async fn test_client(index: usize, server_addr: SocketAddr) -> Arc<BasisClient> {
         let socket = bind_udp_socket(any_local_addr(server_addr)).unwrap();
         socket.connect(server_addr).await.unwrap();
         Arc::new(BasisClient {
@@ -6012,6 +6304,7 @@ mod tests {
             force_avatar_keyframe: AtomicBool::new(false),
             pose: Mutex::new(PoseState::new_at([0.0; 3])),
             avatar_observer: None,
+            packet_diagnostics: PacketDiagnostics::default(),
             avatar_diagnostics: None,
             identity: Identity::random(),
         })
