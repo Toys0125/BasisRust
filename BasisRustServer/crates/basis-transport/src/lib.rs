@@ -260,12 +260,25 @@ pub struct TransportStatsSnapshot {
 
 /// Instantaneous totals over currently connected transport peers. Payload/fragment counts
 /// and datagram counts have different units and may overlap; do not sum them as a backlog.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportDepthSnapshot {
     pub peers: usize,
     pub reliable_pending: usize,
-    pub reliable_queued: usize,
-    pub pending_datagrams: usize,
+    /// None if any peer's outgoing queue is contended during sampling.
+    pub reliable_queued: Option<usize>,
+    /// None if any peer's retained datagram queue is contended during sampling.
+    pub pending_datagrams: Option<usize>,
+}
+
+impl Default for TransportDepthSnapshot {
+    fn default() -> Self {
+        Self {
+            peers: 0,
+            reliable_pending: 0,
+            reliable_queued: Some(0),
+            pending_datagrams: Some(0),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -622,15 +635,31 @@ impl TransportHandle {
         self.peers.iter().map(|peer| peer.total_queued()).sum()
     }
 
-    /// Samples actual Rust queues, taking one queue lock at a time. Concurrent sends/ACKs
-    /// can change them during sampling, so this is not an atomic cross-queue snapshot.
+    /// Copies peer references before sampling queues, without retaining peer-map guards.
+    /// A contended queue makes its aggregate unavailable rather than waiting or reporting
+    /// an incomplete total. Concurrent sends/ACKs can change depths during sampling.
     pub fn depths_snapshot(&self) -> TransportDepthSnapshot {
-        let mut snapshot = TransportDepthSnapshot::default();
-        for peer in self.peers.iter() {
-            snapshot.peers += 1;
+        let peers = self
+            .peers
+            .iter()
+            .map(|peer| Arc::clone(peer.value()))
+            .collect::<Vec<_>>();
+        let mut snapshot = TransportDepthSnapshot {
+            peers: peers.len(),
+            ..TransportDepthSnapshot::default()
+        };
+        for peer in peers {
             snapshot.reliable_pending += peer.total_pending();
-            snapshot.reliable_queued += peer.total_queued();
-            snapshot.pending_datagrams += peer.pending_datagrams.lock().len();
+            snapshot.reliable_queued = snapshot.reliable_queued.and_then(|total| {
+                peer.outgoing_reliable
+                    .try_lock()
+                    .map(|queues| total + queues.values().map(VecDeque::len).sum::<usize>())
+            });
+            snapshot.pending_datagrams = snapshot.pending_datagrams.and_then(|total| {
+                peer.pending_datagrams
+                    .try_lock()
+                    .map(|queue| total + queue.len())
+            });
         }
         snapshot
     }
@@ -4249,14 +4278,45 @@ mod tests {
             TransportDepthSnapshot {
                 peers: 1,
                 reliable_pending: 1,
-                reliable_queued: 1,
-                pending_datagrams: 1,
+                reliable_queued: Some(1),
+                pending_datagrams: Some(1),
             }
         );
 
         handle.disconnect(peer.id, "test").await.unwrap();
         // A retained Arc to old peer queues must not count as a live transport depth.
         assert_eq!(peer.total_pending(), 1);
+        assert_eq!(handle.depths_snapshot(), TransportDepthSnapshot::default());
+    }
+
+    #[tokio::test]
+    async fn contended_depth_sampling_does_not_wait_or_hold_peer_map_guards() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        handle.shutdown();
+        let peer = test_peer_state(0);
+        handle.peers.insert(peer.id, peer.clone());
+        enqueue_reliable_payload(&peer, channels::CHAT, DeliveryMethod::ReliableOrdered, &[1]);
+        let outgoing = peer.outgoing_reliable.lock();
+        let datagrams = peer.pending_datagrams.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sampling_handle = handle.clone();
+        let worker = std::thread::spawn(move || {
+            tx.send(sampling_handle.depths_snapshot()).unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        // While queue guards are still held, a returned sampler must leave the peer map free.
+        if result.is_ok() {
+            handle.peers.remove(&peer.id);
+        }
+        // Release locks even on failure so a regression cannot leave a worker stuck forever.
+        drop(datagrams);
+        drop(outgoing);
+        worker.join().unwrap();
+        let snapshot = result.expect("sampling must not wait for contended queue locks");
+        assert_eq!(snapshot.peers, 1);
+        assert_eq!(snapshot.reliable_pending, 0);
+        assert_eq!(snapshot.reliable_queued, None);
+        assert_eq!(snapshot.pending_datagrams, None);
         assert_eq!(handle.depths_snapshot(), TransportDepthSnapshot::default());
     }
 
