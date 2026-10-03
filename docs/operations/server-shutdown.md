@@ -25,15 +25,30 @@ made durable by a timeout; a stuck output sink cannot be guaranteed to flush.
 Both are attempted before exit, with persistence before native joins and a
 bounded final output attempt so a broken pipe/terminal cannot defeat shutdown.
 
+File-backed deployments depend on the atomic database replacement in
+[PR #18](https://github.com/Toys0125/BasisRust/pull/18). A watchdog can interrupt
+any save, including the final save; the baseline truncating write cannot
+preserve the earlier snapshot. Integrate atomic persistence before enabling
+this lifecycle in a file-backed deployment. Database implementation changes
+remain in the storage PR.
+
 Rustyline's blocking stdin read has no portable cancellation API. The console
 joins its input thread when finished and detaches an input thread still waiting
 for a line. It checks the stop flag before executing any newly returned command.
 Normal process termination reclaims that thread. No indefinite stdin join is
 introduced.
 
+Idle allocator reclaim is a bounded, best-effort owner sweep. Its existing wake
+waves and five-second deadline cannot guarantee that every Tokio owner leaves
+its park loop. It reports actual partial coverage; a deferred owner collects
+once on its next park/unpark or explicit poll. Shutdown can abort the reclaim
+task, and the runtime teardown watchdog covers any started blocking work.
+
 Profiling retains its five-second snapshot window and counters. The tick thread
 only captures the snapshot; a separate console output thread emits each new snapshot as
-a single `BSR Profile` tracing event, subject to `--log-level`. Slow output no
+a single `BSR Profile` tracing event. Explicitly enabled profiling and periodic
+status output use a dedicated diagnostic target enabled even when `--log-level`
+is `warn` or `off`, preserving their previous unconditional output behavior. Slow output no
 longer runs on the avatar tick or Tokio runtime worker threads. A stalled reporter can skip intermediate
 windows because it reads the latest snapshot; health statistics retain the latest
 window as before.

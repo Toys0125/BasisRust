@@ -1,5 +1,7 @@
 mod shutdown;
 
+const DIAGNOSTIC_TARGET: &str = "basis_server_console::diagnostics";
+
 use anyhow::{Context, Result};
 use basis_protocol::{
     avatar::AVATAR_BUNDLE_DICTIONARY_GENERATION, config::ServerConfig, permissions::nodes,
@@ -569,10 +571,18 @@ fn poll_tokio_reclaim(
     }
 }
 
+fn console_log_filter(level: &str) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::new(level).add_directive(
+        "basis_server_console::diagnostics=info"
+            .parse()
+            .expect("static diagnostic log directive"),
+    )
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     tracing_subscriber::fmt()
-        .with_env_filter(args.log_level.clone())
+        .with_env_filter(console_log_filter(&args.log_level))
         .init();
 
     let worker_count = if let Ok(value) = std::env::var("TOKIO_WORKER_THREADS") {
@@ -1033,7 +1043,10 @@ fn start_output_worker(
             let mut last_status = Instant::now();
             while running.load(Ordering::Relaxed) {
                 // The stop channel wakes even a long status interval promptly.
-                if !matches!(rx.recv_timeout(Duration::from_secs(1)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                if !matches!(
+                    rx.recv_timeout(Duration::from_secs(1)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
                     break;
                 }
                 if !running.load(Ordering::Relaxed) {
@@ -1044,11 +1057,11 @@ fn start_output_worker(
                         last_capture = Some(snapshot.captured_at);
                         // Formatting and sink writes belong to this thread,
                         // never the avatar tick or Tokio runtime workers.
-                        info!(target: "basis_server_core::avatar_sync", profile = ?snapshot, "BSR Profile");
+                        info!(target: DIAGNOSTIC_TARGET, profile = ?snapshot, "BSR Profile");
                     }
                 }
                 if status_interval.is_some_and(|interval| last_status.elapsed() >= interval) {
-                    info!("{}", server.status_text_with_detail(true));
+                    info!(target: DIAGNOSTIC_TARGET, "{}", server.status_text_with_detail(true));
                     last_status = Instant::now();
                 }
             }
@@ -1887,6 +1900,40 @@ fn display_list(values: &[String]) -> String {
 mod memory_reclaim_tests {
     use super::*;
 
+    #[test]
+    fn requested_diagnostics_survive_warn_and_off_log_filters() {
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for level in ["warn", "off"] {
+            let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = Capture(output.clone());
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(console_log_filter(level))
+                .with_writer(move || writer.clone())
+                .without_time()
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                info!(target: DIAGNOSTIC_TARGET, "requested profile marker");
+                info!(target: DIAGNOSTIC_TARGET, "requested status marker");
+                info!(target: "basis_server_console", "ordinary info marker");
+            });
+            let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            assert!(text.contains("requested profile marker"), "{level}: {text}");
+            assert!(text.contains("requested status marker"), "{level}: {text}");
+            assert!(!text.contains("ordinary info marker"), "{level}: {text}");
+        }
+    }
+
     #[tokio::test]
     async fn stopping_output_worker_does_not_wait_for_status_interval() {
         let config = ServerConfig {
@@ -1918,8 +1965,48 @@ mod memory_reclaim_tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn bounded_sweep_reports_deferred_owner_then_collects_on_later_poll() {
+        // This current-thread runtime can service only one allocator owner.
+        // Reserve the other slot for an owner that resumes after the sweep.
+        let collected = Arc::new(AtomicUsize::new(0));
+        let collected_by_owner = collected.clone();
+        let epoch = MemoryReclaimEpoch::new(Arc::new(move || {
+            collected_by_owner.fetch_add(1, Ordering::Relaxed);
+        }));
+        let workers = Arc::new(vec![AtomicU64::new(0), AtomicU64::new(0)]);
+        let next_worker_id = Arc::new(AtomicUsize::new(0));
+        let requested = epoch.request_reclaim();
+        let reached = tokio::time::timeout(
+            Duration::from_secs(6),
+            collect_tokio_workers(
+                epoch.clone(),
+                workers.clone(),
+                next_worker_id.clone(),
+                2,
+                requested,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reached, 1);
+        assert_eq!(collected.load(Ordering::Relaxed), 1);
+        assert_eq!(workers[1].load(Ordering::Acquire), 0);
+        let resumed_workers = workers.clone();
+        thread::spawn(move || {
+            poll_tokio_reclaim(&epoch, &resumed_workers, &next_worker_id, 2);
+            poll_tokio_reclaim(&epoch, &resumed_workers, &next_worker_id, 2);
+        })
+        .join()
+        .unwrap();
+        assert!(workers
+            .iter()
+            .all(|seen| seen.load(Ordering::Acquire) == requested));
+        assert_eq!(collected.load(Ordering::Relaxed), 2); // Once for each owner.
+    }
+
     #[test]
-    fn bounded_sweep_reaches_each_tokio_worker() {
+    fn bounded_sweep_reports_actual_tokio_worker_coverage() {
         let collected = Arc::new(AtomicUsize::new(0));
         let collected_by_owner = Arc::clone(&collected);
         let epoch = MemoryReclaimEpoch::new(Arc::new(move || {
@@ -1947,7 +2034,7 @@ mod memory_reclaim_tests {
             move || poll_tokio_reclaim(&epoch, &workers, &next_worker_id, worker_count)
         });
         let runtime = builder.build().unwrap();
-        runtime.block_on(async {
+        let (reached, requested) = runtime.block_on(async {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let requested = epoch.request_reclaim();
             let reached = collect_tokio_workers(
@@ -1959,9 +2046,17 @@ mod memory_reclaim_tests {
             )
             .await;
 
-            assert_eq!(reached, worker_count);
-            assert_eq!(collected.load(Ordering::Relaxed), worker_count);
-            assert!(next_worker_id.load(Ordering::Relaxed) <= worker_count);
+            (reached, requested)
         });
+        drop(runtime);
+        let acknowledged = workers
+            .iter()
+            .filter(|seen| seen.load(Ordering::Acquire) >= requested)
+            .count();
+        // Wake waves cannot guarantee that every owner leaves its park loop.
+        // Coverage may increase later, but the sweep must never invent an ACK.
+        assert!(reached > 0 && reached <= acknowledged && acknowledged <= worker_count);
+        assert_eq!(collected.load(Ordering::Relaxed), acknowledged);
+        assert!(next_worker_id.load(Ordering::Relaxed) <= worker_count);
     }
 }
