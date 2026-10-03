@@ -1,6 +1,6 @@
 use crate::{
     avatar::BitQuality,
-    io::{NetReader, NetWriter, Result as ReadResult},
+    io::{NetReader, NetWriter, Result as ReadResult, WriteResult},
     permissions,
 };
 use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use uuid::Uuid;
 
 pub trait BasisSerialize {
-    fn serialize(&self, writer: &mut NetWriter);
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()>;
 }
 
 pub trait BasisDeserialize: Sized {
@@ -22,9 +22,9 @@ pub struct BytesMessage {
 }
 
 impl BasisSerialize for BytesMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
-        writer.put_u16(self.data.len() as u16);
-        writer.put_bytes(&self.data);
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
+        writer.put_bytes_with_length(&self.data)?;
+        Ok(())
     }
 }
 
@@ -43,8 +43,9 @@ pub struct PlayerIdMessage {
 }
 
 impl BasisSerialize for PlayerIdMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
+        Ok(())
     }
 }
 
@@ -64,10 +65,11 @@ pub struct ClientMetaDataMessage {
 }
 
 impl BasisSerialize for ClientMetaDataMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
-        write_compact_id(writer, non_empty_or_failure(&self.player_uuid));
-        writer.put_string(non_empty_or_failure(&self.player_display_name));
-        write_platform(writer, non_empty_or_failure(&self.player_platform));
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
+        write_compact_id(writer, non_empty_or_failure(&self.player_uuid))?;
+        writer.put_string(non_empty_or_failure(&self.player_display_name))?;
+        write_platform(writer, non_empty_or_failure(&self.player_platform))?;
+        Ok(())
     }
 }
 
@@ -96,7 +98,7 @@ const COMPACT_ID_HEX: u8 = 3;
 const COMPACT_ID_DID_KEY: u8 = 4;
 const DID_KEY_PREFIX: &str = "did:key:";
 
-fn write_compact_id(writer: &mut NetWriter, value: &str) {
+fn write_compact_id(writer: &mut NetWriter, value: &str) -> WriteResult<()> {
     if let Ok(uuid) = Uuid::parse_str(value) {
         if value.len() == 32 || value.len() == 36 {
             let format = if value.len() == 36 {
@@ -120,7 +122,7 @@ fn write_compact_id(writer: &mut NetWriter, value: &str) {
                 writer.put_u8(COMPACT_ID_UUID);
                 writer.put_u8(format);
                 writer.put_bytes(&uuid.to_bytes_le());
-                return;
+                return Ok(());
             }
         }
     }
@@ -130,7 +132,7 @@ fn write_compact_id(writer: &mut NetWriter, value: &str) {
             if parsed.to_string() == value {
                 writer.put_u8(COMPACT_ID_U64);
                 writer.put_u64(parsed);
-                return;
+                return Ok(());
             }
         }
     }
@@ -141,7 +143,7 @@ fn write_compact_id(writer: &mut NetWriter, value: &str) {
             writer.put_u8(COMPACT_ID_DID_KEY);
             writer.put_u8(bytes.len() as u8);
             writer.put_bytes(bytes);
-            return;
+            return Ok(());
         }
     }
 
@@ -162,12 +164,13 @@ fn write_compact_id(writer: &mut NetWriter, value: &str) {
             writer.put_u8(u8::from(has_upper));
             writer.put_u8(bytes.len() as u8);
             writer.put_bytes(&bytes);
-            return;
+            return Ok(());
         }
     }
 
     writer.put_u8(COMPACT_ID_RAW);
-    writer.put_string(value);
+    writer.put_string(value)?;
+    Ok(())
 }
 
 fn read_compact_id(reader: &mut NetReader<'_>) -> ReadResult<String> {
@@ -248,13 +251,14 @@ const KNOWN_PLATFORMS: &[&str] = &[
     "Headless",
 ];
 
-fn write_platform(writer: &mut NetWriter, value: &str) {
+fn write_platform(writer: &mut NetWriter, value: &str) -> WriteResult<()> {
     if let Some(index) = KNOWN_PLATFORMS.iter().position(|known| *known == value) {
         writer.put_u8((index + 1) as u8);
     } else {
         writer.put_u8(0);
-        writer.put_string(value);
+        writer.put_string(value)?;
     }
+    Ok(())
 }
 
 fn read_platform(reader: &mut NetReader<'_>) -> ReadResult<String> {
@@ -280,14 +284,14 @@ pub struct ClientAvatarChangeMessage {
 }
 
 impl BasisSerialize for ClientAvatarChangeMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u8(self.load_mode);
-        writer.put_u16(self.byte_array.len() as u16);
-        writer.put_bytes(&self.byte_array);
+        writer.put_bytes_with_length(&self.byte_array)?;
         writer.put_u8(self.local_avatar_index);
         writer.put_u16(compress_fit_scale(self.arm_scale));
         writer.put_u16(compress_fit_scale(self.leg_scale));
         writer.put_u16(compress_fit_scale(self.torso_scale));
+        Ok(())
     }
 }
 
@@ -319,10 +323,11 @@ pub struct ClientBodyFitMessage {
 }
 
 impl BasisSerialize for ClientBodyFitMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(compress_fit_scale(self.arm_scale));
         writer.put_u16(compress_fit_scale(self.leg_scale));
         writer.put_u16(compress_fit_scale(self.torso_scale));
+        Ok(())
     }
 }
 
@@ -343,9 +348,10 @@ pub struct ServerBodyFitMessage {
 }
 
 impl BasisSerialize for ServerBodyFitMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
-        self.body_fit.serialize(writer);
+        self.body_fit.serialize(writer)?;
+        Ok(())
     }
 }
 
@@ -381,13 +387,14 @@ pub struct AdditionalAvatarData {
 }
 
 impl BasisSerialize for AdditionalAvatarData {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         let len = self.data.len().min(u8::MAX as usize);
         writer.put_u8(len as u8);
         if len > 0 {
             writer.put_u8(self.message_index);
             writer.put_bytes(&self.data[..len]);
         }
+        Ok(())
     }
 }
 
@@ -426,29 +433,35 @@ impl LocalAvatarSyncMessage {
         }
     }
 
-    pub fn serialize_for_channel(&self, writer: &mut NetWriter, has_additional_data: bool) {
+    pub fn serialize_for_channel(
+        &self,
+        writer: &mut NetWriter,
+        has_additional_data: bool,
+    ) -> WriteResult<()> {
         writer.put_bytes(&self.array);
         if has_additional_data {
             writer.put_u8(self.additional_avatar_datas.len() as u8);
             writer.put_u8(self.linked_avatar_index);
             for item in &self.additional_avatar_datas {
-                item.serialize(writer);
+                item.serialize(writer)?;
             }
         }
+        Ok(())
     }
 }
 
 impl BasisSerialize for LocalAvatarSyncMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u8(self.data_quality_level);
         writer.put_bytes(&self.array);
         writer.put_u8(self.additional_avatar_datas.len() as u8);
         if !self.additional_avatar_datas.is_empty() {
             writer.put_u8(self.linked_avatar_index);
             for item in &self.additional_avatar_datas {
-                item.serialize(writer);
+                item.serialize(writer)?;
             }
         }
+        Ok(())
     }
 }
 
@@ -485,10 +498,11 @@ pub struct ReadyMessage {
 }
 
 impl BasisSerialize for ReadyMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
-        self.player_meta_data_message.serialize(writer);
-        self.client_avatar_change_message.serialize(writer);
-        self.local_avatar_sync_message.serialize(writer);
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
+        self.player_meta_data_message.serialize(writer)?;
+        self.client_avatar_change_message.serialize(writer)?;
+        self.local_avatar_sync_message.serialize(writer)?;
+        Ok(())
     }
 }
 
@@ -518,8 +532,8 @@ pub struct ServerMetaDataMessage {
 }
 
 impl BasisSerialize for ServerMetaDataMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
-        self.client_meta_data_message.serialize(writer);
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
+        self.client_meta_data_message.serialize(writer)?;
         writer.put_i32(self.sync_interval);
         writer.put_i32(self.base_multiplier);
         writer.put_f32(self.increase_rate);
@@ -527,14 +541,15 @@ impl BasisSerialize for ServerMetaDataMessage {
         writer.put_i32(self.peer_limit);
         let (bitset, extras) =
             encode_permission_wire(&self.allowed_permissions, &self.denied_permissions);
-        writer.put_bytes_with_length(&bitset);
+        writer.put_bytes_with_length(&bitset)?;
         writer.put_u16(extras.len() as u16);
         if !extras.is_empty() {
-            writer.put_bytes_with_length(&compress_permission_extras(&extras));
+            writer.put_bytes_with_length(&compress_permission_extras(&extras))?;
         }
         writer.put_u8(u8::from(self.uplink_delta_enabled));
         writer.put_i32(self.image_share_egress_megabits_per_second);
         writer.put_f32(self.image_pickup_range_meters);
+        Ok(())
     }
 }
 
@@ -654,12 +669,13 @@ pub struct BasisMessageDescriptor {
 }
 
 impl BasisSerialize for BasisMessageDescriptor {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.id);
         writer.put_u8(self.version);
         writer.put_u8(self.channel);
         writer.put_u8(self.flags);
-        writer.put_string(&self.name);
+        writer.put_string(&self.name)?;
+        Ok(())
     }
 }
 
@@ -681,11 +697,12 @@ pub struct BasisMessageSupply {
 }
 
 impl BasisSerialize for BasisMessageSupply {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.descriptors.len() as u16);
         for descriptor in &self.descriptors {
-            descriptor.serialize(writer);
+            descriptor.serialize(writer)?;
         }
+        Ok(())
     }
 }
 
@@ -706,11 +723,12 @@ pub struct BasisMessageSubscribe {
 }
 
 impl BasisSerialize for BasisMessageSubscribe {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.ids.len() as u16);
         for id in &self.ids {
             writer.put_u16(*id);
         }
+        Ok(())
     }
 }
 
@@ -820,7 +838,7 @@ impl ServerReadyBatchMessage {
 }
 
 impl BasisSerialize for ServerReadyBatchMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         let mut compressed_payload = None;
         if self.payload.len() >= Self::MIN_COMPRESS_BYTES {
             let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
@@ -842,6 +860,7 @@ impl BasisSerialize for ServerReadyBatchMessage {
             writer.put_i32(self.payload.len() as i32);
             writer.put_bytes(&self.payload);
         }
+        Ok(())
     }
 }
 
@@ -881,9 +900,10 @@ pub struct ServerReadyMessage {
 }
 
 impl BasisSerialize for ServerReadyMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
-        self.player_id_message.serialize(writer);
-        self.local_ready_message.serialize(writer);
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
+        self.player_id_message.serialize(writer)?;
+        self.local_ready_message.serialize(writer)?;
+        Ok(())
     }
 }
 
@@ -893,10 +913,11 @@ pub struct NetIdMessage {
 }
 
 impl BasisSerialize for NetIdMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         if !self.player_id.is_empty() {
-            writer.put_string(&self.player_id);
+            writer.put_string(&self.player_id)?;
         }
+        Ok(())
     }
 }
 
@@ -919,8 +940,9 @@ pub struct UshortUniqueIdMessage {
 }
 
 impl BasisSerialize for UshortUniqueIdMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.unique_id_ushort);
+        Ok(())
     }
 }
 
@@ -939,9 +961,10 @@ pub struct ServerNetIdMessage {
 }
 
 impl BasisSerialize for ServerNetIdMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
-        self.net_id_message.serialize(writer);
-        self.ushort_unique_id_message.serialize(writer);
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
+        self.net_id_message.serialize(writer)?;
+        self.ushort_unique_id_message.serialize(writer)?;
+        Ok(())
     }
 }
 
@@ -960,11 +983,12 @@ pub struct ServerUniqueIdMessages {
 }
 
 impl BasisSerialize for ServerUniqueIdMessages {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.messages.len() as u16);
         for message in &self.messages {
-            message.serialize(writer);
+            message.serialize(writer)?;
         }
+        Ok(())
     }
 }
 
@@ -974,10 +998,11 @@ pub struct ChatMessage {
 }
 
 impl BasisSerialize for ChatMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         let len = self.payload.len().min(512);
         writer.put_u16(len as u16);
         writer.put_bytes(&self.payload[..len]);
+        Ok(())
     }
 }
 
@@ -997,9 +1022,10 @@ pub struct ServerChatMessage {
 }
 
 impl BasisSerialize for ServerChatMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
-        self.chat_message.serialize(writer);
+        self.chat_message.serialize(writer)?;
+        Ok(())
     }
 }
 
@@ -1017,8 +1043,9 @@ impl BasisDeserialize for AudioSegmentDataMessage {
 }
 
 impl BasisSerialize for AudioSegmentDataMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_bytes(&self.audio_segment);
+        Ok(())
     }
 }
 
@@ -1040,9 +1067,10 @@ impl ServerAudioSegmentMessage {
 }
 
 impl BasisSerialize for ServerAudioSegmentMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
         writer.put_bytes(&self.audio_segment);
+        Ok(())
     }
 }
 
@@ -1064,11 +1092,12 @@ pub struct ServerSideSyncPlayerMessage {
 }
 
 impl BasisSerialize for ServerSideSyncPlayerMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
         writer.put_u8(self.interval);
         writer.put_u8(self.sequence);
-        self.avatar_serialization.serialize(writer);
+        self.avatar_serialization.serialize(writer)?;
+        Ok(())
     }
 }
 
@@ -1093,7 +1122,7 @@ pub struct AvatarDataMessage {
 }
 
 impl BasisSerialize for AvatarDataMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
         writer.put_u8(self.avatar_link_index);
         writer.put_u8(self.message_index);
@@ -1102,6 +1131,7 @@ impl BasisSerialize for AvatarDataMessage {
             writer.put_u16(*recipient);
         }
         writer.put_bytes(&self.payload);
+        Ok(())
     }
 }
 
@@ -1134,11 +1164,12 @@ pub struct RemoteAvatarDataMessage {
 }
 
 impl BasisSerialize for RemoteAvatarDataMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
         writer.put_u8(self.avatar_link_index);
         writer.put_u8(self.message_index);
         writer.put_bytes(&self.payload);
+        Ok(())
     }
 }
 
@@ -1160,9 +1191,10 @@ pub struct ServerAvatarChangeMessage {
 }
 
 impl BasisSerialize for ServerAvatarChangeMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
-        self.client_avatar_change_message.serialize(writer);
+        self.client_avatar_change_message.serialize(writer)?;
+        Ok(())
     }
 }
 
@@ -1182,9 +1214,10 @@ pub struct ServerAvatarDataMessage {
 }
 
 impl BasisSerialize for ServerAvatarDataMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
-        self.avatar_data_message.serialize(writer);
+        self.avatar_data_message.serialize(writer)?;
+        Ok(())
     }
 }
 
@@ -1234,12 +1267,12 @@ pub struct LocalLoadResource {
 }
 
 impl BasisSerialize for LocalLoadResource {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u8(self.mode);
-        writer.put_string(&self.loaded_net_id);
-        writer.put_string(&self.unlock_password);
-        writer.put_string(&self.combined_url);
-        writer.put_string(&self.uuid_of_creator);
+        writer.put_string(&self.loaded_net_id)?;
+        writer.put_string(&self.unlock_password)?;
+        writer.put_string(&self.combined_url)?;
+        writer.put_string(&self.uuid_of_creator)?;
         writer.put_bool(self.is_admin_locked);
         writer.put_bool(self.persist);
         writer.put_bool(self.static_resource);
@@ -1258,6 +1291,7 @@ impl BasisSerialize for LocalLoadResource {
             writer.put_f32(self.scale_y);
             writer.put_f32(self.scale_z);
         }
+        Ok(())
     }
 }
 
@@ -1325,11 +1359,12 @@ pub struct ModifyResource {
 }
 
 impl BasisSerialize for ModifyResource {
-    fn serialize(&self, writer: &mut NetWriter) {
-        writer.put_string(&self.loaded_net_id);
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
+        writer.put_string(&self.loaded_net_id)?;
         writer.put_u8(self.mode);
         writer.put_bool(self.static_resource);
         writer.put_bool(self.static_admin_locked);
+        Ok(())
     }
 }
 
@@ -1352,13 +1387,14 @@ pub struct SceneDataMessage {
 }
 
 impl BasisSerialize for SceneDataMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.message_index);
         writer.put_u16(self.recipients.len() as u16);
         for recipient in &self.recipients {
             writer.put_u16(*recipient);
         }
         writer.put_bytes(&self.payload);
+        Ok(())
     }
 }
 
@@ -1385,9 +1421,10 @@ pub struct RemoteSceneDataMessage {
 }
 
 impl BasisSerialize for RemoteSceneDataMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.message_index);
         writer.put_bytes(&self.payload);
+        Ok(())
     }
 }
 
@@ -1407,9 +1444,10 @@ pub struct ServerSceneDataMessage {
 }
 
 impl BasisSerialize for ServerSceneDataMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
-        self.scene_data_message.serialize(writer);
+        self.scene_data_message.serialize(writer)?;
+        Ok(())
     }
 }
 
@@ -1420,9 +1458,10 @@ pub struct UnloadResource {
 }
 
 impl BasisSerialize for UnloadResource {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u8(self.mode);
-        writer.put_string(&self.loaded_net_id);
+        writer.put_string(&self.loaded_net_id)?;
+        Ok(())
     }
 }
 
@@ -1442,9 +1481,10 @@ pub struct PreloadReadyMessage {
 }
 
 impl BasisSerialize for PreloadReadyMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
-        writer.put_string(&self.loaded_net_id);
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
+        writer.put_string(&self.loaded_net_id)?;
         writer.put_bool(self.is_ready);
+        Ok(())
     }
 }
 
@@ -1463,8 +1503,9 @@ pub struct SpawnPreloadedMessage {
 }
 
 impl BasisSerialize for SpawnPreloadedMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
-        writer.put_string(&self.loaded_net_id);
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
+        writer.put_string(&self.loaded_net_id)?;
+        Ok(())
     }
 }
 
@@ -1483,9 +1524,10 @@ pub struct DatabasePrimitiveMessage {
 }
 
 impl BasisSerialize for DatabasePrimitiveMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
-        writer.put_string(&self.name);
-        write_database_payload(writer, &self.json_payload);
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
+        writer.put_string(&self.name)?;
+        write_database_payload(writer, &self.json_payload)?;
+        Ok(())
     }
 }
 
@@ -1503,8 +1545,9 @@ pub struct DataBaseRequest {
 }
 
 impl BasisSerialize for DataBaseRequest {
-    fn serialize(&self, writer: &mut NetWriter) {
-        writer.put_string(&self.database_id);
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
+        writer.put_string(&self.database_id)?;
+        Ok(())
     }
 }
 
@@ -1514,8 +1557,9 @@ pub struct ErrorMessage {
 }
 
 impl BasisSerialize for ErrorMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
-        writer.put_string(&self.message);
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
+        writer.put_string(&self.message)?;
+        Ok(())
     }
 }
 
@@ -1533,8 +1577,9 @@ pub struct BasisAvatarCloneRequest {
 }
 
 impl BasisSerialize for BasisAvatarCloneRequest {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.requesting_user);
+        Ok(())
     }
 }
 
@@ -1552,8 +1597,9 @@ pub struct BasisAvatarCloneResponse {
 }
 
 impl BasisSerialize for BasisAvatarCloneResponse {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.requesting_user);
+        Ok(())
     }
 }
 
@@ -1572,9 +1618,10 @@ pub struct OwnershipTransferMessage {
 }
 
 impl BasisSerialize for OwnershipTransferMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
-        writer.put_string(&self.ownership_id);
+        writer.put_string(&self.ownership_id)?;
+        Ok(())
     }
 }
 
@@ -1619,14 +1666,15 @@ pub struct ContentShareMessage {
 }
 
 impl BasisSerialize for ContentShareMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
-        writer.put_string(&self.sphere_net_id);
-        writer.put_string(&self.content_url);
-        writer.put_string(&self.unlock_password);
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
+        writer.put_string(&self.sphere_net_id)?;
+        writer.put_string(&self.content_url)?;
+        writer.put_string(&self.unlock_password)?;
         writer.put_u8(self.content_type as u8);
         writer.put_f32(self.position_x);
         writer.put_f32(self.position_y);
         writer.put_f32(self.position_z);
+        Ok(())
     }
 }
 
@@ -1653,11 +1701,12 @@ pub struct ServerContentShareMessage {
 }
 
 impl BasisSerialize for ServerContentShareMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
-        writer.put_string(&self.sharer_uuid);
-        writer.put_string(&self.sharer_display_name);
-        self.content_share_message.serialize(writer);
+        writer.put_string(&self.sharer_uuid)?;
+        writer.put_string(&self.sharer_display_name)?;
+        self.content_share_message.serialize(writer)?;
+        Ok(())
     }
 }
 
@@ -1667,8 +1716,9 @@ pub struct ContentShareCleanupMessage {
 }
 
 impl BasisSerialize for ContentShareCleanupMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
-        writer.put_string(&self.sphere_net_id);
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
+        writer.put_string(&self.sphere_net_id)?;
+        Ok(())
     }
 }
 
@@ -1687,9 +1737,10 @@ pub struct ServerContentShareCleanupMessage {
 }
 
 impl BasisSerialize for ServerContentShareCleanupMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
-        self.content_share_cleanup_message.serialize(writer);
+        self.content_share_cleanup_message.serialize(writer)?;
+        Ok(())
     }
 }
 
@@ -1707,12 +1758,13 @@ pub struct CameraPipStateMessage {
 }
 
 impl BasisSerialize for CameraPipStateMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
         writer.put_bool(self.is_active);
         if self.is_active {
             write_pip_transform(self, writer);
         }
+        Ok(())
     }
 }
 
@@ -1789,7 +1841,7 @@ pub struct CameraPipPositionMessage {
 }
 
 impl BasisSerialize for CameraPipPositionMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
         writer.put_f32(self.position_x);
         writer.put_f32(self.position_y);
@@ -1798,6 +1850,7 @@ impl BasisSerialize for CameraPipPositionMessage {
         writer.put_f32(self.rotation_y);
         writer.put_f32(self.rotation_z);
         writer.put_f32(self.rotation_w);
+        Ok(())
     }
 }
 
@@ -1847,8 +1900,9 @@ pub struct CameraShutterSoundMessage {
 }
 
 impl BasisSerialize for CameraShutterSoundMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
+        Ok(())
     }
 }
 
@@ -1867,9 +1921,10 @@ pub struct CameraCountdownMessage {
 }
 
 impl BasisSerialize for CameraCountdownMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.player_id);
         writer.put_u8(self.seconds);
+        Ok(())
     }
 }
 
@@ -1888,8 +1943,9 @@ pub struct ClientCameraCountdownMessage {
 }
 
 impl BasisSerialize for ClientCameraCountdownMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u8(self.seconds);
+        Ok(())
     }
 }
 
@@ -1907,8 +1963,9 @@ pub struct ServerStatisticMessage {
 }
 
 impl BasisSerialize for ServerStatisticMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_bytes(&self.data);
+        Ok(())
     }
 }
 
@@ -1928,10 +1985,11 @@ pub struct ServerLibraryItem {
 }
 
 impl BasisSerialize for ServerLibraryItem {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u8(self.mode);
-        writer.put_string(&self.url);
-        writer.put_string(&self.password);
+        writer.put_string(&self.url)?;
+        writer.put_string(&self.password)?;
+        Ok(())
     }
 }
 
@@ -1951,11 +2009,12 @@ pub struct ServerLibraryMessage {
 }
 
 impl BasisSerialize for ServerLibraryMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.items.len() as u16);
         for item in &self.items {
-            item.serialize(writer);
+            item.serialize(writer)?;
         }
+        Ok(())
     }
 }
 
@@ -1977,10 +2036,11 @@ pub struct ConsoleData {
 }
 
 impl BasisSerialize for ConsoleData {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u8(self.message_index);
         writer.put_u16(self.array.len() as u16);
         writer.put_bytes(&self.array);
+        Ok(())
     }
 }
 
@@ -2003,11 +2063,12 @@ pub struct AvatarLoadDataMessage {
 }
 
 impl BasisSerialize for AvatarLoadDataMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u8(self.message_index);
         writer.put_u16(self.who_sent_us_this);
         writer.put_u16(self.payload.len() as u16);
         writer.put_bytes(&self.payload);
+        Ok(())
     }
 }
 
@@ -2279,8 +2340,9 @@ pub struct AdminRequest {
 }
 
 impl BasisSerialize for AdminRequest {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u8(self.mode as u8);
+        Ok(())
     }
 }
 
@@ -2300,15 +2362,16 @@ pub struct BasisP2PSignalMessage {
 }
 
 impl BasisSerialize for BasisP2PSignalMessage {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.other_player_id);
-        writer.put_string(&self.session_token);
+        writer.put_string(&self.session_token)?;
         if let Some(key) = self.ephemeral_public_key {
             writer.put_u8(1);
             writer.put_bytes(&key);
         } else {
             writer.put_u8(0);
         }
+        Ok(())
     }
 }
 
@@ -2341,28 +2404,29 @@ impl BasisDeserialize for DataBaseRequest {
     }
 }
 
-fn write_database_payload(writer: &mut NetWriter, json_payload: &str) {
+fn write_database_payload(writer: &mut NetWriter, json_payload: &str) -> WriteResult<()> {
     let value = serde_json::from_str::<Value>(json_payload)
         .unwrap_or(Value::String(json_payload.to_string()));
     let Some(map) = value.as_object() else {
         writer.put_i32(1);
-        writer.put_string("value");
-        write_database_value(writer, &value);
-        return;
+        writer.put_string("value")?;
+        write_database_value(writer, &value)?;
+        return Ok(());
     };
     writer.put_i32(map.len() as i32);
     for (key, value) in map {
-        writer.put_string(key);
-        write_database_value(writer, value);
+        writer.put_string(key)?;
+        write_database_value(writer, value)?;
     }
+    Ok(())
 }
 
-fn write_database_value(writer: &mut NetWriter, value: &Value) {
+fn write_database_value(writer: &mut NetWriter, value: &Value) -> WriteResult<()> {
     match value {
         Value::Null => writer.put_u8(0),
         Value::String(value) => {
             writer.put_u8(1);
-            writer.put_string(value);
+            writer.put_string(value)?;
         }
         Value::Number(number) => write_database_number(writer, number),
         Value::Bool(value) => {
@@ -2371,9 +2435,10 @@ fn write_database_value(writer: &mut NetWriter, value: &Value) {
         }
         other => {
             writer.put_u8(1);
-            writer.put_string(&other.to_string());
+            writer.put_string(&other.to_string())?;
         }
     }
+    Ok(())
 }
 
 fn write_database_number(writer: &mut NetWriter, number: &Number) {
@@ -2435,12 +2500,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn oversized_bytes_message_propagates_error_without_writing() {
+        let message = BytesMessage {
+            data: vec![0; usize::from(u16::MAX) + 1],
+        };
+        let mut writer = NetWriter::new();
+        writer.put_u8(0xa5);
+        assert_eq!(
+            message.serialize(&mut writer),
+            Err(crate::io::NetWriteError::LengthOverflow {
+                length: 65536,
+                max: 65535,
+            })
+        );
+        assert_eq!(writer.as_slice(), &[0xa5]);
+    }
+
+    #[test]
+    fn nested_ready_message_propagates_string_overflow() {
+        let message = ReadyMessage {
+            player_meta_data_message: ClientMetaDataMessage {
+                player_uuid: "id".to_string(),
+                player_display_name: "é".repeat(32767) + "a",
+                player_platform: "Headless".to_string(),
+            },
+            client_avatar_change_message: ClientAvatarChangeMessage {
+                load_mode: 0,
+                byte_array: Vec::new(),
+                local_avatar_index: 0,
+                arm_scale: 1.0,
+                leg_scale: 1.0,
+                torso_scale: 1.0,
+            },
+            local_avatar_sync_message: LocalAvatarSyncMessage::empty_high(),
+        };
+        assert_eq!(
+            message.serialize(&mut NetWriter::new()),
+            Err(crate::io::NetWriteError::LengthOverflow {
+                length: 65535,
+                max: 65534,
+            })
+        );
+    }
+
+    #[test]
     fn bytes_message_round_trips() {
         let mut writer = NetWriter::new();
         BytesMessage {
             data: vec![1, 2, 3],
         }
-        .serialize(&mut writer);
+        .serialize(&mut writer)
+        .unwrap();
         assert_eq!(writer.as_slice(), &[3, 0, 1, 2, 3]);
         let mut reader = NetReader::new(writer.as_slice());
         assert_eq!(
@@ -2459,7 +2569,8 @@ mod tests {
             player_display_name: String::new(),
             player_platform: String::new(),
         }
-        .serialize(&mut writer);
+        .serialize(&mut writer)
+        .unwrap();
         let mut reader = NetReader::new(writer.as_slice());
         let decoded = ClientMetaDataMessage::deserialize(&mut reader).unwrap();
         assert_eq!(decoded.player_uuid, "Failure");
@@ -2486,7 +2597,7 @@ mod tests {
             local_avatar_sync_message: LocalAvatarSyncMessage::empty_high(),
         };
         let mut writer = NetWriter::new();
-        ready.serialize(&mut writer);
+        ready.serialize(&mut writer).unwrap();
         let mut reader = NetReader::new(writer.as_slice());
         assert_eq!(
             ClientMetaDataMessage::deserialize(&mut reader)
@@ -2507,7 +2618,7 @@ mod tests {
     fn movement_channel_sync_omits_quality_byte() {
         let sync = LocalAvatarSyncMessage::empty_high();
         let mut writer = NetWriter::new();
-        sync.serialize_for_channel(&mut writer, false);
+        sync.serialize_for_channel(&mut writer, false).unwrap();
         assert_eq!(writer.len(), BitQuality::High.payload_len());
     }
 
@@ -2533,7 +2644,7 @@ mod tests {
             },
         };
         let mut writer = NetWriter::new();
-        message.serialize(&mut writer);
+        message.serialize(&mut writer).unwrap();
         assert_eq!(&writer.as_slice()[..2], &513u16.to_le_bytes());
     }
 
@@ -2559,7 +2670,7 @@ mod tests {
             .all(|d| d.version == 1 && d.flags == 0));
 
         let mut writer = NetWriter::new();
-        supply.serialize(&mut writer);
+        supply.serialize(&mut writer).unwrap();
         let mut reader = NetReader::new(writer.as_slice());
         assert_eq!(
             BasisMessageSupply::deserialize(&mut reader).unwrap(),
@@ -2575,7 +2686,7 @@ mod tests {
             payload: payload.clone(),
         };
         let mut writer = NetWriter::new();
-        message.serialize(&mut writer);
+        message.serialize(&mut writer).unwrap();
         let mut reader = NetReader::new(writer.as_slice());
         let decoded = ServerReadyBatchMessage::deserialize(&mut reader).unwrap();
         assert_eq!(decoded.count, 3);
@@ -2593,7 +2704,7 @@ mod tests {
             torso_scale: 1.0,
         };
         let mut writer = NetWriter::new();
-        message.serialize(&mut writer);
+        message.serialize(&mut writer).unwrap();
         let mut reader = NetReader::new(writer.as_slice());
         let decoded = ClientAvatarChangeMessage::deserialize(&mut reader).unwrap();
         assert_eq!(decoded.load_mode, message.load_mode);
@@ -2612,7 +2723,7 @@ mod tests {
             torso_scale: 1.0,
         };
         let mut writer = NetWriter::new();
-        message.serialize(&mut writer);
+        message.serialize(&mut writer).unwrap();
         assert_eq!(writer.len(), 6);
 
         let mut reader = NetReader::new(writer.as_slice());
@@ -2626,7 +2737,7 @@ mod tests {
             body_fit: message,
         };
         let mut writer = NetWriter::new();
-        server.serialize(&mut writer);
+        server.serialize(&mut writer).unwrap();
         assert_eq!(&writer.as_slice()[..2], &513u16.to_le_bytes());
         assert_eq!(writer.len(), 8);
     }
@@ -2637,7 +2748,7 @@ mod tests {
             payload: b"hello".to_vec(),
         };
         let mut writer = NetWriter::new();
-        chat.serialize(&mut writer);
+        chat.serialize(&mut writer).unwrap();
         assert_eq!(writer.as_slice(), &[5, 0, b'h', b'e', b'l', b'l', b'o']);
         let mut reader = NetReader::new(writer.as_slice());
         assert_eq!(ChatMessage::deserialize(&mut reader).unwrap(), chat);
@@ -2675,7 +2786,7 @@ mod tests {
             image_pickup_range_meters: 0.0,
         };
         let mut writer = NetWriter::new();
-        message.serialize(&mut writer);
+        message.serialize(&mut writer).unwrap();
         let mut reader = NetReader::new(writer.as_slice());
         let _ = ClientMetaDataMessage::deserialize(&mut reader).unwrap();
         let _ = reader.get_i32().unwrap();
@@ -2696,7 +2807,8 @@ mod tests {
             player_id: 7,
             ownership_id: "object".to_string(),
         }
-        .serialize(&mut writer);
+        .serialize(&mut writer)
+        .unwrap();
         assert_eq!(&writer.as_slice()[0..2], &7u16.to_le_bytes());
         let mut reader = NetReader::new(writer.as_slice());
         assert_eq!(
@@ -2722,7 +2834,8 @@ mod tests {
             rotation_z: 0.0,
             rotation_w: 1.0,
         }
-        .serialize(&mut writer);
+        .serialize(&mut writer)
+        .unwrap();
         assert_eq!(writer.len(), 3);
     }
 
@@ -2733,7 +2846,7 @@ mod tests {
             data: vec![1, 2, 3],
         };
         let mut writer = NetWriter::new();
-        item.serialize(&mut writer);
+        item.serialize(&mut writer).unwrap();
         assert_eq!(writer.as_slice(), &[3, 9, 1, 2, 3]);
         let mut reader = NetReader::new(writer.as_slice());
         assert_eq!(
@@ -2750,7 +2863,7 @@ mod tests {
             ephemeral_public_key: Some([7u8; 32]),
         };
         let mut writer = NetWriter::new();
-        message.serialize(&mut writer);
+        message.serialize(&mut writer).unwrap();
         let mut reader = NetReader::new(writer.as_slice());
         assert_eq!(
             BasisP2PSignalMessage::deserialize(&mut reader).unwrap(),
@@ -2767,7 +2880,7 @@ mod tests {
             payload: vec![1, 2],
         };
         let mut writer = NetWriter::new();
-        message.serialize(&mut writer);
+        message.serialize(&mut writer).unwrap();
         assert_eq!(writer.as_slice(), &[42, 0, 2, 0, 7, 0, 8, 0, 1, 2]);
     }
 
@@ -2781,7 +2894,7 @@ mod tests {
             }],
         };
         let mut writer = NetWriter::new();
-        message.serialize(&mut writer);
+        message.serialize(&mut writer).unwrap();
         assert_eq!(&writer.as_slice()[..3], &[1, 0, 2]);
         let mut reader = NetReader::new(writer.as_slice());
         assert_eq!(
@@ -2797,7 +2910,8 @@ mod tests {
             player_id: 300,
             seconds: 5,
         }
-        .serialize(&mut writer);
+        .serialize(&mut writer)
+        .unwrap();
         assert_eq!(writer.as_slice(), &[44, 1, 5]);
     }
 }

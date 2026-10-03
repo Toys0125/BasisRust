@@ -191,13 +191,15 @@ impl JoinBroadcastState {
         }
     }
 
-    fn update_peer_ready(&mut self, peer_id: PeerId, ready: ReadyMessage) {
+    fn update_peer_ready(&mut self, peer_id: PeerId, ready: ReadyMessage) -> Result<()> {
+        let payload = serialize_server_ready(peer_id, &ready)?;
         if let Some(peer) = self.peers.get_mut(&peer_id) {
             peer.peer.metadata = ready.player_meta_data_message.clone();
             peer.peer.ready = ready.clone();
-            *peer.spawn_record.payload.write() = serialize_server_ready(peer_id, &ready);
+            *peer.spawn_record.payload.write() = payload;
             peer.spawn_record.revision.fetch_add(1, Ordering::Release);
         }
+        Ok(())
     }
 
     fn remove_peer(&mut self, peer_id: PeerId) {
@@ -872,14 +874,14 @@ async fn flush_pending_leaves(state: &ServerState) {
     }
 }
 
-fn serialize_server_ready(peer_id: PeerId, ready: &ReadyMessage) -> Vec<u8> {
+fn serialize_server_ready(peer_id: PeerId, ready: &ReadyMessage) -> Result<Vec<u8>> {
     let message = ServerReadyMessage {
         local_ready_message: ready.clone(),
         player_id_message: basis_protocol::messages::PlayerIdMessage { player_id: peer_id },
     };
     let mut writer = NetWriter::new();
-    message.serialize(&mut writer);
-    writer.into_vec()
+    message.serialize(&mut writer)?;
+    Ok(writer.into_vec())
 }
 
 fn frame_join_records(records: &[Arc<JoinBroadcastRecord>]) -> Vec<u8> {
@@ -889,7 +891,8 @@ fn frame_join_records(records: &[Arc<JoinBroadcastRecord>]) -> Vec<u8> {
         payload.extend_from_slice(&record.payload.read());
     }
     let mut writer = NetWriter::with_capacity(payload.len() + 32);
-    ServerReadyBatchMessage { count, payload }.serialize(&mut writer);
+    writer.put_u16(count);
+    writer.put_bytes(&payload);
     writer.into_vec()
 }
 
@@ -1060,14 +1063,14 @@ async fn handle_event(state: &ServerState, event: ServerEvent) -> Result<()> {
     }
 }
 
-fn structured_reject_payload(kind: u8, aux0: u16, aux1: u16, message: &str) -> Vec<u8> {
+fn structured_reject_payload(kind: u8, aux0: u16, aux1: u16, message: &str) -> Result<Vec<u8>> {
     let mut writer = NetWriter::new();
     writer.put_u32(channels::REJECT_MAGIC);
     writer.put_u8(kind);
     writer.put_u16(aux0);
     writer.put_u16(aux1);
-    writer.put_string(message);
-    writer.as_slice().to_vec()
+    writer.put_string(message)?;
+    Ok(writer.into_vec())
 }
 
 async fn reject_structured(
@@ -1078,7 +1081,7 @@ async fn reject_structured(
     aux1: u16,
     message: &str,
 ) -> Result<()> {
-    let payload = structured_reject_payload(kind, aux0, aux1, message);
+    let payload = structured_reject_payload(kind, aux0, aux1, message)?;
     state.transport.reject_payload(request, &payload).await?;
     Ok(())
 }
@@ -1266,7 +1269,7 @@ async fn handle_connection_request(
         BytesMessage {
             data: challenge.clone(),
         }
-        .serialize(&mut writer);
+        .serialize(&mut writer)?;
         state
             .transport
             .send(
@@ -1322,7 +1325,7 @@ async fn finalize_accept(
     let existing_players = state
         .join_broadcast
         .lock()
-        .register_peer(connected.clone(), serialize_server_ready(peer_id, &ready));
+        .register_peer(connected.clone(), serialize_server_ready(peer_id, &ready)?);
     state.avatar_sync.register_player(peer_id);
     state.authenticated_peers.insert(peer_id, connected);
     info!("peer connected: {peer_id}");
@@ -1341,7 +1344,7 @@ async fn finalize_accept(
         image_pickup_range_meters: config.image_pickup_range_meters.max(0.0),
     };
     let mut writer = NetWriter::new();
-    server_meta.serialize(&mut writer);
+    server_meta.serialize(&mut writer)?;
     state
         .transport
         .send(
@@ -1354,7 +1357,7 @@ async fn finalize_accept(
 
     let mut registry_writer = NetWriter::new();
     registry_writer.put_u8(channels::REGISTRY_SUB_SUPPLY);
-    core_message_supply().serialize(&mut registry_writer);
+    core_message_supply().serialize(&mut registry_writer)?;
     state
         .transport
         .send(
@@ -1379,9 +1382,13 @@ fn cache_initial_avatar_sync(state: &ServerState, peer_id: PeerId, ready: &Ready
     let channel = channels::player_avatar_channel_for_quality(quality, has_additional);
     let mut writer = NetWriter::with_capacity(1 + ready.local_avatar_sync_message.array.len());
     writer.put_u8(0);
-    ready
+    if let Err(err) = ready
         .local_avatar_sync_message
-        .serialize_for_channel(&mut writer, has_additional);
+        .serialize_for_channel(&mut writer, has_additional)
+    {
+        warn!("failed to serialize initial avatar sync for peer {peer_id}: {err}");
+        return;
+    }
     if let Err(err) =
         state
             .avatar_sync
@@ -1405,7 +1412,7 @@ async fn send_accept_fanout(
             .get(&existing.id)
             .map(|peer| peer.ready.clone())
             .unwrap_or_else(|| existing.ready.clone());
-        let record = serialize_server_ready(existing.id, &ready);
+        let record = serialize_server_ready(existing.id, &ready)?;
 
         if batch_count > 0
             && batch_payload.len() + record.len() > ServerReadyBatchMessage::MAX_PAYLOAD_BYTES
@@ -1415,7 +1422,7 @@ async fn send_accept_fanout(
                 count: batch_count,
                 payload: std::mem::take(&mut batch_payload),
             }
-            .serialize(&mut writer);
+            .serialize(&mut writer)?;
             existing_player_packets.push((
                 channels::CREATE_REMOTE_PLAYERS_FOR_NEW_PEER,
                 DeliveryMethod::ReliableOrdered,
@@ -1433,7 +1440,7 @@ async fn send_accept_fanout(
             count: batch_count,
             payload: batch_payload,
         }
-        .serialize(&mut writer);
+        .serialize(&mut writer)?;
         existing_player_packets.push((
             channels::CREATE_REMOTE_PLAYERS_FOR_NEW_PEER,
             DeliveryMethod::ReliableOrdered,
@@ -1466,7 +1473,10 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
         .collect::<Vec<_>>();
     if !net_ids.is_empty() {
         let mut writer = NetWriter::new();
-        ServerUniqueIdMessages { messages: net_ids }.serialize(&mut writer);
+        if let Err(err) = (ServerUniqueIdMessages { messages: net_ids }).serialize(&mut writer) {
+            warn!("failed to serialize replay_late_join_state: {err}");
+            return;
+        }
         state
             .transport
             .send(
@@ -1484,7 +1494,10 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
             resource.load_strategy = 0;
         }
         let mut writer = NetWriter::new();
-        resource.serialize(&mut writer);
+        if let Err(err) = resource.serialize(&mut writer) {
+            warn!("failed to serialize replay_late_join_state: {err}");
+            return;
+        }
         state
             .transport
             .send(
@@ -1498,7 +1511,10 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
     }
     for ownership in state.ownership.all() {
         let mut writer = NetWriter::new();
-        ownership.serialize(&mut writer);
+        if let Err(err) = ownership.serialize(&mut writer) {
+            warn!("failed to serialize replay_late_join_state: {err}");
+            return;
+        }
         state
             .transport
             .send(
@@ -1513,7 +1529,10 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
     for sphere in state.content_share.all() {
         let mut writer = NetWriter::new();
         writer.put_u8(channels::CONTENT_SHARE_SUB_DROP);
-        sphere.serialize(&mut writer);
+        if let Err(err) = sphere.serialize(&mut writer) {
+            warn!("failed to serialize replay_late_join_state: {err}");
+            return;
+        }
         state
             .transport
             .send(
@@ -1529,7 +1548,10 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
     }
     for pip in state.pip.all_active() {
         let mut writer = NetWriter::new();
-        pip.serialize(&mut writer);
+        if let Err(err) = pip.serialize(&mut writer) {
+            warn!("failed to serialize replay_late_join_state: {err}");
+            return;
+        }
         state
             .transport
             .send(
@@ -1570,7 +1592,10 @@ async fn handle_disconnect(state: &ServerState, peer: PeerId, reason: Disconnect
     }
     for removed in state.ownership.remove_player(peer) {
         let mut writer = NetWriter::new();
-        removed.serialize(&mut writer);
+        if let Err(err) = removed.serialize(&mut writer) {
+            warn!("failed to serialize disconnect cleanup: {err}");
+            continue;
+        }
         state
             .broadcast(
                 channels::REMOVE_CURRENT_OWNER_REQUEST,
@@ -1583,7 +1608,10 @@ async fn handle_disconnect(state: &ServerState, peer: PeerId, reason: Disconnect
     for removed in state.content_share.remove_player(peer) {
         let mut writer = NetWriter::new();
         writer.put_u8(channels::CONTENT_SHARE_SUB_CLEANUP);
-        removed.serialize(&mut writer);
+        if let Err(err) = removed.serialize(&mut writer) {
+            warn!("failed to serialize disconnect cleanup: {err}");
+            continue;
+        }
         state
             .broadcast(
                 channels::CONTENT_SHARE,
@@ -1598,7 +1626,10 @@ async fn handle_disconnect(state: &ServerState, peer: PeerId, reason: Disconnect
         .remove_creator_non_persistent(&departed_uuid)
     {
         let mut writer = NetWriter::new();
-        unload.serialize(&mut writer);
+        if let Err(err) = unload.serialize(&mut writer) {
+            warn!("failed to serialize disconnect cleanup: {err}");
+            continue;
+        }
         state
             .broadcast(
                 channels::UNLOAD_RESOURCE,
@@ -1610,15 +1641,18 @@ async fn handle_disconnect(state: &ServerState, peer: PeerId, reason: Disconnect
     }
     if let Some(pip_destroy) = state.pip.remove_player(peer) {
         let mut writer = NetWriter::new();
-        pip_destroy.serialize(&mut writer);
-        state
-            .broadcast(
-                channels::CAMERA_PIP_STATE,
-                DeliveryMethod::ReliableOrdered,
-                writer.as_slice(),
-                Some(peer),
-            )
-            .await;
+        if let Err(err) = pip_destroy.serialize(&mut writer) {
+            warn!("failed to serialize PIP cleanup: {err}");
+        } else {
+            state
+                .broadcast(
+                    channels::CAMERA_PIP_STATE,
+                    DeliveryMethod::ReliableOrdered,
+                    writer.as_slice(),
+                    Some(peer),
+                )
+                .await;
+        }
     }
     if state.authenticated_peers.remove(&peer).is_some() {
         info!("peer removed: {peer} ({reason:?})");
@@ -1629,7 +1663,10 @@ async fn handle_disconnect(state: &ServerState, peer: PeerId, reason: Disconnect
         if state.authenticated_peers.is_empty() {
             for unload in state.resources.reset_non_persistent() {
                 let mut writer = NetWriter::new();
-                unload.serialize(&mut writer);
+                if let Err(err) = unload.serialize(&mut writer) {
+                    warn!("failed to serialize disconnect cleanup: {err}");
+                    continue;
+                }
                 state
                     .broadcast(
                         channels::UNLOAD_RESOURCE,
@@ -1925,7 +1962,7 @@ async fn handle_message(
                 chat_message: chat,
             };
             let mut writer = NetWriter::new();
-            message.serialize(&mut writer);
+            message.serialize(&mut writer)?;
             state
                 .broadcast(
                     channels::CHAT,
@@ -1960,7 +1997,7 @@ async fn handle_message(
                             None
                         };
                     if let Some(ready) = updated_ready {
-                        state.join_broadcast.lock().update_peer_ready(peer, ready);
+                        state.join_broadcast.lock().update_peer_ready(peer, ready)?;
                     }
                     let message = ServerAvatarChangeMessage {
                         player_id: peer,
@@ -1968,7 +2005,7 @@ async fn handle_message(
                     };
                     let mut writer = NetWriter::new();
                     writer.put_u8(channels::AVATAR_CHANGE_KIND_FULL);
-                    message.serialize(&mut writer);
+                    message.serialize(&mut writer)?;
                     state
                         .broadcast(
                             channels::AVATAR_CHANGE_MESSAGE,
@@ -1993,7 +2030,7 @@ async fn handle_message(
                             None
                         };
                     if let Some(ready) = updated_ready {
-                        state.join_broadcast.lock().update_peer_ready(peer, ready);
+                        state.join_broadcast.lock().update_peer_ready(peer, ready)?;
                     }
                     let message = ServerBodyFitMessage {
                         player_id: peer,
@@ -2001,7 +2038,7 @@ async fn handle_message(
                     };
                     let mut writer = NetWriter::new();
                     writer.put_u8(channels::AVATAR_CHANGE_KIND_BODY_FIT);
-                    message.serialize(&mut writer);
+                    message.serialize(&mut writer)?;
                     state
                         .broadcast(
                             channels::AVATAR_CHANGE_MESSAGE,
@@ -2048,7 +2085,7 @@ async fn handle_message(
                 },
             };
             let mut writer = NetWriter::new();
-            message.serialize(&mut writer);
+            message.serialize(&mut writer)?;
             if existed {
                 state
                     .transport
@@ -2101,7 +2138,7 @@ async fn handle_message(
             };
             if should_broadcast {
                 let mut writer = NetWriter::new();
-                resource.serialize(&mut writer);
+                resource.serialize(&mut writer)?;
                 state
                     .broadcast(
                         channels::LOAD_RESOURCE,
@@ -2121,7 +2158,7 @@ async fn handle_message(
                     return Ok(());
                 }
                 let mut writer = NetWriter::new();
-                request.serialize(&mut writer);
+                request.serialize(&mut writer)?;
                 state
                     .broadcast(
                         channels::UNLOAD_RESOURCE,
@@ -2162,7 +2199,7 @@ async fn handle_message(
             request.static_admin_locked = target_admin_locked;
             if state.resources.modify_resource(&request) {
                 let mut writer = NetWriter::new();
-                request.serialize(&mut writer);
+                request.serialize(&mut writer)?;
                 state
                     .broadcast(
                         channels::MODIFY_RESOURCE,
@@ -2189,7 +2226,7 @@ async fn handle_message(
                     let _ = resource;
                     for unload in state.resources.all_scene_unloads() {
                         let mut writer = NetWriter::new();
-                        unload.serialize(&mut writer);
+                        unload.serialize(&mut writer)?;
                         state
                             .broadcast(
                                 channels::UNLOAD_RESOURCE,
@@ -2214,7 +2251,7 @@ async fn handle_message(
                 ownership_id: request.ownership_id,
             };
             let mut writer = NetWriter::new();
-            response.serialize(&mut writer);
+            response.serialize(&mut writer)?;
             state
                 .transport
                 .send(
@@ -2236,7 +2273,7 @@ async fn handle_message(
                 ownership_id: request.ownership_id,
             };
             let mut writer = NetWriter::new();
-            response.serialize(&mut writer);
+            response.serialize(&mut writer)?;
             state
                 .broadcast(
                     channels::CHANGE_CURRENT_OWNER_REQUEST,
@@ -2254,7 +2291,7 @@ async fn handle_message(
                 .remove_if_owner(&request.ownership_id, request.player_id)
             {
                 let mut writer = NetWriter::new();
-                request.serialize(&mut writer);
+                request.serialize(&mut writer)?;
                 state
                     .broadcast(
                         channels::REMOVE_CURRENT_OWNER_REQUEST,
@@ -2296,7 +2333,7 @@ async fn handle_message(
                     drop(peer_state);
                     let mut writer = NetWriter::new();
                     writer.put_u8(channels::CONTENT_SHARE_SUB_DROP);
-                    server_message.serialize(&mut writer);
+                    server_message.serialize(&mut writer)?;
                     state
                         .broadcast(
                             channels::CONTENT_SHARE,
@@ -2311,7 +2348,7 @@ async fn handle_message(
                     if let Some(server_message) = state.content_share.remove(peer, request) {
                         let mut writer = NetWriter::new();
                         writer.put_u8(channels::CONTENT_SHARE_SUB_CLEANUP);
-                        server_message.serialize(&mut writer);
+                        server_message.serialize(&mut writer)?;
                         state
                             .broadcast(
                                 channels::CONTENT_SHARE,
@@ -2330,7 +2367,7 @@ async fn handle_message(
             let request = ClientCameraPipStateMessage::deserialize(&mut reader)?;
             let response = state.pip.state_change(peer, request);
             let mut writer = NetWriter::new();
-            response.serialize(&mut writer);
+            response.serialize(&mut writer)?;
             state
                 .broadcast(
                     channels::CAMERA_PIP_STATE,
@@ -2345,7 +2382,7 @@ async fn handle_message(
             let request = ClientCameraPipPositionMessage::deserialize(&mut reader)?;
             if let Some(response) = state.pip.position_update(peer, request) {
                 let mut writer = NetWriter::new();
-                response.serialize(&mut writer);
+                response.serialize(&mut writer)?;
                 state
                     .broadcast(
                         channels::CAMERA_PIP_POSITION,
@@ -2499,7 +2536,7 @@ async fn relay_avatar_generic(
         },
     };
     let mut writer = NetWriter::new();
-    message.serialize(&mut writer);
+    message.serialize(&mut writer)?;
     send_to_recipients_or_broadcast(
         state,
         peer,
@@ -2541,7 +2578,7 @@ async fn relay_scene_generic(
         },
     };
     let mut writer = NetWriter::new();
-    message.serialize(&mut writer);
+    message.serialize(&mut writer)?;
     send_to_recipients_or_broadcast(
         state,
         peer,
@@ -2590,7 +2627,7 @@ async fn relay_event(state: &ServerState, peer: PeerId, payload: &[u8]) -> Resul
     writer.put_u8(event_type);
     match event_type {
         channels::EVENT_TYPE_CAMERA_SHUTTER_SOUND => {
-            CameraShutterSoundMessage { player_id: peer }.serialize(&mut writer);
+            CameraShutterSoundMessage { player_id: peer }.serialize(&mut writer)?;
             state
                 .broadcast(
                     channels::EVENTS,
@@ -2607,7 +2644,7 @@ async fn relay_event(state: &ServerState, peer: PeerId, payload: &[u8]) -> Resul
                 player_id: peer,
                 seconds: countdown.seconds,
             }
-            .serialize(&mut writer);
+            .serialize(&mut writer)?;
             state
                 .broadcast(
                     channels::EVENTS,
@@ -2974,7 +3011,7 @@ async fn handle_statistics_request(
     let text = state.status_text_with_detail(true).into_bytes();
     let message = ServerStatisticMessage { data: text };
     let mut writer = NetWriter::new();
-    message.serialize(&mut writer);
+    message.serialize(&mut writer)?;
     state
         .transport
         .send(
@@ -3086,7 +3123,10 @@ async fn relay_shout_voice_message(state: &ServerState, peer: PeerId, payload: &
         audio_segment: payload.to_vec(),
     };
     let mut writer = NetWriter::new();
-    message.serialize(&mut writer);
+    if let Err(err) = message.serialize(&mut writer) {
+        warn!("failed to serialize relay_shout_voice_message: {err}");
+        return;
+    }
     state
         .broadcast(
             channels::SHOUT_VOICE,
@@ -3175,7 +3215,10 @@ fn has_protection_permission(state: &ServerState, peer: PeerId) -> bool {
 
 async fn broadcast_spawn_preloaded(state: &ServerState, spawn: SpawnPreloadedMessage) {
     let mut writer = NetWriter::new();
-    spawn.serialize(&mut writer);
+    if let Err(err) = spawn.serialize(&mut writer) {
+        warn!("failed to serialize broadcast_spawn_preloaded: {err}");
+        return;
+    }
     state
         .broadcast(
             channels::SPAWN_PRELOADED,
@@ -3606,7 +3649,7 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
             AdminRequest {
                 mode: AdminRequestMode::UserOpusBitrateOverride,
             }
-            .serialize(&mut writer);
+            .serialize(&mut writer)?;
             writer.put_i32(applied);
             let _ = state
                 .transport
@@ -3692,8 +3735,8 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
             AdminRequest {
                 mode: AdminRequestMode::MessageAll,
             }
-            .serialize(&mut writer);
-            writer.put_string(&message);
+            .serialize(&mut writer)?;
+            writer.put_string(&message)?;
             state
                 .broadcast(
                     channels::ADMIN,
@@ -3706,7 +3749,7 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
         AdminRequestMode::TeleportAll => {
             let target = reader.get_u16().unwrap_or(peer);
             let mut writer = NetWriter::new();
-            request.serialize(&mut writer);
+            request.serialize(&mut writer)?;
             writer.put_u16(target);
             state
                 .broadcast(
@@ -3720,7 +3763,7 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
         AdminRequestMode::TeleportPlayer => {
             let target = reader.get_u16().unwrap_or(peer);
             let mut writer = NetWriter::new();
-            request.serialize(&mut writer);
+            request.serialize(&mut writer)?;
             writer.put_u16(peer);
             let _ = state
                 .transport
@@ -3810,10 +3853,10 @@ async fn handle_force_avatar(
     AdminRequest {
         mode: AdminRequestMode::ForceAvatarApply,
     }
-    .serialize(&mut writer);
+    .serialize(&mut writer)?;
     writer.put_u16(moderator);
-    writer.put_string(&url);
-    writer.put_string(&password);
+    writer.put_string(&url)?;
+    writer.put_string(&password)?;
     writer.put_u8(embedded_source);
     let payload = writer.into_vec();
 
@@ -3862,7 +3905,7 @@ async fn handle_locomotion_override(
     AdminRequest {
         mode: AdminRequestMode::LocomotionOverrideApply,
     }
-    .serialize(&mut writer);
+    .serialize(&mut writer)?;
     writer.put_u16(moderator);
     writer.put_u8(fields);
     writer.put_f32(jump_height);
@@ -3945,9 +3988,9 @@ async fn send_log_bundle(state: &ServerState, peer: PeerId) -> Result<()> {
     AdminRequest {
         mode: AdminRequestMode::LogBundleBegin,
     }
-    .serialize(&mut begin);
-    begin.put_string(&server_name);
-    begin.put_string("logs");
+    .serialize(&mut begin)?;
+    begin.put_string(&server_name)?;
+    begin.put_string("logs")?;
     begin.put_bool(prepared.compressed);
     begin.put_i32(prepared.payload.len() as i32);
     begin.put_i32(prepared.raw_len as i32);
@@ -3959,9 +4002,9 @@ async fn send_log_bundle(state: &ServerState, peer: PeerId) -> Result<()> {
         AdminRequest {
             mode: AdminRequestMode::LogBundleChunk,
         }
-        .serialize(&mut writer);
+        .serialize(&mut writer)?;
         writer.put_i32(index as i32);
-        writer.put_bytes_with_length(chunk);
+        writer.put_bytes_with_length(chunk)?;
         send_admin_payload_to_peer(state, peer, writer.into_vec()).await?;
     }
 
@@ -3969,13 +4012,13 @@ async fn send_log_bundle(state: &ServerState, peer: PeerId) -> Result<()> {
     AdminRequest {
         mode: AdminRequestMode::LogBundleEnd,
     }
-    .serialize(&mut end);
+    .serialize(&mut end)?;
     end.put_bool(true);
     end.put_string(&format!(
         "Sent {} log file(s), {} KB compressed.",
         prepared.file_count,
         prepared.payload.len() / 1024
-    ));
+    ))?;
     send_admin_payload_to_peer(state, peer, end.into_vec()).await?;
     Ok(())
 }
@@ -4173,7 +4216,7 @@ async fn send_lock_state_to_peer(state: &ServerState, peer_id: PeerId) -> Result
     AdminRequest {
         mode: AdminRequestMode::GlobalGetLockState,
     }
-    .serialize(&mut writer);
+    .serialize(&mut writer)?;
     write_lock_state_fields(&mut writer, &locks);
     state
         .transport
@@ -4244,10 +4287,7 @@ async fn send_initial_admin_state_to_peer(state: &ServerState, peer_id: PeerId) 
 
 fn encode_lock_state_payload(locks: &GlobalState) -> Vec<u8> {
     let mut writer = NetWriter::new();
-    AdminRequest {
-        mode: AdminRequestMode::GlobalGetLockState,
-    }
-    .serialize(&mut writer);
+    writer.put_u8(AdminRequestMode::GlobalGetLockState as u8);
     write_lock_state_fields(&mut writer, locks);
     writer.into_vec()
 }
@@ -4277,28 +4317,28 @@ fn write_lock_state_fields(writer: &mut NetWriter, locks: &GlobalState) {
 
 fn encode_bool_admin_state_payload(mode: AdminRequestMode, value: bool) -> Vec<u8> {
     let mut writer = NetWriter::new();
-    AdminRequest { mode }.serialize(&mut writer);
+    writer.put_u8(mode as u8);
     writer.put_bool(value);
     writer.into_vec()
 }
 
 fn encode_u8_admin_state_payload(mode: AdminRequestMode, value: u8) -> Vec<u8> {
     let mut writer = NetWriter::new();
-    AdminRequest { mode }.serialize(&mut writer);
+    writer.put_u8(mode as u8);
     writer.put_u8(value);
     writer.into_vec()
 }
 
 fn encode_i32_admin_state_payload(mode: AdminRequestMode, value: i32) -> Vec<u8> {
     let mut writer = NetWriter::new();
-    AdminRequest { mode }.serialize(&mut writer);
+    writer.put_u8(mode as u8);
     writer.put_i32(value);
     writer.into_vec()
 }
 
 fn encode_f32_pair_admin_state_payload(mode: AdminRequestMode, first: f32, second: f32) -> Vec<u8> {
     let mut writer = NetWriter::new();
-    AdminRequest { mode }.serialize(&mut writer);
+    writer.put_u8(mode as u8);
     writer.put_f32(first);
     writer.put_f32(second);
     writer.into_vec()
@@ -4306,10 +4346,7 @@ fn encode_f32_pair_admin_state_payload(mode: AdminRequestMode, first: f32, secon
 
 fn encode_reduction_settings_payload(config: &ServerConfig) -> Vec<u8> {
     let mut writer = NetWriter::new();
-    AdminRequest {
-        mode: AdminRequestMode::GlobalGetReductionSettings,
-    }
-    .serialize(&mut writer);
+    writer.put_u8(AdminRequestMode::GlobalGetReductionSettings as u8);
     writer.put_i32(config.bsrsmillisecond_default_interval);
     writer.put_i32(config.bsrbase_multiplier);
     writer.put_f32(config.bsrsincrease_rate);
@@ -4330,10 +4367,7 @@ fn encode_reduction_settings_payload(config: &ServerConfig) -> Vec<u8> {
 
 fn encode_image_bandwidth_payload(config: &ServerConfig) -> Vec<u8> {
     let mut writer = NetWriter::new();
-    AdminRequest {
-        mode: AdminRequestMode::GlobalGetImageBandwidth,
-    }
-    .serialize(&mut writer);
+    writer.put_u8(AdminRequestMode::GlobalGetImageBandwidth as u8);
     writer.put_i32(config.image_share_egress_megabits_per_second);
     writer.put_i32(config.image_share_download_megabits_per_second);
     writer.put_i32(config.image_share_egress_enforcement_percent);
@@ -4342,10 +4376,7 @@ fn encode_image_bandwidth_payload(config: &ServerConfig) -> Vec<u8> {
 
 fn encode_user_opus_bitrate_override_payload(value: i32) -> Vec<u8> {
     let mut writer = NetWriter::new();
-    AdminRequest {
-        mode: AdminRequestMode::UserOpusBitrateOverride,
-    }
-    .serialize(&mut writer);
+    writer.put_u8(AdminRequestMode::UserOpusBitrateOverride as u8);
     writer.put_i32(value);
     writer.into_vec()
 }
@@ -4404,8 +4435,8 @@ async fn send_admin_text(state: &ServerState, peer_id: PeerId, message: &str) ->
     AdminRequest {
         mode: AdminRequestMode::Message,
     }
-    .serialize(&mut writer);
-    writer.put_string(message);
+    .serialize(&mut writer)?;
+    writer.put_string(message)?;
     state
         .transport
         .send(
@@ -4424,29 +4455,29 @@ async fn send_permissions_snapshot(state: &ServerState, peer_id: PeerId) -> Resu
     AdminRequest {
         mode: AdminRequestMode::GetPermissions,
     }
-    .serialize(&mut writer);
+    .serialize(&mut writer)?;
     writer.put_i32(snapshot.groups.len() as i32);
     for group in snapshot.groups.values() {
-        writer.put_string(&group.name);
+        writer.put_string(&group.name)?;
         writer.put_i32(group.nodes.len() as i32);
         for node in &group.nodes {
-            writer.put_string(node);
+            writer.put_string(node)?;
         }
         writer.put_i32(group.parents.len() as i32);
         for parent in &group.parents {
-            writer.put_string(parent);
+            writer.put_string(parent)?;
         }
     }
     writer.put_i32(snapshot.users.len() as i32);
     for user in snapshot.users.values() {
-        writer.put_string(&user.uuid);
+        writer.put_string(&user.uuid)?;
         writer.put_i32(user.groups.len() as i32);
         for group in &user.groups {
-            writer.put_string(group);
+            writer.put_string(group)?;
         }
         writer.put_i32(user.nodes.len() as i32);
         for node in &user.nodes {
-            writer.put_string(node);
+            writer.put_string(node)?;
         }
     }
     state
@@ -4468,7 +4499,7 @@ async fn send_bool_admin_state(
     value: bool,
 ) -> Result<()> {
     let mut writer = NetWriter::new();
-    AdminRequest { mode }.serialize(&mut writer);
+    AdminRequest { mode }.serialize(&mut writer)?;
     writer.put_bool(value);
     state
         .transport
@@ -4484,7 +4515,7 @@ async fn send_bool_admin_state(
 
 async fn broadcast_bool_admin_state(state: &ServerState, mode: AdminRequestMode, value: bool) {
     let mut writer = NetWriter::new();
-    AdminRequest { mode }.serialize(&mut writer);
+    writer.put_u8(mode as u8);
     writer.put_bool(value);
     state
         .broadcast(
@@ -4503,7 +4534,7 @@ async fn send_u8_admin_state(
     value: u8,
 ) -> Result<()> {
     let mut writer = NetWriter::new();
-    AdminRequest { mode }.serialize(&mut writer);
+    AdminRequest { mode }.serialize(&mut writer)?;
     writer.put_u8(value);
     state
         .transport
@@ -4519,7 +4550,7 @@ async fn send_u8_admin_state(
 
 async fn broadcast_u8_admin_state(state: &ServerState, mode: AdminRequestMode, value: u8) {
     let mut writer = NetWriter::new();
-    AdminRequest { mode }.serialize(&mut writer);
+    writer.put_u8(mode as u8);
     writer.put_u8(value);
     state
         .broadcast(
@@ -4696,10 +4727,7 @@ async fn toggle_simple_lock(
 async fn broadcast_lock_state(state: &ServerState) {
     let locks = state.global_state.read().clone();
     let mut writer = NetWriter::new();
-    AdminRequest {
-        mode: AdminRequestMode::GlobalGetLockState,
-    }
-    .serialize(&mut writer);
+    writer.put_u8(AdminRequestMode::GlobalGetLockState as u8);
     write_lock_state_fields(&mut writer, &locks);
     state
         .broadcast(
@@ -4818,16 +4846,18 @@ mod tests {
         let peer_two = test_connected_peer(2);
         state.register_peer(
             peer_one.clone(),
-            serialize_server_ready(peer_one.id, &peer_one.ready),
+            serialize_server_ready(peer_one.id, &peer_one.ready).unwrap(),
         );
         state.register_peer(
             peer_two.clone(),
-            serialize_server_ready(peer_two.id, &peer_two.ready),
+            serialize_server_ready(peer_two.id, &peer_two.ready).unwrap(),
         );
 
         let mut updated_two = peer_two.ready.clone();
         updated_two.client_avatar_change_message.arm_scale = 1.75;
-        state.update_peer_ready(peer_two.id, updated_two.clone());
+        state
+            .update_peer_ready(peer_two.id, updated_two.clone())
+            .unwrap();
 
         state.mark_initial_history_queued(peer_one.id);
         let pending = state.take_batches(peer_one.id);
@@ -4836,17 +4866,19 @@ mod tests {
         assert_eq!(pending[0][0].revision.load(Ordering::Acquire), 1);
         assert_eq!(
             *pending[0][0].payload.read(),
-            serialize_server_ready(peer_two.id, &updated_two)
+            serialize_server_ready(peer_two.id, &updated_two).unwrap()
         );
 
         let mut updated_one = peer_one.ready.clone();
         updated_one.client_avatar_change_message.torso_scale = 1.25;
-        state.update_peer_ready(peer_one.id, updated_one.clone());
+        state
+            .update_peer_ready(peer_one.id, updated_one.clone())
+            .unwrap();
 
         let peer_three = test_connected_peer(3);
         let existing = state.register_peer(
             peer_three.clone(),
-            serialize_server_ready(peer_three.id, &peer_three.ready),
+            serialize_server_ready(peer_three.id, &peer_three.ready).unwrap(),
         );
         let current_one = existing.iter().find(|peer| peer.id == peer_one.id).unwrap();
         assert_eq!(
@@ -4872,7 +4904,8 @@ mod tests {
             SERVER_VERSION,
             SERVER_VERSION - 1,
             "Update required",
-        );
+        )
+        .unwrap();
         let mut reader = NetReader::new(&payload);
         assert_eq!(reader.get_u32().unwrap(), channels::REJECT_MAGIC);
         assert_eq!(

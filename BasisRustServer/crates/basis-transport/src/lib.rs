@@ -59,6 +59,8 @@ const PEER_PING_INTERVAL: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Error)]
 pub enum TransportError {
+    #[error("wire serialization error: {0}")]
+    Write(#[from] basis_protocol::io::NetWriteError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("event channel closed")]
@@ -818,7 +820,7 @@ impl TransportHandle {
 
     pub async fn reject(&self, request: &ConnectionRequest, reason: &str) -> Result<()> {
         let mut payload = NetWriter::new();
-        payload.put_string(reason);
+        payload.put_string(reason)?;
         self.reject_payload(request, payload.as_slice()).await
     }
 
@@ -1049,11 +1051,11 @@ impl TransportHandle {
     }
 
     pub async fn disconnect(&self, peer: PeerId, reason: &str) -> Result<()> {
+        let mut payload = NetWriter::new();
+        payload.put_string(reason)?;
         if let Some((_, state)) = self.peers.remove(&peer) {
             self.by_addr.remove(&state.addr);
             self.retire_peer_id(peer);
-            let mut payload = NetWriter::new();
-            payload.put_string(reason);
             let mut writer = NetWriter::with_capacity(payload.len() + 9);
             writer.put_u8(PacketProperty::Disconnect as u8 | (state.connection_number << 5));
             writer.put_i64(state.connect_time);
@@ -1072,7 +1074,7 @@ impl TransportHandle {
         remote_addr: SocketAddr,
         response: &ServerInfoResponse,
     ) -> Result<()> {
-        let payload = response.serialize();
+        let payload = response.serialize()?;
         let mut packet = Vec::with_capacity(payload.len() + 1);
         packet.push(PacketProperty::UnconnectedMessage as u8);
         packet.extend_from_slice(&payload);
