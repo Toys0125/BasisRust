@@ -714,6 +714,16 @@ thread_local! {
     static AVATAR_BUNDLE_ZSTD_CONTEXT: RefCell<Option<AvatarBundleZstdContext>> = const { RefCell::new(None) };
 }
 
+/// Drop this thread's cached avatar-bundle Zstandard workspace.
+///
+/// Called during settled idle-memory reclamation after burst caches have been
+/// pruned. The next compression lazily creates a fresh context.
+pub fn clear_current_thread_avatar_bundle_zstd_context() {
+    AVATAR_BUNDLE_ZSTD_CONTEXT.with(|cached| {
+        cached.borrow_mut().take();
+    });
+}
+
 fn compress_avatar_bundle_zstd(raw: &[u8], level: i32) -> Result<Vec<u8>> {
     AVATAR_BUNDLE_ZSTD_CONTEXT.with(|cached| {
         let mut cached = cached.borrow_mut();

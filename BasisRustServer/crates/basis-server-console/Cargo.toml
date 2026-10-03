@@ -23,7 +23,10 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 mimalloc = "0.1.52"
+rayon.workspace = true
 rustyline.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-rayon.workspace = true
+# Keep warmed sparse heaps from regrowing RSS through huge-page promotion.
+# no_thp also compiles out allocator huge-page allocation hints.
+[target.'cfg(target_os = "linux")'.dependencies]
+mimalloc = { version = "0.1.52", features = ["no_thp"] }
