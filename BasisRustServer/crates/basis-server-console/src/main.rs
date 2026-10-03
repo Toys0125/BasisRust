@@ -1,3 +1,5 @@
+mod shutdown;
+
 use anyhow::{Context, Result};
 use basis_protocol::{
     avatar::AVATAR_BUNDLE_DICTIONARY_GENERATION, config::ServerConfig, permissions::nodes,
@@ -611,14 +613,30 @@ fn main() -> Result<()> {
             let next_worker_id = Arc::clone(&next_worker_id);
             move || poll_tokio_reclaim(&epoch, &worker_epochs, &next_worker_id, worker_count)
         });
+    let mut watchdog = shutdown::ShutdownWatchdog::new().context("starting shutdown watchdog")?;
     let runtime = builder.build().context("building Tokio runtime")?;
-    runtime.block_on(async_main(
+    let result = runtime.block_on(async_main(
         args,
         epoch,
         worker_epochs,
         next_worker_id,
         worker_count,
-    ))
+        &mut watchdog,
+    ));
+    // Cover startup errors and runtime destruction as well as normal shutdown.
+    watchdog.arm(shutdown::SHUTDOWN_TIMEOUT);
+    drop(runtime);
+    if let Err(err) = &result {
+        eprintln!("Error: {err:#}");
+    }
+    let flushed = shutdown::flush_output(None);
+    if result.is_err() || !flushed {
+        // Report and flush while still guarded; Rust's implicit Result error
+        // output after main returns would otherwise run outside the deadline.
+        std::process::exit(1);
+    }
+    drop(watchdog);
+    Ok(())
 }
 
 fn bsr_window_metrics(snapshot: BsrProfilerSnapshot) -> BsrWindowMetrics {
@@ -740,6 +758,7 @@ async fn async_main(
     worker_epochs: Arc<Vec<AtomicU64>>,
     next_worker_id: Arc<AtomicUsize>,
     worker_count: usize,
+    watchdog: &mut shutdown::ShutdownWatchdog,
 ) -> Result<()> {
     #[cfg(windows)]
     configure_windows_cpu_workers()?;
@@ -785,7 +804,7 @@ async fn async_main(
     server
         .avatar_sync
         .set_memory_reclaim_epoch(memory_reclaim_epoch.clone());
-    let _health_addr = start_health_server(HealthState {
+    let health_result = start_health_server(HealthState {
         config: server.config.clone(),
         player_count: Arc::new({
             let server = server.clone();
@@ -911,7 +930,16 @@ async fn async_main(
             }
         }),
     })
-    .await?;
+    .await;
+    if let Err(err) = health_result {
+        watchdog.arm(shutdown::SHUTDOWN_TIMEOUT);
+        request_shutdown(shutdown_tx);
+        // Server workers already exist when health binding fails.
+        if let Err(cleanup) = server.shutdown().await {
+            warn!("startup failure cleanup failed: {cleanup:#}");
+        }
+        return Err(err);
+    }
 
     let running = Arc::new(AtomicBool::new(true));
     let reclaim_task = tokio::spawn(run_idle_memory_reclaim(
@@ -923,27 +951,34 @@ async fn async_main(
         worker_count,
     ));
     let console_running = running.clone();
-    if config.enable_console {
-        start_console_listener(server.clone(), config_path.clone(), console_running);
-    }
-    if let Ok(interval) = std::env::var("BASIS_STATUS_INTERVAL_SECS") {
-        if let Ok(seconds) = interval.parse::<u64>() {
-            if seconds > 0 {
-                let server = server.clone();
-                let running = running.clone();
-                thread::spawn(move || {
-                    while running.load(Ordering::Relaxed) {
-                        thread::sleep(std::time::Duration::from_secs(seconds));
-                        println!("{}", server.status_text_with_detail(true));
-                    }
-                });
+    let console_thread = config
+        .enable_console
+        .then(|| start_console_listener(server.clone(), config_path.clone(), console_running));
+    let status_interval = std::env::var("BASIS_STATUS_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs);
+    let (output_stop, output_thread) =
+        match start_output_worker(server.clone(), running.clone(), status_interval) {
+            Ok(worker) => worker,
+            Err(err) => {
+                watchdog.arm(shutdown::SHUTDOWN_TIMEOUT);
+                running.store(false, Ordering::SeqCst);
+                reclaim_task.abort();
+                request_shutdown(shutdown_tx);
+                let _ = server.shutdown().await;
+                return Err(err.into());
             }
-        }
-    }
+        };
 
+    // Keep the listener across timer polls so a delivered stop signal is not
+    // discarded when the periodic branch wins select.
+    let stop_signal = tokio::signal::ctrl_c();
+    tokio::pin!(stop_signal);
     loop {
         tokio::select! {
-            result = tokio::signal::ctrl_c() => {
+            result = &mut stop_signal => {
                 if let Err(err) = result {
                     warn!("failed to listen for Ctrl+C: {err}");
                 }
@@ -958,20 +993,67 @@ async fn async_main(
             }
         }
     }
-    info!("Shutting down server...");
+    watchdog.arm(shutdown::SHUTDOWN_TIMEOUT);
+    running.store(false, Ordering::SeqCst);
     reclaim_task.abort();
+    let _ = output_stop.send(());
     request_shutdown(shutdown_tx);
-    match tokio::time::timeout(std::time::Duration::from_secs(5), server.shutdown()).await {
-        Ok(result) => result?,
-        Err(_) => {
-            warn!("server shutdown timed out; exiting process");
-            // Started blocking GPU cleanup tasks cannot be cancelled by the
-            // timeout; runtime teardown would otherwise wait for them again.
-            std::process::exit(1);
+    // Persistence runs before native joins. The independent watchdog covers
+    // synchronous saves and runtime teardown that an async timeout cannot stop.
+    let result = server.shutdown().await;
+    let _ = reclaim_task.await;
+    // Output can block in an OS sink too. Join only after persistence, while
+    // the independent watchdog still covers a stalled writer.
+    let _ = tokio::task::spawn_blocking(move || output_thread.join()).await;
+    if let Some(thread) = console_thread {
+        if thread.is_finished() {
+            let _ = thread.join();
         }
+        // Rustyline's blocking stdin read cannot be cancelled portably. A still
+        // waiting input thread is detached; it never delays process termination.
     }
-    info!("Server shut down successfully.");
+    match &result {
+        Ok(()) => info!("Server shut down successfully."),
+        Err(err) => warn!("server shutdown failed: {err:#}"),
+    }
+    result?;
     Ok(())
+}
+
+fn start_output_worker(
+    server: ServerState,
+    running: Arc<AtomicBool>,
+    status_interval: Option<Duration>,
+) -> io::Result<(std::sync::mpsc::Sender<()>, thread::JoinHandle<()>)> {
+    let (stop, rx) = std::sync::mpsc::channel();
+    let worker = thread::Builder::new()
+        .name("Console-Output".into())
+        .spawn(move || {
+            let mut last_capture = None;
+            let mut last_status = Instant::now();
+            while running.load(Ordering::Relaxed) {
+                // The stop channel wakes even a long status interval promptly.
+                if !matches!(rx.recv_timeout(Duration::from_secs(1)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                    break;
+                }
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Some(snapshot) = server.avatar_sync.bsr_profile_snapshot() {
+                    if last_capture != Some(snapshot.captured_at) {
+                        last_capture = Some(snapshot.captured_at);
+                        // Formatting and sink writes belong to this thread,
+                        // never the avatar tick or Tokio runtime workers.
+                        info!(target: "basis_server_core::avatar_sync", profile = ?snapshot, "BSR Profile");
+                    }
+                }
+                if status_interval.is_some_and(|interval| last_status.elapsed() >= interval) {
+                    info!("{}", server.status_text_with_detail(true));
+                    last_status = Instant::now();
+                }
+            }
+        })?;
+    Ok((stop, worker))
 }
 
 async fn run_idle_memory_reclaim(
@@ -1141,7 +1223,11 @@ fn request_shutdown(shutdown_tx: oneshot::Sender<()>) {
     let _ = shutdown_tx.send(());
 }
 
-fn start_console_listener(server: ServerState, config_path: PathBuf, running: Arc<AtomicBool>) {
+fn start_console_listener(
+    server: ServerState,
+    config_path: PathBuf,
+    running: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
     let runtime = tokio::runtime::Handle::current();
     thread::spawn(move || {
         let mut commands: HashMap<String, CommandHandler> = HashMap::new();
@@ -1244,7 +1330,7 @@ fn start_console_listener(server: ServerState, config_path: PathBuf, running: Ar
         };
         editor.set_helper(Some(ConsoleHelper::new(server.clone())));
 
-        loop {
+        while running.load(Ordering::Relaxed) {
             let line = match editor.readline("> ") {
                 Ok(line) => line,
                 Err(ReadlineError::Interrupted) => {
@@ -1261,6 +1347,9 @@ fn start_console_listener(server: ServerState, config_path: PathBuf, running: Ar
                     break;
                 }
             };
+            if !running.load(Ordering::Relaxed) {
+                break;
+            }
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -1283,7 +1372,7 @@ fn start_console_listener(server: ServerState, config_path: PathBuf, running: Ar
                 break;
             }
         }
-    });
+    })
 }
 
 fn handle_config_command(
@@ -1797,6 +1886,37 @@ fn display_list(values: &[String]) -> String {
 #[cfg(test)]
 mod memory_reclaim_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stopping_output_worker_does_not_wait_for_status_interval() {
+        let config = ServerConfig {
+            has_file_support: false,
+            set_port: 0,
+            ..ServerConfig::default()
+        };
+        let (server, _shutdown_tx) = ServerState::start(config, &std::env::temp_dir())
+            .await
+            .unwrap();
+        let (stop, worker) = start_output_worker(
+            server.clone(),
+            Arc::new(AtomicBool::new(true)),
+            Some(Duration::from_secs(3600)),
+        )
+        .unwrap();
+        stop.send(()).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || worker.join()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn bounded_sweep_reaches_each_tokio_worker() {
