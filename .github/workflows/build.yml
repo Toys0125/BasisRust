@@ -41,6 +41,25 @@ jobs:
             target: aarch64-unknown-linux-gnu
             exe_suffix: ""
             archive: BasisRust-linux-arm64.tar.gz
+          # Static musl builds exist solely to feed the container image, so they ship
+          # the server only. musl has no glibc dependency, which is what lets the image
+          # run on any libc and shrink from ~98 MB to ~22 MB.
+          - name: Linux x64 musl
+            id: linux-x64-musl
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            exe_suffix: ""
+            archive: BasisRust-linux-x64-musl.tar.gz
+            musl: true
+            server_only: true
+          - name: Linux ARM64 musl
+            id: linux-arm64-musl
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            exe_suffix: ""
+            archive: BasisRust-linux-arm64-musl.tar.gz
+            musl: true
+            server_only: true
           - name: macOS ARM64
             id: macos-arm64
             runner: macos-15
@@ -59,6 +78,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install musl toolchain
+        if: matrix.musl == 'true'
+        # musl-tools supplies the arch-correct musl-gcc on both runners
+        # (x86_64-linux-musl-gcc / aarch64-linux-musl-gcc). Rust finds it automatically, so
+        # no linker override is needed. The target's std/core component is installed by the
+        # dtolnay/rust-toolchain step above; without it every crate fails with
+        # "can't find crate for `core`".
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
@@ -71,17 +101,23 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} --manifest-path BasisRustServer/Cargo.toml -p basis-server-console
 
       - name: Build client
+        if: matrix.server_only != 'true'
         run: cargo build --release --target ${{ matrix.target }} --manifest-path BasisRustClient/Cargo.toml
 
       - name: Stage package
         shell: bash
+        env:
+          SERVER_ONLY: ${{ matrix.server_only || 'false' }}
         run: |
-          mkdir -p package/client package/server
-          cp "BasisRustClient/target/${{ matrix.target }}/release/basis-rust-client${{ matrix.exe_suffix }}" package/client/
+          mkdir -p package/server
           cp "BasisRustServer/target/${{ matrix.target }}/release/basis-server-console${{ matrix.exe_suffix }}" package/server/
-          cp BasisRustClient/Config.xml package/client/Config.xml
           cp BasisRustServer/Config.xml package/server/Config.xml
           cp README.md package/README.md
+          if [ "$SERVER_ONLY" != "true" ]; then
+            mkdir -p package/client
+            cp "BasisRustClient/target/${{ matrix.target }}/release/basis-rust-client${{ matrix.exe_suffix }}" package/client/
+            cp BasisRustClient/Config.xml package/client/Config.xml
+          fi
 
       - name: Pretty-print packaged configs
         shell: bash
@@ -103,6 +139,9 @@ jobs:
               Path("package/client/Config.xml"),
               Path("package/server/Config.xml"),
           ):
+              # Server-only archives (musl) have no client directory.
+              if not path.exists():
+                  continue
               document = minidom.parse(str(path))
               strip_whitespace(document)
               pretty = document.documentElement.toprettyxml(indent="  ", newl="\n")

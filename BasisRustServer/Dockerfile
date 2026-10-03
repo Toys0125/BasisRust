@@ -4,26 +4,37 @@
 #
 # This is the single source of truth for the published image
 # `ghcr.io/toys0125/basisrust-server`. `.github/workflows/build-docker-server.yml`
-# builds it from the prebuilt binaries attached to a GitHub release by passing
+# builds it from the static musl binaries attached to a GitHub release by passing
 # `ARTIFACT_DIR=<dir>` naming an unpacked release payload inside the build context.
 # Running `docker build` directly from a source checkout with no `ARTIFACT_DIR`
 # compiles the server in the Rust stage instead, which is what keeps
 # `docker compose build` in docker-compose-server.yml working.
 #
-# Why the runtime base is ubuntu:24.04 and must not be downgraded to a slimmer base:
-# the release binaries are built by .github/workflows/build.yml on ubuntu-24.04 and are
-# dynamically linked (PT_INTERP=/lib64/ld-linux-x86-64.so.2; DT_NEEDED=libc.so.6, libm.so.6,
-# libgcc_s.so.1) against GLIBC_2.39. An older base such as debian:bookworm-slim (GLIBC_2.36)
-# makes the dynamic loader report
-#   libc.so.6: weak version `GLIBC_2.39' not found (required by .../basis-server-console)
-# at every start. That particular requirement happens to be weak-versioned so the process
-# still boots, which makes it a nasty failure to notice; any strong-versioned reference
-# would abort instead. Only the glibc version floor matters here, not the dependency count.
+# Why musl on alpine rather than glibc on ubuntu:
+#   - Size. The image is ~14 MB of base plus the ~10 MB binary. On ubuntu:24.04 the base
+#     alone was ~85 MB, giving a ~98 MB image; on alpine:3.20 it is ~22 MB, and the
+#     compressed pull drops from ~37 MB to ~9 MB.
+#   - Portability. The binaries are statically linked (no PT_INTERP, no DT_NEEDED), so
+#     one artifact runs on glibc and musl distros alike. The glibc builds were not just
+#     bigger but fragile: they link GLIBC_2.39 because build.yml compiles on ubuntu-24.04,
+#     which makes them refuse to load on older bases (debian:bookworm-slim is GLIBC_2.36)
+#     and fail outright on a musl-only distro such as alpine.
+#   - The usual musl objection, its weaker malloc, does not apply: the server sets
+#     mimalloc as its Rust #[global_allocator], so the C allocator is never used.
+#
+# Deliberately NOT stripped. `strip --strip-all` would save ~2.3 MB but removes all
+# ~13k FUNC symbols, and with no separate debuginfo they cannot be recovered, which would
+# break perf symbolisation and backtraces.
 
-ARG RUST_IMAGE=rust:1-bookworm
-ARG RUNTIME_IMAGE=ubuntu:24.04
+ARG RUST_IMAGE=rust:1-alpine
+ARG RUNTIME_IMAGE=alpine:3.20
 
 FROM ${RUST_IMAGE} AS build
+
+# mimalloc compiles C, so a C toolchain is required even though the result is a static musl
+# binary. CI takes a different route: build.yml installs musl-tools on the ubuntu runners,
+# which also yield static musl binaries and avoid shipping a compiler in this stage.
+RUN apk add --no-cache build-base musl-dev
 
 WORKDIR /src
 COPY . /src
@@ -43,14 +54,19 @@ RUN set -eux; \
         cp "/src/target/release/basis-server-console" /out/basis-server-console; \
     fi; \
     chmod 0755 /out/basis-server-console; \
-    # The release binaries are built on ubuntu-24.04, so GLIBC_2.39 is the expected
-    # floor. A source build can legitimately differ in either direction, so only report
-    # a mismatch rather than asserting one is worse than the other.
-    glibc_required="$(readelf --version-info /out/basis-server-console \
-        | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V -u -r | head -n1)"; \
-    if [ "${glibc_required:-none}" != "2.39" ]; then \
-        echo "::warning::binary needs GLIBC_${glibc_required:-none} but the runtime base provides 2.39; confirm RUNTIME_IMAGE still satisfies it"; \
-    fi
+    # The runtime base has no glibc at all, so a dynamically linked binary would fail at
+    # exec with no useful message. Fail here instead. readelf is the authoritative check:
+    # musl's own ldd prints a loader path even for a static-pie binary.
+    if readelf -l /out/basis-server-console 2>/dev/null | grep -q INTERP; then \
+        echo "::error::staged binary is dynamically linked; the alpine runtime needs a static musl build"; \
+        exit 1; \
+    fi; \
+    if readelf -d /out/basis-server-console 2>/dev/null | grep -q NEEDED; then \
+        echo "::error::staged binary has shared library dependencies:"; \
+        readelf -d /out/basis-server-console | grep NEEDED; \
+        exit 1; \
+    fi; \
+    echo "Static check passed: no PT_INTERP, no DT_NEEDED"
 
 # ---------------------------------------------------------------------------
 # Runtime
@@ -72,25 +88,17 @@ LABEL org.opencontainers.image.title="BasisRust Server" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.licenses="MIT"
 
-# libgcc-s1 backs the libgcc_s.so.1 the binary needs; curl backs HEALTHCHECK.
-# ca-certificates is there for deployments that enable outgoing TLS.
-RUN set -eux; \
-    apt-get update; \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        libgcc-s1; \
-    rm -rf /var/lib/apt/lists/*
+# curl backs the HEALTHCHECK below; ca-certificates is there for deployments that enable
+# outgoing TLS. libgcc-s1 is deliberately absent: the binary is fully static.
+RUN apk add --no-cache ca-certificates curl
 
 # Unprivileged runtime user. UID/GID are fixed and exposed as build args so a host
 # volume can be chowned to match (docker-compose-server.yml binds ./config and
 # ./logs, which the server rewrites in place).
 ARG UID=10001
 ARG GID=10001
-RUN set -eux; \
-    groupadd --gid "${GID}" basis; \
-    useradd --uid "${UID}" --gid "${GID}" --home-dir /app --no-create-home \
-        --shell /usr/sbin/nologin basis
+RUN addgroup -g "${GID}" basis \
+    && adduser -D -u "${UID}" -G basis -h /app -s /sbin/nologin basis
 
 WORKDIR /app
 
