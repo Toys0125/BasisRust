@@ -9,6 +9,12 @@ name: Docker; Build & Push Server Image
 # offers native arm64 runners. Each architecture is therefore built on its own native
 # runner and no QEMU emulation is required.
 #
+# It consumes the static musl archives (BasisRust-linux-{x64,arm64}-musl.tar.gz). Those
+# are server-only and are produced for exactly this purpose; the glibc archives remain
+# the ones published for people running the server directly on Linux. Because the musl
+# binaries are statically linked, the image runs on any libc and needs only alpine as a
+# base, which is what keeps it near 22 MB instead of ~98 MB.
+#
 # The image definition itself lives in BasisRustServer/Dockerfile.
 
 on:
@@ -123,11 +129,11 @@ jobs:
           - arch_suffix: amd64
             runner: ubuntu-24.04
             docker_platform: linux/amd64
-            asset: BasisRust-linux-x64.tar.gz
+            asset: BasisRust-linux-x64-musl.tar.gz
           - arch_suffix: arm64
             runner: ubuntu-24.04-arm
             docker_platform: linux/arm64
-            asset: BasisRust-linux-arm64.tar.gz
+            asset: BasisRust-linux-arm64-musl.tar.gz
 
     steps:
       - name: Check out repository
