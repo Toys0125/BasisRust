@@ -27,9 +27,15 @@ discovers them automatically.
   in both forwarding directions.
 
 The fixture owns a temporary directory, ephemeral loopback sockets, a supervised
-client process, and an abortable forwarding task tree. Readiness is based on packet
+client process, and a supervised forwarding task tree. Readiness is based on packet
 events and bounded condition checks, not startup sleeps. The successful client
-exits via its normal `quit` command; failed scenarios kill/reap it. Voice input is a
+exits via its normal `quit` command. Each scenario runs in a child Tokio task while
+its supervisor retains the fixture. Even on an assertion/deadline panic, the
+supervisor awaits `ServerState::shutdown()`, kills/reaps the client, and joins the
+proxy and its forwarders before propagating the original failure. Each cleanup
+operation has a deadline and still runs if an earlier operation fails. An injected
+assertion/deadline regression verifies this failure path. `Drop` remains a
+best-effort fallback for cancellation. Voice input is a
 locally generated mono Ogg Opus silence stream; no user audio, FFmpeg, GPU, audio
 device, Unity installation, fixed ports, or external server is required.
 

@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
+    future::Future,
     net::SocketAddr,
+    pin::Pin,
     process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -17,13 +19,14 @@ use tokio::{
     io::AsyncWriteExt,
     net::UdpSocket,
     process::{Child, Command},
-    sync::{mpsc, oneshot},
-    task::{JoinHandle, JoinSet},
+    sync::{mpsc, oneshot, Mutex},
+    task::{JoinError, JoinHandle, JoinSet},
     time::{timeout, Instant},
 };
 
 pub const LIMIT: Duration = Duration::from_secs(10);
 pub const SILENCE: &[u8] = &[0xf8, 0xff, 0xfe]; // Standard 20 ms Opus silence packet.
+type Scenario<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
@@ -62,6 +65,7 @@ pub struct Live {
     pub child: Child,
     events: mpsc::UnboundedReceiver<Capture>,
     proxy: JoinHandle<()>,
+    proxy_stop: Option<oneshot::Sender<()>>,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
@@ -87,11 +91,13 @@ impl Live {
         let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let port = front.local_addr().unwrap().port();
         let (tx, events) = mpsc::unbounded_channel();
+        let (proxy_stop, stop) = oneshot::channel();
         let proxy = tokio::spawn(proxy(
             front,
             server.transport.local_addr().unwrap(),
             tx,
             fault,
+            stop,
         ));
         let config_path = dir.path().join("Config.xml");
         // Flat PascalCase XML and the upstream default password are deliberately retained.
@@ -166,8 +172,84 @@ impl Live {
             child,
             events,
             proxy,
+            proxy_stop: Some(proxy_stop),
             shutdown: Some(shutdown),
         }
+    }
+
+    pub async fn run(
+        self,
+        scenario: impl for<'a> FnOnce(&'a mut Self) -> Scenario<'a> + Send + 'static,
+    ) {
+        let (_, outcome, errors) = self.exercise(scenario).await;
+        if !errors.is_empty() {
+            eprintln!("fixture cleanup errors: {errors:?}");
+        }
+        if let Err(error) = outcome {
+            // Cleanup is complete before the original assertion/deadline panic escapes
+            // the test and its Tokio runtime is torn down.
+            std::panic::resume_unwind(error.into_panic());
+        }
+        assert!(errors.is_empty(), "fixture cleanup errors: {errors:?}");
+    }
+
+    async fn exercise(
+        self,
+        scenario: impl for<'a> FnOnce(&'a mut Self) -> Scenario<'a> + Send + 'static,
+    ) -> (Self, Result<(), JoinError>, Vec<String>) {
+        let fixture = Arc::new(Mutex::new(self));
+        let owned = fixture.clone();
+        let outcome = tokio::spawn(async move {
+            scenario(&mut *owned.lock().await).await;
+        })
+        .await;
+        let mut fixture = Arc::try_unwrap(fixture)
+            .ok()
+            .expect("scenario retained fixture")
+            .into_inner();
+        let errors = fixture.cleanup().await;
+        (fixture, outcome, errors)
+    }
+
+    async fn cleanup(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        // Attempt every cleanup operation even if another one fails.
+        match timeout(LIMIT, self.server.shutdown()).await {
+            Ok(Ok(())) => {}
+            result => errors.push(format!("server shutdown: {result:?}")),
+        }
+        let running = match self.child.try_wait() {
+            Ok(Some(_)) => false, // try_wait has already reaped the exited child.
+            Ok(None) => true,
+            Err(error) => {
+                errors.push(format!("client status: {error}"));
+                true // Still attempt cleanup when the status cannot be determined.
+            }
+        };
+        if running {
+            if let Err(error) = self.child.start_kill() {
+                errors.push(format!("client kill: {error}"));
+            }
+            match timeout(LIMIT, self.child.wait()).await {
+                Ok(Ok(_)) => {}
+                result => errors.push(format!("client reap: {result:?}")),
+            }
+        }
+        if let Some(stop) = self.proxy_stop.take() {
+            let _ = stop.send(());
+        }
+        match timeout(LIMIT, &mut self.proxy).await {
+            Ok(Ok(())) => {}
+            result => {
+                errors.push(format!("proxy shutdown: {result:?}"));
+                self.proxy.abort();
+                let _ = (&mut self.proxy).await;
+            }
+        }
+        errors
     }
 
     pub fn log(&self) -> String {
@@ -204,7 +286,6 @@ impl Live {
             .expect("client exit deadline")
             .unwrap();
         assert!(status.success(), "client failed: {}", self.log());
-        self.server.shutdown().await.unwrap();
     }
 
     pub async fn await_client_rejection(&mut self) {
@@ -250,6 +331,7 @@ async fn proxy(
     server: SocketAddr,
     tx: mpsc::UnboundedSender<Capture>,
     fault: Fault,
+    mut stop: oneshot::Receiver<()>,
 ) {
     let mut upstreams = HashMap::new();
     let mut receivers = JoinSet::new();
@@ -258,6 +340,10 @@ async fn proxy(
     let mut buffer = vec![0; 65535];
     loop {
         tokio::select! {
+            _ = &mut stop => {
+                receivers.shutdown().await;
+                break;
+            }
             result = front.recv_from(&mut buffer) => {
                 let (len, client) = result.unwrap();
                 if fault == Fault::InvalidSignature && buffer[0] & 31 == 1 && buffer[3] == 2 {
@@ -440,4 +526,40 @@ fn ogg_silence() -> Vec<u8> {
     ));
     output.extend(page(2, 4, 960 * 100, &vec![SILENCE; 100]));
     output
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn assertion_and_packet_deadline_failures_complete_fixture_cleanup() {
+    for deadline_failure in [false, true] {
+        let (mut live, outcome, errors) = Live::start("default_password", 1, false, Fault::None)
+            .await
+            .exercise(move |live| {
+                Box::pin(async move {
+                    live.until(|p| p.from_server && p.channeled(channels::META_DATA))
+                        .await;
+                    if deadline_failure {
+                        // Deliberately expired deadline after real auth/proxy activity.
+                        // An already-ready receive can beat Tokio's deadline check;
+                        // use an empty, open capture channel to force the timeout path.
+                        let (_sender, empty) = mpsc::unbounded_channel();
+                        live.events = empty;
+                        live.next(Instant::now() - Duration::from_secs(1)).await;
+                    } else {
+                        panic!("injected packet assertion failure");
+                    }
+                })
+            })
+            .await;
+        assert!(outcome.unwrap_err().is_panic());
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            live.child.try_wait().unwrap().is_some(),
+            "child was not reaped"
+        );
+        assert!(live.proxy.is_finished(), "proxy task tree was not joined");
+        assert!(live.shutdown.is_none());
+        let path = live.dir.path().to_owned();
+        drop(live);
+        assert!(!path.exists(), "temporary state survived completed cleanup");
+    }
 }
