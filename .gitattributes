@@ -1,0 +1,10 @@
+# Files consumed by Docker builds and by CI must keep LF endings regardless of the local
+# core.autocrlf setting (this repo has autocrlf=true on Windows).
+#
+# BasisRustServer/docker-entrypoint.sh is the important one: it is executed by /bin/sh
+# inside the image, where a stray CR turns into confusing failures such as
+# `BASIS_BASE_DIR=/app\r: not found` that are hard to diagnose from a Windows host. It
+# looks perfectly correct in an editor, so the breakage only appears at container start.
+BasisRustServer/docker-entrypoint.sh text eol=lf
+BasisRustServer/Dockerfile        text eol=lf
+.github/workflows/*.yml           text eol=lf
