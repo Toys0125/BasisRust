@@ -1,0 +1,8 @@
+# Keep operator files and previous outputs out of the build context.
+config/
+# The tracked sample can also contain operator edits.
+Config.xml
+logs/
+captures/
+target/
+*.rs.bk

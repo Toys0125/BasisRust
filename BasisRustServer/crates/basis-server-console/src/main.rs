@@ -787,7 +787,7 @@ async fn async_main(
         base_dir.join(&args.config)
     };
     let mut config = ServerConfig::load_or_create(&config_path)?;
-    config.process_environment_overrides();
+    config.process_environment_overrides()?;
     if args.no_console {
         config.enable_console = false;
     }
