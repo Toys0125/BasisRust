@@ -4,7 +4,7 @@ services:
     environment:
       SetPort: 4296
       EnableConsole: "false"
-      Password: default_password
+      BASIS_SERVER_PASSWORD: ${BASIS_SERVER_PASSWORD:?Set a non-empty server password}
     ports:
       - "4296:4296/udp"
       - "10666:10666/tcp"

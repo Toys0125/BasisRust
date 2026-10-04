@@ -19,6 +19,52 @@ The summarized order-paired outcomes were:
 
 Both candidates are higher-total-CPU cadence/throughput wins for this synthetic dense workload, not CPU reductions. The complete per-run rows, distributions, endpoints and hashes are in the linked JSON files; these headline values do not replace those rows.
 
-The portable runner in [`../run-avatar-workload.py`](../run-avatar-workload.py) uses the same core workload policy, but its checked-in XML fixtures intentionally are not byte-identical to the historical configs. Historical server config hash: `35c48042…`; historical client config hash: `043b8b7f…`. Current fixture hashes: server `c27d64a1…`, client `608c21fa…`. The fixtures use a dedicated `avatar-bench-only` loopback credential instead of historical `default_password`, descriptive server/loopback host settings, a 1,500 client-count default, and normalized XML serialization. Server performance settings (20 ms default interval, base multiplier 1, increase rate 0, 2.5 slowest-send rate, uplink delta, compression/keyframe settings) match the historical harness overrides; remaining complete template values are retained. The portable runner defaults to no CPU pinning and does not itself sample `/proc` CPU windows; pass `--server-cpus 0-7 --client-cpus 8-15` to match historical affinity. Use the original published JSON for the exact historical A/B settings and outcomes; the portable runner is a safe fresh workload reproduction, not a byte-identical recreation of those paired captures.
+The portable runner in [`run-avatar-workload.py`](../../../scripts/perf/run-avatar-workload.py) uses the same core workload policy, but its checked-in XML fixtures intentionally are not byte-identical to the historical configs. Historical server config hash: `35c48042…`; historical client config hash: `043b8b7f…`. Current fixture hashes: server `c27d64a1…`, client `608c21fa…`. The fixtures use a dedicated `avatar-bench-only` loopback credential instead of historical `default_password`, descriptive server/loopback host settings, a 1,500 client-count default, and normalized XML serialization. Server performance settings (20 ms default interval, base multiplier 1, increase rate 0, 2.5 slowest-send rate, uplink delta, compression/keyframe settings) match the historical harness overrides; remaining complete template values are retained. The portable runner defaults to no CPU pinning and does not itself sample `/proc` CPU windows; pass `--server-cpus 0-7 --client-cpus 8-15` to match historical affinity. Use the original published JSON for the exact historical A/B settings and outcomes; the portable runner is a safe fresh workload reproduction, not a byte-identical recreation of those paired captures.
 
 Historical pose generation was synthetic and deterministic, not captured from a Unity runtime. “Unity-policy” means the source-backed send cadence/packing policy exercised by this Rust workload. No result here claims identical Unity physics, scheduling or pose entropy.
+
+## Fresh-checkout workload
+
+From the repository root, install Rust/Cargo 1.95 or newer, a native build
+compiler/linker, and Python 3. The script uses Python's standard library; no pip
+packages or `ffmpeg` are needed for this avatar-only workload. Linux `taskset`
+is required only when affinity flags are supplied. Keep ports 4296/UDP and
+10666/TCP free, or select unused `--port` / `--health-port` values.
+
+```sh
+CARGO_BUILD_JOBS=2 cargo build --locked --release --manifest-path BasisRustServer/Cargo.toml -p basis-server-console
+CARGO_BUILD_JOBS=2 cargo build --locked --release --manifest-path BasisRustClient/Cargo.toml
+python3 scripts/perf/run-avatar-workload.py --output captures/avatar-workload-A
+```
+
+The runner selects these built binaries by default, uses the checked-in
+[server](../fixtures/avatar-1500-server.xml) and
+[client](../fixtures/avatar-1500-client.xml) fixtures, waits for all 1,500 clients
+to authenticate/become active, warms up for 15 seconds and measures for 60
+seconds. It runs loopback only. Output directories must not already exist.
+For a host with the corresponding allowed CPUs, add
+`--server-cpus 0-7 --client-cpus 8-15`; otherwise choose valid affinity sets and
+record them. Use `--help` to select binaries (`--server` / `--client`), client count and durations.
+The fixtures are fixed by the runner; it has no config-selection flag. Clear
+server configuration environment overrides (including `Password` and
+`BASIS_SERVER_PASSWORD`) before running so they do not override the fixture or
+prevent the matching client credential from connecting.
+
+Outputs under the ignored capture directory include `workload.json` (settings and
+binary/config hashes), `commands.txt` (commands), `server.log`, `client.log`,
+`ready-health.json`, `readiness.csv`, `observer.csv`, `observer.sender.csv`,
+`server-pairs.csv` and `server-pairs.global.csv`. Check that the files exist and
+inspect coverage, decode/send errors, applied-update gaps and pair diagnostics;
+the final “completed” message alone does not validate CSV contents or process
+exit codes. Server/client CPU samples must be collected separately over matched
+observer windows; this runner does not sample them.
+
+For A/B comparisons, supply `--server` for each candidate, retain the
+same client binary/configs, and use unique output directories. Repeat in ABBA
+or forward/reverse pairs on the same host with the same clients, durations,
+affinity and runtime settings. Record source/binary/config hashes, compare
+matching measurement windows, and inspect individual runs before aggregating.
+Report CPU together with update gaps, throughput, coverage and errors; a
+speedup obtained by dropping work is not an improvement. State the number of
+repeats and host/workload limits. Current fixture-based runs do not reproduce
+unavailable historical captures; see [artifact availability](../artifact-availability.md).
