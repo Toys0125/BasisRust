@@ -26,13 +26,16 @@ use crate::receiver::shared_receiver_send_mtu_ok;
 use crate::receiver::{ping_bucket_matches, shared_maintenance_loop};
 use crate::simulation::{cadence_seed, jittered_duration, worker_phase_offset, SpawnLayout};
 use crate::transport::{
-    parse_packet, MaintenanceOptions, ParsedPacket, ReliableReceiveState, ReliableSend,
-    LITENETLIB_MAX_MTU, PING_INTERVAL_TICKS,
+    parse_packet, MaintenanceOptions, ReliableReceiveState, ReliableSend, PING_INTERVAL_TICKS,
 };
+#[cfg(target_os = "linux")]
+use crate::transport::{ParsedPacket, LITENETLIB_MAX_MTU};
+#[cfg(unix)]
+use crate::voice::VoiceLibrary;
 use crate::voice::{
     choose_next_speaker, distance_within, opus_packet_duration_ms, serialize_audio_segment,
     serialize_voice_recipients_large, serialize_voice_recipients_small, voice_speaker_target,
-    OggOpusPackets, VoiceLibrary,
+    OggOpusPackets,
 };
 use crate::wire::{avatar_change, build_connection_payload, ready_message};
 use basis_protocol::application::NetworkApplication;
