@@ -38,6 +38,7 @@ def kernel_api():
         'SetInformationJobObject': ([wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
         'AssignProcessToJobObject': ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
         'CloseHandle': ([wintypes.HANDLE], wintypes.BOOL),
+        'SetProcessAffinityMask': ([wintypes.HANDLE, ctypes.c_size_t], wintypes.BOOL),
         'CreateToolhelp32Snapshot': ([wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
         'Thread32First': ([wintypes.HANDLE, ctypes.POINTER(THREAD_ENTRY)], wintypes.BOOL),
         'Thread32Next': ([wintypes.HANDLE, ctypes.POINTER(THREAD_ENTRY)], wintypes.BOOL),
@@ -81,12 +82,14 @@ class WindowsProcessJob:
             if not self.api.CloseHandle(handle):
                 raise ctypes.WinError(ctypes.get_last_error())
 
-    def start(self, command, **kwargs):
+    def start(self, command, affinity_mask=None, **kwargs):
         """Assign a suspended proxy before it can spawn any workload descendants."""
         kwargs['creationflags'] = kwargs.get('creationflags', 0) | 0x00000004  # CREATE_SUSPENDED
         process = subprocess.Popen(command, **kwargs)
         try:
             if not self.api.AssignProcessToJobObject(self.handle, wintypes.HANDLE(int(process._handle))):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if affinity_mask is not None and not self.api.SetProcessAffinityMask(wintypes.HANDLE(int(process._handle)), affinity_mask):
                 raise ctypes.WinError(ctypes.get_last_error())
             self._resume_primary_thread(process.pid)
             return process
