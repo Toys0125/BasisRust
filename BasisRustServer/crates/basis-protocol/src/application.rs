@@ -1,4 +1,4 @@
-use crate::io::{NetReader, NetWriter};
+use crate::io::{NetReader, NetWriter, WriteResult};
 use std::borrow::Cow;
 
 pub const DEFAULT_COMPANY_NAME: &str = "Basis Unity";
@@ -28,23 +28,28 @@ impl NetworkApplication {
         self.company_name == accepted_company_name && self.product_name == accepted_product_name
     }
 
-    pub fn write(writer: &mut NetWriter, company_name: &str, product_name: &str) {
+    pub fn write(
+        writer: &mut NetWriter,
+        company_name: &str,
+        product_name: &str,
+    ) -> WriteResult<()> {
         if company_name == DEFAULT_COMPANY_NAME && product_name == DEFAULT_PRODUCT_NAME {
             writer.put_u8(TAG_DEFAULT);
-            return;
+            return Ok(());
         }
 
         writer.put_u8(TAG_RAW);
         let company_name = truncate_name(company_name);
         let product_name = truncate_name(product_name);
-        writer.put_string(company_name.as_ref());
-        writer.put_string(product_name.as_ref());
+        writer.put_string(company_name.as_ref())?;
+        writer.put_string(product_name.as_ref())?;
+        Ok(())
     }
 
-    pub fn encode(company_name: &str, product_name: &str) -> Vec<u8> {
+    pub fn encode(company_name: &str, product_name: &str) -> WriteResult<Vec<u8>> {
         let mut writer = NetWriter::with_capacity(1 + company_name.len() + product_name.len() + 4);
-        Self::write(&mut writer, company_name, product_name);
-        writer.into_vec()
+        Self::write(&mut writer, company_name, product_name)?;
+        Ok(writer.into_vec())
     }
 
     pub fn try_read(reader: &mut NetReader<'_>) -> Option<Self> {
@@ -105,14 +110,14 @@ mod tests {
     #[test]
     fn default_application_uses_compact_tag() {
         assert_eq!(
-            NetworkApplication::encode(DEFAULT_COMPANY_NAME, DEFAULT_PRODUCT_NAME),
+            NetworkApplication::encode(DEFAULT_COMPANY_NAME, DEFAULT_PRODUCT_NAME).unwrap(),
             vec![TAG_DEFAULT]
         );
     }
 
     #[test]
     fn raw_application_round_trips_basis_strings() {
-        let encoded = NetworkApplication::encode("Example Company", "Example Product");
+        let encoded = NetworkApplication::encode("Example Company", "Example Product").unwrap();
         assert_eq!(encoded[0], TAG_RAW);
 
         let mut reader = NetReader::new(&encoded);
@@ -126,7 +131,7 @@ mod tests {
     fn raw_application_names_are_limited_to_64_utf16_code_units() {
         let company = "a".repeat(MAX_NAME_LENGTH + 5);
         let product = "😀".repeat(40);
-        let encoded = NetworkApplication::encode(&company, &product);
+        let encoded = NetworkApplication::encode(&company, &product).unwrap();
         let mut reader = NetReader::new(&encoded);
         let decoded = NetworkApplication::try_read(&mut reader).unwrap();
         assert_eq!(decoded.company_name.len(), MAX_NAME_LENGTH);

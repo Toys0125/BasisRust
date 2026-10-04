@@ -1082,7 +1082,7 @@ pub struct BsrProfilerSnapshot {
 #[derive(Debug, Default)]
 struct BsrProfiler {
     enabled: AtomicBool,
-    last_print_micros: AtomicU64,
+    last_capture_micros: AtomicU64,
     drain_micros: AtomicU64,
     process_micros: AtomicU64,
     distance_micros: AtomicU64,
@@ -1109,13 +1109,13 @@ struct BsrProfiler {
 }
 
 impl BsrProfiler {
-    const PRINT_INTERVAL_MICROS: u64 = 5_000_000;
+    const CAPTURE_INTERVAL_MICROS: u64 = 5_000_000;
 
     fn new(enabled: bool) -> Self {
         let profiler = Self::default();
         profiler.enabled.store(enabled, Ordering::Relaxed);
         profiler
-            .last_print_micros
+            .last_capture_micros
             .store(now_micros(), Ordering::Relaxed);
         profiler
     }
@@ -1125,7 +1125,7 @@ impl BsrProfiler {
         if enabled && !was_enabled {
             self.reset_window();
             *self.latest.write() = None;
-            self.last_print_micros
+            self.last_capture_micros
                 .store(now_micros(), Ordering::Relaxed);
         }
         self.enabled.store(enabled, Ordering::Relaxed);
@@ -1244,17 +1244,17 @@ impl BsrProfiler {
         self.latest.read().clone()
     }
 
-    fn try_print(&self) {
+    fn try_capture_window(&self) {
         if !self.enabled() {
             return;
         }
         let now = now_micros();
-        let last = self.last_print_micros.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < Self::PRINT_INTERVAL_MICROS {
+        let last = self.last_capture_micros.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < Self::CAPTURE_INTERVAL_MICROS {
             return;
         }
         if self
-            .last_print_micros
+            .last_capture_micros
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
@@ -1275,45 +1275,6 @@ impl BsrProfiler {
         let distance_micros = self.distance_micros.swap(0, Ordering::Relaxed);
         let update_micros = self.update_micros.swap(0, Ordering::Relaxed);
         let trigger_micros = self.trigger_micros.swap(0, Ordering::Relaxed);
-        let drain = drain_micros as f64 / 1000.0;
-        let process = process_micros as f64 / 1000.0;
-        let distance = distance_micros as f64 / 1000.0;
-        let update = update_micros as f64 / 1000.0;
-        let trigger = trigger_micros as f64 / 1000.0;
-        let total = (drain + process + distance + update + trigger).max(f64::EPSILON);
-        let ticks_f = ticks as f64;
-
-        println!(
-            "\n[BSR Profile] {ticks} ticks, {msgs} msgs, {sends} sends, preSer {pre_ser}/{}",
-            pre_ser + pre_skip
-        );
-        println!(
-            "  drain:    {:.3} ms/tick ({:.1}%)",
-            drain / ticks_f,
-            drain / total * 100.0
-        );
-        println!(
-            "  process:  {:.3} ms/tick ({:.1}%)",
-            process / ticks_f,
-            process / total * 100.0
-        );
-        println!(
-            "  distance: {:.3} ms/tick ({:.1}%)",
-            distance / ticks_f,
-            distance / total * 100.0
-        );
-        println!(
-            "  update:   {:.3} ms/tick ({:.1}%)",
-            update / ticks_f,
-            update / total * 100.0
-        );
-        println!(
-            "  trigger:  {:.3} ms/tick ({:.1}%)",
-            trigger / ticks_f,
-            trigger / total * 100.0
-        );
-        println!("  total:    {:.3} ms/tick", total / ticks_f);
-
         let b_emit = self.bundles_emitted.swap(0, Ordering::Relaxed);
         let b_msg = self.bundle_messages.swap(0, Ordering::Relaxed);
         let b_raw = self.bundle_raw_bytes.swap(0, Ordering::Relaxed);
@@ -1352,49 +1313,6 @@ impl BsrProfiler {
             bundle_zstd_compressed_bytes: b_zstd_comp,
             bundle_zstd_micros: b_zstd_micros,
         });
-
-        if b_emit > 0 || b_tail > 0 || b_fallback > 0 {
-            let ratio = if b_raw > 0 {
-                b_comp as f64 / b_raw as f64
-            } else {
-                0.0
-            };
-            let avg_msgs_per_bundle = if b_emit > 0 {
-                b_msg as f64 / b_emit as f64
-            } else {
-                0.0
-            };
-            let avg_raw_per_bundle = if b_emit > 0 {
-                b_raw as f64 / b_emit as f64
-            } else {
-                0.0
-            };
-            let avg_comp_per_bundle = if b_emit > 0 {
-                b_comp as f64 / b_emit as f64
-            } else {
-                0.0
-            };
-            let deflate_ms = b_deflate_micros as f64 / 1000.0;
-            let avg_deflate_us = if b_emit > 0 {
-                b_deflate_micros as f64 / b_emit as f64
-            } else {
-                0.0
-            };
-            let bundles_per_tick = b_emit as f64 / ticks_f;
-            let retry_rate = if b_emit > 0 {
-                b_retry as f64 / b_emit as f64 * 100.0
-            } else {
-                0.0
-            };
-            let saved_bytes = b_raw.saturating_sub(b_comp);
-            println!("  bundles:  {b_emit} emitted ({bundles_per_tick:.2}/tick), {b_msg} msgs in bundles, {b_tail} msgs tail-uncompressed, {b_fallback} fallbacks");
-            println!("            ratio {ratio:.3} ({:.1}% saved on bundled bytes), avg {avg_msgs_per_bundle:.1} msgs/bundle ({avg_raw_per_bundle:.0} B raw -> {avg_comp_per_bundle:.0} B compressed)", (1.0 - ratio) * 100.0);
-            println!("            deflate {:.3} ms/tick ({:.1}% of tick), {avg_deflate_us:.1} us/bundle, retries {b_retry} ({retry_rate:.1}%)", deflate_ms / ticks_f, deflate_ms / total * 100.0);
-            println!(
-                "            saved ~{:.1} KB this window before per-message wire overhead",
-                saved_bytes as f64 / 1024.0
-            );
-        }
     }
 }
 
@@ -1815,12 +1733,13 @@ impl AvatarSyncSystem {
         transport: TransportHandle,
         shutdown: Arc<AtomicBool>,
         peer_snapshot: F,
-    ) where
+    ) -> std::io::Result<thread::JoinHandle<()>>
+    where
         F: Fn() -> Vec<PeerId> + Send + Sync + 'static,
     {
         let system = self.clone();
         let runtime = Handle::current();
-        let _ = thread::Builder::new()
+        thread::Builder::new()
             .name("BSR-TickLoop".to_string())
             .spawn(move || {
                 set_avatar_thread_priority();
@@ -1847,7 +1766,7 @@ impl AvatarSyncSystem {
                         std::hint::spin_loop();
                     }
                 }
-            });
+            })
     }
 
     async fn flush_tick<F>(&self, transport: &TransportHandle, peer_snapshot: &F) -> Result<()>
@@ -2009,7 +1928,7 @@ impl AvatarSyncSystem {
         }
         self.profiler.add_tick(messages_processed as u64);
         self.adapt_slice_count(tick_micros, &config);
-        self.profiler.try_print();
+        self.profiler.try_capture_window();
         Ok(())
     }
 
@@ -3553,6 +3472,36 @@ fn advertised_interval_byte(
 mod tests {
     use super::*;
     use basis_protocol::avatar::{decode_avatar_bundle, encode_avatar_bundle, AvatarBundleItem};
+
+    #[test]
+    fn profile_window_capture_preserves_counters_and_gating() {
+        let profiler = BsrProfiler::new(false);
+        profiler.add_tick(3);
+        profiler.try_capture_window();
+        assert!(profiler.latest().is_none());
+        profiler.set_enabled(true);
+        profiler.add_tick(3);
+        profiler.add_sends(2);
+        profiler.add_phase_micros(BsrPhase::Drain, 12);
+        profiler.add_bundle_emitted(2, 100, 50, 7, true);
+        profiler.try_capture_window();
+        assert!(profiler.latest().is_none()); // Five-second gate still applies.
+        profiler.last_capture_micros.store(0, Ordering::Relaxed);
+        profiler.try_capture_window();
+        let snapshot = profiler.latest().unwrap();
+        assert_eq!(
+            (snapshot.ticks, snapshot.messages, snapshot.sends),
+            (1, 3, 2)
+        );
+        assert_eq!(snapshot.drain_micros, 12);
+        assert_eq!(snapshot.bundle_messages, 2);
+        assert_eq!(snapshot.bundle_raw_bytes, 100);
+        assert_eq!(snapshot.bundle_compressed_bytes, 50);
+        assert_eq!(snapshot.bundle_zstd_micros, 7);
+        assert_eq!(profiler.tick_count.load(Ordering::Relaxed), 0);
+        profiler.try_capture_window();
+        assert_eq!(profiler.latest().unwrap().captured_at, snapshot.captured_at);
+    }
 
     #[test]
     fn bundle_cache_fingerprint_collisions_preserve_full_identity() {

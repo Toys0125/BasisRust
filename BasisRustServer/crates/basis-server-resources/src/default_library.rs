@@ -192,8 +192,8 @@ impl DefaultLibrary {
                 "default library password is too long"
             );
             raw.put_u8(entry.mode);
-            raw.put_string(&entry.url);
-            raw.put_string(&entry.password);
+            raw.put_string(&entry.url)?;
+            raw.put_string(&entry.password)?;
         }
         let raw = raw.into_vec();
         ensure!(
@@ -244,7 +244,7 @@ fn recover_removals(path: &Path) -> Result<()> {
                             "recovering interrupted library removal of {}",
                             original.display()
                         )
-                    })
+                    });
                 }
             }
             fs::remove_file(&moved)?;

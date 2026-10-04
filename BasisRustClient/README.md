@@ -71,7 +71,20 @@ cargo run --release -- --voice --no-voice-reencode
 
 ## Config
 
-The client reads a `Config.xml` file for configuration including avatar data, server settings, and behavior parameters.
+The client reads `Config.xml` relative to the current working directory by
+default, or the path passed to `--config` (also relative to the working directory
+unless absolute). The tracked `Config.xml` is a sample; use an ignored file such
+as `config/local.xml` for local credentials and pass `--config config/local.xml`.
+A missing config is generated from client defaults. Malformed XML warns and
+falls back to all defaults; invalid/empty supplied scalar values fall back per
+field. Explicit CLI `--ip`, `--port`, `--clients` and other supported runtime
+switches override loaded values. Server PascalCase environment overrides and
+`BASIS_SERVER_PASSWORD` do not configure the client; set its XML `Password` to
+match the server. `BASIS_CLIENT_TOKIO_WORKERS` configures the client's runtime
+worker count only. See `--help` for CLI options.
+
+`AvatarPassword`, `AvatarUrl` and `AvatarLoadMode` are client values, not server
+configuration fields. The server uses a separate schema/path and defaults.
 Voice settings include `VoiceEnabled`, `VoiceAudioFolder`, `VoiceSpeakerPercent`,
 `VoiceHearingDistance`, and `VoiceFrameDurationMs`.
 

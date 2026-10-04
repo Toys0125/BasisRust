@@ -1,3 +1,5 @@
+mod pre_auth;
+
 use basis_protocol::{
     channels,
     io::NetWriter,
@@ -59,10 +61,16 @@ const PEER_PING_INTERVAL: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Error)]
 pub enum TransportError {
+    #[error("wire serialization error: {0}")]
+    Write(#[from] basis_protocol::io::NetWriteError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("event channel closed")]
     EventChannelClosed,
+    #[error("peer ID namespace exhausted")]
+    PeerIdExhausted,
+    #[error("admission superseded or already accepted")]
+    StaleAdmission,
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;
@@ -246,6 +254,8 @@ pub struct TransportStatsSnapshot {
     pub raw_bytes_received: u64,
     pub raw_bytes_sent: u64,
     pub raw_send_would_block: u64,
+    /// Non-reliable datagrams discarded after a nonblocking send returned WouldBlock.
+    pub non_reliable_dropped_datagrams: u64,
     pub reliable_window_fills: u64,
     pub reliable_retransmits: u64,
     pub reliable_dispatch_passes: u64,
@@ -254,6 +264,29 @@ pub struct TransportStatsSnapshot {
     pub reliable_acks_released: u64,
     pub reliable_acks_unknown_channel: u64,
     pub reliable_window_stalls: u64,
+}
+
+/// Instantaneous totals over currently connected transport peers. Payload/fragment counts
+/// and datagram counts have different units and may overlap; do not sum them as a backlog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportDepthSnapshot {
+    pub peers: usize,
+    pub reliable_pending: usize,
+    /// None if any peer's outgoing queue is contended during sampling.
+    pub reliable_queued: Option<usize>,
+    /// None if any peer's retained datagram queue is contended during sampling.
+    pub pending_datagrams: Option<usize>,
+}
+
+impl Default for TransportDepthSnapshot {
+    fn default() -> Self {
+        Self {
+            peers: 0,
+            reliable_pending: 0,
+            reliable_queued: Some(0),
+            pending_datagrams: Some(0),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -265,6 +298,7 @@ struct TransportStats {
     raw_bytes_received: AtomicU64,
     raw_bytes_sent: AtomicU64,
     raw_send_would_block: AtomicU64,
+    non_reliable_dropped_datagrams: AtomicU64,
     /// Reliable messages promoted from the outgoing queue into the send window, and
     /// retransmissions emitted, so reliable throughput can be verified from the outside.
     reliable_window_fills: AtomicU64,
@@ -292,6 +326,7 @@ impl TransportStats {
             raw_bytes_received: AtomicU64::new(0),
             raw_bytes_sent: AtomicU64::new(0),
             raw_send_would_block: AtomicU64::new(0),
+            non_reliable_dropped_datagrams: AtomicU64::new(0),
             reliable_window_fills: AtomicU64::new(0),
             reliable_retransmits: AtomicU64::new(0),
             reliable_dispatch_passes: AtomicU64::new(0),
@@ -309,6 +344,8 @@ impl TransportStats {
         self.raw_bytes_received.store(0, Ordering::Relaxed);
         self.raw_bytes_sent.store(0, Ordering::Relaxed);
         self.raw_send_would_block.store(0, Ordering::Relaxed);
+        self.non_reliable_dropped_datagrams
+            .store(0, Ordering::Relaxed);
     }
 
     fn reset_extended(&self) {
@@ -516,6 +553,7 @@ struct AckState {
 struct PendingRequestInfo {
     connect_time: i64,
     connection_number: u8,
+    expires_at: Instant,
 }
 
 #[derive(Clone)]
@@ -523,7 +561,10 @@ pub struct TransportHandle {
     socket: Arc<UdpSocket>,
     peers: Arc<DashMap<PeerId, Arc<PeerState>>>,
     by_addr: Arc<DashMap<SocketAddr, PeerId>>,
-    pending_requests: Arc<DashMap<SocketAddr, PendingRequestInfo>>,
+    pending_requests: Arc<parking_lot::Mutex<HashMap<SocketAddr, PendingRequestInfo>>>,
+    pre_auth_limiter: Arc<parking_lot::Mutex<pre_auth::Limiter>>,
+    peer_allocation: Arc<parking_lot::Mutex<()>>,
+    allocated_peer_ids: Arc<parking_lot::Mutex<HashSet<PeerId>>>,
     next_peer_id: Arc<AtomicU16>,
     reusable_peer_ids: Arc<parking_lot::Mutex<VecDeque<PeerId>>>,
     retired_peer_ids: Arc<parking_lot::Mutex<HashSet<PeerId>>>,
@@ -556,7 +597,10 @@ impl TransportHandle {
             socket: socket.clone(),
             peers: Arc::new(DashMap::new()),
             by_addr: Arc::new(DashMap::new()),
-            pending_requests: Arc::new(DashMap::new()),
+            pending_requests: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            pre_auth_limiter: Arc::new(parking_lot::Mutex::new(pre_auth::Limiter::default())),
+            peer_allocation: Arc::new(parking_lot::Mutex::new(())),
+            allocated_peer_ids: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             next_peer_id: Arc::new(AtomicU16::new(0)),
             reusable_peer_ids: Arc::new(parking_lot::Mutex::new(VecDeque::new())),
             retired_peer_ids: Arc::new(parking_lot::Mutex::new(HashSet::new())),
@@ -604,6 +648,35 @@ impl TransportHandle {
 
     pub fn queued_reliable_count(&self) -> usize {
         self.peers.iter().map(|peer| peer.total_queued()).sum()
+    }
+
+    /// Copies peer references before sampling queues, without retaining peer-map guards.
+    /// A contended queue makes its aggregate unavailable rather than waiting or reporting
+    /// an incomplete total. Concurrent sends/ACKs can change depths during sampling.
+    pub fn depths_snapshot(&self) -> TransportDepthSnapshot {
+        let peers = self
+            .peers
+            .iter()
+            .map(|peer| Arc::clone(peer.value()))
+            .collect::<Vec<_>>();
+        let mut snapshot = TransportDepthSnapshot {
+            peers: peers.len(),
+            ..TransportDepthSnapshot::default()
+        };
+        for peer in peers {
+            snapshot.reliable_pending += peer.total_pending();
+            snapshot.reliable_queued = snapshot.reliable_queued.and_then(|total| {
+                peer.outgoing_reliable
+                    .try_lock()
+                    .map(|queues| total + queues.values().map(VecDeque::len).sum::<usize>())
+            });
+            snapshot.pending_datagrams = snapshot.pending_datagrams.and_then(|total| {
+                peer.pending_datagrams
+                    .try_lock()
+                    .map(|queue| total + queue.len())
+            });
+        }
+        snapshot
     }
 
     pub fn set_statistics_enabled(&self, enabled: bool) {
@@ -661,6 +734,13 @@ impl TransportHandle {
             },
             raw_send_would_block: if statistics_enabled {
                 self.stats.raw_send_would_block.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            non_reliable_dropped_datagrams: if statistics_enabled {
+                self.stats
+                    .non_reliable_dropped_datagrams
+                    .load(Ordering::Relaxed)
             } else {
                 0
             },
@@ -752,6 +832,18 @@ impl TransportHandle {
         }
     }
 
+    /// These callers discard a refused datagram. Reliable/ACK/MTU callers use
+    /// try_send_raw_to directly and must not be counted as non-reliable drops.
+    fn try_send_non_reliable_raw_to(&self, bytes: &[u8], addr: SocketAddr) -> Result<bool> {
+        let sent = self.try_send_raw_to(bytes, addr)?;
+        if !sent && self.statistics_enabled() {
+            self.stats
+                .non_reliable_dropped_datagrams
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(sent)
+    }
+
     pub fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
         self.peers
             .iter()
@@ -763,32 +855,40 @@ impl TransportHandle {
     }
 
     pub async fn accept(&self, request: &ConnectionRequest) -> Result<PeerId> {
-        self.pending_requests.remove(&request.remote_addr);
-        let id = self.allocate_peer_id();
-        let state = Arc::new(PeerState {
-            id,
-            addr: request.remote_addr,
-            connection_number: request.connection_number,
-            connect_time: request.connect_time,
-            last_seen: parking_lot::Mutex::new(Instant::now()),
-            last_ping_sent: parking_lot::Mutex::new(Instant::now()),
-            next_ping_sequence: AtomicU16::new(0),
-            next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),
-            next_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
-            remote_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
-            next_fragment_id: AtomicU16::new(0),
-            pending_reliable: parking_lot::Mutex::new(HashMap::new()),
-            pending_total: AtomicUsize::new(0),
-            pending_datagrams: parking_lot::Mutex::new(VecDeque::new()),
-            reliable_send_turn: parking_lot::Mutex::new(()),
-            outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
-            outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
-            reliable_active: AtomicBool::new(false),
-            confirmed_mtu: AtomicUsize::new(MAX_MERGED_PACKET_SIZE),
-            mtu_probe: parking_lot::Mutex::new(MtuProbeState::new(Instant::now())),
-        });
-        self.by_addr.insert(request.remote_addr, id);
-        self.peers.insert(id, state);
+        let id = {
+            // Reserve and publish under one lock: concurrent accepts cannot choose the same ID.
+            let _allocation = self.peer_allocation.lock();
+            self.remove_pending_request(request);
+            if self.by_addr.contains_key(&request.remote_addr) {
+                return Err(TransportError::StaleAdmission);
+            }
+            let id = self.allocate_peer_id()?;
+            let state = Arc::new(PeerState {
+                id,
+                addr: request.remote_addr,
+                connection_number: request.connection_number,
+                connect_time: request.connect_time,
+                last_seen: parking_lot::Mutex::new(Instant::now()),
+                last_ping_sent: parking_lot::Mutex::new(Instant::now()),
+                next_ping_sequence: AtomicU16::new(0),
+                next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),
+                next_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
+                remote_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
+                next_fragment_id: AtomicU16::new(0),
+                pending_reliable: parking_lot::Mutex::new(HashMap::new()),
+                pending_total: AtomicUsize::new(0),
+                pending_datagrams: parking_lot::Mutex::new(VecDeque::new()),
+                reliable_send_turn: parking_lot::Mutex::new(()),
+                outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
+                outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
+                reliable_active: AtomicBool::new(false),
+                confirmed_mtu: AtomicUsize::new(MAX_MERGED_PACKET_SIZE),
+                mtu_probe: parking_lot::Mutex::new(MtuProbeState::new(Instant::now())),
+            });
+            self.by_addr.insert(request.remote_addr, id);
+            self.peers.insert(id, state);
+            id
+        };
 
         send_connect_accept(
             self,
@@ -801,29 +901,55 @@ impl TransportHandle {
         Ok(id)
     }
 
-    fn allocate_peer_id(&self) -> PeerId {
-        loop {
-            if let Some(id) = self.reusable_peer_ids.lock().pop_front() {
-                if !self.peers.contains_key(&id) {
-                    return id;
-                }
-                continue;
+    fn allocate_peer_id(&self) -> Result<PeerId> {
+        let mut reusable = self.reusable_peer_ids.lock();
+        let retired = self.retired_peer_ids.lock();
+        while let Some(id) = reusable.pop_front() {
+            if !self.peers.contains_key(&id) && !retired.contains(&id) {
+                return Ok(id);
             }
+        }
+        // Once issued, an ID can only return through the explicit cleanup/recycle path.
+        let mut allocated = self.allocated_peer_ids.lock();
+        for _ in 0..=u16::MAX {
             let id = self.next_peer_id.fetch_add(1, Ordering::SeqCst);
-            if !self.peers.contains_key(&id) {
-                return id;
+            if !allocated.contains(&id) && !self.peers.contains_key(&id) && !retired.contains(&id) {
+                allocated.insert(id);
+                return Ok(id);
             }
+        }
+        Err(TransportError::PeerIdExhausted)
+    }
+
+    pub fn is_pending_request(&self, request: &ConnectionRequest) -> bool {
+        self.pending_requests
+            .lock()
+            .get(&request.remote_addr)
+            .is_some_and(|pending| {
+                pending.connect_time == request.connect_time
+                    && pending.connection_number == request.connection_number
+                    && pending.expires_at > Instant::now()
+            })
+    }
+
+    fn remove_pending_request(&self, request: &ConnectionRequest) {
+        let mut pending = self.pending_requests.lock();
+        if pending.get(&request.remote_addr).is_some_and(|old| {
+            old.connect_time == request.connect_time
+                && old.connection_number == request.connection_number
+        }) {
+            pending.remove(&request.remote_addr);
         }
     }
 
     pub async fn reject(&self, request: &ConnectionRequest, reason: &str) -> Result<()> {
         let mut payload = NetWriter::new();
-        payload.put_string(reason);
+        payload.put_string(reason)?;
         self.reject_payload(request, payload.as_slice()).await
     }
 
     pub async fn reject_payload(&self, request: &ConnectionRequest, payload: &[u8]) -> Result<()> {
-        self.pending_requests.remove(&request.remote_addr);
+        self.remove_pending_request(request);
         let mut writer = NetWriter::with_capacity(payload.len() + 9);
         writer.put_u8(PacketProperty::Disconnect as u8 | (request.connection_number << 5));
         writer.put_i64(request.connect_time);
@@ -932,7 +1058,7 @@ impl TransportHandle {
 
         let mut sent = 0usize;
         for packet in build_merged_datagrams(state.connection_number, outbound) {
-            if self.try_send_raw_to(&packet, state.addr)? {
+            if self.try_send_non_reliable_raw_to(&packet, state.addr)? {
                 sent += 1;
             }
         }
@@ -965,7 +1091,9 @@ impl TransportHandle {
             packet.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
             packet.push(packets[0].channel());
             extend_payload_with_patch(&mut packet, payload, packets[0].interval_patch());
-            return self.try_send_raw_to(&packet, state.addr).map(usize::from);
+            return self
+                .try_send_non_reliable_raw_to(&packet, state.addr)
+                .map(usize::from);
         }
 
         let mut sent = 0usize;
@@ -979,7 +1107,7 @@ impl TransportHandle {
             let packet_len = payload.len() + 2;
             let framed_len = packet_len + 2;
             if current_count > 0 && current.len() + framed_len > mtu {
-                if self.try_send_raw_to(&current, state.addr)? {
+                if self.try_send_non_reliable_raw_to(&current, state.addr)? {
                     sent += 1;
                 }
                 current.clear();
@@ -992,7 +1120,7 @@ impl TransportHandle {
                 oversized.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
                 oversized.push(packet.channel());
                 extend_payload_with_patch(&mut oversized, payload, packet.interval_patch());
-                if self.try_send_raw_to(&oversized, state.addr)? {
+                if self.try_send_non_reliable_raw_to(&oversized, state.addr)? {
                     sent += 1;
                 }
                 continue;
@@ -1005,7 +1133,7 @@ impl TransportHandle {
             current_count += 1;
         }
 
-        if current_count > 0 && self.try_send_raw_to(&current, state.addr)? {
+        if current_count > 0 && self.try_send_non_reliable_raw_to(&current, state.addr)? {
             sent += 1;
         }
         Ok(sent)
@@ -1049,11 +1177,17 @@ impl TransportHandle {
     }
 
     pub async fn disconnect(&self, peer: PeerId, reason: &str) -> Result<()> {
-        if let Some((_, state)) = self.peers.remove(&peer) {
-            self.by_addr.remove(&state.addr);
-            self.retire_peer_id(peer);
-            let mut payload = NetWriter::new();
-            payload.put_string(reason);
+        let mut payload = NetWriter::new();
+        payload.put_string(reason)?;
+        let state = {
+            let _allocation = self.peer_allocation.lock();
+            self.peers.remove(&peer).map(|(_, state)| {
+                self.by_addr.remove(&state.addr);
+                self.retire_peer_id(peer);
+                state
+            })
+        };
+        if let Some(state) = state {
             let mut writer = NetWriter::with_capacity(payload.len() + 9);
             writer.put_u8(PacketProperty::Disconnect as u8 | (state.connection_number << 5));
             writer.put_i64(state.connect_time);
@@ -1072,7 +1206,7 @@ impl TransportHandle {
         remote_addr: SocketAddr,
         response: &ServerInfoResponse,
     ) -> Result<()> {
-        let payload = response.serialize();
+        let payload = response.serialize()?;
         let mut packet = Vec::with_capacity(payload.len() + 1);
         packet.push(PacketProperty::UnconnectedMessage as u8);
         packet.extend_from_slice(&payload);
@@ -1414,7 +1548,14 @@ async fn process_packet(
 ) -> Result<()> {
     if let Some(server_info_payload) = server_info_payload(bytes) {
         if server_info_payload.len() >= SERVER_INFO_MIN_REQUEST_BYTES {
-            enqueue_event(
+            if !handle.pre_auth_limiter.lock().allow(
+                remote_addr.ip(),
+                pre_auth::Kind::Info,
+                Instant::now(),
+            ) {
+                return Ok(());
+            }
+            enqueue_pre_auth_event(
                 tx,
                 ServerEvent::UnconnectedRequest {
                     remote_addr,
@@ -1438,94 +1579,135 @@ async fn process_packet(
     };
 
     match property {
-        PacketProperty::ConnectRequest => match parse_connect_request(bytes) {
-            ConnectRequestParse::Ok(parsed) => {
-                if let Some(existing_peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
-                    if let Some(existing_peer) = handle.peers.get(&existing_peer_id) {
-                        if parsed.connect_time == existing_peer.connect_time {
-                            send_connect_accept(
-                                handle,
-                                remote_addr,
-                                existing_peer.connection_number,
-                                existing_peer.connect_time,
-                                existing_peer.id,
-                            )
-                            .await?;
-                            return Ok(());
+        PacketProperty::ConnectRequest => {
+            if !handle.pre_auth_limiter.lock().allow(
+                remote_addr.ip(),
+                pre_auth::Kind::Connection,
+                Instant::now(),
+            ) {
+                return Ok(());
+            }
+            match parse_connect_request(bytes) {
+                ConnectRequestParse::Ok(parsed) => {
+                    if let Some(existing_peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
+                        if let Some(existing_peer) = handle.peers.get(&existing_peer_id) {
+                            if parsed.connect_time == existing_peer.connect_time {
+                                send_connect_accept(
+                                    handle,
+                                    remote_addr,
+                                    existing_peer.connection_number,
+                                    existing_peer.connect_time,
+                                    existing_peer.id,
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+                            if parsed.connect_time < existing_peer.connect_time {
+                                return Ok(());
+                            }
                         }
-                        if parsed.connect_time < existing_peer.connect_time {
-                            return Ok(());
-                        }
                     }
-                    if let Some((_, old_peer)) = handle.peers.remove(&existing_peer_id) {
-                        handle.by_addr.remove(&old_peer.addr);
-                        handle.retire_peer_id(existing_peer_id);
-                        enqueue_event(
-                            tx,
-                            ServerEvent::PeerDisconnected {
-                                peer: existing_peer_id,
-                                reason: DisconnectReason::Remote,
-                            },
-                        )
-                        .await
-                        .map_err(|_| TransportError::EventChannelClosed)?;
-                    }
-                }
-                if let Some(existing) = handle.pending_requests.get(&remote_addr) {
-                    if parsed.connect_time < existing.connect_time
-                        || (parsed.connect_time == existing.connect_time
-                            && connection_number == existing.connection_number)
-                    {
-                        return Ok(());
-                    }
-                }
-                handle.pending_requests.insert(
-                    remote_addr,
-                    PendingRequestInfo {
-                        connect_time: parsed.connect_time,
-                        connection_number,
-                    },
-                );
-                enqueue_event(
-                    tx,
-                    ServerEvent::ConnectionRequest(ConnectionRequest {
+                    let request = ConnectionRequest {
                         remote_addr,
                         payload: Bytes::copy_from_slice(parsed.payload),
                         connection_number,
                         connect_time: parsed.connect_time,
                         local_peer_id: parsed.local_peer_id,
-                    }),
-                )
+                    };
+                    {
+                        // Commit replacement teardown only once both admission and event
+                        // capacity are reserved. Serialize against concurrent accepts.
+                        let _allocation = handle.peer_allocation.lock();
+                        let old_peer_id = handle.by_addr.get(&remote_addr).map(|p| *p);
+                        if old_peer_id.is_some_and(|id| {
+                            handle
+                                .peers
+                                .get(&id)
+                                .is_some_and(|peer| parsed.connect_time <= peer.connect_time)
+                        }) {
+                            return Ok(());
+                        }
+                        let now = Instant::now();
+                        let mut pending = handle.pending_requests.lock();
+                        pending.retain(|_, request| request.expires_at > now);
+                        // Coalesce retries while queued. A newer generation can retry once
+                        // this request finishes or expires, rather than adding unlimited events.
+                        if pending.contains_key(&remote_addr)
+                            || pending.len() >= pre_auth::MAX_PENDING_REQUESTS
+                        {
+                            return Ok(());
+                        }
+                        let event_count = if old_peer_id.is_some() { 2 } else { 1 };
+                        let Some(mut permits) = reserve_pre_auth_events(tx, event_count)? else {
+                            return Ok(());
+                        };
+                        pending.insert(
+                            remote_addr,
+                            PendingRequestInfo {
+                                connect_time: parsed.connect_time,
+                                connection_number,
+                                expires_at: now + pre_auth::REQUEST_TTL,
+                            },
+                        );
+                        if let Some(id) = old_peer_id {
+                            if let Some((_, old_peer)) = handle.peers.remove(&id) {
+                                handle.by_addr.remove(&old_peer.addr);
+                                handle.retire_peer_id(id);
+                                permits.next().unwrap().send(ServerEvent::PeerDisconnected {
+                                    peer: id,
+                                    reason: DisconnectReason::Remote,
+                                });
+                            }
+                        }
+                        permits
+                            .next()
+                            .unwrap()
+                            .send(ServerEvent::ConnectionRequest(request));
+                    }
+                }
+                ConnectRequestParse::InvalidProtocol => {
+                    send_simple_property(handle, remote_addr, PacketProperty::InvalidProtocol)
+                        .await?;
+                }
+                ConnectRequestParse::Malformed => {}
+            }
+        }
+        PacketProperty::Disconnect => {
+            let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) else {
+                return Ok(());
+            };
+            if !handle
+                .peers
+                .get(&peer_id)
+                .is_some_and(|peer| disconnect_matches(&peer, bytes, connection_number))
+            {
+                return Ok(());
+            }
+            // Reserve outside the lock, then publish removal and its event together.
+            // A concurrent replacement must not overtake this disconnect event.
+            let permit = tx
+                .reserve()
                 .await
                 .map_err(|_| TransportError::EventChannelClosed)?;
-            }
-            ConnectRequestParse::InvalidProtocol => {
-                send_simple_property(handle, remote_addr, PacketProperty::InvalidProtocol).await?;
-            }
-            ConnectRequestParse::Malformed => {}
-        },
-        PacketProperty::Disconnect => {
-            if let Some(peer_id) = handle.by_addr.remove(&remote_addr).map(|p| p.1) {
-                let Some((_, peer)) = handle.peers.remove(&peer_id) else {
-                    return Ok(());
-                };
-                if !disconnect_matches(&peer, bytes, connection_number) {
-                    handle.by_addr.insert(remote_addr, peer_id);
-                    handle.peers.insert(peer_id, peer);
+            {
+                let _allocation = handle.peer_allocation.lock();
+                if handle.by_addr.get(&remote_addr).map(|p| *p) != Some(peer_id)
+                    || !handle
+                        .peers
+                        .get(&peer_id)
+                        .is_some_and(|peer| disconnect_matches(&peer, bytes, connection_number))
+                {
                     return Ok(());
                 }
+                handle.peers.remove(&peer_id);
+                handle.by_addr.remove(&remote_addr);
                 handle.retire_peer_id(peer_id);
-                send_simple_property(handle, remote_addr, PacketProperty::ShutdownOk).await?;
-                enqueue_event(
-                    tx,
-                    ServerEvent::PeerDisconnected {
-                        peer: peer_id,
-                        reason: DisconnectReason::Remote,
-                    },
-                )
-                .await
-                .map_err(|_| TransportError::EventChannelClosed)?;
+                permit.send(ServerEvent::PeerDisconnected {
+                    peer: peer_id,
+                    reason: DisconnectReason::Remote,
+                });
             }
+            send_simple_property(handle, remote_addr, PacketProperty::ShutdownOk).await?;
         }
         PacketProperty::Ping => {
             if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
@@ -1579,8 +1761,15 @@ async fn process_packet(
             }
         }
         PacketProperty::NatMessage => {
+            if !handle.pre_auth_limiter.lock().allow(
+                remote_addr.ip(),
+                pre_auth::Kind::Nat,
+                Instant::now(),
+            ) {
+                return Ok(());
+            }
             if let Some((local_addr, token)) = parse_nat_introduce_request(&bytes[1..]) {
-                enqueue_event(
+                enqueue_pre_auth_event(
                     tx,
                     ServerEvent::NatIntroductionRequest {
                         remote_addr,
@@ -1682,6 +1871,38 @@ fn looks_like_server_info_payload(bytes: &[u8]) -> bool {
     let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     let protocol = u16::from_le_bytes([bytes[4], bytes[5]]);
     magic == SERVER_INFO_QUERY_MAGIC && protocol == SERVER_INFO_PROTOCOL_VERSION
+}
+
+// Reserve without awaiting: unauthenticated work cannot stall receive workers or
+// occupy more than this prefix of the shared queue. Authenticated event semantics stay unchanged.
+async fn enqueue_pre_auth_event(
+    tx: &mpsc::Sender<ServerEvent>,
+    event: ServerEvent,
+) -> Result<bool> {
+    let Some(mut permits) = reserve_pre_auth_events(tx, 1)? else {
+        return Ok(false);
+    };
+    permits.next().unwrap().send(event);
+    Ok(true)
+}
+
+fn reserve_pre_auth_events(
+    tx: &mpsc::Sender<ServerEvent>,
+    count: usize,
+) -> Result<Option<mpsc::PermitIterator<'_, ServerEvent>>> {
+    match tx.try_reserve_many(count) {
+        Ok(permits) => {
+            if tx.capacity()
+                < tx.max_capacity()
+                    .saturating_sub(pre_auth::MAX_PENDING_REQUESTS)
+            {
+                return Ok(None);
+            }
+            Ok(Some(permits))
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => Ok(None),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(TransportError::EventChannelClosed),
+    }
 }
 
 async fn enqueue_event(tx: &mpsc::Sender<ServerEvent>, event: ServerEvent) -> Result<()> {
@@ -2373,6 +2594,11 @@ async fn timeout_loop(handle: TransportHandle, tx: mpsc::Sender<ServerEvent>) {
     while !handle.shutdown.load(Ordering::Relaxed) {
         tick.tick().await;
         let now = Instant::now();
+        handle
+            .pending_requests
+            .lock()
+            .retain(|_, request| request.expires_at > now);
+        handle.pre_auth_limiter.lock().cleanup(now);
         let timed_out: Vec<_> = handle
             .peers
             .iter()
@@ -2385,15 +2611,24 @@ async fn timeout_loop(handle: TransportHandle, tx: mpsc::Sender<ServerEvent>) {
             })
             .collect();
         for peer_id in timed_out {
+            let Ok(permit) = tx.reserve().await else {
+                return;
+            };
+            let _allocation = handle.peer_allocation.lock();
+            // Queue backpressure may have delayed this timeout. Recheck liveness
+            // and generation (a recycled ID has a fresh timestamp) before removal.
+            if !handle.peers.get(&peer_id).is_some_and(|peer| {
+                Instant::now().duration_since(*peer.last_seen.lock()) > Duration::from_secs(30)
+            }) {
+                continue;
+            }
             if let Some((_, peer)) = handle.peers.remove(&peer_id) {
                 handle.by_addr.remove(&peer.addr);
                 handle.retire_peer_id(peer_id);
-                let _ = tx
-                    .send(ServerEvent::PeerDisconnected {
-                        peer: peer_id,
-                        reason: DisconnectReason::Timeout,
-                    })
-                    .await;
+                permit.send(ServerEvent::PeerDisconnected {
+                    peer: peer_id,
+                    reason: DisconnectReason::Timeout,
+                });
             }
         }
     }
@@ -4151,6 +4386,365 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn peer_ids_wrap_exhaust_and_reuse_only_after_cleanup() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        handle.next_peer_id.store(u16::MAX, Ordering::SeqCst);
+        assert_eq!(handle.allocate_peer_id().unwrap(), u16::MAX);
+        assert_eq!(handle.allocate_peer_id().unwrap(), 0);
+        handle.retire_peer_id(u16::MAX);
+        // Mark the remaining namespace occupied without creating 65536 sockets.
+        let peer = test_peer_state(1);
+        for id in 0..=u16::MAX {
+            handle.peers.insert(id, peer.clone());
+        }
+        assert!(matches!(
+            handle.allocate_peer_id(),
+            Err(TransportError::PeerIdExhausted)
+        ));
+        // Accept propagates exhaustion without publishing address or peer state.
+        let request = ConnectionRequest {
+            remote_addr: loopback_addr(42),
+            payload: Bytes::new(),
+            connection_number: 0,
+            connect_time: 1,
+            local_peer_id: 0,
+        };
+        assert!(matches!(
+            handle.accept(&request).await,
+            Err(TransportError::PeerIdExhausted)
+        ));
+        assert!(!handle.by_addr.contains_key(&request.remote_addr));
+        handle.peers.remove(&7);
+        // Even when it is absent from peers, retirement must protect queued references.
+        handle.allocated_peer_ids.lock().insert(7);
+        handle.retire_peer_id(7);
+        assert!(matches!(
+            handle.allocate_peer_id(),
+            Err(TransportError::PeerIdExhausted)
+        ));
+        handle.recycle_peer_id(7);
+        handle.recycle_peer_id(7);
+        assert_eq!(handle.allocate_peer_id().unwrap(), 7);
+        assert!(matches!(
+            handle.allocate_peer_id(),
+            Err(TransportError::PeerIdExhausted)
+        ));
+        handle.peers.clear();
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn concurrent_accepts_publish_unique_ids() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for port in 10000..10032 {
+            let handle = handle.clone();
+            tasks.spawn(async move {
+                handle
+                    .accept(&ConnectionRequest {
+                        remote_addr: loopback_addr(port),
+                        payload: Bytes::new(),
+                        connection_number: 0,
+                        connect_time: 1,
+                        local_peer_id: 0,
+                    })
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut ids = HashSet::new();
+        while let Some(result) = tasks.join_next().await {
+            assert!(ids.insert(result.unwrap()));
+        }
+        assert_eq!(ids.len(), 32);
+        assert_eq!(handle.peers.len(), 32);
+        assert_eq!(handle.by_addr.len(), 32);
+        handle.shutdown();
+    }
+
+    fn admission_packet(connect_time: i64) -> Vec<u8> {
+        let mut writer = NetWriter::new();
+        writer.put_u8(PacketProperty::ConnectRequest as u8);
+        writer.put_i32(LITENETLIB_PROTOCOL_ID);
+        writer.put_i64(connect_time);
+        writer.put_i32(0);
+        writer.put_u8(16);
+        writer.put_bytes(&[0; 16]);
+        writer.put_bytes(b"admission");
+        writer.as_slice().to_vec()
+    }
+
+    #[tokio::test]
+    async fn pending_requests_coalesce_expire_and_recover_capacity() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(8192);
+        let packet = admission_packet(1);
+        for port in 1..=2000 {
+            process_packet(&handle, &tx, loopback_addr(port), &packet)
+                .await
+                .unwrap();
+        }
+        assert_eq!(handle.pending_requests.lock().len(), 2000);
+        assert_eq!(rx.len(), 2000);
+        // A changed timestamp/port cannot bypass per-IP tokens, and each address
+        // has only one queued request while core validation is pending.
+        for time in 2..100 {
+            process_packet(&handle, &tx, loopback_addr(1), &admission_packet(time))
+                .await
+                .unwrap();
+        }
+        assert_eq!(rx.len(), 2000);
+        let first = match rx.recv().await.unwrap() {
+            ServerEvent::ConnectionRequest(request) => request,
+            _ => panic!(),
+        };
+        assert!(handle.is_pending_request(&first));
+        handle
+            .pending_requests
+            .lock()
+            .get_mut(&first.remote_addr)
+            .unwrap()
+            .expires_at = Instant::now();
+        assert!(!handle.is_pending_request(&first));
+        process_packet(&handle, &tx, first.remote_addr, &admission_packet(101))
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.pending_requests.lock()[&first.remote_addr].connect_time,
+            101
+        );
+        // Rejecting an old event must not remove the newer generation.
+        handle.remove_pending_request(&first);
+        assert!(handle
+            .pending_requests
+            .lock()
+            .contains_key(&first.remote_addr));
+        handle.pending_requests.lock().clear();
+        {
+            let mut pending = handle.pending_requests.lock();
+            for port in 1..=pre_auth::MAX_PENDING_REQUESTS as u16 {
+                pending.insert(
+                    loopback_addr(port),
+                    PendingRequestInfo {
+                        connect_time: 1,
+                        connection_number: 0,
+                        expires_at: Instant::now() + pre_auth::REQUEST_TTL,
+                    },
+                );
+            }
+        }
+        process_packet(&handle, &tx, loopback_addr(5000), &packet)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.pending_requests.lock().len(),
+            pre_auth::MAX_PENDING_REQUESTS
+        );
+        assert!(!handle
+            .pending_requests
+            .lock()
+            .contains_key(&loopback_addr(5000)));
+        handle
+            .pending_requests
+            .lock()
+            .values_mut()
+            .for_each(|request| request.expires_at = Instant::now());
+        process_packet(&handle, &tx, loopback_addr(5000), &packet)
+            .await
+            .unwrap();
+        assert_eq!(handle.pending_requests.lock().len(), 1);
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn replacement_preserves_live_peer_until_admission_capacity_is_reserved() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let addr = loopback_addr(5000);
+        let request = ConnectionRequest {
+            remote_addr: addr,
+            payload: Bytes::new(),
+            connection_number: 0,
+            connect_time: 1,
+            local_peer_id: 0,
+        };
+        let peer = handle.accept(&request).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(8192);
+        {
+            let mut pending = handle.pending_requests.lock();
+            for port in 1..=pre_auth::MAX_PENDING_REQUESTS as u16 {
+                pending.insert(
+                    loopback_addr(port),
+                    PendingRequestInfo {
+                        connect_time: 1,
+                        connection_number: 0,
+                        expires_at: Instant::now() + pre_auth::REQUEST_TTL,
+                    },
+                );
+            }
+        }
+        process_packet(&handle, &tx, addr, &admission_packet(2))
+            .await
+            .unwrap();
+        assert_eq!(*handle.by_addr.get(&addr).unwrap(), peer);
+        assert!(handle.peers.contains_key(&peer));
+        assert!(!handle.retired_peer_ids.lock().contains(&peer));
+        assert!(rx.try_recv().is_err());
+        handle.pending_requests.lock().clear();
+
+        // Pending capacity alone is insufficient: both events must fit in the
+        // pre-auth prefix before tearing down the working connection.
+        for _ in 0..pre_auth::MAX_PENDING_REQUESTS - 1 {
+            tx.try_send(ServerEvent::PeerConnected(peer)).unwrap();
+        }
+        process_packet(&handle, &tx, addr, &admission_packet(2))
+            .await
+            .unwrap();
+        assert_eq!(*handle.by_addr.get(&addr).unwrap(), peer);
+        assert!(handle.peers.contains_key(&peer));
+        assert!(!handle.pending_requests.lock().contains_key(&addr));
+        assert_eq!(rx.len(), pre_auth::MAX_PENDING_REQUESTS - 1);
+        while rx.try_recv().is_ok() {}
+        let (closed_tx, closed_rx) = mpsc::channel(8);
+        drop(closed_rx);
+        assert!(matches!(
+            process_packet(&handle, &closed_tx, addr, &admission_packet(2)).await,
+            Err(TransportError::EventChannelClosed)
+        ));
+        assert_eq!(*handle.by_addr.get(&addr).unwrap(), peer);
+        assert!(handle.peers.contains_key(&peer));
+        assert!(!handle.pending_requests.lock().contains_key(&addr));
+
+        process_packet(&handle, &tx, addr, &admission_packet(2))
+            .await
+            .unwrap();
+        assert!(!handle.peers.contains_key(&peer));
+        assert!(!handle.by_addr.contains_key(&addr));
+        assert!(handle.retired_peer_ids.lock().contains(&peer));
+        assert!(
+            matches!(rx.recv().await.unwrap(), ServerEvent::PeerDisconnected {
+            peer: disconnected,
+            reason: DisconnectReason::Remote,
+        } if disconnected == peer)
+        );
+        let replacement = match rx.recv().await.unwrap() {
+            ServerEvent::ConnectionRequest(request) => request,
+            _ => panic!("replacement must follow disconnect"),
+        };
+        assert!(handle.is_pending_request(&replacement));
+        let replacement_peer = handle.accept(&replacement).await.unwrap();
+        assert_ne!(replacement_peer, peer);
+        assert_eq!(handle.peers.get(&replacement_peer).unwrap().connect_time, 2);
+        handle.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_disconnect_and_replacement_publish_disconnect_first() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(8192);
+        for port in 5000..5032 {
+            let addr = loopback_addr(port);
+            let old_peer = handle
+                .accept(&ConnectionRequest {
+                    remote_addr: addr,
+                    payload: Bytes::new(),
+                    connection_number: 0,
+                    connect_time: 1,
+                    local_peer_id: 0,
+                })
+                .await
+                .unwrap();
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let mut tasks = tokio::task::JoinSet::new();
+            for replacement in [false, true] {
+                let handle = handle.clone();
+                let tx = tx.clone();
+                let barrier = barrier.clone();
+                tasks.spawn(async move {
+                    barrier.wait().await;
+                    let packet = if replacement {
+                        admission_packet(2)
+                    } else {
+                        let mut packet = vec![PacketProperty::Disconnect as u8];
+                        packet.extend_from_slice(&1i64.to_le_bytes());
+                        packet
+                    };
+                    process_packet(&handle, &tx, addr, &packet).await.unwrap();
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+            assert!(
+                matches!(rx.recv().await.unwrap(), ServerEvent::PeerDisconnected {
+                peer, reason: DisconnectReason::Remote,
+            } if peer == old_peer)
+            );
+            let request = match rx.recv().await.unwrap() {
+                ServerEvent::ConnectionRequest(request) => request,
+                _ => panic!("replacement must follow the old peer's disconnect"),
+            };
+            assert!(rx.try_recv().is_err());
+            assert!(handle.is_pending_request(&request));
+            assert!(!handle.peers.contains_key(&old_peer));
+            assert!(!handle.by_addr.contains_key(&addr));
+            assert!(handle.retired_peer_ids.lock().contains(&old_peer));
+        }
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn preauth_queue_is_bounded_without_blocking_receive_workers() {
+        let (tx, mut rx) = mpsc::channel(8192);
+        for _ in 0..pre_auth::MAX_PENDING_REQUESTS {
+            assert!(enqueue_pre_auth_event(&tx, ServerEvent::PeerConnected(0))
+                .await
+                .unwrap());
+        }
+        assert!(!enqueue_pre_auth_event(&tx, ServerEvent::PeerConnected(0))
+            .await
+            .unwrap());
+        assert_eq!(rx.len(), pre_auth::MAX_PENDING_REQUESTS);
+        rx.recv().await.unwrap();
+        assert!(enqueue_pre_auth_event(&tx, ServerEvent::PeerConnected(0))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn preauth_info_and_nat_ingress_are_limited_without_changing_payloads() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut query = vec![0; SERVER_INFO_MIN_REQUEST_BYTES];
+        query[0..4].copy_from_slice(&SERVER_INFO_QUERY_MAGIC.to_le_bytes());
+        query[4..6].copy_from_slice(&SERVER_INFO_PROTOCOL_VERSION.to_le_bytes());
+        query[6..8].copy_from_slice(&0xCAFEu16.to_le_bytes());
+        for port in 1..=32 {
+            process_packet(&handle, &tx, loopback_addr(port), &query)
+                .await
+                .unwrap();
+        }
+        assert_eq!(rx.len(), 1);
+        match rx.recv().await.unwrap() {
+            ServerEvent::UnconnectedRequest { nonce, payload, .. } => {
+                assert_eq!(nonce, 0xCAFE);
+                assert_eq!(payload.as_ref(), query);
+            }
+            _ => panic!(),
+        }
+        let mut nat = vec![PacketProperty::NatMessage as u8];
+        nat.extend_from_slice(&NAT_INTRODUCE_REQUEST_HASH.to_le_bytes());
+        write_litenet_endpoint(&mut nat, loopback_addr(1234));
+        write_litenet_string(&mut nat, "token");
+        for port in 1..=100 {
+            process_packet(&handle, &tx, loopback_addr(port), &nat)
+                .await
+                .unwrap();
+        }
+        assert_eq!(rx.len(), 32);
+        handle.shutdown();
+    }
+
     fn loopback_addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
     }
@@ -4178,6 +4772,163 @@ mod tests {
             confirmed_mtu: AtomicUsize::new(MAX_MERGED_PACKET_SIZE),
             mtu_probe: parking_lot::Mutex::new(MtuProbeState::new(Instant::now())),
         })
+    }
+
+    #[tokio::test]
+    async fn transport_depths_track_actual_queues_and_disconnection() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        // Keep this queue-assembly test independent of the background dispatch timing.
+        handle.shutdown();
+        assert_eq!(handle.depths_snapshot(), TransportDepthSnapshot::default());
+        let peer = test_peer_state(0);
+        handle.peers.insert(peer.id, peer.clone());
+        enqueue_reliable_payload(&peer, channels::CHAT, DeliveryMethod::ReliableOrdered, &[1]);
+        let built =
+            build_outbound_packet(&peer, channels::CHAT, DeliveryMethod::ReliableOrdered, &[2]);
+        let (channel_id, sequence) = built.reliable_key.unwrap();
+        record_pending_reliable(&peer, channel_id, sequence, built.bytes.clone(), None);
+        peer.pending_datagrams.lock().push_back(built.bytes);
+        assert_eq!(
+            handle.depths_snapshot(),
+            TransportDepthSnapshot {
+                peers: 1,
+                reliable_pending: 1,
+                reliable_queued: Some(1),
+                pending_datagrams: Some(1),
+            }
+        );
+
+        handle.disconnect(peer.id, "test").await.unwrap();
+        // A retained Arc to old peer queues must not count as a live transport depth.
+        assert_eq!(peer.total_pending(), 1);
+        assert_eq!(handle.depths_snapshot(), TransportDepthSnapshot::default());
+    }
+
+    #[tokio::test]
+    async fn contended_depth_sampling_does_not_wait_or_hold_peer_map_guards() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        handle.shutdown();
+        let peer = test_peer_state(0);
+        handle.peers.insert(peer.id, peer.clone());
+        enqueue_reliable_payload(&peer, channels::CHAT, DeliveryMethod::ReliableOrdered, &[1]);
+        let outgoing = peer.outgoing_reliable.lock();
+        let datagrams = peer.pending_datagrams.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sampling_handle = handle.clone();
+        let worker = std::thread::spawn(move || {
+            tx.send(sampling_handle.depths_snapshot()).unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        // While queue guards are still held, a returned sampler must leave the peer map free.
+        if result.is_ok() {
+            handle.peers.remove(&peer.id);
+        }
+        // Release locks even on failure so a regression cannot leave a worker stuck forever.
+        drop(datagrams);
+        drop(outgoing);
+        worker.join().unwrap();
+        let snapshot = result.expect("sampling must not wait for contended queue locks");
+        assert_eq!(snapshot.peers, 1);
+        assert_eq!(snapshot.reliable_pending, 0);
+        assert_eq!(snapshot.reliable_queued, None);
+        assert_eq!(snapshot.pending_datagrams, None);
+        assert_eq!(handle.depths_snapshot(), TransportDepthSnapshot::default());
+    }
+
+    #[tokio::test]
+    async fn non_reliable_drop_counter_excludes_retries_and_respects_statistics_toggle() {
+        let (handle, _events) =
+            TransportHandle::bind_with_statistics_options(loopback_addr(0), true, false)
+                .await
+                .unwrap();
+        handle.shutdown();
+        let peer = test_peer_state(0);
+        handle.peers.insert(peer.id, peer.clone());
+        handle.test_blocked_send_addrs.write().insert(peer.addr);
+
+        // Retained reliable/ACK datagrams and MTU probes use this raw path.
+        assert!(!handle.try_send_raw_to(&[1], peer.addr).unwrap());
+        assert_eq!(handle.stats_snapshot().raw_send_would_block, 1);
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 0);
+
+        let single = [(channels::AVATAR, Bytes::from_static(&[1]))];
+        assert_eq!(
+            handle
+                .try_send_many_unreliable_bytes(peer.id, &single)
+                .unwrap(),
+            0
+        );
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 1);
+
+        let merged = [single[0].clone(), single[0].clone()];
+        assert_eq!(
+            handle
+                .try_send_many_unreliable_bytes(peer.id, &merged)
+                .unwrap(),
+            0
+        );
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 2);
+
+        // Exercise the flush, oversized, and trailing-merged branches (three datagrams).
+        let split = [
+            single[0].clone(),
+            (channels::AVATAR, Bytes::from(vec![1; 1300])),
+            single[0].clone(),
+        ];
+        assert_eq!(
+            handle
+                .try_send_many_unreliable_bytes(peer.id, &split)
+                .unwrap(),
+            0
+        );
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 5);
+
+        let mixed = [
+            (
+                channels::AVATAR,
+                DeliveryMethod::Unreliable,
+                Bytes::from_static(&[1]),
+            ),
+            (
+                channels::AVATAR,
+                DeliveryMethod::Sequenced,
+                Bytes::from_static(&[2]),
+            ),
+            (
+                channels::CHAT,
+                DeliveryMethod::ReliableOrdered,
+                Bytes::from_static(&[3]),
+            ),
+        ];
+        assert_eq!(handle.try_send_many_bytes(peer.id, &mixed).unwrap(), 0);
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 6);
+        assert_eq!(handle.queued_reliable_count(), 1);
+        assert_eq!(handle.stats_snapshot().raw_send_would_block, 7);
+
+        handle.set_statistics_enabled(false);
+        handle
+            .try_send_many_unreliable_bytes(peer.id, &single)
+            .unwrap();
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 0);
+        assert_eq!(
+            handle
+                .stats
+                .non_reliable_dropped_datagrams
+                .load(Ordering::Relaxed),
+            6
+        );
+        handle.set_statistics_enabled(true);
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 0);
+        handle
+            .try_send_many_unreliable_bytes(peer.id, &single)
+            .unwrap();
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 1);
+
+        handle.disconnect(peer.id, "test").await.unwrap();
+        handle
+            .try_send_many_unreliable_bytes(peer.id, &single)
+            .unwrap();
+        assert_eq!(handle.stats_snapshot().non_reliable_dropped_datagrams, 1);
     }
 
     #[test]
@@ -4484,15 +5235,15 @@ mod tests {
     #[tokio::test]
     async fn peer_ids_reuse_only_after_cleanup_release() {
         let (handle, _events) = TransportHandle::bind(any_addr(0)).await.unwrap();
-        let first = handle.allocate_peer_id();
-        let second = handle.allocate_peer_id();
+        let first = handle.allocate_peer_id().unwrap();
+        let second = handle.allocate_peer_id().unwrap();
         assert_eq!(first, 0);
         assert_eq!(second, 1);
 
         handle.retire_peer_id(first);
-        assert_eq!(handle.allocate_peer_id(), 2);
+        assert_eq!(handle.allocate_peer_id().unwrap(), 2);
 
         handle.recycle_peer_id(first);
-        assert_eq!(handle.allocate_peer_id(), first);
+        assert_eq!(handle.allocate_peer_id().unwrap(), first);
     }
 }

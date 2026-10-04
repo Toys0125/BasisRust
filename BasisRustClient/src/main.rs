@@ -462,48 +462,8 @@ where
     }
 }
 
-#[derive(Default, Debug, Clone)]
-struct NetWriter {
-    data: Vec<u8>,
-}
-
-impl NetWriter {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            data: Vec::with_capacity(capacity),
-        }
-    }
-
-    fn put_u8(&mut self, value: u8) {
-        self.data.push(value);
-    }
-
-    fn put_u16(&mut self, value: u16) {
-        self.data.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn put_i32(&mut self, value: i32) {
-        self.data.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn put_i64(&mut self, value: i64) {
-        self.data.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn put_bytes(&mut self, value: &[u8]) {
-        self.data.extend_from_slice(value);
-    }
-
-    fn put_raw_len_string(&mut self, value: &str) {
-        let bytes = value.as_bytes();
-        self.put_u16(bytes.len() as u16);
-        self.put_bytes(bytes);
-    }
-
-    fn into_vec(self) -> Vec<u8> {
-        self.data
-    }
-}
+// Use the shared checked length-prefixed wire writer.
+type NetWriter = ProtocolNetWriter;
 
 fn parse_server_avatar_metadata(payload: &[u8]) -> Result<ServerAvatarMetadata> {
     let mut reader = ProtocolNetReader::new(payload);
@@ -587,9 +547,9 @@ fn unity_synthetic_angles(elapsed_secs: f64, amplitude_radians: f32) -> [f32; 10
     angles
 }
 
-fn put_bytes_message(writer: &mut NetWriter, data: &[u8]) {
-    writer.put_u16(data.len() as u16);
-    writer.put_bytes(data);
+fn put_bytes_message(writer: &mut NetWriter, data: &[u8]) -> Result<()> {
+    writer.put_bytes_with_length(data)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -608,15 +568,16 @@ impl ClientMetaDataMessage {
         }
     }
 
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> Result<()> {
         let message = ProtocolClientMetaDataMessage {
             player_uuid: non_empty_or_failure(&self.player_uuid).to_owned(),
             player_display_name: non_empty_or_failure(&self.player_display_name).to_owned(),
             player_platform: non_empty_or_failure(&self.player_platform).to_owned(),
         };
         let mut encoded = ProtocolNetWriter::new();
-        message.serialize(&mut encoded);
+        message.serialize(&mut encoded)?;
         writer.put_bytes(encoded.as_slice());
+        Ok(())
     }
 }
 
@@ -644,10 +605,11 @@ impl ReadyMessage {
         })
     }
 
-    fn serialize(&self, writer: &mut NetWriter) {
-        self.metadata.serialize(writer);
-        self.avatar_change.serialize(writer);
+    fn serialize(&self, writer: &mut NetWriter) -> Result<()> {
+        self.metadata.serialize(writer)?;
+        self.avatar_change.serialize(writer)?;
         self.local_avatar_sync.serialize_initial(writer);
+        Ok(())
     }
 }
 
@@ -667,7 +629,7 @@ impl ClientAvatarChangeMessage {
         })
     }
 
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> Result<()> {
         let message = ProtocolClientAvatarChangeMessage {
             load_mode: self.load_mode,
             byte_array: self.byte_array.clone(),
@@ -677,18 +639,19 @@ impl ClientAvatarChangeMessage {
             torso_scale: 1.0,
         };
         let mut encoded = ProtocolNetWriter::new();
-        message.serialize(&mut encoded);
+        message.serialize(&mut encoded)?;
         writer.put_bytes(encoded.as_slice());
+        Ok(())
     }
 }
 
 fn encode_avatar_network_load(url: &str, unlock_password: &str) -> Result<Vec<u8>> {
     let mut raw = NetWriter::with_capacity(url.len() + unlock_password.len() + 6);
-    raw.put_raw_len_string(url);
-    raw.put_raw_len_string(unlock_password);
+    raw.put_raw_len_string(url)?;
+    raw.put_raw_len_string(unlock_password)?;
     // Current Basis clients append an optional content version tag. The built-in loading avatar has
     // no external content version, so the canonical value is an empty string.
-    raw.put_raw_len_string("");
+    raw.put_raw_len_string("")?;
 
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(&raw.into_vec())?;
@@ -1057,17 +1020,17 @@ fn encode_axis_mm(meters: f32) -> [u8; 3] {
     [mm as u8, (mm >> 8) as u8, (mm >> 16) as u8]
 }
 
-fn build_connection_payload(config: &Config, ready: &ReadyMessage) -> Vec<u8> {
+fn build_connection_payload(config: &Config, ready: &ReadyMessage) -> Result<Vec<u8>> {
     let auth = config.password.as_bytes();
     let mut writer = NetWriter::with_capacity(512);
     writer.put_u16(SERVER_VERSION);
     writer.put_bytes(&NetworkApplication::encode(
         &config.company_name,
         &config.product_name,
-    ));
-    put_bytes_message(&mut writer, auth);
-    ready.serialize(&mut writer);
-    writer.into_vec()
+    )?);
+    put_bytes_message(&mut writer, auth)?;
+    ready.serialize(&mut writer)?;
+    Ok(writer.into_vec())
 }
 
 #[cfg(test)]
@@ -1114,13 +1077,13 @@ impl Identity {
             .verify(challenge, &signature)
             .context("DID signature self-verification failed")?;
         let mut writer = NetWriter::with_capacity(96);
-        put_bytes_message(&mut writer, &signature.to_bytes());
+        put_bytes_message(&mut writer, &signature.to_bytes())?;
         let fragment = if self.fragment.is_empty() {
             "N/A".as_bytes()
         } else {
             self.fragment.as_bytes()
         };
-        put_bytes_message(&mut writer, fragment);
+        put_bytes_message(&mut writer, fragment)?;
         Ok(writer.into_vec())
     }
 }
@@ -2232,11 +2195,11 @@ impl BasisClient {
         ready: &ReadyMessage,
         shared_maintenance_enabled: bool,
     ) -> Result<()> {
+        let payload = build_connection_payload(config, ready)?;
         if self.in_use.swap(true, Ordering::SeqCst) {
             error!("Call Shutdown First!");
             return Err(anyhow!("Call Shutdown First!"));
         }
-        let payload = build_connection_payload(config, ready);
         let request = self.make_connect_request(&payload);
         self.send_connected(&request).await?;
         debug!(
@@ -5909,6 +5872,53 @@ mod tests {
     use std::io::Read;
 
     #[test]
+    fn connection_payload_propagates_oversized_login_password() {
+        let config = Config {
+            password: "p".repeat(65536),
+            ..Config::default()
+        };
+        let ready = ReadyMessage::new(&config, [0.0; 3]).unwrap();
+        let error = build_connection_payload(&config, &ready).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<basis_protocol::io::NetWriteError>(),
+            Some(&basis_protocol::io::NetWriteError::LengthOverflow {
+                length: 65536,
+                max: 65535
+            })
+        );
+    }
+
+    #[test]
+    fn connection_payload_propagates_oversized_avatar_buffer() {
+        let config = Config::default();
+        let mut ready = ReadyMessage::new(&config, [0.0; 3]).unwrap();
+        ready.avatar_change.byte_array = vec![0; 65536];
+        let error = build_connection_payload(&config, &ready).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<basis_protocol::io::NetWriteError>(),
+            Some(&basis_protocol::io::NetWriteError::LengthOverflow {
+                length: 65536,
+                max: 65535,
+            })
+        );
+    }
+
+    #[test]
+    fn avatar_network_load_propagates_oversized_utf8_fields() {
+        let oversized = "é".repeat(32768);
+        for (url, password) in [(oversized.as_str(), ""), ("", oversized.as_str())] {
+            let error = encode_avatar_network_load(url, password).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<basis_protocol::io::NetWriteError>(),
+                Some(&basis_protocol::io::NetWriteError::LengthOverflow {
+                    length: 65536,
+                    max: 65535
+                })
+            );
+        }
+    }
+
+    #[test]
     fn shared_receive_handoff_waits_for_valid_avatar_metadata() {
         // Other reliable channels may arrive before META_DATA. They must not enable the shared
         // receiver, which acknowledges but intentionally discards application payloads.
@@ -5926,13 +5936,14 @@ mod tests {
             player_display_name: "test".to_string(),
             player_platform: "Headless".to_string(),
         }
-        .serialize(&mut writer);
+        .serialize(&mut writer)
+        .unwrap();
         writer.put_i32(20);
         writer.put_i32(1);
         writer.put_f32(0.0);
         writer.put_f32(2.5);
         writer.put_i32(1500);
-        writer.put_bytes_with_length(&[]);
+        writer.put_bytes_with_length(&[]).unwrap();
         writer.put_u16(0);
         writer.put_u8(1);
         assert!(parse_server_avatar_metadata(writer.as_slice()).is_ok());
@@ -6314,7 +6325,7 @@ mod tests {
     fn connection_payload_starts_with_v55_application_auth_and_ready() {
         let config = Config::default();
         let ready = ReadyMessage::new(&config, [0.0, 0.0, 0.0]).unwrap();
-        let payload = build_connection_payload(&config, &ready);
+        let payload = build_connection_payload(&config, &ready).unwrap();
         assert_eq!(SERVER_VERSION, 55);
         assert_eq!(&payload[0..2], &SERVER_VERSION.to_le_bytes());
         assert_eq!(payload[2], 1);
@@ -6331,7 +6342,7 @@ mod tests {
             ..Config::default()
         };
         let ready = ReadyMessage::new(&config, [0.0, 0.0, 0.0]).unwrap();
-        let payload = build_connection_payload(&config, &ready);
+        let payload = build_connection_payload(&config, &ready).unwrap();
 
         let mut reader = ProtocolNetReader::new(&payload);
         assert_eq!(reader.get_u16().unwrap(), SERVER_VERSION);
@@ -6756,7 +6767,8 @@ printf 'out_time=00:00:02.000000\nspeed=2x\nprogress=end\n'
             player_display_name: String::new(),
             player_platform: String::new(),
         }
-        .serialize(&mut writer);
+        .serialize(&mut writer)
+        .unwrap();
         let bytes = writer.into_vec();
         let mut reader = ProtocolNetReader::new(&bytes);
         let decoded = ProtocolClientMetaDataMessage::deserialize(&mut reader).unwrap();
@@ -6911,13 +6923,14 @@ printf 'out_time=00:00:02.000000\nspeed=2x\nprogress=end\n'
             player_display_name: "test".to_string(),
             player_platform: "Headless".to_string(),
         }
-        .serialize(&mut writer);
+        .serialize(&mut writer)
+        .unwrap();
         writer.put_i32(20);
         writer.put_i32(1);
         writer.put_f32(0.0);
         writer.put_f32(2.5);
         writer.put_i32(1500);
-        writer.put_bytes_with_length(&[]);
+        writer.put_bytes_with_length(&[]).unwrap();
         writer.put_u16(0);
         writer.put_u8(1);
         let metadata = parse_server_avatar_metadata(writer.as_slice()).unwrap();
@@ -7711,7 +7724,7 @@ printf 'out_time=00:00:02.000000\nspeed=2x\nprogress=end\n'
         // Sequence zero arrives as a CompactMerged raw entry and must be treated as new,
         // dispatched to the auth handler, and included in the same ACK window.
         let mut challenge = NetWriter::default();
-        put_bytes_message(&mut challenge, b"csharp-challenge");
+        put_bytes_message(&mut challenge, b"csharp-challenge").unwrap();
         let mut seq0 = vec![PacketProperty::Channeled as u8, 0, 0, channel_id];
         seq0.extend_from_slice(&challenge.into_vec());
         let mut compact = vec![PacketProperty::CompactMerged as u8, 0x40, seq0.len() as u8];
