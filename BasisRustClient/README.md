@@ -77,7 +77,9 @@ unless absolute). The tracked `Config.xml` is a sample; use an ignored file such
 as `config/local.xml` for local credentials and pass `--config config/local.xml`.
 A missing config is generated from client defaults. Malformed XML warns and
 falls back to all defaults; invalid/empty supplied scalar values fall back per
-field. Explicit CLI `--ip`, `--port`, `--clients` and other supported runtime
+field. Use `--strict-config` to reject malformed XML and invalid supplied scalar
+values instead of falling back; errors identify the file and field. Explicit
+CLI `--ip`, `--port`, `--clients` and other supported runtime
 switches override loaded values. Server PascalCase environment overrides and
 `BASIS_SERVER_PASSWORD` do not configure the client; set its XML `Password` to
 match the server. `BASIS_CLIENT_TOKIO_WORKERS` configures the client's runtime
