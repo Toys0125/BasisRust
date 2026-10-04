@@ -248,10 +248,11 @@ strict screening flag requires non-worse p50/p95 and non-lower observer applied
 items in each block, alongside matching inputs, matching ports, sequential
 execution and delivery gates. The flag is
 a workload recovery screen, not a significance test or a production guarantee.
-Full individual runs, commands, hashes, window endpoints, observer counts,
-scheduler metrics, sender-progress minima, validation flags and all six
-separately compared series, including rejected screens, are in the
-[machine-readable results](results/windows-regression-resolution-20261004-summary.json).
+The [consolidated results](results/README.md#windows-cadence-investigation-2026-10-04)
+summarize all six separate series, including rejected screens, and list the
+preserved artifact locations. Full individual runs, commands, hashes, endpoints,
+observer counts, scheduler metrics, sender-progress minima and validation flags
+remain in the local captures and archived JSON exports.
 The original control/client hashes were reverified; the original captures and
 other worktrees were preserved. No branch or PR was merged.
 

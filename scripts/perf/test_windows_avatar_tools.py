@@ -23,16 +23,43 @@ CAPTURE.mkdir(parents=True)
 
 class ComparisonTests(unittest.TestCase):
     def compare(self, identical=False):
-        """Replay a complete validated series with default CLI labels."""
-        published = json.loads((ROOT/'docs/performance/results/windows-regression-resolution-20261004-summary.json').read_text())
-        runs = published['series']['six-750']['comparison']['runs']
+        """Exercise default labels with eight synthetic validated run summaries."""
+        metadata = {
+            'clients':750, 'tokio_workers':4, 'server_rayon_threads_override':None,
+            'server_kind':'rust', 'server_avatar_diagnostics':False,
+            'warmup_seconds':45, 'measurement_window_seconds':60,
+            'server_ip':'127.0.0.1', 'movement_interval_ms':20, 'jitter_percent':0,
+            'unity_frame_accumulator_fps':60, 'layout':'colocated', 'pose':'synthetic',
+            'voice':False, 'p2p':False, 'server_profiling':False,
+            'client_binary_sha256':'3'*64, 'server_config_fixture_sha256':'4'*64,
+            'client_config_fixture_sha256':'5'*64, 'relevant_environment':{},
+            'server_port':64142, 'health_port':64353,
+        }
+        runs = []
+        counts = {'before':0, 'six':0}
+        for index, label in enumerate(('before','six','six','before',
+                                       'six','before','before','six')):
+            counts[label] += 1
+            candidate = label == 'six'
+            # Deliberately invented measurements and hashes: test inputs only.
+            metrics = {
+                'gap_p50_ms':90 if candidate else 100,
+                'gap_p95_ms':140 if candidate else 150,
+                'observer_items_per_second':1100 if candidate else 1000,
+                'combined_cpu_cores':5, 'server_cpu_cores':4, 'client_cpu_cores':1,
+                'udp_payload_mb_per_second':100, 'udp_datagrams_per_second':10000,
+                'logical_avatar_sends_per_second':1000000, 'host_cpu_cores':10,
+            }
+            server_hash = ('2' if candidate and not identical else '1')*64
+            runs.append({'name':f'{label}-{counts[label]}', 'valid':True,
+                         'server_sha256':server_hash, 'metrics':metrics,
+                         'metadata':dict(metadata, server_binary_sha256=server_hash,
+                                         started_unix_seconds=index*120,
+                                         finished_unix_seconds=index*120+105)})
         directory = CAPTURE/('identical' if identical else 'distinct')
         directory.mkdir()
         manifest = {'runs':[{'name':run['name']} for run in runs]}
         for run in runs:
-            if identical:
-                run['server_sha256'] = runs[0]['server_sha256']
-                run['metadata']['server_binary_sha256'] = runs[0]['server_sha256']
             (directory/run['name']).mkdir()
             (directory/run['name']/'validated-summary.json').write_text(json.dumps(run))
         (directory/'experiment.json').write_text(json.dumps(manifest))
@@ -40,8 +67,8 @@ class ComparisonTests(unittest.TestCase):
                                str(ROOT/'scripts/perf/compare-windows-avatar-crossover.py'),
                                str(directory),'--summary-only'],capture_output=True,text=True,timeout=20)
 
-    def test_retained_candidate_is_the_default(self):
-        """A current six-job capture works without an explicit candidate argument."""
+    def test_six_candidate_is_the_default(self):
+        """The six-job label works without an explicit candidate argument."""
         result = self.compare()
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertTrue(json.loads(result.stdout)['screen_recovered'])

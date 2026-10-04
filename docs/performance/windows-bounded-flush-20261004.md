@@ -153,12 +153,12 @@ be pooled as if host conditions were constant.
 | final-four-750 / 750-four-2 | 68.38 / 97.69 | 10,598 | 5.233 | 223.6 |
 | final-four-750 / 750-merged-2 | 78.66 / 117.57 | 9,213 | 5.479 | 173.6 |
 
-Full counters, window endpoints, scheduler-status ranges, observer distributions,
-sender progress, validation flags, commands and binary/config hashes are in the
-[machine-readable summary](results/windows-bounded-flush-20261004-summary.json).
-The [original review](review-20261004.md) and its
-[results](results/review-20261004-summary.json) were copied for supporting
-evidence; the original checkout/captures remain untouched.
+The [consolidated results](results/README.md#windows-cadence-investigation-2026-10-04)
+summarize every comparison and list the preserved artifact locations. Full
+counters, endpoints, distributions, validation flags, commands and hashes remain
+in the local captures and archived JSON exports. The
+[original review](review-20261004.md) supports the baseline; its original
+checkout and captures remain untouched.
 
 ## Validation and limits
 
