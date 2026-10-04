@@ -15,6 +15,7 @@ import json
 import os
 import pathlib
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -36,6 +37,16 @@ def host_cpu():
     return {'unix_seconds': time.time(), 'busy_seconds': seconds(kernel) + seconds(user) - seconds(idle)}
 
 
+def select_port(family, socktype, host, port):
+    # Probe once for the entire crossover. Do not vary the server destination
+    # port between variants: Windows loopback profiles include port lookups.
+    with socket.socket(family, socktype) as probe:
+        if family == socket.AF_INET6:
+            probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        probe.bind((host, port))
+        return probe.getsockname()[1]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', required=True, type=pathlib.Path)
@@ -44,6 +55,8 @@ def main():
     parser.add_argument('--clients', type=int, default=750)
     parser.add_argument('--diagnostics', action='store_true')
     parser.add_argument('--flush-lanes', type=int)
+    parser.add_argument('--port', type=int, default=0, help='one UDP server port for all runs; 0 selects it once')
+    parser.add_argument('--health-port', type=int, default=0, help='one health port for all runs; 0 selects it once')
     parser.add_argument('--variants', nargs='+', required=True, help='ordered name=server.exe entries')
     args = parser.parse_args()
     if os.name != 'nt':
@@ -67,6 +80,10 @@ def main():
         parser.error('clients must be at least 2')
     if args.flush_lanes is not None and not 0 <= args.flush_lanes <= 8:
         parser.error('flush lanes must be 0..8; 0 uses the existing Rayon scheduling')
+    if not 0 <= args.port <= 65535 or not 0 <= args.health_port <= 65535:
+        parser.error('ports must be 0..65535')
+    server_port = select_port(socket.AF_INET6, socket.SOCK_DGRAM, '::', args.port)
+    health_port = select_port(socket.AF_INET, socket.SOCK_STREAM, '127.0.0.1', args.health_port)
     capture = args.output.resolve()
     capture.mkdir(parents=True)
     env = dict(os.environ)
@@ -86,7 +103,8 @@ def main():
                 'server_fixture_sha256': hashlib.sha256(args.server_config.read_bytes()).hexdigest(),
                 'client_fixture_sha256': hashlib.sha256((ROOT/'docs/performance/fixtures/avatar-1500-client.xml').read_bytes()).hexdigest(),
                 'source_patch_sha256': hashlib.sha256(source_diff).hexdigest(),
-                'loopback': True, 'no_affinity': True, 'flush_lanes': args.flush_lanes}
+                'loopback': True, 'no_affinity': True, 'flush_lanes': args.flush_lanes,
+                'server_port': server_port, 'health_port': health_port}
     manifest_path = capture / 'experiment.json'
     for name, binary in variants:
         output = capture / name
@@ -94,7 +112,8 @@ def main():
                    '--server', str(binary), '--client', str(args.client.resolve()),
                    '--server-config', str(args.server_config.resolve()),
                    '--output', str(output), '--clients', str(args.clients), '--workers', '4',
-                   '--warmup-seconds', '45', '--window-seconds', '60']
+                   '--warmup-seconds', '45', '--window-seconds', '60',
+                   '--port', str(server_port), '--health-port', str(health_port)]
         if not args.diagnostics:
             command.append('--no-server-avatar-diagnostics')
         entry = {'name': name, 'server': str(binary), 'server_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'command': command}
@@ -128,6 +147,8 @@ def main():
         result['checks']['frozen_client_hash'] = result['metadata']['client_binary_sha256'] == manifest['client_sha256']
         result['checks']['matching_server_fixture'] = result['metadata']['server_config_fixture_sha256'] == manifest['server_fixture_sha256']
         result['checks']['matching_client_fixture'] = result['metadata']['client_config_fixture_sha256'] == manifest['client_fixture_sha256']
+        result['checks']['matching_server_port'] = result['metadata']['server_port'] == server_port
+        result['checks']['matching_health_port'] = result['metadata']['health_port'] == health_port
         result['valid'] = all(result['checks'].values())
         entry['valid'] = result['valid']
         result['command'] = command

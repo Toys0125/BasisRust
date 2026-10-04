@@ -1450,7 +1450,7 @@ impl AvatarSyncSystem {
             bypass_reduction_ids: Arc::new(DashMap::new()),
             diagnostics,
             receiver_flush_lanes: env_usize("BASIS_AVATAR_FLUSH_LANES")
-                .unwrap_or(if cfg!(windows) { 4 } else { 0 })
+                .unwrap_or(if cfg!(windows) { 6 } else { 0 })
                 .min(MAX_RECEIVER_FLUSH_LANES),
         }
     }
@@ -2789,14 +2789,6 @@ fn try_emit_bundle_range<'a>(
     bundle_cache: &AvatarBundleCache,
     wire_budget: usize,
 ) -> Result<BundleEmit> {
-    let slices = bundle[range.clone()]
-        .iter()
-        .map(|item| AvatarBundleSlice {
-            original_channel: item.original_channel,
-            payload: &item.payload,
-            interval_patch: Some((item.interval_offset, item.interval_byte)),
-        })
-        .collect::<Vec<_>>();
     let delta_only = bundle[range.clone()]
         .iter()
         .all(|item| item.original_channel == channels::DELTA_AVATAR);
@@ -2809,7 +2801,19 @@ fn try_emit_bundle_range<'a>(
             AvatarBundleCompression::Lz4
         };
     let cell = bundle_cache.cell_for(&bundle[range.clone()], compression);
-    let encode = || try_encode_avatar_bundle_slices_with_compression(&slices, compression);
+    let encode = || {
+        // Cache hits already own the encoded bytes. Only construct the borrowed
+        // encoder input when this caller actually needs to encode a bundle.
+        let slices = bundle[range.clone()]
+            .iter()
+            .map(|item| AvatarBundleSlice {
+                original_channel: item.original_channel,
+                payload: &item.payload,
+                interval_patch: Some((item.interval_offset, item.interval_byte)),
+            })
+            .collect::<Vec<_>>();
+        try_encode_avatar_bundle_slices_with_compression(&slices, compression)
+    };
     let (encoded, deflate_micros);
     let uncached;
     if let Some(cell) = &cell {
@@ -3504,7 +3508,7 @@ mod tests {
             .num_threads(8)
             .build()
             .unwrap();
-        for lanes in [0, 1, 2, 4, 8] {
+        for lanes in [0, 1, 2, 4, 6, 8] {
             for count in [0, 1, 3, 17, 65] {
                 let receivers = (0..count).collect::<Vec<_>>();
                 let visits = (0..count).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
@@ -3534,7 +3538,7 @@ mod tests {
 
     #[test]
     fn receiver_flush_propagates_transport_failure() {
-        for lanes in [0, 1, 2, 4, 8] {
+        for lanes in [0, 1, 2, 4, 6, 8] {
             let error = try_for_each_receiver_flush(&[1, 2, 3], lanes, |receiver| {
                 if *receiver == 2 {
                     anyhow::bail!("send failed");

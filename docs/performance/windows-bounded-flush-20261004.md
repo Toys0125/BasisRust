@@ -1,6 +1,11 @@
 # Windows avatar delivery: bounded UDP flush, 2026-10-04
 
-Windows avatar flush now divides each tick's receiver groups into at most four
+This records the earlier four-job experiment. The subsequent
+[direct pre-merge validation](windows-regression-resolution-20261004.md) retained
+a six-job Windows default after independent crossover confirmation. The
+four-job measurements below remain the original results.
+
+The first candidate divided each tick's receiver groups into at most four
 jobs on the existing Rayon pool. Sixteen new sequential loopback runs passed
 delivery validation. Four jobs improved p50, p95, observer applied items and
 combined process CPU in both crossover orders at 750 and 1,000 clients in this
@@ -22,7 +27,8 @@ flush callbacks stay within the configured bound, empty/short/uneven batches
 work, and transport failure propagates.
 
 `BASIS_AVATAR_FLUSH_LANES` is read at system initialization. Windows defaults
-to **4**; other platforms default to **0**, retaining the previous Rayon flush
+to **4** for this experiment (the follow-up defaults to **6**); other platforms
+default to **0**, retaining the previous Rayon flush
 scheduling. Positive values cap avatar flush jobs; **1** is serial, **0** restores
 the previous scheduling, values above **8** clamp to 8, and invalid strings use
 the platform default. This bounds avatar emission independently of build
