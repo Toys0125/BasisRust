@@ -42,3 +42,13 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: gh release upload "$RELEASE_TAG" release-assets/* --clobber
+
+  docker:
+    name: Publish server image
+    needs: attach
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-docker-server.yml
+    with:
+      tag: ${{ github.event.release.tag_name || inputs.tag }}

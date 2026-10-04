@@ -78,9 +78,9 @@ XML is private operator data. Ignore rules do not protect tracked sample edits.
 
 From `BasisRustServer/`, Docker builds use the pinned official
 [Rust 1.95.0 release](https://blog.rust-lang.org/2026/04/16/Rust-1.95.0/) and
-[Bookworm image index](https://hub.docker.com/layers/library/rust/1.95-bookworm/images/sha256-3a9f3b7a4dbe011e3f6ebf0dd363685af52c85af958a29276b47a460d6323575).
+[Alpine image](https://hub.docker.com/_/rust) (`rust:1.95.0-alpine`).
 The multi-platform index digest is
-`sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1`;
+`sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2`;
 `--locked` preserves the dependency lockfile. CPU-only builds are the default.
 Docker daemon access and Compose are prerequisites for these commands.
 
@@ -90,8 +90,11 @@ For Bash, read it without putting the value in command history:
 ```sh
 read -rsp 'Server password: ' BASIS_SERVER_PASSWORD; printf '\n'
 export BASIS_SERVER_PASSWORD
+# On Linux, match the account that owns the bind-mounted files (use a non-root account).
+export BASIS_UID="$(id -u)" BASIS_GID="$(id -g)"
+mkdir -p config logs data/initialresources data/defaultlibrary data/CrashReports
 docker compose -f docker-compose-server.yml up --build -d
-unset BASIS_SERVER_PASSWORD
+unset BASIS_SERVER_PASSWORD BASIS_UID BASIS_GID
 ```
 
 Compose requires a non-empty value. The image alone also accepts a mounted XML
@@ -99,12 +102,37 @@ password or either supported password environment name; it preserves the default
 when none is provided. Never pass an empty `Password` value.
 
 The container uses `--base-dir /app`, so the Compose mounts `./config:/app/config`
-and `./logs:/app/logs` match the runtime paths. Without that flag the executable
+and `./logs:/app/logs` match the runtime paths. Bind mounts under `./data/` provide
+writable storage for `initialresources`, `defaultlibrary`, and `CrashReports`;
+config/log mounts retain their existing host paths. The server defaults to UID/GID 10001; set
+`BASIS_UID` and `BASIS_GID` to the non-root owner of existing bind-mounted files.
+A one-shot permissions service initializes only empty root-owned mount directories.
+By default it never recursively changes ownership or alters existing files; operators must
+provide mounts writable by the configured account. Docker
+stops the server with SIGINT so its bounded shutdown saves persistent state.
+Without the base-directory flag the executable
 in `/usr/local/bin` would look under `/usr/local/bin/config`. The build context
 excludes local config, logs, captures and target outputs. Container health still
 binds to loopback by default; publishing port 10666 does not itself expose that
 listener. To expose it intentionally, set `HealthCheckHost=0.0.0.0` and restrict
 host/network access. UDP port 4296 is published. See [security guidance](../SECURITY.md).
+
+When upgrading an older root-running Compose deployment, stop it and back up
+`config/` and `logs/` before starting the new server. Export `BASIS_UID` and
+`BASIS_GID` for the non-root account that should own the deployment files, as
+above. If existing mounts or files are not writable by that account, use this
+explicit, one-time migration:
+
+```sh
+BASIS_MIGRATE_ROOT_OWNERSHIP=true docker compose -f docker-compose-server.yml up --build -d
+```
+
+This opt-in transfers only root-owned entries in the five persistent mounts to
+the configured account. It preserves other owners and file modes, does not follow
+symlinks, and does not traverse nested filesystems. Subsequent starts should omit
+the migration flag. Writable root-owned mounts (including group/ACL access) can
+run without migration. Setup leaves populated mounts unchanged and lets the
+server's actual file access determine whether permission changes are needed.
 
 ## Test
 

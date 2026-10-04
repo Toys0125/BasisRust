@@ -1,6 +1,56 @@
 services:
+  # Initialize only empty root-owned bind mounts created by Compose. Existing
+  # directories and files retain their ownership; match their owner with BASIS_UID/GID.
+  basis-rust-server-permissions:
+    image: alpine:3.20
+    user: "0:0"
+    network_mode: none
+    environment:
+      BASIS_UID: ${BASIS_UID:-10001}
+      BASIS_GID: ${BASIS_GID:-10001}
+      BASIS_MIGRATE_ROOT_OWNERSHIP: ${BASIS_MIGRATE_ROOT_OWNERSHIP:-false}
+    command:
+      - sh
+      - -ec
+      - |
+        for id in "$${BASIS_UID}" "$${BASIS_GID}"; do
+          case "$$id" in ''|*[!0-9]*) echo "BASIS_UID/GID must be positive integers" >&2; exit 1;; esac
+          [ "$$id" -gt 0 ] || { echo "BASIS_UID/GID must be nonzero" >&2; exit 1; }
+        done
+        case "$${BASIS_MIGRATE_ROOT_OWNERSHIP}" in true|false) ;; *) echo "BASIS_MIGRATE_ROOT_OWNERSHIP must be true or false" >&2; exit 1;; esac
+        for dir in /initialresources /defaultlibrary /crashreports /config /logs; do
+          if [ "$${BASIS_MIGRATE_ROOT_OWNERSHIP}" = true ]; then
+            # Explicit upgrade only: leave non-root owners and symlink targets intact.
+            # Kernel mount records also identify bind mounts on the same filesystem.
+            test -r /proc/self/mountinfo
+            set -- "$$dir" -xdev
+            while read -r id parent device root point rest; do
+              point="$$(printf '%bX' "$$point")"
+              point="$${point%X}"
+              case "$$point" in
+                "$$dir"/*) set -- "$$@" -exec test '{}' = "$$point" ';' -prune -o ;;
+              esac
+            done < /proc/self/mountinfo
+            find "$$@" -user 0 -exec chown -h "$${BASIS_UID}:$${BASIS_GID}" '{}' +
+          elif [ "$$(stat -c %u "$$dir")" = 0 ]; then
+            if [ -z "$$(find "$$dir" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+              chown "$${BASIS_UID}:$${BASIS_GID}" "$$dir"
+            fi
+          fi
+        done
+    volumes:
+      - ./data/initialresources:/initialresources
+      - ./data/defaultlibrary:/defaultlibrary
+      - ./data/CrashReports:/crashreports
+      - ./config:/config
+      - ./logs:/logs
+
   basis-rust-server:
     build: .
+    user: "${BASIS_UID:-10001}:${BASIS_GID:-10001}"
+    depends_on:
+      basis-rust-server-permissions:
+        condition: service_completed_successfully
     environment:
       SetPort: 4296
       EnableConsole: "false"
@@ -9,5 +59,8 @@ services:
       - "4296:4296/udp"
       - "10666:10666/tcp"
     volumes:
+      - ./data/initialresources:/app/initialresources
+      - ./data/defaultlibrary:/app/defaultlibrary
+      - ./data/CrashReports:/app/CrashReports
       - ./config:/app/config
       - ./logs:/app/logs

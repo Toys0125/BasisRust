@@ -1,8 +1,24 @@
-# Keep operator files and previous outputs out of the build context.
+# Build output. The local target/ directory is several GB and must never be sent to
+# the daemon or cached in the build context.
+target/
+**/target/
+
+# Runtime state. The server recreates config/, logs/, initialresources/ and
+# defaultlibrary/ on first boot and expects config/ + logs/ to be bind mounts in
+# production, so keeping them out of the image also makes CI and local builds
+# byte-for-byte identical.
 config/
-# The tracked sample can also contain operator edits.
+data/
 Config.xml
 logs/
 captures/
-target/
+
+# Anything unpacked for a release-driven build (see docker-artifacts in .gitignore).
+*.tar.gz
+*.zip
+
+# Local-only compose variants and editor noise.
+docker-compose-headless.local-capture.yml
+Dockerfile.*
+*.md
 *.rs.bk
