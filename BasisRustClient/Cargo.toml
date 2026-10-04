@@ -29,3 +29,7 @@ uuid = { version = "1", features = ["v4", "fast-rng"] }
 
 [target.'cfg(windows)'.dependencies]
 mimalloc = { version = "0.1.52", optional = true }
+
+[dev-dependencies]
+basis-server-core = { path = "../BasisRustServer/crates/basis-server-core" }
+tempfile = "3"

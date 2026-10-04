@@ -437,6 +437,8 @@ pub struct ServerState {
     pub statistics: Statistics,
     pending_leaves: Arc<Mutex<Vec<PeerId>>>,
     shutdown: Arc<AtomicBool>,
+    tick_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    workers: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl ServerState {
@@ -581,17 +583,23 @@ impl ServerState {
             statistics: Statistics::new(config.health_include_extended_metrics),
             pending_leaves: Arc::new(Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
+            tick_thread: Arc::new(Mutex::new(None)),
+            workers: Arc::new(Mutex::new(Vec::new())),
         };
-        state
+        let tick_thread = state
             .avatar_sync
             .spawn_tick_loop(state.transport.clone(), state.shutdown.clone(), {
                 let peers = state.authenticated_peers.clone();
                 move || peers.iter().map(|entry| *entry.key()).collect()
-            });
-        spawn_leave_broadcast_loop(state.clone());
-        admin_runtime::spawn_permission_updates(state.clone());
+            })
+            .context("starting avatar tick thread")?;
+        *state.tick_thread.lock() = Some(tick_thread);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        tokio::spawn(event_loop(state.clone(), events, shutdown_rx));
+        state.workers.lock().extend([
+            spawn_leave_broadcast_loop(state.clone()),
+            admin_runtime::spawn_permission_updates(state.clone()),
+            tokio::spawn(event_loop(state.clone(), events, shutdown_rx)),
+        ]);
         Ok((state, shutdown_tx))
     }
 
@@ -810,20 +818,60 @@ impl ServerState {
         if self.shutdown.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        let permission_result = self.permissions.flush_pending_save();
         self.transport.shutdown();
+        // Save before waiting on any worker: native work or an in-flight handler
+        // may never return. The console bounds this entire lifecycle, including
+        // synchronous persistence and runtime teardown, with a watchdog.
+        let initial_save = self.flush_shutdown_state();
+        if let Err(err) = &initial_save {
+            error!("initial shutdown persistence failed: {err:#}");
+        }
+        let workers = std::mem::take(&mut *self.workers.lock());
+        let mut worker_result = Ok(());
+        for worker in workers {
+            if let Err(err) = worker.await {
+                warn!("server worker failed to join: {err}");
+                worker_result = Err(anyhow::anyhow!("server worker failed to join: {err}"));
+            }
+        }
+        // Accepted event handlers have now finished; persist their final changes.
+        let final_save = self.flush_shutdown_state();
+        if let Err(err) = &final_save {
+            error!("final shutdown persistence failed: {err:#}");
+        }
         for peer in self.authenticated_peers.iter() {
             let _ = self
                 .transport
                 .disconnect(*peer.key(), "Server shutting down")
                 .await;
         }
-        let database_result = self.database.shutdown();
-        // Finish persistence and network cleanup before waiting for GPU readback.
-        // Always join the workers, including when persistence fails.
+        let tick_thread = self.tick_thread.lock().take();
+        let tick_result = if let Some(thread) = tick_thread {
+            tokio::task::spawn_blocking(move || thread.join())
+                .await
+                .context("joining avatar tick task")
+                .and_then(|result| {
+                    result.map_err(|_| anyhow::anyhow!("avatar tick thread panicked"))
+                })
+        } else {
+            Ok(())
+        };
+        // Dropping the GPU channels stops new submissions; joining readback or
+        // driver cleanup is deliberately still covered by the console watchdog.
         self.avatar_sync.stop_compute_offload().await;
-        database_result?;
-        permission_result?;
+        worker_result?;
+        tick_result?;
+        final_save?;
+        initial_save?;
+        Ok(())
+    }
+
+    fn flush_shutdown_state(&self) -> Result<()> {
+        let permissions = self.permissions.flush_pending_save();
+        let database = self.database.shutdown();
+        // Attempt both saves even if one fails.
+        database?;
+        permissions?;
         Ok(())
     }
 
@@ -867,7 +915,7 @@ fn is_p2p_offload_channel(channel: u8) -> bool {
 
 const LEAVE_BROADCAST_INTERVAL: Duration = Duration::from_millis(50);
 
-fn spawn_leave_broadcast_loop(state: ServerState) {
+fn spawn_leave_broadcast_loop(state: ServerState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(LEAVE_BROADCAST_INTERVAL).await;
@@ -876,7 +924,7 @@ fn spawn_leave_broadcast_loop(state: ServerState) {
             }
             flush_pending_leaves(&state).await;
         }
-    });
+    })
 }
 
 fn serialize_leave_batch(leaves: &[PeerId]) -> Vec<u8> {
@@ -996,11 +1044,13 @@ async fn event_loop(
         .map(|count| (count.get() * 4).clamp(8, 256))
         .unwrap_or(32);
     let workers = Arc::new(Semaphore::new(worker_limit));
+    let mut handlers = tokio::task::JoinSet::new();
     let mut join_flush = tokio::time::interval(JOIN_BATCH_FLUSH_INTERVAL);
     join_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     join_flush.tick().await;
-    loop {
+    while !state.shutdown.load(Ordering::Relaxed) {
         tokio::select! {
+            _ = handlers.join_next(), if !handlers.is_empty() => {}
             _ = join_flush.tick() => {
                 flush_join_batches(&state).await;
             }
@@ -1022,13 +1072,20 @@ async fn event_loop(
                 };
                 let Ok(permit) = permit else { break; };
                 let state = state.clone();
-                tokio::spawn(async move {
+                handlers.spawn(async move {
                     let _permit = permit;
                     if let Err(err) = handle_event(&state, event).await {
                         error!("server event failed: {err:#}");
                     }
                 });
             }
+        }
+    }
+    // Stop admission, then finish accepted handlers before final persistence.
+    events.close();
+    while let Some(result) = handlers.join_next().await {
+        if let Err(err) = result {
+            warn!("event handler failed to join: {err}");
         }
     }
 }
@@ -4851,6 +4908,62 @@ pub fn migrate_legacy_resource_dirs(base_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_saves_before_worker_wait_and_again_after_final_updates() {
+        let path =
+            std::env::temp_dir().join(format!("basis-core-shutdown-{}.json", uuid::Uuid::new_v4()));
+        let config = ServerConfig {
+            has_file_support: false,
+            set_port: 0,
+            override_auto_discovery_of_ipv: true,
+            ipv4_address: "127.0.0.1".into(),
+            ..ServerConfig::default()
+        };
+        let (mut server, _shutdown_tx) = ServerState::start(config, &std::env::temp_dir())
+            .await
+            .unwrap();
+        server.database = PersistentDatabase::file_backed(&path);
+        server
+            .database
+            .add_or_update(basis_server_storage::BasisData {
+                name: "initial".into(),
+                json_payload: serde_json::json!(1),
+            });
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let database = server.database.clone();
+        server.workers.lock().push(tokio::spawn(async move {
+            ready_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            database.add_or_update(basis_server_storage::BasisData {
+                name: "final".into(),
+                json_payload: serde_json::json!(2),
+            });
+        }));
+        ready_rx.await.unwrap();
+        let mut shutdown = Box::pin(server.shutdown());
+        // Poll shutdown until it is waiting on the deliberately blocked worker.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut shutdown)
+                .await
+                .is_err()
+        );
+        let saved = PersistentDatabase::file_backed(&path);
+        saved.load().unwrap();
+        assert!(saved.get("initial").is_some());
+        assert!(saved.get("final").is_none());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        saved.load().unwrap();
+        assert!(saved.get("final").is_some());
+        assert!(server.workers.lock().is_empty());
+        assert!(server.tick_thread.lock().is_none());
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn password_comparison_preserves_open_empty_utf8_and_mismatch_semantics() {

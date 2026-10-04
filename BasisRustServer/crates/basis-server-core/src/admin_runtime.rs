@@ -94,7 +94,7 @@ pub(super) fn is_voice_muted(state: &ServerState, peer: PeerId) -> bool {
     peer_uuid(state, peer).is_some_and(|uuid| state.moderation.mute_state(&uuid).0)
 }
 
-pub(super) fn spawn_permission_updates(state: ServerState) {
+pub(super) fn spawn_permission_updates(state: ServerState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(50));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -110,7 +110,7 @@ pub(super) fn spawn_permission_updates(state: ServerState) {
         if let Err(err) = state.permissions.flush_pending_save() {
             warn!("permission shutdown save failed: {err:#}");
         }
-    });
+    })
 }
 
 async fn sync_permission_changes(state: &ServerState) -> Result<()> {
