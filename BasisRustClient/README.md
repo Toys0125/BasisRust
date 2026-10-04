@@ -106,6 +106,25 @@ probes to reduce packet-processing cost. See the
 
 ## Dependencies
 
-This crate depends on:
-- `basis-protocol` — Protocol definitions and message types (shared with the server)
-- `basis-transport` — UDP transport layer (shared with the server)
+The client workspace contains:
+
+- `basis-rust-client` — CLI parsing, interactive console input, runtime setup, and Windows allocator.
+- `basis-client-core` — Configuration, connections, reliability, platform receivers, avatar simulation and observation, voice, population management, and command dispatch in focused modules.
+
+The core uses the server's `basis-protocol` for message serialization, network
+writers, avatar codecs, delta encoding, and DID responses. It uses
+`basis-transport` for packet types, delivery methods, sequence comparison, wire
+constants, and timestamps. Client socket handling and shared receivers remain
+in the core because the server transport's connection API accepts server peers.
+
+Other Rust callers can construct `basis_client_core::ClientOptions` with
+`Default` and call `basis_client_core::run` on their Tokio runtime, supplying a
+callback that starts a command channel. The console binary and build output
+paths are unchanged.
+
+Validate all client packages with:
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```

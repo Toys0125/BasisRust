@@ -82,9 +82,29 @@ pub(crate) const CURL_BITS: [u8; 4] = [5, 6, 7, 8];
 pub(crate) const SPLAY_BITS: [u8; 4] = [3, 4, 5, 6];
 
 pub fn encode_avatar_network_load(url: &str, unlock_password: &str) -> Result<Vec<u8>> {
-    let mut raw = NetWriter::with_capacity(url.len() + unlock_password.len() + 4);
+    encode_avatar_network_load_inner(url, unlock_password, None)
+}
+
+/// Encode the current client format, including its optional content version tag.
+pub fn encode_avatar_network_load_with_version(
+    url: &str,
+    unlock_password: &str,
+    version: &str,
+) -> Result<Vec<u8>> {
+    encode_avatar_network_load_inner(url, unlock_password, Some(version))
+}
+
+fn encode_avatar_network_load_inner(
+    url: &str,
+    unlock_password: &str,
+    version: Option<&str>,
+) -> Result<Vec<u8>> {
+    let mut raw = NetWriter::with_capacity(url.len() + unlock_password.len() + 6);
     raw.put_raw_len_string(url)?;
     raw.put_raw_len_string(unlock_password)?;
+    if let Some(version) = version {
+        raw.put_raw_len_string(version)?;
+    }
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(&raw.into_vec())?;
     Ok(encoder.finish()?)
@@ -1255,6 +1275,23 @@ mod tests {
             "http://localhost/avatar"
         );
         assert_eq!(reader.get_raw_len_string().unwrap(), "pw");
+        assert_eq!(reader.remaining(), 0);
+    }
+
+    #[test]
+    fn avatar_network_load_includes_explicit_content_version() {
+        for version in ["", "v2"] {
+            let encoded =
+                encode_avatar_network_load_with_version("LoadingAvatar", "N/A", version).unwrap();
+            let mut decoder = DeflateDecoder::new(encoded.as_slice());
+            let mut raw = Vec::new();
+            decoder.read_to_end(&mut raw).unwrap();
+            let mut reader = NetReader::new(&raw);
+            assert_eq!(reader.get_raw_len_string().unwrap(), "LoadingAvatar");
+            assert_eq!(reader.get_raw_len_string().unwrap(), "N/A");
+            assert_eq!(reader.get_raw_len_string().unwrap(), version);
+            assert_eq!(reader.remaining(), 0);
+        }
     }
 
     #[test]

@@ -40,7 +40,7 @@ jobs:
         run: cargo fmt --manifest-path BasisRustServer/Cargo.toml --all -- --check
 
       - name: Check client formatting
-        run: cargo fmt --manifest-path BasisRustClient/Cargo.toml -- --check
+        run: cargo fmt --manifest-path BasisRustClient/Cargo.toml --all -- --check
 
   validate:
     name: ${{ matrix.name }}
@@ -59,7 +59,7 @@ jobs:
             features: "--features basis-server-console/gpu"
           - name: Client check, test, clippy
             manifest: BasisRustClient/Cargo.toml
-            workspace: "false"
+            workspace: "true"
 
     steps:
       - name: Check out source

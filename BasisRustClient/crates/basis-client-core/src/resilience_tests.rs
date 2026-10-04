@@ -1,4 +1,7 @@
 use super::*;
+use crate::client::OBSERVER_CANDIDATE_COUNT;
+use crate::observer_sequence::{ObserverSequence, SequenceDecision};
+use crate::tests;
 
 #[test]
 fn strict_config_reports_file_and_invalid_present_field() {
@@ -69,11 +72,6 @@ fn strict_config_creates_same_flat_default_file() {
     std::fs::remove_file(&path).unwrap();
     assert_eq!(xml, config.to_pretty_xml());
     assert!(xml.contains("<Configuration>\n  <Password>default_password</Password>"));
-    assert!(
-        Args::try_parse_from(["client", "--strict-config"])
-            .unwrap()
-            .strict_config
-    );
 }
 
 #[tokio::test]
@@ -438,7 +436,7 @@ async fn observer_candidates_are_bounded_and_reconnect_uses_same_session() {
         observer_session: Some(session.clone()),
         ..Config::default()
     };
-    let ready = ReadyMessage::new(&config, [0.0; 3]).unwrap();
+    let ready = ready_message(&config, [0.0; 3]).unwrap();
     for index in [0, 2, 3, 2] {
         let client = BasisClient::start(index, &config, ready.clone(), [0.0; 3], true)
             .await
