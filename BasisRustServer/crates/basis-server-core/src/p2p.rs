@@ -438,12 +438,16 @@ impl P2pBroker {
     ) {
         let mut writer = NetWriter::new();
         writer.put_u8(sub);
-        BasisP2PSignalMessage {
+        if let Err(err) = (BasisP2PSignalMessage {
             other_player_id,
             session_token: token.to_string(),
             ephemeral_public_key: ephemeral_public_key.copied(),
+        })
+        .serialize(&mut writer)
+        {
+            tracing::warn!("failed to serialize P2P signal: {err}");
+            return;
         }
-        .serialize(&mut writer);
         let _ = transport
             .send(
                 to,

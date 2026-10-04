@@ -52,12 +52,15 @@ impl Client {
         let config = state.config.read().clone();
         let (company, product) =
             application.unwrap_or((&config.company_name, &config.product_name));
-        NetworkApplication::write(&mut writer, company, product);
+        NetworkApplication::write(&mut writer, company, product).unwrap();
         BytesMessage {
             data: auth.to_vec(),
         }
-        .serialize(&mut writer);
-        super::tests::ready_message(uuid).serialize(&mut writer);
+        .serialize(&mut writer)
+        .unwrap();
+        super::tests::ready_message(uuid)
+            .serialize(&mut writer)
+            .unwrap();
         socket.send(writer.as_slice()).await.unwrap();
         Self {
             socket,
@@ -87,11 +90,14 @@ impl Client {
 
     async fn send_identity_response(&mut self, signature: Vec<u8>) {
         let mut response = NetWriter::new();
-        BytesMessage { data: signature }.serialize(&mut response);
+        BytesMessage { data: signature }
+            .serialize(&mut response)
+            .unwrap();
         BytesMessage {
             data: b"N/A".to_vec(),
         }
-        .serialize(&mut response);
+        .serialize(&mut response)
+        .unwrap();
         self.send(channels::AUTH_IDENTITY, response.as_slice(), true)
             .await;
     }
@@ -136,7 +142,7 @@ impl Client {
 
     async fn admin(&mut self, mode: AdminRequestMode, payload: impl FnOnce(&mut NetWriter)) {
         let mut writer = NetWriter::new();
-        AdminRequest { mode }.serialize(&mut writer);
+        AdminRequest { mode }.serialize(&mut writer).unwrap();
         payload(&mut writer);
         self.send(channels::ADMIN, writer.as_slice(), true).await;
     }
@@ -275,7 +281,7 @@ async fn client_packets_verify_snapshot_gate_queries_mutes_and_live_permission_u
         .admin(AdminRequestMode::QueryPermission, |w| {
             w.put_u16(peer_by_uuid(&state, "staff").unwrap());
             w.put_u8(1);
-            w.put_string("MODERATOR");
+            w.put_string("MODERATOR").unwrap();
         })
         .await;
     let query = ordinary
@@ -290,7 +296,7 @@ async fn client_packets_verify_snapshot_gate_queries_mutes_and_live_permission_u
     assert!(reader.get_bool().unwrap() && reader.get_bool().unwrap());
     staff
         .admin(AdminRequestMode::SetVoiceMute, |w| {
-            w.put_string("ordinary");
+            w.put_string("ordinary").unwrap();
             w.put_bool(true);
         })
         .await;
@@ -317,7 +323,7 @@ async fn client_packets_verify_snapshot_gate_queries_mutes_and_live_permission_u
     .is_err());
     staff
         .admin(AdminRequestMode::SetVoiceMute, |w| {
-            w.put_string("ordinary");
+            w.put_string("ordinary").unwrap();
             w.put_bool(false);
         })
         .await;
