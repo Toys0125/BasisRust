@@ -1,3 +1,6 @@
 Config.xml
 config/
 captures/
+# Local runtime logs; source audio inputs and published result summaries stay visible.
+/logs/
+/BasisRustClient/logs/

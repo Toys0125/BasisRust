@@ -9,7 +9,8 @@ moderation and admin permissions, console commands, and source drift detection.
 
 ## Run
 
-Requires Rust 1.95 or later; use `rustup update stable` to update.
+Requires Rust 1.95 or later. The Docker builder uses the exact 1.95.0 release;
+see [prerequisites](../README.md#prerequisites).
 
 ```powershell
 cargo run -p basis-server-console -- --base-dir . --config config/config.xml
@@ -30,6 +31,80 @@ Useful flags:
 --health-port <u16>
 --log-level <filter>
 ```
+
+## Configuration
+
+Server startup precedence (highest wins): explicit `--port`, `--health-host`,
+`--health-port` and `--no-console`; environment overrides; XML supplied fields;
+`ServerConfig` defaults. `--log-level` controls tracing separately. Environment
+names use exact PascalCase config field names (for example `SetPort`); invalid
+non-secret scalar environment values are ignored. `BASIS_SERVER_PASSWORD` takes
+precedence over legacy `Password`. A supplied empty or non-Unicode password
+environment override stops startup without printing its value; it never becomes
+an empty-password bypass. No secret is generated automatically.
+
+The default config path is `<executable-directory>/config/config.xml`, not the
+tracked top-level `Config.xml`. A relative `--config` is resolved under
+`--base-dir`; an absolute path is used directly. A missing file is created from
+defaults before environment/CLI overrides. Malformed XML or invalid supplied
+server scalar fields fail startup. Old config versions or missing extended
+metrics fields are upgraded/saved before runtime overrides are applied.
+
+`BasisRustServer/Config.xml` is a tracked minimal server sample with valid flat
+PascalCase fields. Its former `Ip`, `Port`, `ClientCount`, `AvatarPassword`,
+`AvatarUrl` and `AvatarLoadMode` tags belonged to the client template and were
+ignored by the server. Client Avatar fields remain supported in the client's
+tracked sample; the two schemas are distinct. Copy the server sample to an
+ignored local config if desired:
+
+```sh
+mkdir -p config
+cp Config.xml config/config.xml
+cargo run --locked -p basis-server-console -- --base-dir . --config config/config.xml
+```
+
+From this workspace, these commands use `./config/config.xml`. Keep the
+compatibility default password for local parity tests only; configure matching
+non-empty deployment passwords on clients. `ApiEnabled=false` and
+`MaxSceneRelayMegabitsPerSecondPerPlayer=0` remain upstream defaults. Operators
+can explicitly enable/configure the API or set relay limits.
+
+Runtime overrides are not automatically saved. The explicit `/config save`
+command writes all current in-memory values, including environment secrets, to
+the selected config file. Config inspection redacts secret fields, but the saved
+XML is private operator data. Ignore rules do not protect tracked sample edits.
+
+## Docker deployment
+
+From `BasisRustServer/`, Docker builds use the pinned official
+[Rust 1.95.0 release](https://blog.rust-lang.org/2026/04/16/Rust-1.95.0/) and
+[Bookworm image index](https://hub.docker.com/layers/library/rust/1.95-bookworm/images/sha256-3a9f3b7a4dbe011e3f6ebf0dd363685af52c85af958a29276b47a460d6323575).
+The multi-platform index digest is
+`sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1`;
+`--locked` preserves the dependency lockfile. CPU-only builds are the default.
+Docker daemon access and Compose are prerequisites for these commands.
+
+Inject the password at runtime, rather than baking it into an image layer.
+For Bash, read it without putting the value in command history:
+
+```sh
+read -rsp 'Server password: ' BASIS_SERVER_PASSWORD; printf '\n'
+export BASIS_SERVER_PASSWORD
+docker compose -f docker-compose-server.yml up --build -d
+unset BASIS_SERVER_PASSWORD
+```
+
+Compose requires a non-empty value. The image alone also accepts a mounted XML
+password or either supported password environment name; it preserves the default
+when none is provided. Never pass an empty `Password` value.
+
+The container uses `--base-dir /app`, so the Compose mounts `./config:/app/config`
+and `./logs:/app/logs` match the runtime paths. Without that flag the executable
+in `/usr/local/bin` would look under `/usr/local/bin/config`. The build context
+excludes local config, logs, captures and target outputs. Container health still
+binds to loopback by default; publishing port 10666 does not itself expose that
+listener. To expose it intentionally, set `HealthCheckHost=0.0.0.0` and restrict
+host/network access. UDP port 4296 is published. See [security guidance](../SECURITY.md).
 
 ## Test
 
@@ -115,7 +190,9 @@ Implemented now:
 - `basis-transport` UDP server event loop and LiteNetLib-shaped packet handling
 - `basis-server-core` startup, auth parsing, accept/finalize, metadata/spawn fanout, basic movement/chat/database routing
 - `/health`
-  - C#-parity transport fields follow `EnableStatistics`. BasisRust has no separate C#-style unreliable/voice queue, so `queuePerPeer`, `voiceQueuePerPeer`, and `droppedVoice` are `0`; `droppedUnreliable` maps to UDP `WouldBlock` drops.
+  - Legacy transport fields follow `EnableStatistics`, retaining their numeric types and names. BasisRust has no separate C#-style unreliable/voice queue, so `queuePerPeer`, `voiceQueuePerPeer`, and `droppedVoice` remain compatibility placeholders (`0`). In pinned BasisVR `81f190b`, the queue fields are per-peer **capacities**, and the drop fields count items shed on queue overflow. Rust's existing `droppedUnreliable` mapping remains the count of nonblocking UDP `WouldBlock` attempts, including reliable retries; it is not a C# queue-overflow count or an actual datagram-loss count.
+  - The always-present `statisticsCapabilities` object reports `enabled` and availability for `sent`, `recv`, `packetsSent`, `packetsRecv`, `droppedUnreliable`, `droppedVoice`, `queuePerPeer`, `voiceQueuePerPeer`, and `transport`. `measured` means an actual Rust measurement, `partial` means one or both transport queue depths could not be sampled due to contention, `mapped` identifies the legacy `droppedUnreliable` mapping, `unsupported` identifies the three queue/voice placeholders, and `disabled` means a supported/mapped metric is omitted by `EnableStatistics=false`. An unsupported zero must not be interpreted as a measured empty queue or loss-free voice stream.
+  - With `EnableStatistics=true`, the additive `transport` object exposes actual Rust transport metrics without requiring extended metrics. `peers` counts transport connections, including those awaiting application authentication. `reliablePending` counts in-flight reliable payloads/fragments awaiting ACKs; `reliableQueued` counts reliable payloads/fragments awaiting dispatch; `pendingDatagrams` counts reliable/ACK datagrams retained for socket retry. These are server-wide instantaneous totals, not per-peer capacities; sampling copies peer references before inspecting queues, never waits for queue locks, and is not atomic across queues. If any peer queue is contended, its entire aggregate (`reliableQueued` or `pendingDatagrams`) is `null` and `statisticsCapabilities.transport` is `partial`; other measurements remain available. Retained datagrams may overlap in-flight payloads, so do not sum the depths. `udpSendWouldBlock` counts refused nonblocking UDP send attempts (including retries/control traffic). `nonReliableDroppedDatagrams` counts only datagrams discarded on `WouldBlock` in nonblocking unreliable/sequenced sends; merged datagrams count once regardless of contained messages. It excludes reliable retries, control traffic, other send errors, and sends to disconnected peers. UDP/drop counters reset when transport statistics collection is re-enabled; depths reflect current connections. The entire `transport` block and legacy statistics are omitted, and their health callbacks are not sampled, when `EnableStatistics=false` (even if extended metrics are enabled).
   - `HealthIncludeExtendedMetrics=false` by default; enabling it collects and exposes the detailed `/status live` / `/status verbose` counters under `extended`. With it disabled, the app/avatar extended counters are not incremented.
   - `HealthIncludeBSRProfiling` controls the optional `bsr` block and enables BSR profiling collection. Rust has no managed GC, so the C#-parity `gc` object reports zeroed counters with `supported=false`.
 - interactive console commands: `/players`, `/status`, `/shutdown`, `/help`, `/clear`, `/config`, core `/perm`

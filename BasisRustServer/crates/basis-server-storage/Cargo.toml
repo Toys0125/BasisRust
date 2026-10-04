@@ -9,3 +9,10 @@ anyhow.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile = "3.27"
+
+[target.'cfg(unix)'.dependencies]
+xattr = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }
