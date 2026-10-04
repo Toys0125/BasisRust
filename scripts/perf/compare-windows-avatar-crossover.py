@@ -13,7 +13,7 @@ import statistics
 parser = argparse.ArgumentParser()
 parser.add_argument('capture', type=pathlib.Path)
 parser.add_argument('--control', default='before')
-parser.add_argument('--candidate', default='four')
+parser.add_argument('--candidate', default='six')
 parser.add_argument('--summary-only', action='store_true')
 args = parser.parse_args()
 if not args.control or not args.candidate or args.control == args.candidate:
@@ -23,13 +23,19 @@ runs = [json.loads((args.capture/r['name']/'validated-summary.json').read_text()
 if len(runs) < 8 or len(runs) % 4:
     raise ValueError('Require at least two complete balanced four-run blocks')
 def group(run):
+    """Classify validated run names by the requested control/candidate prefixes."""
     for label in (args.control, args.candidate):
         if run['name'].startswith(label+'-'):
             return label
     raise ValueError('Unknown variant: '+run['name'])
+variant_hashes = {}
 for label in (args.control, args.candidate):
-    if len({r['server_sha256'] for r in runs if group(r)==label}) != 1:
+    hashes = {r['server_sha256'] for r in runs if group(r)==label}
+    if len(hashes) != 1:
         raise ValueError('Different frozen binaries within variant')
+    variant_hashes[label] = next(iter(hashes))
+if variant_hashes[args.control] == variant_hashes[args.candidate]:
+    raise ValueError('Control and candidate must use different frozen server binaries')
 matching = ('clients','tokio_workers','server_rayon_threads_override','server_kind',
             'server_avatar_diagnostics','warmup_seconds','measurement_window_seconds',
             'server_ip','movement_interval_ms','jitter_percent','unity_frame_accumulator_fps',
@@ -42,6 +48,7 @@ keys = ('gap_p50_ms','gap_p95_ms','observer_items_per_second','combined_cpu_core
         'server_cpu_cores','client_cpu_cores','udp_payload_mb_per_second',
         'udp_datagrams_per_second','logical_avatar_sends_per_second','host_cpu_cores')
 def comparison(subset):
+    """Compare per-variant means without treating observer updates as repeats."""
     means = {label:{key:statistics.mean(r['metrics'][key] for r in subset if group(r)==label) for key in keys}
              for label in (args.control,args.candidate)}
     change = {key:100*(means[args.candidate][key]/means[args.control][key]-1) for key in keys}

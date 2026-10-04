@@ -21,6 +21,7 @@ import sys
 import time
 
 from summarize_windows_avatar import summarize
+from windows_process_job import WindowsProcessJob
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -30,6 +31,7 @@ class FILETIME(ctypes.Structure):
 
 
 def host_cpu():
+    """Sample cumulative host busy CPU for later window-aligned deltas."""
     idle, kernel, user = FILETIME(), FILETIME(), FILETIME()
     if not ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
         raise ctypes.WinError()
@@ -38,6 +40,7 @@ def host_cpu():
 
 
 def select_port(family, socktype, host, port):
+    """Probe one destination port to reuse throughout the sequential crossover."""
     # Probe once for the entire crossover. Do not vary the server destination
     # port between variants: Windows loopback profiles include port lookups.
     with socket.socket(family, socktype) as probe:
@@ -48,6 +51,7 @@ def select_port(family, socktype, host, port):
 
 
 def main():
+    """Run frozen variants sequentially, owning each complete process tree."""
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', required=True, type=pathlib.Path)
     parser.add_argument('--client', required=True, type=pathlib.Path)
@@ -121,9 +125,9 @@ def main():
         manifest_path.write_text(json.dumps(manifest, indent=2)+'\n')
         print('START '+name, flush=True)
         samples = []
-        with (capture/(name+'-harness.log')).open('w') as log:
-            process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                       creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        with (capture/(name+'-harness.log')).open('w') as log, WindowsProcessJob() as job:
+            process = job.start(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
             try:
                 deadline = time.monotonic()+600
                 while process.poll() is None:
@@ -134,7 +138,6 @@ def main():
                 if process.returncode:
                     raise RuntimeError('Harness failed: '+str(process.returncode))
             finally:
-                (capture/(name+'-host-cpu.json')).write_text(json.dumps(samples, indent=2)+'\n')
                 if process.poll() is None:
                     try:
                         process.send_signal(signal.CTRL_BREAK_EVENT)
@@ -142,6 +145,7 @@ def main():
                     except (OSError, subprocess.TimeoutExpired):
                         process.terminate()
                         process.wait(timeout=30)
+                (capture/(name+'-host-cpu.json')).write_text(json.dumps(samples, indent=2)+'\n')
         result = summarize(output)
         result['checks']['frozen_server_hash'] = result['metadata']['server_binary_sha256'] == entry['server_sha256']
         result['checks']['frozen_client_hash'] = result['metadata']['client_binary_sha256'] == manifest['client_sha256']

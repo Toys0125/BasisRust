@@ -257,6 +257,25 @@ other worktrees were preserved. No branch or PR was merged.
 
 ## Reproduction
 
+PR review strengthened the benchmark tools after the performance captures.
+The comparator now defaults to the retained `six` label and rejects identical
+control/candidate executable hashes. Each crossover run uses a private Windows
+kill-on-close Job Object: its RTK proxy starts suspended, joins the job before
+spawning descendants, then resumes. Graceful cancellation still applies, while
+forced termination or launcher exit also closes ownership of the complete run.
+No job priority, affinity, CPU, or memory limits are imposed.
+
+Five targeted tests cover current default labels, identical-binary rejection,
+job closure, forced proxy exit, and a failed launch before resume. The cleanup
+tests verify worker/grandchild exit and socket release while an independently
+owned process stays alive. A real two-client crossover also passed all delivery
+gates. Run these checks with
+`rtk proxy python -B scripts/perf/test_windows_avatar_tools.py`.
+Review-fix smoke artifacts are retained separately under
+`captures/pr27-review-fixes-20261004/` and generated `captures/avatar-tools-tests-*`
+directories. The Rust avatar source, frozen performance binaries and all 48
+reported performance measurements are preserved.
+
 Build each server revision in its separate Server workspace with
 `rtk proxy cargo build --locked --release --jobs 2 -p basis-server-console`.
 The candidate build starts from `5915bca` plus the recorded avatar source patch.
