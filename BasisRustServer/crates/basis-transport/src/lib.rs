@@ -27,22 +27,22 @@ use tracing::{debug, trace, warn};
 
 pub type PeerId = u16;
 
-const DEFAULT_WINDOW_SIZE: usize = 128;
-const MAX_SEQUENCE: u16 = 32768;
+pub const DEFAULT_WINDOW_SIZE: usize = 128;
+pub const MAX_SEQUENCE: u16 = 32768;
 const MAX_PENDING_RELIABLE_PER_PEER: usize = 4096;
 const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 const SOCKET_TTL: u32 = 255;
 const MAX_MERGED_PACKET_SIZE: usize = 1200;
-const LITENETLIB_INITIAL_MTU: usize = 1024;
+pub const LITENETLIB_INITIAL_MTU: usize = 1024;
 // The LiteNetLib client accepts this ladder. Grow only after it echoes our exact probe.
 const LITENETLIB_MTU_STEPS: [usize; 6] = [1024, 1164, 1392, 1404, 1424, 1432];
 const MTU_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_MTU_PROBE_ATTEMPTS: u8 = 4;
-const LITENETLIB_CHANNELED_HEADER_SIZE: usize = 4;
-const LITENETLIB_FRAGMENT_HEADER_SIZE: usize = 6;
-const LITENETLIB_FRAGMENTED_HEADER_SIZE: usize =
+pub const LITENETLIB_CHANNELED_HEADER_SIZE: usize = 4;
+pub const LITENETLIB_FRAGMENT_HEADER_SIZE: usize = 6;
+pub const LITENETLIB_FRAGMENTED_HEADER_SIZE: usize =
     LITENETLIB_CHANNELED_HEADER_SIZE + LITENETLIB_FRAGMENT_HEADER_SIZE;
-const RELIABLE_FRAGMENT_PAYLOAD_SIZE: usize =
+pub const RELIABLE_FRAGMENT_PAYLOAD_SIZE: usize =
     LITENETLIB_INITIAL_MTU - LITENETLIB_FRAGMENTED_HEADER_SIZE;
 const DEFAULT_MAX_RECEIVE_WORKERS: usize = 8;
 
@@ -2969,7 +2969,8 @@ fn peer_send_turn(peer: &PeerState, mut try_send: impl FnMut(&[u8]) -> Result<bo
     true
 }
 
-fn relative_sequence(seq: u16, expected: u16) -> i32 {
+/// Compare LiteNetLib sequence numbers across the wrapping sequence space.
+pub fn relative_sequence(seq: u16, expected: u16) -> i32 {
     let seq = seq as i32;
     let expected = expected as i32;
     let diff = seq - expected;
@@ -2982,7 +2983,8 @@ fn relative_sequence(seq: u16, expected: u16) -> i32 {
     }
 }
 
-fn dotnet_utc_ticks() -> i64 {
+/// LiteNetLib connection and pong timestamps use .NET UTC ticks.
+pub fn dotnet_utc_ticks() -> i64 {
     const TICKS_AT_UNIX_EPOCH: i64 = 621_355_968_000_000_000;
     let unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

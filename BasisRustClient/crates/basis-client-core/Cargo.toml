@@ -1,0 +1,25 @@
+[package]
+name = "basis-client-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+basis-protocol = { path = "../../../BasisRustServer/crates/basis-protocol" }
+basis-transport = { path = "../../../BasisRustServer/crates/basis-transport" }
+bs58 = "0.5"
+ed25519-dalek = "2"
+libc = "0.2"
+num_cpus = "1"
+quick-xml = { version = "0.38", features = ["serialize"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+socket2 = "0.5"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "fast-rng"] }
+
+[dev-dependencies]
+flate2 = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

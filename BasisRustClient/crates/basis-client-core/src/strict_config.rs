@@ -1,6 +1,7 @@
 //! Opt-in validation; the legacy loader and flat PascalCase schema remain unchanged.
-use super::{RawConfig, Result};
+use crate::config::RawConfig;
 use anyhow::anyhow;
+use anyhow::Result;
 use quick_xml::{events::Event, Reader};
 use std::{path::Path, str::FromStr};
 

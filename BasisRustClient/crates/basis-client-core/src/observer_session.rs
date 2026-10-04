@@ -1,5 +1,6 @@
 //! One measurement session survives client replacement. Nonowners avoid the mutex.
-use super::{AvatarObserver, StdMutex};
+use crate::observer::AvatarObserver;
+use std::sync::Mutex as StdMutex;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     MutexGuard,

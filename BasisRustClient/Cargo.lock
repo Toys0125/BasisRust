@@ -86,6 +86,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "basis-client-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "basis-protocol",
+ "basis-transport",
+ "bs58",
+ "ed25519-dalek",
+ "flate2",
+ "libc",
+ "num_cpus",
+ "quick-xml",
+ "rand 0.8.6",
+ "serde",
+ "socket2 0.5.10",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "basis-protocol"
 version = "0.1.0"
 dependencies = [
@@ -109,25 +131,18 @@ name = "basis-rust-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "basis-client-core",
  "basis-protocol",
  "basis-server-core",
  "basis-transport",
  "bs58",
  "clap",
  "ed25519-dalek",
- "flate2",
- "libc",
  "mimalloc",
  "num_cpus",
- "quick-xml",
- "rand 0.8.6",
- "serde",
- "socket2 0.5.10",
  "tempfile",
  "tokio",
- "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

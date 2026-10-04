@@ -10,6 +10,27 @@ permissions:
   contents: read
 
 jobs:
+  client-windows:
+    name: Client check, test, clippy (Windows)
+    runs-on: windows-latest
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Check client workspace with default allocator
+        run: cargo check --locked --manifest-path BasisRustClient/Cargo.toml --workspace --all-targets
+      - name: Check client workspace without mimalloc
+        run: cargo check --locked --manifest-path BasisRustClient/Cargo.toml --workspace --all-targets --no-default-features
+      - name: Test client workspace
+        run: cargo test --locked --manifest-path BasisRustClient/Cargo.toml --workspace
+      - name: Lint client workspace
+        run: cargo clippy --locked --manifest-path BasisRustClient/Cargo.toml --workspace --all-targets -- -D warnings
+
   storage-windows:
     name: Storage persistence (Windows)
     runs-on: windows-latest
@@ -40,7 +61,7 @@ jobs:
         run: cargo fmt --manifest-path BasisRustServer/Cargo.toml --all -- --check
 
       - name: Check client formatting
-        run: cargo fmt --manifest-path BasisRustClient/Cargo.toml -- --check
+        run: cargo fmt --manifest-path BasisRustClient/Cargo.toml --all -- --check
 
   validate:
     name: ${{ matrix.name }}
@@ -59,7 +80,7 @@ jobs:
             features: "--features basis-server-console/gpu"
           - name: Client check, test, clippy
             manifest: BasisRustClient/Cargo.toml
-            workspace: "false"
+            workspace: "true"
 
     steps:
       - name: Check out source
