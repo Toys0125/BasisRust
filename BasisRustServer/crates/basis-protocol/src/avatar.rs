@@ -83,8 +83,8 @@ pub(crate) const SPLAY_BITS: [u8; 4] = [3, 4, 5, 6];
 
 pub fn encode_avatar_network_load(url: &str, unlock_password: &str) -> Result<Vec<u8>> {
     let mut raw = NetWriter::with_capacity(url.len() + unlock_password.len() + 4);
-    raw.put_raw_len_string(url);
-    raw.put_raw_len_string(unlock_password);
+    raw.put_raw_len_string(url)?;
+    raw.put_raw_len_string(unlock_password)?;
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(&raw.into_vec())?;
     Ok(encoder.finish()?)

@@ -162,6 +162,7 @@ dependencies = [
  "rayon",
  "rustc-hash",
  "serde_json",
+ "subtle",
  "tokio",
  "tracing",
  "unicode-general-category",

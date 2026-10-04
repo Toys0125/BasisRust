@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::{
-    io::{NetReader, NetWriter},
+    io::{NetReader, NetWriter, WriteResult},
     messages::{BasisDeserialize, BasisSerialize, BytesMessage},
 };
 
@@ -12,11 +12,12 @@ pub struct DidChallenge {
 }
 
 impl BasisSerialize for DidChallenge {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         BytesMessage {
             data: self.bytes.clone(),
         }
-        .serialize(writer);
+        .serialize(writer)?;
+        Ok(())
     }
 }
 
@@ -72,11 +73,11 @@ pub fn did_key_verifying_key(did: &str) -> Result<VerifyingKey> {
 }
 
 impl BasisSerialize for DidResponse {
-    fn serialize(&self, writer: &mut NetWriter) {
+    fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         BytesMessage {
             data: self.signature.clone(),
         }
-        .serialize(writer);
+        .serialize(writer)?;
         BytesMessage {
             data: if self.fragment.is_empty() {
                 b"N/A".to_vec()
@@ -84,7 +85,8 @@ impl BasisSerialize for DidResponse {
                 self.fragment.as_bytes().to_vec()
             },
         }
-        .serialize(writer);
+        .serialize(writer)?;
+        Ok(())
     }
 }
 
