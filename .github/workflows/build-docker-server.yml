@@ -238,6 +238,13 @@ jobs:
                 docker exec "$cid" curl -fsS http://127.0.0.1:10666/health
                 echo ""
                 docker logs "$cid" 2>&1 | tail -n 20
+                docker stop --time 8 "$cid" >/dev/null
+                exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$cid")"
+                if [ "$exit_code" != "0" ]; then
+                  echo "::error::Container did not stop gracefully (exit $exit_code)"
+                  docker logs "$cid" 2>&1 | tail -n 50
+                  exit 1
+                fi
                 exit 0
                 ;;
               unhealthy)

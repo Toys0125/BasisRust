@@ -78,9 +78,9 @@ XML is private operator data. Ignore rules do not protect tracked sample edits.
 
 From `BasisRustServer/`, Docker builds use the pinned official
 [Rust 1.95.0 release](https://blog.rust-lang.org/2026/04/16/Rust-1.95.0/) and
-[Bookworm image index](https://hub.docker.com/layers/library/rust/1.95-bookworm/images/sha256-3a9f3b7a4dbe011e3f6ebf0dd363685af52c85af958a29276b47a460d6323575).
+[Alpine image](https://hub.docker.com/_/rust) (`rust:1.95.0-alpine`).
 The multi-platform index digest is
-`sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1`;
+`sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2`;
 `--locked` preserves the dependency lockfile. CPU-only builds are the default.
 Docker daemon access and Compose are prerequisites for these commands.
 
@@ -99,7 +99,10 @@ password or either supported password environment name; it preserves the default
 when none is provided. Never pass an empty `Password` value.
 
 The container uses `--base-dir /app`, so the Compose mounts `./config:/app/config`
-and `./logs:/app/logs` match the runtime paths. Without that flag the executable
+and `./logs:/app/logs` match the runtime paths. A one-shot permissions service
+prepares these directories for the server's unprivileged UID/GID 10001. Docker
+stops the server with SIGINT so its bounded shutdown saves persistent state.
+Without the base-directory flag the executable
 in `/usr/local/bin` would look under `/usr/local/bin/config`. The build context
 excludes local config, logs, captures and target outputs. Container health still
 binds to loopback by default; publishing port 10666 does not itself expose that

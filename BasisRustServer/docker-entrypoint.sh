@@ -37,8 +37,9 @@ mkdir -p "$BASIS_BASE_DIR/config"
 # --config is relative to --base-dir. The file does not need to exist: the server writes
 # a schema-correct default on first boot.
 #
-# `exec` hands PID 1 and all signals (SIGTERM in particular, which the server treats as
-# a shutdown request) straight to the server. There are no child processes to reap, so
+# `exec` hands PID 1 and all signals straight to the server. The Dockerfile selects
+# SIGINT for container stop so the console runs its graceful shutdown path.
+# There are no child processes to reap, so
 # no init shim is required.
 exec /usr/local/bin/basis-server-console \
     --base-dir "$BASIS_BASE_DIR" \
