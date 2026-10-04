@@ -35,6 +35,18 @@ pub enum ConsoleCommand {
     Help,
 }
 
+struct RunShutdown {
+    shutdown: Arc<AtomicBool>,
+    signal_task: tokio::task::AbortHandle,
+}
+
+impl Drop for RunShutdown {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.signal_task.abort();
+    }
+}
+
 /// Run the client population on the caller's Tokio runtime.
 ///
 /// The callback starts the command source after the initial population is connected.
@@ -56,7 +68,7 @@ pub async fn run(
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal_shutdown = shutdown.clone();
     let (signal_ready_tx, signal_ready_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
+    let signal_task = tokio::spawn(async move {
         let result = tokio::select! {
             biased;
             result = tokio::signal::ctrl_c() => result,
@@ -73,6 +85,10 @@ pub async fn run(
         info!("shutdown requested");
         signal_shutdown.store(true, Ordering::SeqCst);
     });
+    let _run_shutdown = RunShutdown {
+        shutdown: shutdown.clone(),
+        signal_task: signal_task.abort_handle(),
+    };
     let _ = signal_ready_rx.await;
     info!("tokio runtime workers={worker_threads}");
     let config_path = args.config.clone();
@@ -479,4 +495,42 @@ pub async fn run(
     );
     disconnect_clients_in_batches(&managed_clients, quit_batch_size, quit_batch_delay).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_shutdown_stops_maintenance_and_signal_listener_on_success_and_error() {
+        fn finish_run(guard: RunShutdown, fail: bool) -> Result<()> {
+            let _guard = guard;
+            if fail {
+                return Err(anyhow!("startup failed"));
+            }
+            Ok(())
+        }
+
+        for fail in [false, true] {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let signal_task = tokio::spawn(std::future::pending::<()>());
+            let maintenance = tokio::spawn(shared_maintenance_loop(
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Notify::new()),
+                shutdown.clone(),
+            ));
+            let guard = RunShutdown {
+                shutdown: shutdown.clone(),
+                signal_task: signal_task.abort_handle(),
+            };
+
+            assert_eq!(finish_run(guard, fail).is_err(), fail);
+            assert!(shutdown.load(Ordering::SeqCst));
+            assert!(signal_task.await.unwrap_err().is_cancelled());
+            time::timeout(Duration::from_secs(1), maintenance)
+                .await
+                .expect("shared maintenance must stop when run exits")
+                .unwrap();
+        }
+    }
 }
