@@ -8,6 +8,7 @@ services:
     environment:
       BASIS_UID: ${BASIS_UID:-10001}
       BASIS_GID: ${BASIS_GID:-10001}
+      BASIS_MIGRATE_ROOT_OWNERSHIP: ${BASIS_MIGRATE_ROOT_OWNERSHIP:-false}
     command:
       - sh
       - -ec
@@ -16,10 +17,18 @@ services:
           case "$$id" in ''|*[!0-9]*) echo "BASIS_UID/GID must be positive integers" >&2; exit 1;; esac
           [ "$$id" -gt 0 ] || { echo "BASIS_UID/GID must be nonzero" >&2; exit 1; }
         done
+        case "$${BASIS_MIGRATE_ROOT_OWNERSHIP}" in true|false) ;; *) echo "BASIS_MIGRATE_ROOT_OWNERSHIP must be true or false" >&2; exit 1;; esac
         for dir in /initialresources /defaultlibrary /crashreports /config /logs; do
-          if [ "$$(stat -c %u "$$dir")" = 0 ] &&
-             [ -z "$$(find "$$dir" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
-            chown "$${BASIS_UID}:$${BASIS_GID}" "$$dir"
+          if [ "$${BASIS_MIGRATE_ROOT_OWNERSHIP}" = true ]; then
+            # Explicit upgrade only: leave non-root owners and symlink targets intact.
+            find "$$dir" -xdev -user 0 -exec chown -h "$${BASIS_UID}:$${BASIS_GID}" {} +
+          elif [ "$$(stat -c %u "$$dir")" = 0 ]; then
+            if [ -z "$$(find "$$dir" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+              chown "$${BASIS_UID}:$${BASIS_GID}" "$$dir"
+            else
+              echo "Populated root-owned mount $$dir requires explicit upgrade migration; see README.md and BASIS_MIGRATE_ROOT_OWNERSHIP" >&2
+              exit 1
+            fi
           fi
         done
     volumes:
