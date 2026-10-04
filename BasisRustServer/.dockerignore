@@ -8,6 +8,7 @@ target/
 # production, so keeping them out of the image also makes CI and local builds
 # byte-for-byte identical.
 config/
+data/
 Config.xml
 logs/
 captures/

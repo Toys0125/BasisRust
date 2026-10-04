@@ -90,8 +90,11 @@ For Bash, read it without putting the value in command history:
 ```sh
 read -rsp 'Server password: ' BASIS_SERVER_PASSWORD; printf '\n'
 export BASIS_SERVER_PASSWORD
+# On Linux, match the account that owns the bind-mounted files (use a non-root account).
+export BASIS_UID="$(id -u)" BASIS_GID="$(id -g)"
+mkdir -p config logs data/initialresources data/defaultlibrary data/CrashReports
 docker compose -f docker-compose-server.yml up --build -d
-unset BASIS_SERVER_PASSWORD
+unset BASIS_SERVER_PASSWORD BASIS_UID BASIS_GID
 ```
 
 Compose requires a non-empty value. The image alone also accepts a mounted XML
@@ -99,8 +102,13 @@ password or either supported password environment name; it preserves the default
 when none is provided. Never pass an empty `Password` value.
 
 The container uses `--base-dir /app`, so the Compose mounts `./config:/app/config`
-and `./logs:/app/logs` match the runtime paths. A one-shot permissions service
-prepares these directories for the server's unprivileged UID/GID 10001. Docker
+and `./logs:/app/logs` match the runtime paths. Bind mounts under `./data/` provide
+writable storage for `initialresources`, `defaultlibrary`, and `CrashReports`;
+config/log mounts retain their existing host paths. The server defaults to UID/GID 10001; set
+`BASIS_UID` and `BASIS_GID` to the non-root owner of existing bind-mounted files.
+A one-shot permissions service initializes only empty root-owned mount directories.
+It never recursively changes ownership or alters existing files; operators must
+provide mounts writable by the configured account. Docker
 stops the server with SIGINT so its bounded shutdown saves persistent state.
 Without the base-directory flag the executable
 in `/usr/local/bin` would look under `/usr/local/bin/config`. The build context

@@ -1,17 +1,37 @@
 services:
-  # Compose may create fresh bind-mount directories as root. Prepare only the
-  # server's persistent directories before starting its unprivileged process.
+  # Initialize only empty root-owned bind mounts created by Compose. Existing
+  # directories and files retain their ownership; match their owner with BASIS_UID/GID.
   basis-rust-server-permissions:
     image: alpine:3.20
     user: "0:0"
     network_mode: none
-    command: ["sh", "-c", "chown -R 10001:10001 /config /logs"]
+    environment:
+      BASIS_UID: ${BASIS_UID:-10001}
+      BASIS_GID: ${BASIS_GID:-10001}
+    command:
+      - sh
+      - -ec
+      - |
+        for id in "$${BASIS_UID}" "$${BASIS_GID}"; do
+          case "$$id" in ''|*[!0-9]*) echo "BASIS_UID/GID must be positive integers" >&2; exit 1;; esac
+          [ "$$id" -gt 0 ] || { echo "BASIS_UID/GID must be nonzero" >&2; exit 1; }
+        done
+        for dir in /initialresources /defaultlibrary /crashreports /config /logs; do
+          if [ "$$(stat -c %u "$$dir")" = 0 ] &&
+             [ -z "$$(find "$$dir" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+            chown "$${BASIS_UID}:$${BASIS_GID}" "$$dir"
+          fi
+        done
     volumes:
+      - ./data/initialresources:/initialresources
+      - ./data/defaultlibrary:/defaultlibrary
+      - ./data/CrashReports:/crashreports
       - ./config:/config
       - ./logs:/logs
 
   basis-rust-server:
     build: .
+    user: "${BASIS_UID:-10001}:${BASIS_GID:-10001}"
     depends_on:
       basis-rust-server-permissions:
         condition: service_completed_successfully
@@ -23,5 +43,8 @@ services:
       - "4296:4296/udp"
       - "10666:10666/tcp"
     volumes:
+      - ./data/initialresources:/app/initialresources
+      - ./data/defaultlibrary:/app/defaultlibrary
+      - ./data/CrashReports:/app/CrashReports
       - ./config:/app/config
       - ./logs:/app/logs
