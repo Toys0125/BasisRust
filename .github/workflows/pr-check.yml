@@ -10,6 +10,27 @@ permissions:
   contents: read
 
 jobs:
+  client-windows:
+    name: Client check, test, clippy (Windows)
+    runs-on: windows-latest
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Check client workspace with default allocator
+        run: cargo check --locked --manifest-path BasisRustClient/Cargo.toml --workspace --all-targets
+      - name: Check client workspace without mimalloc
+        run: cargo check --locked --manifest-path BasisRustClient/Cargo.toml --workspace --all-targets --no-default-features
+      - name: Test client workspace
+        run: cargo test --locked --manifest-path BasisRustClient/Cargo.toml --workspace
+      - name: Lint client workspace
+        run: cargo clippy --locked --manifest-path BasisRustClient/Cargo.toml --workspace --all-targets -- -D warnings
+
   storage-windows:
     name: Storage persistence (Windows)
     runs-on: windows-latest

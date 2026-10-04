@@ -21,9 +21,6 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time;
 use tracing::{error, info, warn};
 
-/// Help displayed by the headless console command loop.
-pub const CONSOLE_HELP: &str = "Console commands:\n  voice              enable voice simulation\n  add [count]        add clients (default: 100)\n  quit [batch] [ms]  disconnect in batches (default batch/delay: 100/250ms)";
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConsoleCommand {
     EnableVoice,
@@ -32,7 +29,6 @@ pub enum ConsoleCommand {
         batch_size: Option<usize>,
         delay_ms: Option<u64>,
     },
-    Help,
 }
 
 struct RunShutdown {
@@ -381,7 +377,6 @@ pub async fn run(
         .duration_secs
         .map(|duration| time::Instant::now() + Duration::from_secs(duration));
 
-    println!("{CONSOLE_HELP}");
     while !shutdown.load(Ordering::Relaxed) {
         if duration_deadline
             .map(|deadline| time::Instant::now() >= deadline)
@@ -460,7 +455,6 @@ pub async fn run(
                         );
                         shutdown.store(true, Ordering::SeqCst);
                     }
-                    Some(ConsoleCommand::Help) => println!("{CONSOLE_HELP}"),
                     None => console_closed = true,
                 }
             }

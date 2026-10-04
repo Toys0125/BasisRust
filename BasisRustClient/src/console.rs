@@ -5,10 +5,18 @@ use tokio::{
     sync::mpsc,
 };
 
-fn parse_console_command(line: &str) -> Option<ConsoleCommand> {
+const CONSOLE_HELP: &str = "Console commands:\n  voice              enable voice simulation\n  add [count]        add clients (default: 100)\n  quit [batch] [ms]  disconnect in batches (default batch/delay: 100/250ms)";
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConsoleInput {
+    Client(ConsoleCommand),
+    Help,
+}
+
+fn parse_console_command(line: &str) -> Option<ConsoleInput> {
     let mut parts = line.split_whitespace();
     let command = parts.next()?.to_ascii_lowercase();
-    match command.as_str() {
+    let command = match command.as_str() {
         "voice" | "v" => Some(ConsoleCommand::EnableVoice),
         "enable"
             if parts
@@ -34,18 +42,26 @@ fn parse_console_command(line: &str) -> Option<ConsoleCommand> {
                 delay_ms,
             })
         }
-        "help" | "h" | "?" => Some(ConsoleCommand::Help),
+        "help" | "h" | "?" => return Some(ConsoleInput::Help),
         _ => None,
-    }
+    }?;
+    Some(ConsoleInput::Client(command))
 }
 
 pub(crate) async fn console_input(commands: mpsc::UnboundedSender<ConsoleCommand>) {
+    println!("{CONSOLE_HELP}");
     let stdin = BufReader::new(io::stdin());
     let mut lines = stdin.lines();
     print!("> ");
     let _ = std::io::stdout().flush();
     while let Ok(Some(line)) = lines.next_line().await {
-        if let Some(command) = parse_console_command(&line) {
+        if let Some(input) = parse_console_command(&line) {
+            let ConsoleInput::Client(command) = input else {
+                println!("{CONSOLE_HELP}");
+                print!("> ");
+                let _ = std::io::stdout().flush();
+                continue;
+            };
             // Do not start another stdin read after quit. Tokio's stdin uses a blocking
             // helper thread, which can otherwise keep the runtime alive after shutdown.
             let quitting = matches!(command, ConsoleCommand::Quit { .. });
@@ -63,38 +79,42 @@ pub(crate) async fn console_input(commands: mpsc::UnboundedSender<ConsoleCommand
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ConsoleInput::Client;
     #[test]
     fn console_commands_default_to_voice_add_100_and_batched_quit() {
         assert_eq!(
             parse_console_command("voice"),
-            Some(ConsoleCommand::EnableVoice)
+            Some(Client(ConsoleCommand::EnableVoice))
         );
         assert_eq!(
             parse_console_command("enable voice"),
-            Some(ConsoleCommand::EnableVoice)
+            Some(Client(ConsoleCommand::EnableVoice))
         );
         assert_eq!(
             parse_console_command("add"),
-            Some(ConsoleCommand::AddClients(100))
+            Some(Client(ConsoleCommand::AddClients(100)))
         );
         assert_eq!(
             parse_console_command("add 250"),
-            Some(ConsoleCommand::AddClients(250))
+            Some(Client(ConsoleCommand::AddClients(250)))
         );
         assert_eq!(
             parse_console_command("quit 25 500"),
-            Some(ConsoleCommand::Quit {
+            Some(Client(ConsoleCommand::Quit {
                 batch_size: Some(25),
                 delay_ms: Some(500),
-            })
+            }))
         );
         assert_eq!(
             parse_console_command("q"),
-            Some(ConsoleCommand::Quit {
+            Some(Client(ConsoleCommand::Quit {
                 batch_size: None,
                 delay_ms: None,
-            })
+            }))
         );
+        for command in ["help", "h", "?"] {
+            assert_eq!(parse_console_command(command), Some(ConsoleInput::Help));
+        }
         assert_eq!(parse_console_command("unknown"), None);
     }
 }

@@ -24,4 +24,4 @@ mod wire;
 mod tests;
 
 pub use config::{ClientOptions, Config};
-pub use runtime::{run, ConsoleCommand, CONSOLE_HELP};
+pub use runtime::{run, ConsoleCommand};
