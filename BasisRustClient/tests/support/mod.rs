@@ -243,8 +243,9 @@ impl Live {
         }
         match timeout(LIMIT, &mut self.proxy).await {
             Ok(Ok(())) => {}
-            result => {
-                errors.push(format!("proxy shutdown: {result:?}"));
+            Ok(Err(error)) => errors.push(format!("proxy shutdown: {error:?}")),
+            Err(error) => {
+                errors.push(format!("proxy shutdown: {error:?}"));
                 self.proxy.abort();
                 let _ = (&mut self.proxy).await;
             }
@@ -345,7 +346,12 @@ async fn proxy(
                 break;
             }
             result = front.recv_from(&mut buffer) => {
-                let (len, client) = result.unwrap();
+                let (len, client) = match result {
+                    // Windows reports an ICMP port-unreachable from a stopped
+                    // client as ConnectionReset on the next UDP receive.
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => continue,
+                    result => result.unwrap(),
+                };
                 if fault == Fault::InvalidSignature && buffer[0] & 31 == 1 && buffer[3] == 2 {
                     // Change one signature byte in the actual client's response. Retain
                     // its framing, channel, sequence, and all remaining bytes.
@@ -391,7 +397,10 @@ async fn receive_server(
 ) {
     let mut buffer = vec![0; 65535];
     loop {
-        let len = upstream.recv(&mut buffer).await.unwrap();
+        let len = match upstream.recv(&mut buffer).await {
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => continue,
+            result => result.unwrap(),
+        };
         let frames = frames(&buffer[..len]);
         let drop = loss
             && !gap_ack.load(Ordering::Relaxed)
@@ -526,6 +535,27 @@ fn ogg_silence() -> Vec<u8> {
     ));
     output.extend(page(2, 4, 960 * 100, &vec![SILENCE; 100]));
     output
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_failed_proxy_is_not_polled_twice_during_cleanup() {
+    let mut live = Live::start("default_password", 1, false, Fault::None).await;
+    live.proxy.abort();
+    let _ = (&mut live.proxy).await;
+    live.proxy = tokio::spawn(async { panic!("injected proxy failure") });
+    timeout(LIMIT, async {
+        while !live.proxy.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let errors = live.cleanup().await;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("proxy shutdown:"), "{errors:?}");
+    assert!(live.child.try_wait().unwrap().is_some());
+    assert!(live.shutdown.is_none());
+    assert!(live.proxy.is_finished());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
