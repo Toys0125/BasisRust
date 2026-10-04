@@ -39,6 +39,7 @@ const DISTANCE_UPDATE_INTERVAL_MS: u64 = 500;
 const AVATAR_TICK_INTERVAL_MS: u64 = 4;
 const RECEIVER_BUILD_MIN_BATCH: usize = 4;
 const RECEIVER_FLUSH_MIN_BATCH: usize = 8;
+const MAX_RECEIVER_FLUSH_LANES: usize = 8;
 const TICK_SPIN_RESERVE_MICROS: u64 = 100;
 const MAX_SLICE_COUNT: usize = 32;
 const NO_RECEIVER_BASELINE: u64 = u64::MAX;
@@ -1413,6 +1414,9 @@ pub struct AvatarSyncSystem {
     offloaded_pairs: Arc<DashMap<u64, ()>>,
     bypass_reduction_ids: Arc<DashMap<PeerId, ()>>,
     diagnostics: Option<Arc<AvatarSyncDiagnostics>>,
+    // Zero keeps the existing Rayon scheduling; positive values bound send
+    // concurrency independently of the pool used to build receiver packets.
+    receiver_flush_lanes: usize,
 }
 
 impl AvatarSyncSystem {
@@ -1445,6 +1449,9 @@ impl AvatarSyncSystem {
             offloaded_pairs: Arc::new(DashMap::new()),
             bypass_reduction_ids: Arc::new(DashMap::new()),
             diagnostics,
+            receiver_flush_lanes: env_usize("BASIS_AVATAR_FLUSH_LANES")
+                .unwrap_or(if cfg!(windows) { 6 } else { 0 })
+                .min(MAX_RECEIVER_FLUSH_LANES),
         }
     }
 
@@ -1904,6 +1911,7 @@ impl AvatarSyncSystem {
             transport.clone(),
             receiver_groups,
             self.diagnostics.as_deref(),
+            self.receiver_flush_lanes,
         )?;
         if let Some(diagnostics) = self.diagnostics.as_ref() {
             diagnostics.maybe_emit(&self.states, &self.tracking);
@@ -2612,22 +2620,39 @@ fn flush_receiver_groups_parallel<'a>(
     transport: TransportHandle,
     receiver_groups: Vec<OutboundAvatarBatch<'a>>,
     diagnostics: Option<&AvatarSyncDiagnostics>,
+    flush_lanes: usize,
 ) -> Result<()> {
-    receiver_groups
+    let flush_batch = |batch: &OutboundAvatarBatch<'a>| -> Result<()> {
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.record_batch(batch.receiver, &batch.diagnostic_items, false);
+        }
+        transport.try_send_many_unreliable_packets(batch.receiver, &batch.sends)?;
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.record_batch(batch.receiver, &batch.diagnostic_items, true);
+        }
+        Ok(())
+    };
+    try_for_each_receiver_flush(&receiver_groups, flush_lanes, flush_batch)
+}
+
+fn try_for_each_receiver_flush<T: Sync>(
+    receivers: &[T],
+    flush_lanes: usize,
+    flush_batch: impl Fn(&T) -> Result<()> + Sync + Send,
+) -> Result<()> {
+    if flush_lanes > 0 {
+        // Partition into at most N jobs, rather than changing the global build
+        // pool or creating more threads. Each job emits its receivers serially.
+        // Windows loopback profiles show contention inside the send path.
+        let chunk_len = receivers.len().div_ceil(flush_lanes).max(1);
+        return receivers
+            .par_chunks(chunk_len)
+            .try_for_each(|chunk| chunk.iter().try_for_each(&flush_batch));
+    }
+    receivers
         .par_iter()
         .with_min_len(RECEIVER_FLUSH_MIN_BATCH)
-        .try_for_each(|batch| {
-            if let Some(diagnostics) = diagnostics {
-                diagnostics.record_batch(batch.receiver, &batch.diagnostic_items, false);
-            }
-            transport
-                .try_send_many_unreliable_packets(batch.receiver, &batch.sends)
-                .map(|_| {
-                    if let Some(diagnostics) = diagnostics {
-                        diagnostics.record_batch(batch.receiver, &batch.diagnostic_items, true);
-                    }
-                })
-        })?;
+        .try_for_each(flush_batch)?;
     Ok(())
 }
 
@@ -2764,14 +2789,6 @@ fn try_emit_bundle_range<'a>(
     bundle_cache: &AvatarBundleCache,
     wire_budget: usize,
 ) -> Result<BundleEmit> {
-    let slices = bundle[range.clone()]
-        .iter()
-        .map(|item| AvatarBundleSlice {
-            original_channel: item.original_channel,
-            payload: &item.payload,
-            interval_patch: Some((item.interval_offset, item.interval_byte)),
-        })
-        .collect::<Vec<_>>();
     let delta_only = bundle[range.clone()]
         .iter()
         .all(|item| item.original_channel == channels::DELTA_AVATAR);
@@ -2784,7 +2801,19 @@ fn try_emit_bundle_range<'a>(
             AvatarBundleCompression::Lz4
         };
     let cell = bundle_cache.cell_for(&bundle[range.clone()], compression);
-    let encode = || try_encode_avatar_bundle_slices_with_compression(&slices, compression);
+    let encode = || {
+        // Cache hits already own the encoded bytes. Only construct the borrowed
+        // encoder input when this caller actually needs to encode a bundle.
+        let slices = bundle[range.clone()]
+            .iter()
+            .map(|item| AvatarBundleSlice {
+                original_channel: item.original_channel,
+                payload: &item.payload,
+                interval_patch: Some((item.interval_offset, item.interval_byte)),
+            })
+            .collect::<Vec<_>>();
+        try_encode_avatar_bundle_slices_with_compression(&slices, compression)
+    };
     let (encoded, deflate_micros);
     let uncached;
     if let Some(cell) = &cell {
@@ -3472,6 +3501,54 @@ fn advertised_interval_byte(
 mod tests {
     use super::*;
     use basis_protocol::avatar::{decode_avatar_bundle, encode_avatar_bundle, AvatarBundleItem};
+
+    #[test]
+    fn receiver_flush_visits_every_receiver_once_with_bounded_concurrency() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        for lanes in [0, 1, 2, 4, 6, 8] {
+            for count in [0, 1, 3, 17, 65] {
+                let receivers = (0..count).collect::<Vec<_>>();
+                let visits = (0..count).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
+                let active = AtomicUsize::new(0);
+                let peak = AtomicUsize::new(0);
+                pool.install(|| {
+                    try_for_each_receiver_flush(&receivers, lanes, |receiver| {
+                        let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(concurrent, Ordering::SeqCst);
+                        visits[*receiver].fetch_add(1, Ordering::SeqCst);
+                        thread::yield_now();
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                })
+                .unwrap();
+                assert!(visits
+                    .iter()
+                    .all(|visits| visits.load(Ordering::SeqCst) == 1));
+                assert_eq!(active.load(Ordering::SeqCst), 0);
+                if lanes > 0 {
+                    assert!(peak.load(Ordering::SeqCst) <= lanes);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn receiver_flush_propagates_transport_failure() {
+        for lanes in [0, 1, 2, 4, 6, 8] {
+            let error = try_for_each_receiver_flush(&[1, 2, 3], lanes, |receiver| {
+                if *receiver == 2 {
+                    anyhow::bail!("send failed");
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(error.to_string(), "send failed");
+        }
+    }
 
     #[test]
     fn profile_window_capture_preserves_counters_and_gating() {

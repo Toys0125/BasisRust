@@ -96,6 +96,12 @@ def stop_process(process):
             process.wait(timeout=5)
 
 
+def interrupt_workload(signum, frame):
+    # Let the run's finally block stop its owned server/client processes when
+    # a crossover driver cancels this process group.
+    raise KeyboardInterrupt
+
+
 def health(port):
     with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
         return json.loads(response.read())
@@ -219,6 +225,7 @@ def main():
     client_log = None
     server = client = None
     started = time.time()
+    signal.signal(signal.SIGBREAK, interrupt_workload)
     try:
         server_env = dict(os.environ)
         server_env.update({
@@ -416,6 +423,7 @@ def main():
                                                  "BASIS_UDP_RECEIVE_WORKERS", "BASIS_CLIENT_TOKIO_WORKERS",
                                                  "BASIS_AVATAR_MIN_RECEIVER_SLICES", "BASIS_AVATAR_MAX_RECEIVER_SLICES",
                                                  "BASIS_AVATAR_TICK_BUDGET_MS", "BASIS_AVATAR_RECEIVER_CYCLE_BUDGET_MS",
+                                                 "BASIS_AVATAR_FLUSH_LANES",
                                                  "EnableBSRProfiling", "HealthIncludeBSRProfiling", "EnableComputeOffload",
                                                  "BASIS_AVATAR_DIAGNOSTICS")},
             "server_exit_code": server.returncode, "client_exit_code": client.returncode,
