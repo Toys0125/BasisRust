@@ -162,3 +162,15 @@ Report CPU together with update gaps, throughput, coverage and errors; a
 speedup obtained by dropping work is not an improvement. State the number of
 repeats and host/workload limits. Current fixture-based runs do not reproduce
 unavailable historical captures; see [artifact availability](../artifact-availability.md).
+
+## Hardware settings tuning
+
+For a frozen-binary flush-lane sweep with native CPU/RSS sampling, delivery
+validation and a readable recommendation/inconclusive report on Linux or
+Windows, see [hardware tuning](../hardware-tuning.md). This settings path is
+separate from binary revision comparisons and retains every failed/outlier run.
+
+The [2026-10-04 tuning CLI smoke](../hardware-tuning-validation-20261004.md)
+retains four Linux quick runs and reports an inconclusive result; its
+[JSON](hardware-tuning-smoke-20261004.json) includes all measured runs and gates.
+This is tool validation, not a new universal performance recommendation.
