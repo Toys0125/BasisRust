@@ -5,6 +5,12 @@ and give avatar delivery a 6 ms work budget with at most eight default Rayon
 workers in the server console. The 750-client comparison measured lower
 applied-update gaps than C#, with higher CPU use and more delivered updates.
 
+The [October 4 follow-up](windows-bounded-flush-20261004.md) bounds Windows
+avatar flush to four jobs on the existing pool. Matched 750/1,000-client
+loopback repeats measured lower applied gaps with more delivered items and
+lower combined process CPU, at the cost of more UDP traffic. The original
+pre-merge cadence difference remains unisolated.
+
 ## Retained changes
 
 - **Allocator:** At 1,000 clients, Windows mimalloc reduced sampled peak working
@@ -19,6 +25,11 @@ applied-update gaps than C#, with higher CPU use and more delivered updates.
   nominal tick interval remains 4 ms. Console Rayon workers default to
   `min(available_parallelism, 8)`. Budget/worker overrides remain available,
   including `RAYON_NUM_THREADS=0`. Linux retains its 3 ms budget and automatic pool.
+- **Flush:** Windows avatar emission defaults to at most four concurrent jobs,
+  independently of build parallelism. `BASIS_AVATAR_FLUSH_LANES=0` restores the
+  previous scheduling; positive values cap flush jobs (maximum 8). Other
+  platforms retain the previous scheduling by default. See the October 4
+  report for the rejected two-job variant, delivery gates and workload limits.
 - **Atomics:** `try_update` replaces deprecated `fetch_update` without changing
   admission checks, memory ordering, or rollback. The server requires Rust 1.95
   or later; the latest Windows build used Rust 1.99.
