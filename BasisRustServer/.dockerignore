@@ -8,6 +8,7 @@ target/
 # production, so keeping them out of the image also makes CI and local builds
 # byte-for-byte identical.
 config/
+Config.xml
 logs/
 captures/
 
@@ -19,3 +20,4 @@ captures/
 docker-compose-headless.local-capture.yml
 Dockerfile.*
 *.md
+*.rs.bk

@@ -26,7 +26,7 @@
 # ~13k FUNC symbols, and with no separate debuginfo they cannot be recovered, which would
 # break perf symbolisation and backtraces.
 
-ARG RUST_IMAGE=rust:1-alpine
+ARG RUST_IMAGE=rust:1.95.0-alpine@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2
 ARG RUNTIME_IMAGE=alpine:3.20
 
 FROM ${RUST_IMAGE} AS build
@@ -51,7 +51,7 @@ RUN set -eux; \
         cp "/src/${ARTIFACT_DIR}/basis-server-console" /out/basis-server-console; \
     else \
         echo "No prebuilt binary at '${ARTIFACT_DIR}'; compiling from source"; \
-        cargo build --release -p basis-server-console; \
+        CARGO_BUILD_JOBS=2 cargo build --locked --release -p basis-server-console; \
         cp "/src/target/release/basis-server-console" /out/basis-server-console; \
     fi; \
     chmod 0755 /out/basis-server-console; \
@@ -155,3 +155,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS "http://${HealthCheckHost}:${HealthCheckPort}${HealthPath}" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
+# The console handles SIGINT, including persistence and its bounded watchdog.
+# Docker's default SIGTERM would bypass that graceful shutdown path.
+STOPSIGNAL SIGINT
