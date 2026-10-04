@@ -120,7 +120,8 @@ host/network access. UDP port 4296 is published. See [security guidance](../SECU
 When upgrading an older root-running Compose deployment, stop it and back up
 `config/` and `logs/` before starting the new server. Export `BASIS_UID` and
 `BASIS_GID` for the non-root account that should own the deployment files, as
-above. Populated root-owned mounts require this explicit, one-time migration:
+above. If existing mounts or files are not writable by that account, use this
+explicit, one-time migration:
 
 ```sh
 BASIS_MIGRATE_ROOT_OWNERSHIP=true docker compose -f docker-compose-server.yml up --build -d
@@ -129,8 +130,9 @@ BASIS_MIGRATE_ROOT_OWNERSHIP=true docker compose -f docker-compose-server.yml up
 This opt-in transfers only root-owned entries in the five persistent mounts to
 the configured account. It preserves other owners and file modes, does not follow
 symlinks, and does not traverse nested filesystems. Subsequent starts should omit
-the migration flag. Without it, setup refuses a populated root-owned mount with
-an upgrade error instead of starting a server that cannot save its state.
+the migration flag. Writable root-owned mounts (including group/ACL access) can
+run without migration. Setup leaves populated mounts unchanged and lets the
+server's actual file access determine whether permission changes are needed.
 
 ## Test
 

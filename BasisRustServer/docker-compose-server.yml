@@ -21,13 +21,20 @@ services:
         for dir in /initialresources /defaultlibrary /crashreports /config /logs; do
           if [ "$${BASIS_MIGRATE_ROOT_OWNERSHIP}" = true ]; then
             # Explicit upgrade only: leave non-root owners and symlink targets intact.
-            find "$$dir" -xdev -user 0 -exec chown -h "$${BASIS_UID}:$${BASIS_GID}" {} +
+            # Kernel mount records also identify bind mounts on the same filesystem.
+            test -r /proc/self/mountinfo
+            set -- "$$dir" -xdev
+            while read -r id parent device root point rest; do
+              point="$$(printf '%bX' "$$point")"
+              point="$${point%X}"
+              case "$$point" in
+                "$$dir"/*) set -- "$$@" -exec test '{}' = "$$point" ';' -prune -o ;;
+              esac
+            done < /proc/self/mountinfo
+            find "$$@" -user 0 -exec chown -h "$${BASIS_UID}:$${BASIS_GID}" '{}' +
           elif [ "$$(stat -c %u "$$dir")" = 0 ]; then
             if [ -z "$$(find "$$dir" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
               chown "$${BASIS_UID}:$${BASIS_GID}" "$$dir"
-            else
-              echo "Populated root-owned mount $$dir requires explicit upgrade migration; see README.md and BASIS_MIGRATE_ROOT_OWNERSHIP" >&2
-              exit 1
             fi
           fi
         done
