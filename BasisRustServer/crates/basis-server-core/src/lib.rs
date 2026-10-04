@@ -62,7 +62,8 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use subtle::ConstantTimeEq;
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info, warn};
 
 pub use avatar_sync::{AvatarSyncConfig, AvatarSyncSystem};
@@ -79,17 +80,65 @@ struct PendingIdentity {
     challenge: Vec<u8>,
     expires_at: Instant,
     _timeout_cancel: oneshot::Sender<()>,
+    _admission_slot: AdmissionSlot,
 }
 
-fn identity_challenge_ttl(state: &ServerState, configured_ms: i32) -> Duration {
-    let configured_ms = configured_ms.max(0) as u64;
-    let population_extra_ms = (state.transport.peer_snapshots().len() as u64)
+const MAX_PENDING_ADMISSIONS: usize = 4096;
+
+// Reserve half the pending capacity for other source IPs, while retaining the
+// established 2000-client same-host load-test batch.
+const MAX_PENDING_PER_IP: usize = MAX_PENDING_ADMISSIONS / 2;
+
+struct AdmissionSlot {
+    _permit: OwnedSemaphorePermit,
+    ip: IpAddr,
+    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+impl Drop for AdmissionSlot {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock();
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
+
+fn reserve_admission(state: &ServerState, ip: IpAddr) -> Option<AdmissionSlot> {
+    let permit = state.admission_slots.clone().try_acquire_owned().ok()?;
+    let ip = match ip {
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ip)),
+        ip => ip,
+    };
+    let mut counts = state.admissions_per_ip.lock();
+    let count = counts.entry(ip).or_default();
+    if *count >= MAX_PENDING_PER_IP {
+        return None;
+    }
+    *count += 1;
+    Some(AdmissionSlot {
+        _permit: permit,
+        ip,
+        counts: state.admissions_per_ip.clone(),
+    })
+}
+
+fn identity_challenge_ttl(authenticated_population: usize, configured_ms: i32) -> Duration {
+    // Keep the legitimate batch allowance, but unverified transports must not extend it.
+    // A hard ceiling bounds how long a slot and its timeout task can be held.
+    let population_extra_ms = (authenticated_population as u64)
         .saturating_mul(12)
         .min(45_000);
     Duration::from_millis(
-        configured_ms
+        (configured_ms.max(0) as u64)
             .saturating_add(population_extra_ms)
-            .min(i32::MAX as u64),
+            .min(60_000),
     )
 }
 
@@ -366,6 +415,9 @@ pub struct ServerState {
     pub authenticated_peers: Arc<DashMap<PeerId, ConnectedPeer>>,
     join_broadcast: Arc<Mutex<JoinBroadcastState>>,
     pending_identity: Arc<DashMap<PeerId, PendingIdentity>>,
+    admission_slots: Arc<Semaphore>,
+    admission_commit: Arc<Mutex<()>>,
+    admissions_per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
     pub permissions: PermissionManager,
     pub database: PersistentDatabase,
     pub resources: ResourceState,
@@ -509,6 +561,9 @@ impl ServerState {
             authenticated_peers: Arc::new(DashMap::new()),
             join_broadcast: Arc::new(Mutex::new(JoinBroadcastState::default())),
             pending_identity: Arc::new(DashMap::new()),
+            admission_slots: Arc::new(Semaphore::new(MAX_PENDING_ADMISSIONS)),
+            admission_commit: Arc::new(Mutex::new(())),
+            admissions_per_ip: Arc::new(Mutex::new(HashMap::new())),
             permissions,
             database,
             resources: ResourceState::default(),
@@ -1018,12 +1073,15 @@ async fn event_loop(
                     }
                     continue;
                 }
+                // Acquire before spawning, so a flood cannot create unbounded waiting tasks.
+                let permit = tokio::select! {
+                    _ = &mut shutdown => break,
+                    permit = workers.clone().acquire_owned() => permit,
+                };
+                let Ok(permit) = permit else { break; };
                 let state = state.clone();
-                let workers = workers.clone();
                 handlers.spawn(async move {
-                    let Ok(_permit) = workers.acquire_owned().await else {
-                        return;
-                    };
+                    let _permit = permit;
                     if let Err(err) = handle_event(&state, event).await {
                         error!("server event failed: {err:#}");
                     }
@@ -1154,6 +1212,9 @@ async fn handle_connection_request(
     payload: Bytes,
     request: basis_transport::ConnectionRequest,
 ) -> Result<()> {
+    if !state.transport.is_pending_request(&request) {
+        return Ok(());
+    }
     let config = state.config.read().clone();
     if state.moderation.is_ip_banned(&remote_addr.ip().to_string()) {
         state.transport.reject(&request, "Banned IP").await?;
@@ -1289,10 +1350,40 @@ async fn handle_connection_request(
         return Ok(());
     }
 
-    let peer_id = state.transport.accept(&request).await?;
+    let Some(admission_slot) = reserve_admission(state, remote_addr.ip()) else {
+        reject_structured(
+            state,
+            &request,
+            channels::REJECT_KIND_SERVER_FULL,
+            0,
+            0,
+            "Server admission capacity reached. Please try again later.",
+        )
+        .await?;
+        return Ok(());
+    };
+    let peer_id = match state.transport.accept(&request).await {
+        Ok(peer) => peer,
+        Err(basis_transport::TransportError::PeerIdExhausted) => {
+            reject_structured(
+                state,
+                &request,
+                channels::REJECT_KIND_SERVER_FULL,
+                0,
+                0,
+                "Server connection capacity reached. Please try again later.",
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(basis_transport::TransportError::StaleAdmission) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
     if config.use_auth_identity {
-        let challenge_ttl =
-            identity_challenge_ttl(state, config.auth_validation_time_out_miliseconds);
+        let challenge_ttl = identity_challenge_ttl(
+            state.player_count(),
+            config.auth_validation_time_out_miliseconds,
+        );
         let mut challenge = vec![0; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut challenge);
         let expires_at = Instant::now() + challenge_ttl;
@@ -1304,11 +1395,12 @@ async fn handle_connection_request(
                 challenge: challenge.clone(),
                 expires_at,
                 _timeout_cancel: timeout_cancel,
+                _admission_slot: admission_slot,
             },
         );
         let timeout_challenge = challenge.clone();
         let pending_identity = state.pending_identity.clone();
-        let transport = state.transport.clone();
+        let timeout_state = state.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(challenge_ttl) => {
@@ -1319,9 +1411,7 @@ async fn handle_connection_request(
                         })
                         .is_some()
                     {
-                        let _ = transport
-                            .disconnect(peer_id, "Authentication timeout")
-                            .await;
+                        disconnect_admission(&timeout_state, peer_id, "Authentication timeout").await;
                     }
                 }
                 _ = &mut timeout_cancelled => {}
@@ -1354,7 +1444,12 @@ fn password_matches(server_password: &str, auth_bytes: &[u8]) -> bool {
     if auth_bytes.is_empty() {
         return false;
     }
-    auth_bytes == server_password.as_bytes()
+    bool::from(auth_bytes.ct_eq(server_password.as_bytes()))
+}
+
+async fn disconnect_admission(state: &ServerState, peer: PeerId, reason: &str) {
+    let _ = state.transport.disconnect(peer, reason).await;
+    handle_disconnect(state, peer, DisconnectReason::Remote).await;
 }
 
 async fn finalize_accept(
@@ -1368,14 +1463,16 @@ async fn finalize_accept(
     if config.basis_user_restriction_mode == BasisUserRestrictionMode::RejoinOnly
         && !identity_verified
     {
-        state
-            .transport
-            .disconnect(peer_id, "Rejoin-only mode requires authenticated identity.")
-            .await?;
+        disconnect_admission(
+            state,
+            peer_id,
+            "Rejoin-only mode requires authenticated identity.",
+        )
+        .await;
         return Ok(());
     }
     if let Some(reason) = admission_rejection(state, &ready) {
-        state.transport.disconnect(peer_id, reason).await?;
+        disconnect_admission(state, peer_id, reason).await;
         return Ok(());
     }
     let metadata = ready.player_meta_data_message.clone();
@@ -1384,12 +1481,29 @@ async fn finalize_accept(
         metadata: metadata.clone(),
         ready: ready.clone(),
     };
-    let existing_players = state
-        .join_broadcast
-        .lock()
-        .register_peer(connected.clone(), serialize_server_ready(peer_id, &ready)?);
-    state.avatar_sync.register_player(peer_id);
-    state.authenticated_peers.insert(peer_id, connected);
+    let existing_players = {
+        let _commit = state.admission_commit.lock();
+        if config.peer_limit > 0 && state.player_count() >= config.peer_limit as usize {
+            None
+        } else {
+            let existing = state
+                .join_broadcast
+                .lock()
+                .register_peer(connected.clone(), serialize_server_ready(peer_id, &ready)?);
+            state.avatar_sync.register_player(peer_id);
+            state.authenticated_peers.insert(peer_id, connected);
+            Some(existing)
+        }
+    };
+    let Some(existing_players) = existing_players else {
+        disconnect_admission(
+            state,
+            peer_id,
+            "This server is full. Please try again later.",
+        )
+        .await;
+        return Ok(());
+    };
     info!("peer connected: {peer_id}");
 
     let server_meta = ServerMetaDataMessage {
@@ -1872,6 +1986,9 @@ async fn handle_message(
         .statistics
         .inbound_packets
         .fetch_add(1, Ordering::Relaxed);
+    if channel != channels::AUTH_IDENTITY && !state.authenticated_peers.contains_key(&peer) {
+        return Ok(());
+    }
     if (channels::PLAYER_AVATAR_QUALITY_CHANNELS.contains(&channel)
         || channel == channels::DELTA_AVATAR)
         && !state.avatar_sync.is_player_registered(peer)
@@ -1882,10 +1999,7 @@ async fn handle_message(
         channels::AUTH_IDENTITY => {
             if let Some((_, pending)) = state.pending_identity.remove(&peer) {
                 if pending.expires_at <= Instant::now() {
-                    state
-                        .transport
-                        .disconnect(peer, "Authentication timeout")
-                        .await?;
+                    disconnect_admission(state, peer, "Authentication timeout").await;
                     return Ok(());
                 }
                 let identity_check = (|| -> Result<()> {
@@ -1901,10 +2015,12 @@ async fn handle_message(
                     response.verify(&pending.challenge, &verifying_key)
                 })();
                 if let Err(error) = identity_check {
-                    state
-                        .transport
-                        .disconnect(peer, &format!("Identity verification failed: {error}"))
-                        .await?;
+                    disconnect_admission(
+                        state,
+                        peer,
+                        &format!("Identity verification failed: {error}"),
+                    )
+                    .await;
                     return Ok(());
                 }
                 finalize_accept(state, peer, pending.ready, true).await?;
@@ -4880,6 +4996,33 @@ mod tests {
         assert!(server.workers.lock().is_empty());
         assert!(server.tick_thread.lock().is_none());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn password_comparison_preserves_open_empty_utf8_and_mismatch_semantics() {
+        assert!(password_matches("", b""));
+        assert!(password_matches("", b"arbitrary"));
+        assert!(!password_matches("default_password", b""));
+        assert!(password_matches("default_password", b"default_password"));
+        for index in 0..16 {
+            let mut wrong = b"default_password".to_vec();
+            wrong[index] ^= 1;
+            assert!(!password_matches("default_password", &wrong));
+        }
+        assert!(!password_matches("default_password", b"default_password\0"));
+        assert!(password_matches("páss🔑", "páss🔑".as_bytes()));
+        assert!(!password_matches("páss🔑", b"pass"));
+    }
+
+    #[test]
+    fn identity_ttl_has_a_hard_bound_and_keeps_legitimate_batch_allowance() {
+        assert_eq!(identity_challenge_ttl(0, -1), Duration::ZERO);
+        assert_eq!(identity_challenge_ttl(0, 5000), Duration::from_secs(5));
+        assert_eq!(identity_challenge_ttl(2000, 5000), Duration::from_secs(29));
+        assert_eq!(
+            identity_challenge_ttl(usize::MAX, i32::MAX),
+            Duration::from_secs(60)
+        );
     }
 
     #[test]
