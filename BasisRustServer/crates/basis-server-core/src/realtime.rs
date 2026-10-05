@@ -4,9 +4,11 @@ use basis_transport::PeerSession;
 use std::{collections::VecDeque, thread};
 
 const VOICE_BATCH_INTERVAL: Duration = Duration::from_millis(10);
-const VOICE_MAX_AGE: Duration = Duration::from_millis(60);
+// Allow a short scheduling burst across both bounded stages, without retaining
+// seconds of audio or discarding frames still useful to a voice jitter buffer.
+const VOICE_MAX_AGE: Duration = Duration::from_millis(100);
 const VOICE_FRAMES_PER_SENDER: usize = 3;
-const VOICE_BATCHES_PER_LANE: usize = 3;
+const VOICE_BATCHES_PER_LANE: usize = 5;
 const MAX_VOICE_PAYLOAD: usize = 4096;
 
 struct Input {
@@ -285,19 +287,11 @@ fn voice_loop(state: &ServerState, inbox: &VoiceInbox, lanes: &[Arc<SendLane>]) 
         let _ = writeln!(file, "unix_seconds,received,replaced,expired,handed_off,pending_frames,lane_replacements,sent_datagrams,expired_deliveries");
     }
     let mut report = Instant::now();
-    let mut last_voice = None;
     while !state.shutdown.load(Ordering::Relaxed) {
         state.avatar_sync.poll_memory_reclaim();
         let started = Instant::now();
         let mut groups = Vec::new();
         let inputs = inbox.drain(started);
-        if !inputs.is_empty() {
-            last_voice = Some(started);
-        }
-        state.avatar_sync.set_voice_active(
-            last_voice
-                .is_some_and(|last| started.duration_since(last) < Duration::from_millis(250)),
-        );
         // Capture recipient incarnations once per batch, rather than cloning a connection
         // for every sender/recipient pair. Send lanes validate them again at dispatch.
         let sessions = if inputs.is_empty() {
@@ -669,12 +663,15 @@ mod tests {
     }
 
     #[test]
-    fn send_lane_keeps_at_most_three_pending_batches() {
+    fn send_lane_keeps_a_fixed_number_of_pending_batches() {
         let lane = SendLane::default();
         for _ in 0..1000 {
             lane.push(Arc::new(VoiceBatch::default()));
         }
-        assert_eq!(lane.replaced.load(Ordering::Relaxed), 997);
+        assert_eq!(
+            lane.replaced.load(Ordering::Relaxed),
+            1000 - VOICE_BATCHES_PER_LANE as u64
+        );
         assert_eq!(lane.pending.lock().len(), VOICE_BATCHES_PER_LANE);
     }
 }
