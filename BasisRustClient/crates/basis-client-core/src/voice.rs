@@ -700,6 +700,7 @@ pub(crate) async fn voice_playback_task(
             }
 
             if packet.data.len() > MAX_VOICE_PACKET_BYTES {
+                if let Some(diagnostics) = &client.voice_diagnostics { diagnostics.skipped(); }
                 packets_skipped += 1;
                 warn!(
                     "skipping oversized voice packet for client {} from {}: {} bytes",
@@ -708,6 +709,7 @@ pub(crate) async fn voice_playback_task(
                     packet.data.len()
                 );
             } else if packet.duration_ms > MAX_UNITY_VOICE_FRAME_DURATION_MS {
+                if let Some(diagnostics) = &client.voice_diagnostics { diagnostics.skipped(); }
                 packets_skipped += 1;
                 warn!(
                     "skipping voice packet for client {} from {}: {}ms exceeds Unity voice max {}ms",
@@ -719,7 +721,11 @@ pub(crate) async fn voice_playback_task(
             } else {
                 let sequence = client.voice_sequence.fetch_add(1, Ordering::SeqCst);
                 let payload = serialize_audio_segment(sequence, &packet.data);
-                client.send_unreliable(channels::VOICE, &payload).await?;
+                let result = client.send_unreliable(channels::VOICE, &payload).await;
+                if let Some(diagnostics) = &client.voice_diagnostics {
+                    diagnostics.sent(packet.data.len(), result.is_ok());
+                }
+                result?;
                 packets_sent += 1;
                 if !logged_first_send {
                     logged_first_send = true;

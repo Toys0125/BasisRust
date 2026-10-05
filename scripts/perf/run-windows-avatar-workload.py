@@ -156,9 +156,26 @@ def main():
     parser.add_argument("--remote-root", help="isolated matching-revision worktree on the remote host")
     parser.add_argument("--remote-output", help="new remote artifact directory")
     parser.add_argument("--server-ip", default="127.0.0.1")
+    parser.add_argument("--voice-audio-folder", type=pathlib.Path, help="enable measured voice traffic from this Ogg Opus folder (local clients only)")
+    parser.add_argument("--voice-speaker-percent", type=int, default=10)
+    parser.add_argument("--no-voice-reencode", action="store_true", help="use pre-encoded Unity-compatible 20 ms Opus packets")
+    parser.add_argument("--max-server-working-set-mib", type=int, help="stop measurement at this server working set; voice default=24576 MiB, otherwise unlimited; 0 disables")
+    parser.add_argument("--post-client-seconds", type=int, default=0, help="observe server memory/health after clients exit before stopping the server")
     args = parser.parse_args()
+    if args.max_server_working_set_mib is None:
+        args.max_server_working_set_mib = 24576 if args.voice_audio_folder else 0
+    if args.max_server_working_set_mib < 0:
+        parser.error("server working set limit must be >=0")
+    if args.post_client_seconds < 0:
+        parser.error("post-client seconds must be >=0")
     if args.server_kind == "csharp" and args.remote_ssh:
         parser.error("C# comparison currently supports local clients only")
+    if args.voice_audio_folder and args.remote_ssh:
+        parser.error("voice measurements currently support local Windows clients only")
+    if not 1 <= args.voice_speaker_percent <= 100:
+        parser.error("voice speaker percent must be between 1 and 100")
+    if args.voice_audio_folder and not args.voice_audio_folder.is_dir():
+        parser.error(f"voice audio folder missing: {args.voice_audio_folder}")
     if args.remote_ssh and not (args.remote_root and args.remote_output and args.server_ip != "127.0.0.1"):
         parser.error("remote mode requires --remote-root, --remote-output, and the server LAN IP")
     rtk = shutil.which("rtk")
@@ -266,6 +283,9 @@ def main():
         time.sleep(2)
         client_env = dict(os.environ)
         client_env.update({"BASIS_CLIENT_TOKIO_WORKERS": str(args.workers), "BASIS_AVATAR_DIAGNOSTICS": "true"})
+        client_env.pop("BASIS_VOICE_DIAGNOSTIC_CSV", None)
+        if args.voice_audio_folder:
+            client_env["BASIS_VOICE_DIAGNOSTIC_CSV"] = str(output / "voice.csv")
         remote_root = pathlib.PurePosixPath(args.remote_root) if args.remote_ssh else None
         remote_output = pathlib.PurePosixPath(args.remote_output) if args.remote_ssh else None
         client_executable = str(remote_root / "client-target/release/basis-rust-client") if args.remote_ssh else str(client_bin)
@@ -281,6 +301,12 @@ def main():
                       "--observe-avatar-csv", observer_csv, "--avatar-observe-radius", "40",
                       "--avatar-observe-expected-peers", str(args.clients - 1),
                       "--observe-avatar-start-file", client_marker, "--observe-avatar-window-secs", str(args.window_seconds)]
+        if args.voice_audio_folder:
+            client_cmd.extend(["--voice", "--voice-audio-folder", str(args.voice_audio_folder.resolve()),
+                               "--voice-speaker-percent", str(args.voice_speaker_percent),
+                               "--voice-jitter-percent", "0", "--voice-frame-duration-ms", "20"])
+            if args.no_voice_reencode:
+                client_cmd.append("--no-voice-reencode")
         if args.remote_ssh:
             remote_helper = str(remote_root / "remote-avatar-client.py")
             subprocess.run([rtk, "proxy", "scp", str(ROOT / "scripts/perf/remote-avatar-client.py"),
@@ -316,7 +342,26 @@ def main():
             raise RuntimeError(f"{args.clients} clients did not become ready; peers={active_peers}, active_states={active_count}, client_joins={joined_count}")
 
         (output / "ready-health.json").write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
-        time.sleep(args.warmup_seconds)
+        warmup_started = time.monotonic()
+        warmup_ended_early_reason = None
+        with (output / "warmup-metrics.csv").open("w", newline="", encoding="utf-8") as stream:
+            warmup_writer = csv.DictWriter(stream, fieldnames=["elapsed_seconds", "server_working_set_bytes", "server_commit_charge_bytes", "server_cpu_seconds"])
+            warmup_writer.writeheader()
+            while time.monotonic() - warmup_started < args.warmup_seconds:
+                sm = process_metrics(server.pid)
+                if sm is None or server.poll() is not None or client.poll() is not None:
+                    raise RuntimeError("server/client exited during warmup")
+                warmup_writer.writerow({"elapsed_seconds": time.monotonic() - warmup_started,
+                                        "server_working_set_bytes": sm["working_set_bytes"],
+                                        "server_commit_charge_bytes": sm["commit_charge_bytes"],
+                                        "server_cpu_seconds": sm["cpu_seconds"]})
+                stream.flush()
+                if args.max_server_working_set_mib and sm["working_set_bytes"] >= args.max_server_working_set_mib * 2**19:
+                    warmup_ended_early_reason = "server working set reached half the memory limit; starting measurement early"
+                    print(warmup_ended_early_reason, flush=True)
+                    break
+                time.sleep(min(1, max(0, args.warmup_seconds - (time.monotonic() - warmup_started))))
+        actual_warmup_seconds = time.monotonic() - warmup_started
         if args.remote_ssh:
             subprocess.run(ssh(["touch", client_marker]), check=True)
         marker.write_text(f"{time.time():.6f}\n", encoding="utf-8")
@@ -336,6 +381,7 @@ def main():
             readiness.writeheader()
             previous, previous_time = {}, time.monotonic()
             end = previous_time + args.window_seconds
+            measurement_stop_reason = None
             try:
                 while time.monotonic() < end:
                     now = time.monotonic()
@@ -367,12 +413,17 @@ def main():
                         raise RuntimeError(f"readiness dropped during measurement: peers={active_peers}, active_states={active_count}")
                     if client.poll() is not None or server.poll() is not None:
                         raise RuntimeError(f"process exited during measurement: client={client.poll()} server={server.poll()}")
+                    if args.max_server_working_set_mib and sm and sm["working_set_bytes"] >= args.max_server_working_set_mib * 2**20:
+                        measurement_stop_reason = f"server working set reached {sm['working_set_bytes'] / 2**20:.1f} MiB (limit {args.max_server_working_set_mib} MiB)"
+                        print(f"Measurement stopped: {measurement_stop_reason}", flush=True)
+                        break
                     previous_time = now
                     time.sleep(min(2, max(0, end - time.monotonic())))
             finally:
                 readiness_file.close()
 
-        time.sleep(2)
+        if not measurement_stop_reason:
+            time.sleep(2)
         if client.poll() is None and client.stdin:
             try:
                 client.stdin.write(b"quit 100 0\n")
@@ -382,6 +433,23 @@ def main():
                 stop_process(client)
         else:
             stop_process(client)
+        if args.post_client_seconds:
+            post_started = time.monotonic()
+            with (output / "post-client-metrics.csv").open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=["unix_seconds", "elapsed_seconds", "players_online", "server_working_set_bytes", "server_commit_charge_bytes", "server_cpu_seconds"])
+                writer.writeheader()
+                while time.monotonic() - post_started < args.post_client_seconds:
+                    metrics = process_metrics(server.pid)
+                    if metrics is None or server.poll() is not None:
+                        raise RuntimeError("server exited during post-client observation")
+                    status = health(args.health_port)
+                    writer.writerow({"unix_seconds": time.time(), "elapsed_seconds": time.monotonic() - post_started,
+                                     "players_online": status.get("players_online"),
+                                     "server_working_set_bytes": metrics["working_set_bytes"],
+                                     "server_commit_charge_bytes": metrics["commit_charge_bytes"],
+                                     "server_cpu_seconds": metrics["cpu_seconds"]})
+                    stream.flush()
+                    time.sleep(min(1, max(0, args.post_client_seconds - (time.monotonic() - post_started))))
         stop_process(server)
         shutil.copytree(base_dir / "config", output / "effective-server-config")
         remote_metadata = None
@@ -405,12 +473,22 @@ def main():
             "server_avatar_diagnostics": args.server_kind == "rust" and not args.no_server_avatar_diagnostics,
             "readiness_basis": "transport visitors plus client join logs; final observer validates avatar coverage" if args.server_kind == "csharp" else "authenticated players and active avatar states",
             "warmup_seconds": args.warmup_seconds, "measurement_window_seconds": args.window_seconds,
+            "actual_warmup_seconds": actual_warmup_seconds,
+            "warmup_ended_early_reason": warmup_ended_early_reason,
+            "measurement_complete": measurement_stop_reason is None,
+            "measurement_stop_reason": measurement_stop_reason,
+            "max_server_working_set_mib": args.max_server_working_set_mib,
+            "post_client_observation_seconds": args.post_client_seconds,
             "server_port": args.port, "health_port": args.health_port,
             "server_ip": args.server_ip,
             "movement_interval_ms": 20, "jitter_percent": 0, "unity_frame_accumulator_fps": 60,
             "layout": "remote Linux client, zero positional drift" if args.remote_ssh else "colocated, zero positional drift",
             "pose": "valid synthetic deterministic root/body rotation channels; not captured Unity pose",
-            "voice": False, "p2p": False, "server_profiling": False,
+            "voice": bool(args.voice_audio_folder), "p2p": False, "server_profiling": False,
+            "voice_audio_folder": str(args.voice_audio_folder.resolve()) if args.voice_audio_folder else None,
+            "voice_speaker_percent": args.voice_speaker_percent if args.voice_audio_folder else 0,
+            "voice_frame_duration_ms": 20 if args.voice_audio_folder else None,
+            "voice_reencode": not args.no_voice_reencode if args.voice_audio_folder else None,
             "expected_observer_peers": args.clients - 1,
             "server_binary_sha256": sha256(server_bin), "client_binary_sha256": remote_metadata["client_binary_sha256"] if remote_metadata else sha256(client_bin),
             "server_config_fixture_sha256": sha256(args.server_config),
