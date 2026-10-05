@@ -7,8 +7,11 @@ const VOICE_BATCH_INTERVAL: Duration = Duration::from_millis(10);
 // Allow a short scheduling burst across both bounded stages, without retaining
 // seconds of audio or discarding frames still useful to a voice jitter buffer.
 const VOICE_MAX_AGE: Duration = Duration::from_millis(100);
-const VOICE_FRAMES_PER_SENDER: usize = 3;
-const VOICE_BATCHES_PER_LANE: usize = 5;
+// Capacity covers the same 100 ms freshness window: five 20 ms source frames,
+// and ten 10 ms batches. Scheduling bursts should expire by age, not earlier
+// merely because a still-useful frame cannot fit in the next stage.
+const VOICE_FRAMES_PER_SENDER: usize = 5;
+const VOICE_BATCHES_PER_LANE: usize = 10;
 const MAX_VOICE_PAYLOAD: usize = 4096;
 const VOICE_SEND_QUANTUM: usize = 32;
 
@@ -665,9 +668,9 @@ mod tests {
                 .iter()
                 .map(|i| i.payload[0])
                 .collect::<Vec<_>>(),
-            [253, 254, 255]
+            [251, 252, 253, 254, 255]
         );
-        assert_eq!(inbox.replaced.load(Ordering::Relaxed), 253);
+        assert_eq!(inbox.replaced.load(Ordering::Relaxed), 251);
         assert!(inbox.pending.lock().is_empty());
     }
 
