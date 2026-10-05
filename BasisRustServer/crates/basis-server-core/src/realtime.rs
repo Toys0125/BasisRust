@@ -104,36 +104,6 @@ struct VoiceBatch {
     sessions: HashMap<PeerId, PeerSession>,
 }
 
-struct VoicePacket {
-    channel: u8,
-    payload: Bytes,
-    received: Instant,
-}
-
-impl basis_transport::UnreliablePacket for VoicePacket {
-    fn channel(&self) -> u8 {
-        self.channel
-    }
-    fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-    fn interval_patch(&self) -> Option<(usize, u8)> {
-        None
-    }
-}
-
-impl basis_transport::UnreliablePacket for &VoicePacket {
-    fn channel(&self) -> u8 {
-        self.channel
-    }
-    fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-    fn interval_patch(&self) -> Option<(usize, u8)> {
-        None
-    }
-}
-
 #[derive(Default)]
 struct SendLane {
     pending: Mutex<VecDeque<Arc<VoiceBatch>>>,
@@ -455,7 +425,7 @@ fn send_loop(state: &ServerState, transport: &TransportHandle, lane: &SendLane, 
     let _priority = set_voice_thread_priority();
     // Reuse recipient buffers. One lane exclusively owns every recipient's voice order.
     let mut packets = (0..=u16::MAX)
-        .map(|_| Vec::<VoicePacket>::new())
+        .map(|_| Vec::<usize>::new())
         .collect::<Vec<_>>();
     let mut sessions = HashMap::<PeerId, PeerSession>::new();
     let mut offsets = vec![0usize; u16::MAX as usize + 1];
@@ -481,6 +451,10 @@ fn send_loop(state: &ServerState, transport: &TransportHandle, lane: &SendLane, 
             continue;
         }
         buffers_used = true;
+        // The immutable batch owns each encoded payload for the entire flush.
+        // Recipient lists keep indices, avoiding millions of shared refcount
+        // updates and retaining one encoded copy of each source frame.
+        let mut frame_refs = Vec::new();
         // Fold scheduling bursts into one MTU-packed flush instead of discarding the
         // previous batch. Both queued batches and audio age still have hard limits.
         for batch in &batches {
@@ -505,6 +479,8 @@ fn send_loop(state: &ServerState, transport: &TransportHandle, lane: &SendLane, 
                 {
                     continue;
                 }
+                let first_frame = frame_refs.len();
+                frame_refs.extend(frames);
                 for recipient in &group.targets[index] {
                     if !group.shout && state.p2p_broker.is_offloaded(group.peer, *recipient) {
                         continue;
@@ -522,13 +498,7 @@ fn send_loop(state: &ServerState, transport: &TransportHandle, lane: &SendLane, 
                             entry.insert(session.clone());
                         }
                     }
-                    for (channel, payload, received) in &frames {
-                        sends.push(VoicePacket {
-                            channel: *channel,
-                            payload: payload.clone(),
-                            received: *received,
-                        });
-                    }
+                    sends.extend(first_frame..frame_refs.len());
                 }
             }
         }
@@ -556,8 +526,13 @@ fn send_loop(state: &ServerState, transport: &TransportHandle, lane: &SendLane, 
                 let now = Instant::now();
                 let quantum = sends[offset..end]
                     .iter()
-                    .filter(|packet| {
-                        now.saturating_duration_since(packet.received) <= VOICE_MAX_AGE
+                    .filter_map(|frame| {
+                        let (channel, payload, received) = frame_refs[*frame];
+                        (now.saturating_duration_since(*received) <= VOICE_MAX_AGE).then_some((
+                            *channel,
+                            payload.as_ref(),
+                            None,
+                        ))
                     })
                     .collect::<Vec<_>>();
                 lane.expired_deliveries
