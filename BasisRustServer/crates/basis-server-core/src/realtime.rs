@@ -10,6 +10,7 @@ const VOICE_MAX_AGE: Duration = Duration::from_millis(100);
 const VOICE_FRAMES_PER_SENDER: usize = 3;
 const VOICE_BATCHES_PER_LANE: usize = 5;
 const MAX_VOICE_PAYLOAD: usize = 4096;
+const VOICE_SEND_QUANTUM: usize = 32;
 
 struct Input {
     session: PeerSession,
@@ -110,6 +111,18 @@ struct VoicePacket {
 }
 
 impl basis_transport::UnreliablePacket for VoicePacket {
+    fn channel(&self) -> u8 {
+        self.channel
+    }
+    fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+    fn interval_patch(&self) -> Option<(usize, u8)> {
+        None
+    }
+}
+
+impl basis_transport::UnreliablePacket for &VoicePacket {
     fn channel(&self) -> u8 {
         self.channel
     }
@@ -439,6 +452,8 @@ fn send_loop(state: &ServerState, transport: &TransportHandle, lane: &SendLane, 
         .map(|_| Vec::<VoicePacket>::new())
         .collect::<Vec<_>>();
     let mut sessions = HashMap::<PeerId, PeerSession>::new();
+    let mut offsets = vec![0usize; u16::MAX as usize + 1];
+    let mut dispatch_cursor = 0usize;
     let mut buffers_used = false;
     while !state.shutdown.load(Ordering::Relaxed) {
         state.avatar_sync.poll_memory_reclaim();
@@ -511,25 +526,54 @@ fn send_loop(state: &ServerState, transport: &TransportHandle, lane: &SendLane, 
                 }
             }
         }
-        for (peer, session) in sessions.drain() {
-            let sends = &mut packets[peer as usize];
-            let now = Instant::now();
-            sends.retain(|packet| {
-                let fresh = now.saturating_duration_since(packet.received) <= VOICE_MAX_AGE;
-                if !fresh {
-                    lane.expired_deliveries.fetch_add(1, Ordering::Relaxed);
+        let mut dispatch = sessions.keys().copied().collect::<Vec<_>>();
+        if !dispatch.is_empty() {
+            let start = dispatch_cursor % dispatch.len();
+            dispatch.rotate_left(start);
+            dispatch_cursor = dispatch_cursor.wrapping_add(1);
+        }
+        for peer in &dispatch {
+            offsets[*peer as usize] = 0;
+        }
+        // Small round-robin turns prevent a dense fanout from using the entire
+        // audio deadline on the first recipients and starving the remaining ones.
+        loop {
+            let mut progressed = false;
+            for peer in &dispatch {
+                let sends = &packets[*peer as usize];
+                let offset = offsets[*peer as usize];
+                if offset == sends.len() {
+                    continue;
                 }
-                fresh
-            });
-            match transport.try_send_session_many_unreliable_packets(&session, sends) {
-                Ok(sent) => {
-                    lane.datagrams.fetch_add(sent as u64, Ordering::Relaxed);
+                progressed = true;
+                let end = (offset + VOICE_SEND_QUANTUM).min(sends.len());
+                let now = Instant::now();
+                let quantum = sends[offset..end]
+                    .iter()
+                    .filter(|packet| {
+                        now.saturating_duration_since(packet.received) <= VOICE_MAX_AGE
+                    })
+                    .collect::<Vec<_>>();
+                lane.expired_deliveries
+                    .fetch_add((end - offset - quantum.len()) as u64, Ordering::Relaxed);
+                match transport.try_send_session_many_unreliable_packets(&sessions[peer], &quantum)
+                {
+                    Ok(sent) => {
+                        lane.datagrams.fetch_add(sent as u64, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        warn!("voice send failed: {error}");
+                    }
                 }
-                Err(error) => {
-                    warn!("voice send failed: {error}");
-                }
+                offsets[*peer as usize] = end;
             }
-            sends.clear();
+            if !progressed || state.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        sessions.clear();
+        for peer in dispatch {
+            packets[peer as usize].clear();
         }
     }
 }
