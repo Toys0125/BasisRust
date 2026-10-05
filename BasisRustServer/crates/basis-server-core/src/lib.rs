@@ -1,5 +1,6 @@
 mod admin_runtime;
 mod avatar_sync;
+mod event_diagnostics;
 #[cfg(feature = "gpu")]
 mod gpu_distance;
 #[cfg(not(feature = "gpu"))]
@@ -1050,6 +1051,7 @@ async fn event_loop(
         .map(|count| (count.get() * 4).clamp(8, 256))
         .unwrap_or(32);
     let workers = Arc::new(Semaphore::new(worker_limit));
+    let diagnostics = event_diagnostics::EventDiagnostics::start_from_env(&state, worker_limit);
     let mut handlers = tokio::task::JoinSet::new();
     let mut join_flush = tokio::time::interval(JOIN_BATCH_FLUSH_INTERVAL);
     join_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1067,6 +1069,9 @@ async fn event_loop(
             }
             maybe_event = events.recv() => {
                 let Some(event) = maybe_event else { break; };
+                if let Some(diagnostics) = &diagnostics {
+                    diagnostics.record_event_queue_depth(events.len());
+                }
                 if is_high_frequency_inline_event(&event) {
                     if let Err(err) = handle_event(&state, event).await {
                         error!("server event failed: {err:#}");
@@ -1079,13 +1084,19 @@ async fn event_loop(
                     permit = workers.clone().acquire_owned() => permit,
                 };
                 let Ok(permit) = permit else { break; };
+                let mut diagnostic_guard = diagnostics.as_ref().map(|d| d.spawned(&event));
                 let state = state.clone();
-                handlers.spawn(async move {
+                let task = async move {
                     let _permit = permit;
+                    if let Some(guard) = &mut diagnostic_guard { guard.started(); }
                     if let Err(err) = handle_event(&state, event).await {
                         error!("server event failed: {err:#}");
                     }
-                });
+                };
+                if let Some(diagnostics) = &diagnostics {
+                    diagnostics.record_task_size(std::mem::size_of_val(&task));
+                }
+                handlers.spawn(task);
             }
         }
     }

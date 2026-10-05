@@ -1,0 +1,449 @@
+{
+  "date": "2026-10-05",
+  "server_revision": "09cf74f6168a02d3a8355dcfbed389fcd530ddb6",
+  "cause": "Unbounded allocated event tasks waiting for a worker semaphore. Voice fanout occupies workers; avatar deltas share the dispatcher and dominate waiting memory in the 1,000-user run.",
+  "evidence": [
+    "Task counts and process memory have R-squared greater than 0.9999 in both original-dispatch reproductions.",
+    "The 1,000-user queue peak contains 506,072 avatar delta tasks and 59,126 voice tasks.",
+    "Queues drain to zero and process memory returns to 29-42 MiB after client exit and idle reclamation.",
+    "The matched bounded-admission experiment caps allocated tasks at 64 and marked-window working set at 198 MiB, versus 3,222 MiB with original dispatch.",
+    "The bounded-admission probe saturates the existing 262,144-event ingress queue, so it is a causal experiment rather than a complete voice-capacity fix."
+  ],
+  "raw_capture": "captures/voice-memory-investigation-20261005",
+  "diagnostics": {
+    "counter_interval_seconds": 1,
+    "process_interval_seconds": 2,
+    "native_allocation_stack_profiler_used": false,
+    "task_count_cross_check": "Tokio RuntimeMetrics num_alive_tasks",
+    "causal_probe_removed_from_normal_source": true
+  },
+  "validation": {
+    "focused_tests_passed": 3,
+    "locked_release_build_passed": true,
+    "rust_formatting_passed": true,
+    "python_parsing_passed": true,
+    "git_diff_check_passed": true,
+    "outcome_assertions_passed": true
+  },
+  "limitations": [
+    "One local Windows loopback run per condition; server and headless load generator share the host.",
+    "Task/frame accounting and a causal probe identify the retained work; no native allocation-stack trace was collected.",
+    "Queue and memory maxima may occur at different times; regression joins samples by timestamp interpolation.",
+    "The 250-user first diagnostic version did not measure delta or ingress queue counts.",
+    "The bounded probe changes where unreliable traffic is queued/dropped; it is not an equal-work efficiency claim.",
+    "The investigation confirms the dominant growth mechanism in these runs, not the absence of all unrelated leaks."
+  ],
+  "runs": [
+    {
+      "name": "250-diagnostic",
+      "capture": "C:\\Users\\mgsta\\Documents\\BasisRust\\captures\\voice-memory-investigation-20261005\\250-diagnostic",
+      "metadata": {
+        "platform": "Windows-11-10.0.26100-SP0",
+        "os_name": "nt",
+        "python": "3.12.0",
+        "git_revision": "09cf74f6168a02d3a8355dcfbed389fcd530ddb6",
+        "logical_processors": 16,
+        "server_pid": 26368,
+        "client_pid": 1684,
+        "clients": 250,
+        "tokio_workers": 4,
+        "server_rayon_threads_override": null,
+        "server_kind": "rust",
+        "server_avatar_diagnostics": false,
+        "readiness_basis": "authenticated players and active avatar states",
+        "warmup_seconds": 5,
+        "measurement_window_seconds": 30,
+        "actual_warmup_seconds": 5.0,
+        "warmup_ended_early_reason": null,
+        "measurement_complete": true,
+        "measurement_stop_reason": null,
+        "max_server_working_set_mib": 4096,
+        "post_client_observation_seconds": 45,
+        "server_port": 57549,
+        "health_port": 60428,
+        "server_ip": "127.0.0.1",
+        "movement_interval_ms": 20,
+        "jitter_percent": 0,
+        "unity_frame_accumulator_fps": 60,
+        "layout": "colocated, zero positional drift",
+        "pose": "valid synthetic deterministic root/body rotation channels; not captured Unity pose",
+        "voice": true,
+        "p2p": false,
+        "server_profiling": false,
+        "voice_audio_folder": "C:\\Users\\mgsta\\Documents\\BasisRust\\captures\\voice-1000-20261005\\audio-20ms-mono",
+        "voice_speaker_percent": 100,
+        "voice_frame_duration_ms": 20,
+        "voice_reencode": false,
+        "expected_observer_peers": 249,
+        "server_binary_sha256": "e19e5c229b0e28db35789aaf40775b71f6a6f82723ed736a60db3e30d6e65f70",
+        "client_binary_sha256": "96214d0ca8b7b6e7af6f633df5c2dda2f7289796a27debb3d567b403d9f79235",
+        "server_config_fixture_sha256": "45e53763aa8d0958b122acd905ebf94cd3a3be029956291536a62ac57f394039",
+        "client_config_fixture_sha256": "de95a12078e505b491594a5f63c2abc84e69ad38c80920a5e970882516acb126",
+        "server_config_local_copy_sha256": "45e53763aa8d0958b122acd905ebf94cd3a3be029956291536a62ac57f394039",
+        "server_config_files_sha256": {
+          "banned_players.xml": "ac795546f09b0fadbe3eb2ddd3db12f1bfe5a7110af4f124f316dd47c638ca4f",
+          "config.xml": "45e53763aa8d0958b122acd905ebf94cd3a3be029956291536a62ac57f394039",
+          "muted_players.xml": "7bacfe5704a0e69ff1e34a1ddfe739337c12081fb388ce8c7de3f1a41cf620d9",
+          "permissions.xml": "78f5d649adfc1327d403482adb340bc484b73302df3972e9fdfbe97548838536"
+        },
+        "server_runtime_files_sha256": null,
+        "relevant_environment": {
+          "RAYON_NUM_THREADS": {
+            "server": null,
+            "client": null
+          },
+          "TOKIO_WORKER_THREADS": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_UDP_RECEIVE_WORKERS": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_CLIENT_TOKIO_WORKERS": {
+            "server": null,
+            "client": "4"
+          },
+          "BASIS_AVATAR_MIN_RECEIVER_SLICES": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_AVATAR_MAX_RECEIVER_SLICES": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_AVATAR_TICK_BUDGET_MS": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_AVATAR_RECEIVER_CYCLE_BUDGET_MS": {
+            "server": null,
+            "client": null
+          },
+          "EnableBSRProfiling": {
+            "server": "false",
+            "client": null
+          },
+          "HealthIncludeBSRProfiling": {
+            "server": "false",
+            "client": null
+          },
+          "EnableComputeOffload": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_AVATAR_DIAGNOSTICS": {
+            "server": null,
+            "client": "true"
+          }
+        },
+        "server_exit_code": 3221225786,
+        "client_exit_code": 0,
+        "started_unix_seconds": 1791230455.8330717,
+        "finished_unix_seconds": 1791230548.675074
+      },
+      "peak_waiting_tasks": 434040,
+      "peak_allocated_event_tasks": 434104,
+      "voice_waiting_at_peak": 221948,
+      "delta_waiting_at_peak": null,
+      "peak_tokio_alive_tasks": 434121,
+      "peak_running_handlers": 64,
+      "worker_limit": 64,
+      "task_future_bytes": 5552,
+      "waiting_future_frames_mib_at_peak": 2298.1549072265625,
+      "handle_event_future_bytes": 4848,
+      "voice_relay_future_bytes": 704,
+      "load_peak_server_working_set_mib": 2495.25390625,
+      "load_or_post_peak_server_working_set_mib": 2718.3515625,
+      "load_server_growth_mib_s": 64.55113105891058,
+      "load_server_cpu_cores": 12.276443254290719,
+      "post_final_server_working_set_mib": 34.76953125,
+      "post_final_players_online": 0,
+      "final_waiting_tasks": 0,
+      "final_running_handlers": 0,
+      "max_event_queue_depth": null,
+      "task_to_memory_fit": {
+        "bytes_per_waiting_task": 6380.943068465976,
+        "working_set_intercept_mib": 43.19468390271504,
+        "r_squared": 0.9999921420833289,
+        "samples": 15,
+        "method": "linear interpolation of 1s task counters at process-sample times; ordinary least squares"
+      },
+      "all_clients_active_during_measurement": true,
+      "client_clean_exit": true,
+      "admission_policy": "spawn task, then acquire permit inside it (original behavior)"
+    },
+    {
+      "name": "1000-original-dispatch",
+      "capture": "C:\\Users\\mgsta\\Documents\\BasisRust\\captures\\voice-memory-investigation-20261005\\1000-original-dispatch",
+      "metadata": {
+        "platform": "Windows-11-10.0.26100-SP0",
+        "os_name": "nt",
+        "python": "3.12.0",
+        "git_revision": "09cf74f6168a02d3a8355dcfbed389fcd530ddb6",
+        "logical_processors": 16,
+        "server_pid": 38772,
+        "client_pid": 26476,
+        "clients": 1000,
+        "tokio_workers": 4,
+        "server_rayon_threads_override": null,
+        "server_kind": "rust",
+        "server_avatar_diagnostics": false,
+        "readiness_basis": "authenticated players and active avatar states",
+        "warmup_seconds": 5,
+        "measurement_window_seconds": 15,
+        "actual_warmup_seconds": 5.0,
+        "warmup_ended_early_reason": null,
+        "measurement_complete": true,
+        "measurement_stop_reason": null,
+        "max_server_working_set_mib": 4096,
+        "post_client_observation_seconds": 45,
+        "server_port": 63025,
+        "health_port": 59119,
+        "server_ip": "127.0.0.1",
+        "movement_interval_ms": 20,
+        "jitter_percent": 0,
+        "unity_frame_accumulator_fps": 60,
+        "layout": "colocated, zero positional drift",
+        "pose": "valid synthetic deterministic root/body rotation channels; not captured Unity pose",
+        "voice": true,
+        "p2p": false,
+        "server_profiling": false,
+        "voice_audio_folder": "C:\\Users\\mgsta\\Documents\\BasisRust\\captures\\voice-1000-20261005\\audio-20ms-mono",
+        "voice_speaker_percent": 10,
+        "voice_frame_duration_ms": 20,
+        "voice_reencode": false,
+        "expected_observer_peers": 999,
+        "server_binary_sha256": "051806845659b6db65de947e34f7b1883f655e6f1a2c00f4e0eb3d299796398f",
+        "client_binary_sha256": "96214d0ca8b7b6e7af6f633df5c2dda2f7289796a27debb3d567b403d9f79235",
+        "server_config_fixture_sha256": "45e53763aa8d0958b122acd905ebf94cd3a3be029956291536a62ac57f394039",
+        "client_config_fixture_sha256": "de95a12078e505b491594a5f63c2abc84e69ad38c80920a5e970882516acb126",
+        "server_config_local_copy_sha256": "45e53763aa8d0958b122acd905ebf94cd3a3be029956291536a62ac57f394039",
+        "server_config_files_sha256": {
+          "banned_players.xml": "ac795546f09b0fadbe3eb2ddd3db12f1bfe5a7110af4f124f316dd47c638ca4f",
+          "config.xml": "45e53763aa8d0958b122acd905ebf94cd3a3be029956291536a62ac57f394039",
+          "muted_players.xml": "7bacfe5704a0e69ff1e34a1ddfe739337c12081fb388ce8c7de3f1a41cf620d9",
+          "permissions.xml": "78f5d649adfc1327d403482adb340bc484b73302df3972e9fdfbe97548838536"
+        },
+        "server_runtime_files_sha256": null,
+        "relevant_environment": {
+          "RAYON_NUM_THREADS": {
+            "server": null,
+            "client": null
+          },
+          "TOKIO_WORKER_THREADS": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_UDP_RECEIVE_WORKERS": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_CLIENT_TOKIO_WORKERS": {
+            "server": null,
+            "client": "4"
+          },
+          "BASIS_AVATAR_MIN_RECEIVER_SLICES": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_AVATAR_MAX_RECEIVER_SLICES": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_AVATAR_TICK_BUDGET_MS": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_AVATAR_RECEIVER_CYCLE_BUDGET_MS": {
+            "server": null,
+            "client": null
+          },
+          "EnableBSRProfiling": {
+            "server": "false",
+            "client": null
+          },
+          "HealthIncludeBSRProfiling": {
+            "server": "false",
+            "client": null
+          },
+          "EnableComputeOffload": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_AVATAR_DIAGNOSTICS": {
+            "server": null,
+            "client": "true"
+          }
+        },
+        "server_exit_code": 3221225786,
+        "client_exit_code": 0,
+        "started_unix_seconds": 1791230698.2929962,
+        "finished_unix_seconds": 1791230781.3407898
+      },
+      "peak_waiting_tasks": 565198,
+      "peak_allocated_event_tasks": 565261,
+      "voice_waiting_at_peak": 59126,
+      "delta_waiting_at_peak": 506072,
+      "peak_tokio_alive_tasks": 565278,
+      "peak_running_handlers": 64,
+      "worker_limit": 64,
+      "task_future_bytes": 5568,
+      "waiting_future_frames_mib_at_peak": 3001.2344970703125,
+      "handle_event_future_bytes": 4848,
+      "voice_relay_future_bytes": 704,
+      "load_peak_server_working_set_mib": 3222.359375,
+      "load_or_post_peak_server_working_set_mib": 3675.12890625,
+      "load_server_growth_mib_s": 152.19919983962316,
+      "load_server_cpu_cores": 13.007122284507643,
+      "post_final_server_working_set_mib": 42.328125,
+      "post_final_players_online": 0,
+      "final_waiting_tasks": 0,
+      "final_running_handlers": 0,
+      "max_event_queue_depth": 333,
+      "task_to_memory_fit": {
+        "bytes_per_waiting_task": 6296.842472186061,
+        "working_set_intercept_mib": 170.44001064226973,
+        "r_squared": 0.9999473453143123,
+        "samples": 8,
+        "method": "linear interpolation of 1s task counters at process-sample times; ordinary least squares"
+      },
+      "all_clients_active_during_measurement": true,
+      "client_clean_exit": true,
+      "admission_policy": "spawn task, then acquire permit inside it (original behavior)"
+    },
+    {
+      "name": "1000-bounded-admission",
+      "capture": "C:\\Users\\mgsta\\Documents\\BasisRust\\captures\\voice-memory-investigation-20261005\\1000-bounded-admission",
+      "metadata": {
+        "platform": "Windows-11-10.0.26100-SP0",
+        "os_name": "nt",
+        "python": "3.12.0",
+        "git_revision": "09cf74f6168a02d3a8355dcfbed389fcd530ddb6",
+        "logical_processors": 16,
+        "server_pid": 41904,
+        "client_pid": 26284,
+        "clients": 1000,
+        "tokio_workers": 4,
+        "server_rayon_threads_override": null,
+        "server_kind": "rust",
+        "server_avatar_diagnostics": false,
+        "readiness_basis": "authenticated players and active avatar states",
+        "warmup_seconds": 5,
+        "measurement_window_seconds": 15,
+        "actual_warmup_seconds": 5.0,
+        "warmup_ended_early_reason": null,
+        "measurement_complete": true,
+        "measurement_stop_reason": null,
+        "max_server_working_set_mib": 4096,
+        "post_client_observation_seconds": 60,
+        "server_port": 55088,
+        "health_port": 62374,
+        "server_ip": "127.0.0.1",
+        "movement_interval_ms": 20,
+        "jitter_percent": 0,
+        "unity_frame_accumulator_fps": 60,
+        "layout": "colocated, zero positional drift",
+        "pose": "valid synthetic deterministic root/body rotation channels; not captured Unity pose",
+        "voice": true,
+        "p2p": false,
+        "server_profiling": false,
+        "voice_audio_folder": "C:\\Users\\mgsta\\Documents\\BasisRust\\captures\\voice-1000-20261005\\audio-20ms-mono",
+        "voice_speaker_percent": 10,
+        "voice_frame_duration_ms": 20,
+        "voice_reencode": false,
+        "expected_observer_peers": 999,
+        "server_binary_sha256": "051806845659b6db65de947e34f7b1883f655e6f1a2c00f4e0eb3d299796398f",
+        "client_binary_sha256": "96214d0ca8b7b6e7af6f633df5c2dda2f7289796a27debb3d567b403d9f79235",
+        "server_config_fixture_sha256": "45e53763aa8d0958b122acd905ebf94cd3a3be029956291536a62ac57f394039",
+        "client_config_fixture_sha256": "de95a12078e505b491594a5f63c2abc84e69ad38c80920a5e970882516acb126",
+        "server_config_local_copy_sha256": "45e53763aa8d0958b122acd905ebf94cd3a3be029956291536a62ac57f394039",
+        "server_config_files_sha256": {
+          "banned_players.xml": "ac795546f09b0fadbe3eb2ddd3db12f1bfe5a7110af4f124f316dd47c638ca4f",
+          "config.xml": "45e53763aa8d0958b122acd905ebf94cd3a3be029956291536a62ac57f394039",
+          "muted_players.xml": "7bacfe5704a0e69ff1e34a1ddfe739337c12081fb388ce8c7de3f1a41cf620d9",
+          "permissions.xml": "78f5d649adfc1327d403482adb340bc484b73302df3972e9fdfbe97548838536"
+        },
+        "server_runtime_files_sha256": null,
+        "relevant_environment": {
+          "RAYON_NUM_THREADS": {
+            "server": null,
+            "client": null
+          },
+          "TOKIO_WORKER_THREADS": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_UDP_RECEIVE_WORKERS": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_CLIENT_TOKIO_WORKERS": {
+            "server": null,
+            "client": "4"
+          },
+          "BASIS_AVATAR_MIN_RECEIVER_SLICES": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_AVATAR_MAX_RECEIVER_SLICES": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_AVATAR_TICK_BUDGET_MS": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_AVATAR_RECEIVER_CYCLE_BUDGET_MS": {
+            "server": null,
+            "client": null
+          },
+          "EnableBSRProfiling": {
+            "server": "false",
+            "client": null
+          },
+          "HealthIncludeBSRProfiling": {
+            "server": "false",
+            "client": null
+          },
+          "EnableComputeOffload": {
+            "server": null,
+            "client": null
+          },
+          "BASIS_AVATAR_DIAGNOSTICS": {
+            "server": null,
+            "client": "true"
+          }
+        },
+        "server_exit_code": 3221225786,
+        "client_exit_code": 0,
+        "started_unix_seconds": 1791230781.9468558,
+        "finished_unix_seconds": 1791230879.8997583
+      },
+      "peak_waiting_tasks": 22,
+      "peak_allocated_event_tasks": 64,
+      "voice_waiting_at_peak": 14,
+      "delta_waiting_at_peak": 8,
+      "peak_tokio_alive_tasks": 81,
+      "peak_running_handlers": 64,
+      "worker_limit": 64,
+      "task_future_bytes": 5568,
+      "waiting_future_frames_mib_at_peak": 0.1168212890625,
+      "handle_event_future_bytes": 4848,
+      "voice_relay_future_bytes": 704,
+      "load_peak_server_working_set_mib": 198.34765625,
+      "load_or_post_peak_server_working_set_mib": 202.015625,
+      "load_server_growth_mib_s": 1.3323972757578084,
+      "load_server_cpu_cores": 12.915532830460943,
+      "post_final_server_working_set_mib": 28.94921875,
+      "post_final_players_online": 0,
+      "final_waiting_tasks": 0,
+      "final_running_handlers": 0,
+      "max_event_queue_depth": 262143,
+      "task_to_memory_fit": null,
+      "all_clients_active_during_measurement": true,
+      "client_clean_exit": true,
+      "admission_policy": "permit before cloning/spawning (temporary causal probe)"
+    }
+  ]
+}

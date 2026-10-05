@@ -18,6 +18,7 @@ mod simulation;
 mod strict_config;
 mod transport;
 mod voice;
+mod voice_diagnostics;
 mod wire;
 
 #[cfg(test)]

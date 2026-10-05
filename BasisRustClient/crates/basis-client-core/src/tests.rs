@@ -526,6 +526,7 @@ pub(super) async fn test_client(index: usize, server_addr: SocketAddr) -> Arc<Ba
         avatar_observer: None,
         packet_diagnostics: PacketDiagnostics::default(),
         avatar_diagnostics: None,
+        voice_diagnostics: None,
         identity: Identity::random(),
     })
 }

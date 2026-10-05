@@ -69,6 +69,7 @@ pub(crate) struct BasisClient {
     pub(crate) avatar_observer: Option<Arc<ObserverSession>>,
     pub(crate) packet_diagnostics: PacketDiagnostics,
     pub(crate) avatar_diagnostics: Option<Arc<ClientAvatarDiagnostics>>,
+    pub(crate) voice_diagnostics: Option<crate::voice_diagnostics::VoiceDiagnostics>,
     pub(crate) identity: Identity,
 }
 
@@ -120,6 +121,8 @@ impl BasisClient {
             packet_diagnostics: PacketDiagnostics::default(),
             avatar_diagnostics: ClientAvatarDiagnostics::enabled_from_env()
                 .then(|| Arc::new(ClientAvatarDiagnostics::default())),
+            voice_diagnostics: crate::voice_diagnostics::VoiceDiagnostics::enabled()
+                .then(|| crate::voice_diagnostics::VoiceDiagnostics::new(index)),
             identity,
         });
 
@@ -530,6 +533,9 @@ impl BasisClient {
             }
             PacketProperty::Unreliable => {
                 if let (Some(channel), Some(payload)) = (bytes.get(1).copied(), bytes.get(2..)) {
+                    if let Some(diagnostics) = &self.voice_diagnostics {
+                        diagnostics.receive(channel, payload);
+                    }
                     self.observe_avatar_channel(channel, payload).await;
                 }
             }
