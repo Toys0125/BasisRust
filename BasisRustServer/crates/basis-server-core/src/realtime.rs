@@ -279,7 +279,7 @@ fn is_avatar_input(event: &ServerEvent) -> bool {
 }
 
 fn voice_loop(state: &ServerState, inbox: &VoiceInbox, lanes: &[Arc<SendLane>]) {
-    set_voice_thread_priority();
+    let _priority = set_voice_thread_priority();
     let mut csv = std::env::var_os("BASIS_VOICE_SERVER_DIAGNOSTIC_CSV")
         .and_then(|path| std::fs::File::create(path).ok())
         .map(std::io::BufWriter::new);
@@ -433,7 +433,7 @@ fn voice_loop(state: &ServerState, inbox: &VoiceInbox, lanes: &[Arc<SendLane>]) 
 }
 
 fn send_loop(state: &ServerState, transport: &TransportHandle, lane: &SendLane, index: usize) {
-    set_voice_thread_priority();
+    let _priority = set_voice_thread_priority();
     // Reuse recipient buffers. One lane exclusively owns every recipient's voice order.
     let mut packets = (0..=u16::MAX)
         .map(|_| Vec::<VoicePacket>::new())
@@ -447,7 +447,8 @@ fn send_loop(state: &ServerState, transport: &TransportHandle, lane: &SendLane, 
             if pending.is_empty() {
                 lane.wake.wait_for(&mut pending, VOICE_BATCH_INTERVAL);
             }
-            pending.drain(..).collect::<Vec<_>>()
+            let take = pending.len().min(2);
+            pending.drain(..take).collect::<Vec<_>>()
         };
         if batches.is_empty() {
             if buffers_used && state.authenticated_peers.is_empty() {
@@ -459,11 +460,25 @@ fn send_loop(state: &ServerState, transport: &TransportHandle, lane: &SendLane, 
             continue;
         }
         buffers_used = true;
-        let now = Instant::now();
         // Fold scheduling bursts into one MTU-packed flush instead of discarding the
         // previous batch. Both queued batches and audio age still have hard limits.
         for batch in &batches {
             for group in &batch.groups {
+                let now = Instant::now();
+                let frames = group
+                    .frames
+                    .iter()
+                    .filter(|(_, _, received)| {
+                        now.saturating_duration_since(*received) <= VOICE_MAX_AGE
+                    })
+                    .collect::<Vec<_>>();
+                lane.expired_deliveries.fetch_add(
+                    ((group.frames.len() - frames.len()) * group.targets[index].len()) as u64,
+                    Ordering::Relaxed,
+                );
+                if frames.is_empty() {
+                    continue;
+                }
                 if !state.transport.is_current_session(&group.session)
                     || !voice_allowed(state, group.peer, group.shout)
                 {
@@ -486,16 +501,12 @@ fn send_loop(state: &ServerState, transport: &TransportHandle, lane: &SendLane, 
                             entry.insert(session.clone());
                         }
                     }
-                    for (channel, payload, received) in &group.frames {
-                        if now.saturating_duration_since(*received) <= VOICE_MAX_AGE {
-                            sends.push(VoicePacket {
-                                channel: *channel,
-                                payload: payload.clone(),
-                                received: *received,
-                            });
-                        } else {
-                            lane.expired_deliveries.fetch_add(1, Ordering::Relaxed);
-                        }
+                    for (channel, payload, received) in &frames {
+                        sends.push(VoicePacket {
+                            channel: *channel,
+                            payload: payload.clone(),
+                            received: *received,
+                        });
                     }
                 }
             }
@@ -524,17 +535,47 @@ fn send_loop(state: &ServerState, transport: &TransportHandle, lane: &SendLane, 
 }
 
 #[cfg(windows)]
-fn set_voice_thread_priority() {
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
-    };
-    unsafe {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+struct VoiceThreadPriority(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for VoiceThreadPriority {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                windows_sys::Win32::System::Threading::AvRevertMmThreadCharacteristics(self.0);
+            }
+        }
     }
 }
 
+#[cfg(windows)]
+fn set_voice_thread_priority() -> VoiceThreadPriority {
+    use windows_sys::Win32::System::Threading::{
+        AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority, GetCurrentThread, SetThreadPriority,
+        AVRT_PRIORITY_HIGH, THREAD_PRIORITY_HIGHEST,
+    };
+    // MMCSS reserves scheduling time for audio without using time-critical priority.
+    // Fall back when the multimedia scheduler is unavailable on a headless host.
+    let mut task_index = 0;
+    let task_name = [65u16, 117, 100, 105, 111, 0]; // "Audio"
+    let handle = unsafe { AvSetMmThreadCharacteristicsW(task_name.as_ptr(), &mut task_index) };
+    unsafe {
+        if handle.is_null() {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        } else {
+            AvSetMmThreadPriority(handle, AVRT_PRIORITY_HIGH);
+        }
+    }
+    VoiceThreadPriority(handle)
+}
+
 #[cfg(not(windows))]
-fn set_voice_thread_priority() {}
+struct VoiceThreadPriority;
+
+#[cfg(not(windows))]
+fn set_voice_thread_priority() -> VoiceThreadPriority {
+    VoiceThreadPriority
+}
 
 #[cfg(test)]
 mod tests {
