@@ -499,6 +499,7 @@ def main():
             "relevant_environment": {key: {"server": server_env.get(key), "client": client_env.get(key)}
                                      for key in ("RAYON_NUM_THREADS", "TOKIO_WORKER_THREADS",
                                                  "BASIS_UDP_RECEIVE_WORKERS", "BASIS_CLIENT_TOKIO_WORKERS",
+                                                 "BASIS_VOICE_SEND_WORKERS", "BASIS_VOICE_SERVER_DIAGNOSTIC_CSV", "BASIS_EVENT_DIAGNOSTIC_CSV",
                                                  "BASIS_AVATAR_MIN_RECEIVER_SLICES", "BASIS_AVATAR_MAX_RECEIVER_SLICES",
                                                  "BASIS_AVATAR_TICK_BUDGET_MS", "BASIS_AVATAR_RECEIVER_CYCLE_BUDGET_MS",
                                                  "BASIS_AVATAR_FLUSH_LANES",

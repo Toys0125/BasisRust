@@ -7,6 +7,11 @@ server config compatibility, LiteNetLib-shaped UDP transport, server core
 accept/auth/spawn routing, health endpoint, persistent storage,
 moderation and admin permissions, console commands, and source drift detection.
 
+Voice uses dedicated batching and send threads, with bounded admission and fair
+recipient turns. Avatar pose/delta input uses a separate thread; avatar downlinks
+retain their tick and flush workers. See the
+[voice processing and load-test report](../docs/performance/voice-isolation.md).
+
 ## Run
 
 Requires Rust 1.95 or later. The Docker builder uses the exact 1.95.0 release;
