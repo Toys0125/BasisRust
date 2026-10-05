@@ -559,6 +559,7 @@ struct PendingRequestInfo {
 #[derive(Clone)]
 pub struct TransportHandle {
     socket: Arc<UdpSocket>,
+    synchronous_sender: Option<Arc<std::net::UdpSocket>>,
     peers: Arc<DashMap<PeerId, Arc<PeerState>>>,
     by_addr: Arc<DashMap<SocketAddr, PeerId>>,
     pending_requests: Arc<parking_lot::Mutex<HashMap<SocketAddr, PendingRequestInfo>>>,
@@ -570,9 +571,26 @@ pub struct TransportHandle {
     retired_peer_ids: Arc<parking_lot::Mutex<HashSet<PeerId>>>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<TransportStats>,
+    realtime_handler: Arc<parking_lot::RwLock<Option<Arc<RealtimeHandler>>>>,
     #[cfg(test)]
     test_blocked_send_addrs: Arc<parking_lot::RwLock<HashSet<SocketAddr>>>,
 }
+
+/// An incarnation of a connection, so queued work cannot target a reused peer ID.
+#[derive(Clone)]
+pub struct PeerSession {
+    peer: PeerId,
+    state: Arc<PeerState>,
+}
+
+impl PeerSession {
+    pub fn same_connection(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+}
+
+/// Return true when a message was consumed. Implementations must never block on capacity.
+pub type RealtimeHandler = dyn Fn(&ServerEvent, PeerSession) -> bool + Send + Sync;
 
 impl TransportHandle {
     pub async fn bind(addr: SocketAddr) -> Result<(Self, mpsc::Receiver<ServerEvent>)> {
@@ -595,6 +613,7 @@ impl TransportHandle {
         let (tx, rx) = mpsc::channel(262_144);
         let handle = Self {
             socket: socket.clone(),
+            synchronous_sender: None,
             peers: Arc::new(DashMap::new()),
             by_addr: Arc::new(DashMap::new()),
             pending_requests: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -609,6 +628,7 @@ impl TransportHandle {
                 enable_statistics,
                 enable_extended_statistics,
             )),
+            realtime_handler: Arc::new(parking_lot::RwLock::new(None)),
             #[cfg(test)]
             test_blocked_send_addrs: Arc::new(parking_lot::RwLock::new(HashSet::new())),
         };
@@ -625,6 +645,46 @@ impl TransportHandle {
         self.socket.local_addr()
     }
 
+    pub fn set_realtime_handler(&self, handler: Option<Arc<RealtimeHandler>>) {
+        *self.realtime_handler.write() = handler;
+    }
+
+    /// A nonblocking send handle for a dedicated OS thread. It retains the server's
+    /// bound address and shared peer/statistics state, without reactor readiness checks.
+    pub fn dedicated_unreliable_sender(&self) -> std::io::Result<Self> {
+        let socket: std::net::UdpSocket = socket2::SockRef::from(self.socket.as_ref())
+            .try_clone()?
+            .into();
+        socket.set_nonblocking(true)?;
+        let mut handle = self.clone();
+        handle.synchronous_sender = Some(Arc::new(socket));
+        Ok(handle)
+    }
+
+    pub fn peer_session(&self, peer: PeerId) -> Option<PeerSession> {
+        self.peers.get(&peer).map(|state| PeerSession {
+            peer,
+            state: state.clone(),
+        })
+    }
+
+    pub fn is_current_session(&self, session: &PeerSession) -> bool {
+        self.peers
+            .get(&session.peer)
+            .is_some_and(|state| Arc::ptr_eq(&state, &session.state))
+    }
+
+    fn route_realtime(&self, event: &ServerEvent) -> bool {
+        let ServerEvent::Message { peer, .. } = event else {
+            return false;
+        };
+        let handler = self.realtime_handler.read().clone();
+        match (handler, self.peer_session(*peer)) {
+            (Some(handler), Some(session)) => handler(event, session),
+            _ => false,
+        }
+    }
+
     pub fn connected_peers_count(&self) -> usize {
         self.peers.len()
     }
@@ -639,6 +699,7 @@ impl TransportHandle {
     }
 
     pub fn shutdown(&self) {
+        self.set_realtime_handler(None);
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
@@ -810,7 +871,11 @@ impl TransportHandle {
             }
             return Ok(false);
         }
-        match self.socket.try_send_to(bytes, addr) {
+        let result = match &self.synchronous_sender {
+            Some(socket) => socket.send_to(bytes, addr),
+            None => self.socket.try_send_to(bytes, addr),
+        };
+        match result {
             Ok(sent) => {
                 if self.statistics_enabled() {
                     self.stats.raw_packets_sent.fetch_add(1, Ordering::Relaxed);
@@ -1084,6 +1149,19 @@ impl TransportHandle {
         let Some(state) = self.peers.get(&peer).map(|p| p.clone()) else {
             return Ok(0);
         };
+
+        self.try_send_session_many_unreliable_packets(&PeerSession { peer, state }, packets)
+    }
+
+    pub fn try_send_session_many_unreliable_packets<T: UnreliablePacket>(
+        &self,
+        session: &PeerSession,
+        packets: &[T],
+    ) -> Result<usize> {
+        if packets.is_empty() || !self.is_current_session(session) {
+            return Ok(0);
+        }
+        let state = &session.state;
 
         if packets.len() == 1 {
             let payload = packets[0].payload();
@@ -1835,6 +1913,9 @@ async fn process_packet(
                         delivery,
                         payload: Bytes::copy_from_slice(payload),
                     };
+                    if handle.route_realtime(&event) {
+                        return Ok(());
+                    }
                     if matches!(
                         delivery,
                         DeliveryMethod::Unreliable | DeliveryMethod::Sequenced
@@ -4804,6 +4885,107 @@ mod tests {
         // A retained Arc to old peer queues must not count as a live transport depth.
         assert_eq!(peer.total_pending(), 1);
         assert_eq!(handle.depths_snapshot(), TransportDepthSnapshot::default());
+    }
+
+    #[tokio::test]
+    async fn realtime_routing_bypasses_a_full_shared_event_queue() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        handle.shutdown();
+        let peer = test_peer_state(0);
+        handle.peers.insert(peer.id, peer.clone());
+        handle.by_addr.insert(peer.addr, peer.id);
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let counter = delivered.clone();
+        handle.set_realtime_handler(Some(Arc::new(move |event, _| {
+            if matches!(
+                event,
+                ServerEvent::Message {
+                    channel: channels::VOICE,
+                    ..
+                }
+            ) {
+                counter.fetch_add(1, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        })));
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(ServerEvent::PeerConnected(peer.id)).unwrap();
+        process_packet(
+            &handle,
+            &tx,
+            peer.addr,
+            &[
+                PacketProperty::Unreliable as u8,
+                channels::VOICE,
+                7,
+                0,
+                0xf8,
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(delivered.load(Ordering::Relaxed), 1);
+        assert_eq!(rx.len(), 1);
+        handle.set_realtime_handler(None);
+    }
+
+    #[tokio::test]
+    async fn queued_unreliable_sends_cannot_target_reused_peer_ids() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        handle.shutdown();
+        let old = test_peer_state(0);
+        handle.peers.insert(old.id, old);
+        let session = handle.peer_session(0).unwrap();
+        handle.peers.insert(0, test_peer_state(0));
+        assert!(!handle.is_current_session(&session));
+        assert_eq!(
+            handle
+                .try_send_session_many_unreliable_packets(
+                    &session,
+                    &[(channels::VOICE, Bytes::from_static(b"old"))]
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn dedicated_sender_preserves_source_port_merged_wire_and_statistics() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        handle.shutdown();
+        let receiver = UdpSocket::bind(loopback_addr(0)).await.unwrap();
+        let mut peer = test_peer_state(0);
+        Arc::get_mut(&mut peer).unwrap().addr = receiver.local_addr().unwrap();
+        handle.peers.insert(0, peer);
+        let sender = handle.dedicated_unreliable_sender().unwrap();
+        let session = handle.peer_session(0).unwrap();
+        let packets = [
+            (channels::VOICE, Bytes::from_static(b"one")),
+            (channels::VOICE_LARGE, Bytes::from_static(b"two")),
+        ];
+        assert_eq!(
+            sender
+                .try_send_session_many_unreliable_packets(&session, &packets)
+                .unwrap(),
+            1
+        );
+        let mut bytes = [0; 1200];
+        let (length, source) =
+            time::timeout(Duration::from_secs(1), receiver.recv_from(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(source, handle.local_addr().unwrap());
+        assert_eq!(
+            PacketProperty::from_byte(bytes[0]),
+            Some(PacketProperty::Merged)
+        );
+        assert_eq!(&bytes[5..8], b"one");
+        assert_eq!(&bytes[12..15], b"two");
+        assert_eq!(handle.stats_snapshot().raw_packets_sent, 1);
+        assert_eq!(handle.stats_snapshot().raw_bytes_sent, length as u64);
     }
 
     #[tokio::test]

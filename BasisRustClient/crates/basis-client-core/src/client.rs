@@ -712,6 +712,9 @@ impl BasisClient {
         payload: &[u8],
     ) -> Result<()> {
         let channel = channel_id / 4;
+        if let Some(diagnostics) = &self.voice_diagnostics {
+            diagnostics.receive(channel, payload);
+        }
         let delivery = DeliveryMethod::from_channel_id(channel_id);
         if matches!(
             delivery,

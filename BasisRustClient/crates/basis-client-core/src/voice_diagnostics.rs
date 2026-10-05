@@ -1,14 +1,16 @@
 //! Opt-in Windows load-test measurements; normal clients allocate no counters.
 use crate::client::BasisClient;
+use crate::config::MAX_UNITY_VOICE_FRAME_DURATION_MS;
+use crate::voice::{opus_packet_duration_ms, MAX_VOICE_PACKET_BYTES};
 use anyhow::Result;
 use basis_protocol::channels;
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::{sync::Mutex, time};
+use tracing::info;
 
 static WINDOW_ACTIVE: AtomicBool = AtomicBool::new(false);
 

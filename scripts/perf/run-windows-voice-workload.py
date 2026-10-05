@@ -97,8 +97,8 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
         manifest = list(pool.map(encode, enumerate(files)))
     (output / "audio-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    (output / "source-changes.patch").write_bytes(subprocess.check_output([rtk, "proxy", "git", "diff", "--", "BasisRustClient/src/main.rs", "scripts/perf/run-windows-avatar-workload.py"], cwd=ROOT))
-    for path in (ROOT / "BasisRustClient/src/voice_diagnostics.rs", pathlib.Path(__file__), ROOT / "scripts/perf/analyze-windows-voice.py"):
+    (output / "source-changes.patch").write_bytes(subprocess.check_output([rtk, "proxy", "git", "diff", "--", "BasisRustClient/crates/basis-client-core/src", "BasisRustServer/crates/basis-server-core/src", "BasisRustServer/crates/basis-transport/src", "scripts/perf/run-windows-avatar-workload.py"], cwd=ROOT))
+    for path in (ROOT / "BasisRustClient/crates/basis-client-core/src/voice_diagnostics.rs", pathlib.Path(__file__), ROOT / "scripts/perf/analyze-windows-voice.py"):
         shutil.copy2(path, output / path.name)
     (output / "source-revision.txt").write_text(subprocess.check_output([rtk, "proxy", "git", "rev-parse", "HEAD"], cwd=ROOT, text=True), encoding="utf-8")
     env = dict(os.environ)
