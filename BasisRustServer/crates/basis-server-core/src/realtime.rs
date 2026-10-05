@@ -171,9 +171,15 @@ fn voice_allowed(state: &ServerState, peer: PeerId, shout: bool) -> bool {
 pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> {
     let voice = Arc::new(VoiceInbox::default());
     let avatars = Arc::new(Mutex::new(HashMap::<PeerId, AvatarPending>::new()));
-    let lane_count = std::thread::available_parallelism()
-        .map(|n| (n.get() / 4).clamp(1, 4))
+    let logical_processors = std::thread::available_parallelism()
+        .map(|n| n.get())
         .unwrap_or(1);
+    let lane_count = std::env::var("BASIS_VOICE_SEND_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or_else(|| (logical_processors / 2).max(1))
+        .clamp(1, logical_processors.min(16));
     let lanes = (0..lane_count)
         .map(|_| Arc::new(SendLane::default()))
         .collect::<Vec<_>>();
