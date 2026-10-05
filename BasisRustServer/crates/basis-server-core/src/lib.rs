@@ -12,6 +12,7 @@ mod gpu_distance_types;
 mod gpu_policy;
 pub mod memory_reclaim;
 mod p2p;
+mod realtime;
 
 pub use avatar_sync::BsrProfilerSnapshot;
 
@@ -442,6 +443,7 @@ pub struct ServerState {
     shutdown: Arc<AtomicBool>,
     tick_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     workers: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    realtime_threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 }
 
 impl ServerState {
@@ -588,6 +590,7 @@ impl ServerState {
             shutdown: Arc::new(AtomicBool::new(false)),
             tick_thread: Arc::new(Mutex::new(None)),
             workers: Arc::new(Mutex::new(Vec::new())),
+            realtime_threads: Arc::new(Mutex::new(Vec::new())),
         };
         let tick_thread = state
             .avatar_sync
@@ -597,6 +600,13 @@ impl ServerState {
             })
             .context("starting avatar tick thread")?;
         *state.tick_thread.lock() = Some(tick_thread);
+        match realtime::start(&state) {
+            Ok(threads) => *state.realtime_threads.lock() = threads,
+            Err(error) => {
+                state.shutdown().await?;
+                return Err(error.context("starting realtime threads"));
+            }
+        }
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         state.workers.lock().extend([
             spawn_leave_broadcast_loop(state.clone()),
@@ -849,6 +859,20 @@ impl ServerState {
                 .await;
         }
         let tick_thread = self.tick_thread.lock().take();
+        let realtime_threads = std::mem::take(&mut *self.realtime_threads.lock());
+        let realtime_result = tokio::task::spawn_blocking(move || {
+            let mut failed = false;
+            for thread in realtime_threads {
+                failed |= thread.join().is_err();
+            }
+            if failed {
+                Err(anyhow::anyhow!("realtime thread panicked"))
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .context("joining realtime threads")?;
         let tick_result = if let Some(thread) = tick_thread {
             tokio::task::spawn_blocking(move || thread.join())
                 .await
@@ -864,6 +888,7 @@ impl ServerState {
         self.avatar_sync.stop_compute_offload().await;
         worker_result?;
         tick_result?;
+        realtime_result?;
         final_save?;
         initial_save?;
         Ok(())
@@ -1070,7 +1095,7 @@ async fn event_loop(
             maybe_event = events.recv() => {
                 let Some(event) = maybe_event else { break; };
                 if let Some(diagnostics) = &diagnostics {
-                    diagnostics.record_event_queue_depth(events.len());
+                    diagnostics.record_queue_depth(events.len());
                 }
                 if is_high_frequency_inline_event(&event) {
                     if let Err(err) = handle_event(&state, event).await {

@@ -256,6 +256,43 @@ fn admin_mode(payload: &[u8], mode: AdminRequestMode) -> bool {
 }
 
 #[tokio::test]
+async fn voice_continues_while_avatar_input_is_blocked() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let mut sender = Client::connect(&state, "voice-sender").await;
+    let mut recipient = Client::connect(&state, "voice-recipient").await;
+    let sender_id = peer_by_uuid(&state, "voice-sender").unwrap();
+    let recipient_id = peer_by_uuid(&state, "voice-recipient").unwrap();
+    state.voice_recipients.insert(sender_id, vec![recipient_id]);
+    state
+        .uplink_delta_states
+        .insert(sender_id, UplinkDeltaState::empty());
+    let avatar_lock = state.uplink_delta_states.get_mut(&sender_id).unwrap();
+    sender
+        .send(
+            channels::DELTA_AVATAR,
+            &[BitQuality::High as u8, 0, 0],
+            false,
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    for sequence in 0..10 {
+        sender
+            .send(channels::VOICE, &[sequence, 0, 0xf8, 0], false)
+            .await;
+        let payload = tokio::time::timeout(
+            Duration::from_millis(100),
+            recipient.receive_inner(|c, _| c == channels::VOICE),
+        )
+        .await
+        .expect("avatar input blocked voice");
+        assert_eq!(payload, [sender_id as u8, sequence, 0, 0xf8, 0]);
+    }
+    drop(avatar_lock);
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
 async fn client_packets_verify_snapshot_gate_queries_mutes_and_live_permission_updates() {
     let (state, shutdown, _) = super::tests::test_server(false).await;
     state.permissions.add_user_to_group("staff", "moderator");

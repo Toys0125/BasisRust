@@ -1,5 +1,7 @@
 # Voice memory growth investigation — October 5, 2026
 
+This is a historical investigation of revision `09cf74f`, before the admission fixes now on `main`. The dispatcher on current `main` acquires capacity before spawning. The [dedicated voice processing report](voice-isolation.md) measures the remaining shared-pipeline contention against current `main` (`f78dfa4`).
+
 **The growth is an unbounded backlog of allocated dispatcher tasks.** The server limits concurrently executing handlers to 64 on this host, but it creates a Tokio task for every queued event before the task acquires a worker permit. Slow voice fanout occupies those workers while more tasks accumulate. Avatar uplink deltas share this path and accounted for 89.5% of the waiting tasks in the 1,000-user reproduction.
 
 The cause is supported by three independent observations: measured task counts explain the process memory, both return to small values after traffic stops, and reserving worker capacity before task creation removes the large growth in the same workload. The temporary admission experiment also fills the existing ingress queue, so it establishes the allocation cause without establishing a complete voice-capacity fix.

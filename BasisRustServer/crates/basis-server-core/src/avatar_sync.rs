@@ -1417,6 +1417,7 @@ pub struct AvatarSyncSystem {
     // Zero keeps the existing Rayon scheduling; positive values bound send
     // concurrency independently of the pool used to build receiver packets.
     receiver_flush_lanes: usize,
+    voice_active: Arc<AtomicBool>,
 }
 
 impl AvatarSyncSystem {
@@ -1452,11 +1453,22 @@ impl AvatarSyncSystem {
             receiver_flush_lanes: env_usize("BASIS_AVATAR_FLUSH_LANES")
                 .unwrap_or(if cfg!(windows) { 6 } else { 0 })
                 .min(MAX_RECEIVER_FLUSH_LANES),
+            voice_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn set_memory_reclaim_epoch(&self, epoch: crate::memory_reclaim::MemoryReclaimEpoch) {
         *self.memory_reclaim.write() = Some(epoch);
+    }
+
+    pub(crate) fn poll_memory_reclaim(&self) {
+        if let Some(epoch) = self.memory_reclaim.read().as_ref() {
+            epoch.poll_current_thread();
+        }
+    }
+
+    pub(crate) fn set_voice_active(&self, active: bool) {
+        self.voice_active.store(active, Ordering::Relaxed);
     }
 
     pub fn set_offloaded_pairs(&mut self, offloaded_pairs: Arc<DashMap<u64, ()>>) {
@@ -1911,7 +1923,10 @@ impl AvatarSyncSystem {
             transport.clone(),
             receiver_groups,
             self.diagnostics.as_deref(),
-            self.receiver_flush_lanes,
+            voice_protected_flush_lanes(
+                self.receiver_flush_lanes,
+                self.voice_active.load(Ordering::Relaxed),
+            ),
         )?;
         if let Some(diagnostics) = self.diagnostics.as_ref() {
             diagnostics.maybe_emit(&self.states, &self.tracking);
@@ -2654,6 +2669,20 @@ fn try_for_each_receiver_flush<T: Sync>(
         .with_min_len(RECEIVER_FLUSH_MIN_BATCH)
         .try_for_each(flush_batch)?;
     Ok(())
+}
+
+fn voice_protected_flush_lanes(configured: usize, voice_active: bool) -> usize {
+    // Fewer concurrent avatar UDP writers leave send capacity for voice. Avatar
+    // receiver jobs still all run; their adaptive cadence accounts for longer flushes.
+    if voice_active {
+        if configured == 0 {
+            2
+        } else {
+            configured.min(2)
+        }
+    } else {
+        configured
+    }
 }
 
 fn emit_greedy_avatar_bundles<'a>(
@@ -3501,6 +3530,15 @@ fn advertised_interval_byte(
 mod tests {
     use super::*;
     use basis_protocol::avatar::{decode_avatar_bundle, encode_avatar_bundle, AvatarBundleItem};
+
+    #[test]
+    fn voice_reserves_send_concurrency_and_restores_avatar_configuration_when_idle() {
+        assert_eq!(voice_protected_flush_lanes(6, true), 2);
+        assert_eq!(voice_protected_flush_lanes(0, true), 2);
+        assert_eq!(voice_protected_flush_lanes(1, true), 1);
+        assert_eq!(voice_protected_flush_lanes(6, false), 6);
+        assert_eq!(voice_protected_flush_lanes(0, false), 0);
+    }
 
     #[test]
     fn receiver_flush_visits_every_receiver_once_with_bounded_concurrency() {
