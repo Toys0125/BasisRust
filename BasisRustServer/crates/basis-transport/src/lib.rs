@@ -1057,7 +1057,7 @@ impl TransportHandle {
         }
 
         let mut sent = 0usize;
-        for packet in build_merged_datagrams(state.connection_number, outbound) {
+        for packet in build_send_datagrams(state.connection_number, outbound) {
             if self.try_send_non_reliable_raw_to(&packet, state.addr)? {
                 sent += 1;
             }
@@ -1099,26 +1099,51 @@ impl TransportHandle {
         let mut sent = 0usize;
         let mtu = state.confirmed_mtu.load(Ordering::Relaxed);
         let mut current = Vec::with_capacity(mtu);
-        current.push(PacketProperty::Merged as u8 | (state.connection_number << 5));
+        current.push(PacketProperty::CompactMerged as u8 | (state.connection_number << 5));
         let mut current_count = 0usize;
 
         for packet in packets {
             let payload = packet.payload();
-            let packet_len = payload.len() + 2;
-            let framed_len = packet_len + 2;
+            let channel = packet.channel();
+            // The compact tag carries a 6-bit channel. Anything outside that range
+            // (never expected: TOTAL_CHANNELS is 64) or beyond a u16 length travels
+            // as a bare Unreliable packet, exactly like an oversized payload.
+            let compact_eligible =
+                channel & !COMPACT_CHANNEL_MASK == 0 && payload.len() <= u16::MAX as usize;
+            if !compact_eligible {
+                if current_count > 0 {
+                    if self.try_send_non_reliable_raw_to(&current, state.addr)? {
+                        sent += 1;
+                    }
+                    current.clear();
+                    current
+                        .push(PacketProperty::CompactMerged as u8 | (state.connection_number << 5));
+                    current_count = 0;
+                }
+                let mut bare = Vec::with_capacity(payload.len() + 2);
+                bare.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
+                bare.push(channel);
+                extend_payload_with_patch(&mut bare, payload, packet.interval_patch());
+                if self.try_send_non_reliable_raw_to(&bare, state.addr)? {
+                    sent += 1;
+                }
+                continue;
+            }
+
+            let framed_len = compact_entry_header_len(payload.len()) + payload.len();
             if current_count > 0 && current.len() + framed_len > mtu {
                 if self.try_send_non_reliable_raw_to(&current, state.addr)? {
                     sent += 1;
                 }
                 current.clear();
-                current.push(PacketProperty::Merged as u8 | (state.connection_number << 5));
+                current.push(PacketProperty::CompactMerged as u8 | (state.connection_number << 5));
                 current_count = 0;
             }
 
             if framed_len + 1 > mtu {
-                let mut oversized = Vec::with_capacity(packet_len);
+                let mut oversized = Vec::with_capacity(payload.len() + 2);
                 oversized.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
-                oversized.push(packet.channel());
+                oversized.push(channel);
                 extend_payload_with_patch(&mut oversized, payload, packet.interval_patch());
                 if self.try_send_non_reliable_raw_to(&oversized, state.addr)? {
                     sent += 1;
@@ -1126,9 +1151,7 @@ impl TransportHandle {
                 continue;
             }
 
-            current.extend_from_slice(&(packet_len as u16).to_le_bytes());
-            current.push(PacketProperty::Unreliable as u8 | (state.connection_number << 5));
-            current.push(packet.channel());
+            push_compact_entry_header(&mut current, channel, payload.len());
             extend_payload_with_patch(&mut current, payload, packet.interval_patch());
             current_count += 1;
         }
@@ -1170,7 +1193,7 @@ impl TransportHandle {
             outbound.push(built.bytes);
         }
 
-        for packet in build_merged_datagrams(state.connection_number, outbound) {
+        for packet in build_send_datagrams(state.connection_number, outbound) {
             self.send_raw_to(&packet, state.addr).await?;
         }
         Ok(())
@@ -1480,6 +1503,189 @@ fn unpack_single_merged_packet(merged: &[u8]) -> Vec<u8> {
         return merged.to_vec();
     }
     merged[3..3 + size].to_vec()
+}
+
+/// Compact-merge framing flags. The tag byte carries LONG_LENGTH (u16 length
+/// follows) or a single u8 length, RAW_PACKET (the entry is a complete
+/// LiteNetLib packet replayed verbatim) or an Unreliable payload whose 2-byte
+/// header is stripped, plus a 6-bit channel for non-raw entries.
+const COMPACT_LONG_LENGTH_FLAG: u8 = 0x80;
+const COMPACT_RAW_PACKET_FLAG: u8 = 0x40;
+const COMPACT_CHANNEL_MASK: u8 = 0x3f;
+
+/// Header bytes (tag + length) for one compact Unreliable entry.
+fn compact_entry_header_len(payload_len: usize) -> usize {
+    if payload_len <= u8::MAX as usize {
+        2
+    } else {
+        3
+    }
+}
+
+fn push_compact_entry_header(output: &mut Vec<u8>, channel: u8, payload_len: usize) {
+    if payload_len <= u8::MAX as usize {
+        output.push(channel & COMPACT_CHANNEL_MASK);
+        output.push(payload_len as u8);
+    } else {
+        output.push(channel & COMPACT_CHANNEL_MASK | COMPACT_LONG_LENGTH_FLAG);
+        output.extend_from_slice(&(payload_len as u16).to_le_bytes());
+    }
+}
+
+/// Classify a fully built outbound packet for compact sending. Only Unreliable
+/// packets with a 6-bit channel qualify: they shed their 2-byte header and
+/// become compact entries. Channeled/Ack packets would ride as raw entries at
+/// equal or larger cost than classic Merged framing, so they (and anything
+/// else) keep the Merged path via `build_send_datagrams`.
+fn compact_unreliable_entry(packet: &[u8]) -> Option<(u8, &[u8])> {
+    if packet.len() < 2 {
+        return None;
+    }
+    if PacketProperty::from_byte(packet[0]) != Some(PacketProperty::Unreliable) {
+        return None;
+    }
+    let channel = packet[1];
+    if channel & !COMPACT_CHANNEL_MASK != 0 {
+        return None;
+    }
+    Some((channel, &packet[2..]))
+}
+
+/// Pack pre-built Unreliable packets into CompactMerged datagrams capped at
+/// `mtu` bytes. Callers must have verified every packet with
+/// `compact_unreliable_entry`; a single-packet batch is returned unwrapped,
+/// and a packet that cannot share a datagram travels as its original bytes.
+fn build_compact_merged_datagrams(
+    connection_number: u8,
+    mtu: usize,
+    packets: Vec<Vec<u8>>,
+) -> Vec<Vec<u8>> {
+    if packets.len() <= 1 {
+        return packets;
+    }
+
+    let mut datagrams = Vec::new();
+    let mut current = Vec::with_capacity(mtu);
+    let mut current_count = 0usize;
+    current.push(PacketProperty::CompactMerged as u8 | (connection_number << 5));
+
+    for packet in packets {
+        let seal_compact =
+            |current: &mut Vec<u8>, current_count: &mut usize, datagrams: &mut Vec<Vec<u8>>| {
+                if *current_count == 1 {
+                    datagrams.push(unpack_single_compact_packet(current));
+                } else if *current_count > 1 {
+                    datagrams.push(std::mem::take(current));
+                }
+                current.clear();
+                current.push(PacketProperty::CompactMerged as u8 | (connection_number << 5));
+                *current_count = 0;
+            };
+        let Some((channel, payload)) = compact_unreliable_entry(&packet) else {
+            // Not compact-eligible: seal the in-progress compact datagram (if
+            // any) and pass the packet through untouched. Whole-batch callers
+            // via `build_send_datagrams` never hit this; it keeps direct calls
+            // and future mixed batches correct.
+            if current_count > 0 {
+                seal_compact(&mut current, &mut current_count, &mut datagrams);
+            }
+            datagrams.push(packet);
+            continue;
+        };
+        let framed_len = compact_entry_header_len(payload.len()) + payload.len();
+        if current_count > 0 && current.len() + framed_len > mtu {
+            seal_compact(&mut current, &mut current_count, &mut datagrams);
+        }
+
+        if framed_len + 1 > mtu {
+            if current_count > 0 {
+                seal_compact(&mut current, &mut current_count, &mut datagrams);
+            }
+            datagrams.push(packet);
+            continue;
+        }
+
+        push_compact_entry_header(&mut current, channel, payload.len());
+        current.extend_from_slice(payload);
+        current_count += 1;
+    }
+
+    if current_count == 1 {
+        datagrams.push(unpack_single_compact_packet(&current));
+    } else if current_count > 1 {
+        datagrams.push(current);
+    }
+    datagrams
+}
+
+/// Inverse of the single-entry case above: recover the original Unreliable
+/// packet from a one-entry CompactMerged datagram, mirroring
+/// `unpack_single_merged_packet`.
+fn unpack_single_compact_packet(compact: &[u8]) -> Vec<u8> {
+    compact_single_entry(compact).unwrap_or_else(|| compact.to_vec())
+}
+
+/// Decode the sole entry of a one-entry CompactMerged datagram back into the
+/// full Unreliable packet bytes (header + channel + payload).
+fn compact_single_entry(compact: &[u8]) -> Option<Vec<u8>> {
+    if compact.is_empty() {
+        return None;
+    }
+    if PacketProperty::from_byte(compact[0]) != Some(PacketProperty::CompactMerged) {
+        return None;
+    }
+    let mut position = 1usize;
+    if compact.len() - position < 2 {
+        return None;
+    }
+    let tag = compact[position];
+    position += 1;
+    if tag & COMPACT_RAW_PACKET_FLAG != 0 {
+        return None;
+    }
+    let channel = tag & COMPACT_CHANNEL_MASK;
+    let payload_len = if tag & COMPACT_LONG_LENGTH_FLAG != 0 {
+        if compact.len() - position < 2 {
+            return None;
+        }
+        let len = u16::from_le_bytes([compact[position], compact[position + 1]]) as usize;
+        position += 2;
+        if len <= u8::MAX as usize {
+            return None;
+        }
+        len
+    } else {
+        let len = compact[position] as usize;
+        position += 1;
+        len
+    };
+    if position + payload_len != compact.len() {
+        return None;
+    }
+    let connection_number = (compact[0] & 0x60) >> 5;
+    let mut packet = Vec::with_capacity(payload_len + 2);
+    packet.push(PacketProperty::Unreliable as u8 | (connection_number << 5));
+    packet.push(channel);
+    packet.extend_from_slice(&compact[position..position + payload_len]);
+    Some(packet)
+}
+
+/// Send-path datagram packer: CompactMerged when every packet is a
+/// compact-eligible Unreliable packet (the bandwidth win), classic Merged
+/// otherwise (raw Channeled/Ack entries gain nothing from compact framing).
+/// Single-packet batches pass through unwrapped either way.
+fn build_send_datagrams(connection_number: u8, packets: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    if packets.len() <= 1 {
+        return packets;
+    }
+    let all_compact = packets
+        .iter()
+        .all(|packet| compact_unreliable_entry(packet).is_some());
+    if all_compact {
+        build_compact_merged_datagrams(connection_number, MAX_MERGED_PACKET_SIZE, packets)
+    } else {
+        build_merged_datagrams(connection_number, packets)
+    }
 }
 
 fn bind_udp_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
@@ -3344,6 +3550,99 @@ mod tests {
         assert_eq!(datagrams, vec![packet]);
     }
 
+    #[test]
+    fn compact_merged_unreliable_batch_uses_short_and_long_framing() {
+        let small = {
+            let mut packet = vec![PacketProperty::Unreliable as u8, channels::CHAT];
+            packet.extend_from_slice(&[1, 2, 3]);
+            packet
+        };
+        let large_payload = vec![7u8; 300];
+        let large = {
+            let mut packet = vec![PacketProperty::Unreliable as u8, channels::AVATAR];
+            packet.extend_from_slice(&large_payload);
+            packet
+        };
+        let datagrams = build_compact_merged_datagrams(
+            0,
+            MAX_MERGED_PACKET_SIZE,
+            vec![small.clone(), large.clone()],
+        );
+        assert_eq!(datagrams.len(), 1);
+        let datagram = &datagrams[0];
+        assert_eq!(
+            datagram[0],
+            PacketProperty::CompactMerged as u8,
+            "outer header must be CompactMerged"
+        );
+        // Short entry: [channel][u8 len][payload].
+        assert_eq!(datagram[1], channels::CHAT);
+        assert_eq!(datagram[2], 3);
+        assert_eq!(&datagram[3..6], &[1, 2, 3]);
+        // Long entry: [channel | LONG][u16 len][payload].
+        assert_eq!(datagram[6], channels::AVATAR | COMPACT_LONG_LENGTH_FLAG);
+        assert_eq!(u16::from_le_bytes([datagram[7], datagram[8]]), 300);
+        assert_eq!(&datagram[9..309], large_payload.as_slice());
+        // Compact must be smaller than classic Merged for the same batch.
+        let merged = build_merged_datagrams(0, vec![small, large]);
+        assert_eq!(merged.len(), 1);
+        assert!(datagram.len() < merged[0].len());
+    }
+
+    #[test]
+    fn compact_single_packet_batch_is_unwrapped_to_bare_unreliable() {
+        let mut packet = vec![PacketProperty::Unreliable as u8 | (2 << 5), channels::CHAT];
+        packet.extend_from_slice(&[9, 9]);
+        let datagrams =
+            build_compact_merged_datagrams(2, MAX_MERGED_PACKET_SIZE, vec![packet.clone()]);
+        assert_eq!(datagrams, vec![packet]);
+    }
+
+    #[test]
+    fn compact_oversized_packet_travels_as_original_bytes() {
+        let big_payload = vec![5u8; MAX_MERGED_PACKET_SIZE];
+        let mut big = vec![PacketProperty::Unreliable as u8, channels::AVATAR];
+        big.extend_from_slice(&big_payload);
+        let mut small = vec![PacketProperty::Unreliable as u8, channels::CHAT];
+        small.extend_from_slice(&[1]);
+        let datagrams = build_compact_merged_datagrams(
+            0,
+            MAX_MERGED_PACKET_SIZE,
+            vec![small.clone(), big.clone()],
+        );
+        assert_eq!(datagrams.len(), 2);
+        assert_eq!(datagrams[0], small);
+        assert_eq!(datagrams[1], big);
+    }
+
+    #[test]
+    fn send_datagrams_prefers_compact_for_unreliable_and_merged_for_mixed() {
+        let unreliable = |channel: u8, payload: &[u8]| {
+            let mut packet = vec![PacketProperty::Unreliable as u8, channel];
+            packet.extend_from_slice(payload);
+            packet
+        };
+        let all_unreliable = vec![
+            unreliable(channels::CHAT, &[1, 2, 3]),
+            unreliable(channels::AVATAR, &[4, 5]),
+        ];
+        let datagrams = build_send_datagrams(0, all_unreliable);
+        assert_eq!(datagrams.len(), 1);
+        assert_eq!(datagrams[0][0] & 0x1f, PacketProperty::CompactMerged as u8);
+
+        let mixed = vec![
+            unreliable(channels::CHAT, &[1, 2, 3]),
+            vec![PacketProperty::Channeled as u8, 0, 0, 0x8a, 2],
+        ];
+        let datagrams = build_send_datagrams(0, mixed);
+        assert_eq!(datagrams.len(), 1);
+        assert_eq!(datagrams[0][0] & 0x1f, PacketProperty::Merged as u8);
+
+        let single = vec![unreliable(channels::CHAT, &[1])];
+        let datagrams = build_send_datagrams(0, single.clone());
+        assert_eq!(datagrams, single);
+    }
+
     /// The dispatch loop frames packets with `MergedDatagramBuilder` instead of
     /// `build_merged_datagrams`. The two must stay byte-identical or real clients break, so
     /// pin the equivalence across the size boundaries that exercise every branch: several
@@ -5074,15 +5373,17 @@ mod tests {
         let len = time::timeout(Duration::from_secs(1), async {
             loop {
                 let (len, _) = client.recv_from(&mut recv).await.unwrap();
-                if recv[0] & 0x1f == PacketProperty::Merged as u8 {
+                if recv[0] & 0x1f == PacketProperty::CompactMerged as u8 {
                     break len;
                 }
             }
         })
         .await
         .unwrap();
-        assert_eq!(recv[0] & 0x1f, PacketProperty::Merged as u8);
-        assert_eq!(len, 1 + 2 * (2 + 2 + 650));
+        assert_eq!(recv[0] & 0x1f, PacketProperty::CompactMerged as u8);
+        // Compact entries strip the 2-byte Unreliable header; 650-byte payloads
+        // need the long (tag + u16) form: 1 + 2 * (3 + 650).
+        assert_eq!(len, 1 + 2 * (3 + 650));
         assert!(len <= server.peer_mtu(peer));
         server.shutdown();
     }
@@ -5230,6 +5531,65 @@ mod tests {
                 assert_eq!(payload.as_ref(), &[1, 2, 3]);
             }
             other => panic!("unexpected event: {other:?}"),
+        }
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn compact_merged_send_encoder_round_trips_through_decoder() {
+        // The new send encoder must agree with the receive decoder byte for
+        // byte, including the >255 long-length form and multi-entry batches.
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let remote = UdpSocket::bind(loopback_addr(0)).await.unwrap();
+        let remote_addr = remote.local_addr().unwrap();
+        let request = ConnectionRequest {
+            remote_addr,
+            payload: Bytes::new(),
+            connection_number: 0,
+            connect_time: 123,
+            local_peer_id: 0,
+        };
+        let peer = handle.accept(&request).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let unreliable = |channel: u8, payload: Vec<u8>| {
+            let mut packet = vec![PacketProperty::Unreliable as u8, channel];
+            packet.extend_from_slice(&payload);
+            packet
+        };
+        let packets = vec![
+            unreliable(channels::CHAT, vec![1, 2, 3]),
+            unreliable(channels::AVATAR, vec![9u8; 300]),
+            unreliable(channels::SCENE, vec![7]),
+        ];
+        let expected: Vec<(u8, Vec<u8>)> = packets
+            .iter()
+            .map(|packet| (packet[1], packet[2..].to_vec()))
+            .collect();
+        let datagrams = build_send_datagrams(0, packets);
+        assert!(!datagrams.is_empty());
+        for datagram in &datagrams {
+            assert_eq!(datagram[0] & 0x1f, PacketProperty::CompactMerged as u8);
+            process_compact_merged_packet(&handle, &tx, remote_addr, 0, datagram)
+                .await
+                .unwrap();
+        }
+
+        for (channel, payload) in expected {
+            match rx.recv().await.unwrap() {
+                ServerEvent::Message {
+                    peer: event_peer,
+                    channel: event_channel,
+                    delivery,
+                    payload: event_payload,
+                } => {
+                    assert_eq!(event_peer, peer);
+                    assert_eq!(event_channel, channel);
+                    assert_eq!(delivery, DeliveryMethod::Unreliable);
+                    assert_eq!(event_payload.as_ref(), payload.as_slice());
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
         }
         handle.shutdown();
     }
