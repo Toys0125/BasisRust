@@ -69,24 +69,43 @@ impl VoiceInbox {
 
 #[derive(Default)]
 struct AvatarPending {
+    high_pose: Option<Input>,
     pose: Option<Input>,
     delta: Option<Input>,
 }
 
 impl AvatarPending {
     fn push(&mut self, input: Input) {
-        let previous = self.pose.as_ref().or(self.delta.as_ref());
+        let previous = self
+            .high_pose
+            .as_ref()
+            .or(self.pose.as_ref())
+            .or(self.delta.as_ref());
         if previous.is_some_and(|old| !old.session.same_connection(&input.session)) {
             *self = Self::default();
         }
         if input.channel != channels::DELTA_AVATAR {
-            // A later full frame supersedes the earlier pose and its dependent delta.
-            self.pose = Some(input);
-            self.delta = None;
+            if channels::quality_from_channel(input.channel) == BitQuality::High as u8 {
+                // Keep the delta baseline even when a lower-quality pose follows it.
+                self.high_pose = Some(input);
+                self.delta = None;
+            } else {
+                // Coalesce lower-quality poses independently of the HIGH baseline.
+                self.pose = Some(input);
+            }
         } else {
             // Deltas reference the full keyframe, never the preceding delta.
             self.delta = Some(input);
         }
+    }
+
+    fn drain(&mut self) -> Vec<Input> {
+        let mut inputs = [self.high_pose.take(), self.pose.take(), self.delta.take()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        inputs.sort_by_key(|input| input.received);
+        inputs
     }
 }
 
@@ -188,8 +207,8 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
                         while !avatar_state.shutdown.load(Ordering::Relaxed) {
                             avatar_state.avatar_sync.poll_memory_reclaim();
                             let pending = std::mem::take(&mut *avatar_input.lock());
-                            for (peer, pending) in pending {
-                                for input in [pending.pose, pending.delta].into_iter().flatten() {
+                            for (peer, mut pending) in pending {
+                                for input in pending.drain() {
                                     if !avatar_state.transport.is_current_session(&input.session)
                                         || !avatar_state.authenticated_peers.contains_key(&peer)
                                     {
@@ -217,6 +236,7 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
         return Err(error);
     }
     let authenticated = state.authenticated_peers.clone();
+    let inbound_packets = state.statistics.inbound_packets.clone();
     state
         .transport
         .set_realtime_handler(Some(Arc::new(move |event, session| {
@@ -235,6 +255,9 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
             );
             if !is_voice && !is_avatar_input(event) {
                 return false;
+            }
+            if is_voice {
+                inbound_packets.fetch_add(1, Ordering::Relaxed);
             }
             // Do not allocate queues for unauthenticated senders.
             if !authenticated.contains_key(peer)
@@ -298,10 +321,6 @@ fn voice_loop(state: &ServerState, inbox: &VoiceInbox, lanes: &[Arc<SendLane>]) 
                 .collect::<HashMap<_, _>>()
         };
         for (peer, inputs) in inputs {
-            state
-                .statistics
-                .inbound_packets
-                .fetch_add(inputs.len() as u64, Ordering::Relaxed);
             // Ordinary and announcement traffic share sequence order within each kind.
             for shout in [false, true] {
                 if !voice_allowed(state, peer, shout) {
@@ -712,7 +731,7 @@ mod tests {
         pending.push(input(&session, channels::PLAYER_AVATAR_HIGH, 1, now));
         pending.push(input(&session, channels::DELTA_AVATAR, 2, now));
         pending.push(input(&session, channels::DELTA_AVATAR, 3, now));
-        assert_eq!(pending.pose.as_ref().unwrap().payload[0], 1);
+        assert_eq!(pending.high_pose.as_ref().unwrap().payload[0], 1);
         assert_eq!(pending.delta.as_ref().unwrap().payload[0], 3);
         pending.push(input(&session, channels::PLAYER_AVATAR_HIGH, 4, now));
         assert!(pending.delta.is_none());

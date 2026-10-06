@@ -3,7 +3,6 @@
 
 import argparse
 import csv
-import ctypes
 import hashlib
 import json
 import os
@@ -23,31 +22,39 @@ import xml.etree.ElementTree as ET
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "docs/performance/fixtures"
+WINDOWS = os.name == "nt"
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CTRL_BREAK_EVENT = 1
+CLOCK_TICKS = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+# spawn kwargs that mirror CREATE_NEW_PROCESS_GROUP on Windows.
+SPAWN_KWARGS = {"creationflags": CREATE_NEW_PROCESS_GROUP} if WINDOWS else {"start_new_session": True}
+# Signals a workload process group can be interrupted with.
+GROUP_BREAK_SIGNAL = signal.CTRL_BREAK_EVENT if WINDOWS else signal.SIGINT
+GROUP_BREAK_SIGNALS = (signal.SIGBREAK, signal.SIGINT) if WINDOWS else (signal.SIGINT,)
 
 
-class FILETIME(ctypes.Structure):
-    _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+if WINDOWS:
+    import ctypes
 
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
 
-class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
-    _fields_ = [
-        ("cb", ctypes.c_uint32), ("PageFaultCount", ctypes.c_uint32),
-        ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
-        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
-        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-        ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
-    ]
+    class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("cb", ctypes.c_uint32), ("PageFaultCount", ctypes.c_uint32),
+            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
 
-
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-psapi = ctypes.WinDLL("psapi", use_last_error=True)
-kernel32.OpenProcess.restype = ctypes.c_void_p
-kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-kernel32.GetProcessTimes.argtypes = [ctypes.c_void_p, ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME)]
-kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), ctypes.c_uint32]
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.GetProcessTimes.argtypes = [ctypes.c_void_p, ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME), ctypes.POINTER(FILETIME)]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), ctypes.c_uint32]
 
 
 def sha256(path):
@@ -59,33 +66,67 @@ def filetime_seconds(value):
 
 
 def process_metrics(pid):
-    handle = kernel32.OpenProcess(0x1000, False, pid)
-    if not handle:
-        return None
+    """CPU and memory counters for a child process.
+
+    Windows uses GetProcessTimes/GetProcessMemoryInfo. Linux reads /proc, where
+    utime/stime come from field 14/15 of /proc/<pid>/stat (in clock ticks) and
+    resident memory from VmRSS in /proc/<pid>/status. Linux has no direct
+    equivalent of the Windows commit charge, so resident plus swapped pages is
+    reported instead; that makes *_commit_charge_bytes a different quantity
+    here and not comparable to a Windows run.
+    """
+    if WINDOWS:
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            created, exited, kernel, user = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+            counters = PROCESS_MEMORY_COUNTERS()
+            counters.cb = ctypes.sizeof(counters)
+            if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+                return None
+            if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+                return None
+            return {
+                "kernel_cpu_seconds": filetime_seconds(kernel),
+                "user_cpu_seconds": filetime_seconds(user),
+                "cpu_seconds": filetime_seconds(kernel) + filetime_seconds(user),
+                "working_set_bytes": counters.WorkingSetSize,
+                "commit_charge_bytes": counters.PagefileUsage,
+            }
+        finally:
+            kernel32.CloseHandle(handle)
+
     try:
-        created, exited, kernel, user = FILETIME(), FILETIME(), FILETIME(), FILETIME()
-        counters = PROCESS_MEMORY_COUNTERS()
-        counters.cb = ctypes.sizeof(counters)
-        if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
-            return None
-        if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
-            return None
-        return {
-            "kernel_cpu_seconds": filetime_seconds(kernel),
-            "user_cpu_seconds": filetime_seconds(user),
-            "cpu_seconds": filetime_seconds(kernel) + filetime_seconds(user),
-            "working_set_bytes": counters.WorkingSetSize,
-            "commit_charge_bytes": counters.PagefileUsage,
-        }
-    finally:
-        kernel32.CloseHandle(handle)
+        with open(f"/proc/{pid}/stat", "rb") as stream:
+            # comm can contain spaces and parentheses, so split after the last ')'.
+            fields = stream.read().rpartition(b")")[2].split()
+        user_ticks = int(fields[11])
+        kernel_ticks = int(fields[12])
+        with open(f"/proc/{pid}/status", "rb") as stream:
+            status = stream.read().decode("ascii", "replace")
+    except (OSError, ValueError, IndexError):
+        return None
+    pages = {}
+    for line in status.splitlines():
+        key, _, value = line.partition(":")
+        if key in ("VmRSS", "VmSwap"):
+            pages[key] = int(value.split()[0]) * 1024
+    working_set = pages.get("VmRSS", 0)
+    return {
+        "kernel_cpu_seconds": kernel_ticks / CLOCK_TICKS,
+        "user_cpu_seconds": user_ticks / CLOCK_TICKS,
+        "cpu_seconds": (user_ticks + kernel_ticks) / CLOCK_TICKS,
+        "working_set_bytes": working_set,
+        "commit_charge_bytes": working_set + pages.get("VmSwap", 0),
+    }
 
 
 def stop_process(process):
     if process is None or process.poll() is not None:
         return
     try:
-        process.send_signal(CTRL_BREAK_EVENT)
+        process.send_signal(GROUP_BREAK_SIGNAL)
         process.wait(timeout=20)
     except (OSError, subprocess.TimeoutExpired):
         process.terminate()
@@ -139,8 +180,8 @@ def population(status, server_log, client_log, server_kind):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server", type=pathlib.Path, default=ROOT / "BasisRustServer/target/release/basis-server-console.exe")
-    parser.add_argument("--client", type=pathlib.Path, default=ROOT / "BasisRustClient/target/release/basis-rust-client.exe")
+    parser.add_argument("--server", type=pathlib.Path, default=ROOT / ("BasisRustServer/target/release/basis-server-console.exe" if WINDOWS else "BasisRustServer/target/release/basis-server-console"))
+    parser.add_argument("--client", type=pathlib.Path, default=ROOT / ("BasisRustClient/target/release/basis-rust-client.exe" if WINDOWS else "BasisRustClient/target/release/basis-rust-client"))
     parser.add_argument("--server-kind", choices=("rust", "csharp"), default="rust")
     parser.add_argument("--server-config", type=pathlib.Path, default=FIXTURES / "avatar-1500-server.xml")
     parser.add_argument("--no-server-avatar-diagnostics", action="store_true", help="disable Rust per-pair timing diagnostics for process-counter comparisons")
@@ -159,6 +200,14 @@ def main():
     parser.add_argument("--voice-audio-folder", type=pathlib.Path, help="enable measured voice traffic from this Ogg Opus folder (local clients only)")
     parser.add_argument("--voice-speaker-percent", type=int, default=10)
     parser.add_argument("--no-voice-reencode", action="store_true", help="use pre-encoded Unity-compatible 20 ms Opus packets")
+    parser.add_argument("--no-client-shared-receive", action="store_true",
+                        help="force per-client receive tasks; on Linux the shared epoll receiver defaults on and "
+                             "discards unreliable payloads for non-observer clients, which silently starves voice")
+    parser.add_argument("--client-voice-all-clients", action="store_true",
+                        help="measure voice reception on every client instead of observer candidates only. On Linux the "
+                             "load-sink receive filter drops top-level Unreliable and CompactMerged for non-observer "
+                             "clients, so the Rust server (Merged) reaches all clients while LiteNetLib (CompactMerged) "
+                             "reaches only observers; disable it so both server legs measure the same population")
     parser.add_argument("--max-server-working-set-mib", type=int, help="stop measurement at this server working set; voice default=24576 MiB, otherwise unlimited; 0 disables")
     parser.add_argument("--post-client-seconds", type=int, default=0, help="observe server memory/health after clients exit before stopping the server")
     args = parser.parse_args()
@@ -191,8 +240,6 @@ def main():
         args.port = available_port(socket.AF_INET6, socket.SOCK_DGRAM, "::")
     if args.health_port == 0:
         args.health_port = available_port(socket.AF_INET, socket.SOCK_STREAM, "127.0.0.1")
-    if os.name != "nt":
-        parser.error("this harness uses Windows process metrics and process-group signals")
     if args.clients < 2 or args.warmup_seconds < 0 or args.window_seconds < 1 or args.workers < 1 or (args.rayon_threads is not None and args.rayon_threads < 0):
         parser.error("clients >=2, warmup >=0, window >=1, client workers >=1, and Rayon threads >=0 are required")
     if not server_bin.is_file() or not client_bin.is_file():
@@ -203,7 +250,7 @@ def main():
         parser.error(f"output directory already exists: {output}")
 
     output.mkdir(parents=True)
-    base_dir = pathlib.Path(tempfile.mkdtemp(prefix="basis-avatar-server-win-"))
+    base_dir = pathlib.Path(tempfile.mkdtemp(prefix="basis-avatar-server-" + ("win" if WINDOWS else "linux") + "-"))
     (base_dir / "config").mkdir()
     server_config = base_dir / "config/config.xml"
     shutil.copyfile(args.server_config, server_config)
@@ -242,7 +289,8 @@ def main():
     client_log = None
     server = client = None
     started = time.time()
-    signal.signal(signal.SIGBREAK, interrupt_workload)
+    for break_signal in GROUP_BREAK_SIGNALS:
+        signal.signal(break_signal, interrupt_workload)
     try:
         server_env = dict(os.environ)
         server_env.update({
@@ -264,7 +312,7 @@ def main():
             server_cmd = [str(launch_server)]
         (output / "commands.txt").write_text(" ".join(server_cmd) + "\n", encoding="utf-8")
         server = subprocess.Popen(server_cmd, cwd=ROOT, env=server_env, stdout=server_log,
-                                  stderr=subprocess.STDOUT, creationflags=CREATE_NEW_PROCESS_GROUP)
+                                  stderr=subprocess.STDOUT, **SPAWN_KWARGS)
 
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -284,6 +332,10 @@ def main():
         client_env = dict(os.environ)
         client_env.update({"BASIS_CLIENT_TOKIO_WORKERS": str(args.workers), "BASIS_AVATAR_DIAGNOSTICS": "true"})
         client_env.pop("BASIS_VOICE_DIAGNOSTIC_CSV", None)
+        if args.no_client_shared_receive:
+            client_env["BASIS_CLIENT_SHARED_RECEIVE"] = "0"
+        if args.client_voice_all_clients:
+            client_env["BASIS_CLIENT_LOAD_SINK_FILTER"] = "0"
         if args.voice_audio_folder:
             client_env["BASIS_VOICE_DIAGNOSTIC_CSV"] = str(output / "voice.csv")
         remote_root = pathlib.PurePosixPath(args.remote_root) if args.remote_ssh else None
@@ -317,7 +369,7 @@ def main():
             command_file.write(" ".join(client_cmd) + "\n")
         client_log = (output / "client.log").open("w", buffering=1)
         client = subprocess.Popen(client_cmd, cwd=ROOT, env=client_env, stdin=subprocess.PIPE, stdout=client_log,
-                                  stderr=subprocess.STDOUT, creationflags=CREATE_NEW_PROCESS_GROUP)
+                                  stderr=subprocess.STDOUT, **SPAWN_KWARGS)
         process_ids = {"server_pid": server.pid, "client_pid": None if args.remote_ssh else client.pid}
         if args.remote_ssh:
             process_ids["ssh_process_pid"] = client.pid
@@ -485,6 +537,7 @@ def main():
             "layout": "remote Linux client, zero positional drift" if args.remote_ssh else "colocated, zero positional drift",
             "pose": "valid synthetic deterministic root/body rotation channels; not captured Unity pose",
             "voice": bool(args.voice_audio_folder), "p2p": False, "server_profiling": False,
+            "client_shared_receive_disabled": args.no_client_shared_receive,
             "voice_audio_folder": str(args.voice_audio_folder.resolve()) if args.voice_audio_folder else None,
             "voice_speaker_percent": args.voice_speaker_percent if args.voice_audio_folder else 0,
             "voice_frame_duration_ms": 20 if args.voice_audio_folder else None,
@@ -502,7 +555,7 @@ def main():
                                                  "BASIS_VOICE_SEND_WORKERS", "BASIS_VOICE_SERVER_DIAGNOSTIC_CSV", "BASIS_EVENT_DIAGNOSTIC_CSV",
                                                  "BASIS_AVATAR_MIN_RECEIVER_SLICES", "BASIS_AVATAR_MAX_RECEIVER_SLICES",
                                                  "BASIS_AVATAR_TICK_BUDGET_MS", "BASIS_AVATAR_RECEIVER_CYCLE_BUDGET_MS",
-                                                 "BASIS_AVATAR_FLUSH_LANES",
+                                                 "BASIS_AVATAR_FLUSH_LANES", "BASIS_CLIENT_SHARED_RECEIVE", "BASIS_CLIENT_LOAD_SINK_FILTER",
                                                  "EnableBSRProfiling", "HealthIncludeBSRProfiling", "EnableComputeOffload",
                                                  "BASIS_AVATAR_DIAGNOSTICS")},
             "server_exit_code": server.returncode, "client_exit_code": client.returncode,
