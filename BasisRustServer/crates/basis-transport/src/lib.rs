@@ -1190,7 +1190,7 @@ impl TransportHandle {
         }
 
         if !self.compact_merge_send() {
-            return self.try_send_many_unreliable_merged_packets(&state, packets);
+            return self.try_send_many_unreliable_merged_packets(state, packets);
         }
 
         let mut sent = 0usize;
@@ -1208,7 +1208,7 @@ impl TransportHandle {
             let compact_eligible =
                 channel & !COMPACT_CHANNEL_MASK == 0 && payload.len() <= u16::MAX as usize;
             if !compact_eligible {
-                if self.flush_compact_current(&state, &mut current, current_count)? {
+                if self.flush_compact_current(state, &mut current, current_count)? {
                     sent += 1;
                 }
                 current_count = 0;
@@ -1224,7 +1224,7 @@ impl TransportHandle {
 
             let framed_len = compact_entry_header_len(payload.len()) + payload.len();
             if current_count > 0 && current.len() + framed_len > mtu {
-                if self.flush_compact_current(&state, &mut current, current_count)? {
+                if self.flush_compact_current(state, &mut current, current_count)? {
                     sent += 1;
                 }
                 current_count = 0;
@@ -1246,7 +1246,7 @@ impl TransportHandle {
             current_count += 1;
         }
 
-        if self.flush_compact_current(&state, &mut current, current_count)? {
+        if self.flush_compact_current(state, &mut current, current_count)? {
             sent += 1;
         }
         Ok(sent)
