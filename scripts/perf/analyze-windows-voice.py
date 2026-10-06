@@ -88,6 +88,7 @@ def validate_samples(path, audio_folder):
 
 def summarize(path, audio_folder):
     meta = json.loads((path / "workload.json").read_text())
+    csharp = meta.get("server_kind") == "csharp"
     observer = {}
     with (path / "observer.csv").open(newline="", encoding="utf-8-sig") as stream:
         for row in csv.reader(stream):
@@ -110,14 +111,17 @@ def summarize(path, audio_folder):
     for key, name, divisor in (("bytesOut", "udp_payload_egress_mb_s", 1_000_000),
                                ("bytesIn", "udp_payload_ingress_mb_s", 1_000_000),
                                ("packetsOut", "udp_datagrams_out_s", 1), ("packetsIn", "udp_datagrams_in_s", 1)):
-        metrics[name] = (health[-1]["extended"]["rawUdp"][key] - health[0]["extended"]["rawUdp"][key]) / seconds / divisor if seconds > 0 else None
+        counter = {"bytesOut": "sent", "bytesIn": "recv", "packetsOut": "packetsSent", "packetsIn": "packetsRecv"}[key]
+        first = health[0][counter] if csharp else health[0]["extended"]["rawUdp"][key]
+        last = health[-1][counter] if csharp else health[-1]["extended"]["rawUdp"][key]
+        metrics[name] = (last - first) / seconds / divisor if seconds > 0 else None
     for key in ("gap_p50_ms", "gap_p95_ms"):
         metrics["avatar_" + key] = float(observer.get(key, 0))
     metrics["avatar_observer_applied_items_s"] = (int(observer.get("applied_full_items", 0)) + int(observer.get("applied_delta_items", 0))) / max(int(observer["window_ms"]) / 1000, 0.001)
     senders = rows(path / "observer.sender.csv")
     checks = {
         "measurement_completed": meta.get("measurement_complete", True),
-        "all_clients_authenticated_active": all(int(row["players_online"]) == meta["clients"] and int(row["active_states"]) == meta["clients"] for row in process),
+        "all_clients_authenticated_active": all(int(row["players_online"]) == meta["clients"] and int(row["client_join_logs" if csharp else "active_states"]) == meta["clients"] for row in process),
         "sender_records_complete": len(senders) == meta["clients"],
         "all_avatar_senders_connected": all(row["connected_at_end"] == "true" for row in senders),
         "zero_avatar_send_errors": all(int(row["send_errors"]) == 0 for row in senders),
@@ -126,10 +130,19 @@ def summarize(path, audio_folder):
         "observer_avatar_peers_complete": int(observer["near_peers"]) == meta["clients"] - 1,
         "client_clean_exit": meta["client_exit_code"] == 0,
         "server_controlled_stop": meta["server_exit_code"] in (0, 3221225786),
-        "zero_udp_would_block": all(item["extended"]["rawUdp"]["wouldBlock"] == 0 for item in health),
-        "zero_server_protocol_errors": all(item["extended"]["appMessages"]["protocolErrors"] == 0 for item in health),
-        "zero_non_reliable_drops": all(item.get("transport", {}).get("nonReliableDroppedDatagrams", 0) == 0 for item in health),
+        "zero_non_reliable_drops": all((item["droppedUnreliable"] if csharp else item.get("transport", {}).get("nonReliableDroppedDatagrams", 0)) == 0 for item in health),
     }
+    unavailable_checks = []
+    if csharp:
+        # C# exposes explicit shedding counters, but not these Rust diagnostics.
+        # Missing instrumentation must not be reported as a successful zero check.
+        checks["zero_reported_voice_drops"] = all(item["droppedVoice"] == 0 for item in health)
+        unavailable_checks = ["zero_udp_would_block", "zero_server_protocol_errors"]
+        metrics["server_reported_unreliable_drops"] = health[-1]["droppedUnreliable"] - health[0]["droppedUnreliable"]
+        metrics["server_reported_voice_drops"] = health[-1]["droppedVoice"] - health[0]["droppedVoice"]
+    else:
+        checks["zero_udp_would_block"] = all(item["extended"]["rawUdp"]["wouldBlock"] == 0 for item in health)
+        checks["zero_server_protocol_errors"] = all(item["extended"]["appMessages"]["protocolErrors"] == 0 for item in health)
     for key in ("missing_expected_peers", "stale_peers_500ms", "decode_errors", "unapplied_deltas", "malformed_items", "non_newer_sequences"):
         checks["zero_avatar_" + key] = int(observer.get(key, 0)) == 0
     voice, audio_validation, capacity = None, None, {}
@@ -183,6 +196,7 @@ def summarize(path, audio_folder):
                     "at_least_99pct_expected_fanout_received": metrics["voice_receipt_to_expected_fanout_ratio"] >= 0.99,
                     "observer_voice_p95_under_40ms": metrics.get("voice_gap_p95_floor_ms", 10000) < 40}
     return {"name": path.name, "capture": str(path), "valid": all(checks.values()), "checks": checks,
+            "unavailable_checks": unavailable_checks,
             "capacity_pass": all(capacity.values()) if capacity else None, "capacity_checks": capacity,
             "metrics": metrics, "voice": voice, "audio_validation": audio_validation,
             "avatar_observer": observer, "readiness_samples": len(process), "metadata": meta}

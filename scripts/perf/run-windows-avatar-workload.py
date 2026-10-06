@@ -444,7 +444,7 @@ def main():
                         raise RuntimeError("server exited during post-client observation")
                     status = health(args.health_port)
                     writer.writerow({"unix_seconds": time.time(), "elapsed_seconds": time.monotonic() - post_started,
-                                     "players_online": status.get("players_online"),
+                                     "players_online": status.get("visitors" if args.server_kind == "csharp" else "players_online"),
                                      "server_working_set_bytes": metrics["working_set_bytes"],
                                      "server_commit_charge_bytes": metrics["commit_charge_bytes"],
                                      "server_cpu_seconds": metrics["cpu_seconds"]})
