@@ -1569,18 +1569,21 @@ fn build_compact_merged_datagrams(
     let mut current_count = 0usize;
     current.push(PacketProperty::CompactMerged as u8 | (connection_number << 5));
 
+    // Sealed datagrams keep their buffer; the fresh accumulator reserves a
+    // full MTU up front so multi-datagram batches do not regrow it entry by
+    // entry after every seal.
+    let seal_compact =
+        |current: &mut Vec<u8>, current_count: &mut usize, datagrams: &mut Vec<Vec<u8>>| {
+            if *current_count == 1 {
+                datagrams.push(unpack_single_compact_packet(current));
+            } else if *current_count > 1 {
+                datagrams.push(std::mem::replace(current, Vec::with_capacity(mtu)));
+            }
+            current.clear();
+            current.push(PacketProperty::CompactMerged as u8 | (connection_number << 5));
+            *current_count = 0;
+        };
     for packet in packets {
-        let seal_compact =
-            |current: &mut Vec<u8>, current_count: &mut usize, datagrams: &mut Vec<Vec<u8>>| {
-                if *current_count == 1 {
-                    datagrams.push(unpack_single_compact_packet(current));
-                } else if *current_count > 1 {
-                    datagrams.push(std::mem::take(current));
-                }
-                current.clear();
-                current.push(PacketProperty::CompactMerged as u8 | (connection_number << 5));
-                *current_count = 0;
-            };
         let Some((channel, payload)) = compact_unreliable_entry(&packet) else {
             // Not compact-eligible: seal the in-progress compact datagram (if
             // any) and pass the packet through untouched. Whole-batch callers
