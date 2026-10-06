@@ -517,6 +517,7 @@ impl ServerState {
             config.health_include_extended_metrics,
         )
         .await?;
+        transport.set_compact_merge_send(config.compact_merged);
         info!("server listening on {}", transport.local_addr()?);
 
         let p2p_broker = p2p::P2pBroker::default();
@@ -719,6 +720,7 @@ impl ServerState {
         );
         self.transport
             .set_extended_statistics_enabled(config.health_include_extended_metrics);
+        self.transport.set_compact_merge_send(config.compact_merged);
         self.statistics
             .set_enabled(config.health_include_extended_metrics);
 

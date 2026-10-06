@@ -140,7 +140,17 @@ pub(crate) fn shared_receiver_process_merged(client: &BasisClient, fd: RawFd, by
             return;
         }
         let packet = &bytes[pos..pos + size];
+        pos += size;
         let property = packet.first().copied().unwrap_or_default() & 0x1f;
+        if property == PacketProperty::Unreliable as u8 {
+            // Load sinks discard unreliable application data: no parse, no
+            // ACK state. A short header keeps the malformed-packet
+            // diagnostic the full parse would have recorded.
+            if packet.len() < 2 {
+                client.record_unparsed_packet(packet);
+            }
+            continue;
+        }
         match parse_packet(packet) {
             None => client.record_unparsed_packet(packet),
             Some(packet)
@@ -163,7 +173,6 @@ pub(crate) fn shared_receiver_process_merged(client: &BasisClient, fd: RawFd, by
             }
             _ => {}
         }
-        pos += size;
     }
     if pos != bytes.len() {
         client

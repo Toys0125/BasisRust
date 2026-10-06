@@ -2491,3 +2491,352 @@ fn read_raw_len_string(bytes: &[u8], offset: usize) -> (String, usize) {
 
 #[path = "resilience_tests.rs"]
 mod resilience_tests;
+
+fn profile_full_unreliable(channel: u8, payload: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(payload.len() + 2);
+    packet.push(PacketProperty::Unreliable as u8);
+    packet.push(channel);
+    packet.extend_from_slice(payload);
+    packet
+}
+
+/// MTU cap the server packers use. Profiling at the same cap reproduces the
+/// datagram splits of a real tick instead of one oversized datagram.
+const PROFILE_MTU: usize = 1200;
+
+fn profile_build_merged(entries: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    // Mirrors build_merged_datagrams: u16 length + full packet per entry,
+    // sealed at the MTU cap with single-entry datagrams unwrapped to bare
+    // packets.
+    let mut datagrams = Vec::new();
+    let mut current = vec![PacketProperty::Merged as u8];
+    let mut count = 0usize;
+    for entry in entries {
+        let framed = 2 + entry.len();
+        if framed + 1 > PROFILE_MTU {
+            if count > 0 {
+                if count == 1 {
+                    datagrams.push(current[3..].to_vec());
+                } else {
+                    datagrams.push(std::mem::replace(
+                        &mut current,
+                        vec![PacketProperty::Merged as u8],
+                    ));
+                }
+                count = 0;
+            }
+            datagrams.push(entry.clone());
+            continue;
+        }
+        if count > 0 && current.len() + framed > PROFILE_MTU {
+            if count == 1 {
+                datagrams.push(current[3..].to_vec());
+                current = vec![PacketProperty::Merged as u8];
+            } else {
+                datagrams.push(std::mem::replace(
+                    &mut current,
+                    vec![PacketProperty::Merged as u8],
+                ));
+            }
+            count = 0;
+        }
+        current.extend_from_slice(&(entry.len() as u16).to_le_bytes());
+        current.extend_from_slice(entry);
+        count += 1;
+    }
+    if count == 1 {
+        datagrams.push(current[3..].to_vec());
+    } else if count > 1 {
+        datagrams.push(current);
+    }
+    datagrams
+}
+
+fn profile_compact_framed_len(payload_len: usize) -> usize {
+    if payload_len <= u8::MAX as usize {
+        2 + payload_len
+    } else {
+        3 + payload_len
+    }
+}
+
+fn profile_build_compact(entries: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    // Mirrors the server encoder: strip the 2-byte Unreliable header,
+    // tag + u8 len for payloads <= 255, tag + LONG + u16 len above, sealed
+    // at the MTU cap with single-entry datagrams unwrapped to bare packets.
+    let mut datagrams = Vec::new();
+    let mut current = vec![PacketProperty::CompactMerged as u8];
+    let mut count = 0usize;
+    for entry in entries {
+        let channel = entry[1];
+        let payload = &entry[2..];
+        let framed = profile_compact_framed_len(payload.len());
+        if framed + 1 > PROFILE_MTU {
+            if count > 0 {
+                if count == 1 {
+                    datagrams.push(profile_compact_unwrap(&current));
+                } else {
+                    datagrams.push(std::mem::replace(
+                        &mut current,
+                        vec![PacketProperty::CompactMerged as u8],
+                    ));
+                }
+                count = 0;
+            }
+            datagrams.push(entry.clone());
+            continue;
+        }
+        if count > 0 && current.len() + framed > PROFILE_MTU {
+            if count == 1 {
+                datagrams.push(profile_compact_unwrap(&current));
+                current = vec![PacketProperty::CompactMerged as u8];
+            } else {
+                datagrams.push(std::mem::replace(
+                    &mut current,
+                    vec![PacketProperty::CompactMerged as u8],
+                ));
+            }
+            count = 0;
+        }
+        if payload.len() <= u8::MAX as usize {
+            current.push(channel);
+            current.push(payload.len() as u8);
+        } else {
+            current.push(channel | 0x80);
+            current.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        }
+        current.extend_from_slice(payload);
+        count += 1;
+    }
+    if count == 1 {
+        datagrams.push(profile_compact_unwrap(&current));
+    } else if count > 1 {
+        datagrams.push(current);
+    }
+    datagrams
+}
+
+/// Rebuild the bare Unreliable packet from a single-entry compact datagram
+/// (outer header + tag + length + payload), mirroring the server unwrap.
+fn profile_compact_unwrap(datagram: &[u8]) -> Vec<u8> {
+    let tag = datagram[1];
+    let (channel, payload) = if tag & 0x80 != 0 {
+        (tag & 0x3f, &datagram[4..])
+    } else {
+        (tag & 0x3f, &datagram[3..])
+    };
+    let mut packet = Vec::with_capacity(payload.len() + 2);
+    packet.push(PacketProperty::Unreliable as u8);
+    packet.push(channel);
+    packet.extend_from_slice(payload);
+    packet
+}
+
+/// Epoll/receive-path profiler: measures `handle_packet` throughput for wire
+/// datagrams shaped like a real avatar tick, comparing classic Merged against
+/// the CompactMerged framing the server now sends.
+///
+/// Run explicitly (ignored by default, release mode for representative
+/// numbers):
+///   cargo test -p basis-client-core --release profile_receive_framing -- --ignored --nocapture
+///
+/// Context: the Linux-only shared epoll fast path consumes Merged inline
+/// (`shared_receiver_process_merged`: no allocation, no Tokio handoff), while
+/// CompactMerged falls through to this `handle_packet` path on every
+/// platform. Load-sink clients additionally drop CompactMerged in kernel BPF,
+/// so this profile covers the cost real (non-load-sink) clients pay per
+/// avatar entry: framing parse and direct dispatch without a per-entry copy.
+#[tokio::test]
+#[ignore]
+async fn profile_receive_framing_throughput() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(0, server.local_addr().unwrap()).await;
+
+    fn scenario(name: &str, sizes: &[usize]) -> (String, Vec<Vec<u8>>) {
+        let entries: Vec<Vec<u8>> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| {
+                let fill = (i as u8).wrapping_mul(37).wrapping_add(11);
+                profile_full_unreliable(channels::AVATAR, &vec![fill; len])
+            })
+            .collect();
+        (name.to_string(), entries)
+    }
+
+    // Representative avatar tick: 10 entries, 60..276 B (8 short-form, 2 long-form).
+    // Compressed-bundle tick: 3 large entries, all long-form.
+    // Ticks are packed at the server MTU cap, so a tick may span datagrams.
+    let scenarios = [
+        scenario("tick", &[60, 84, 108, 132, 156, 180, 204, 228, 252, 276]),
+        scenario("bundle", &[350, 350, 350]),
+    ];
+
+    const WARMUP: usize = 500;
+    const MEASURED: usize = 5000;
+    const ROUNDS: usize = 5;
+
+    async fn run_tick(client: &Arc<BasisClient>, datagrams: &[Vec<u8>]) {
+        for datagram in datagrams {
+            client.handle_packet(datagram).await.unwrap();
+        }
+    }
+
+    for (name, entries) in &scenarios {
+        let merged = profile_build_merged(entries);
+        let compact = profile_build_compact(entries);
+        let merged_bytes: usize = merged.iter().map(Vec::len).sum();
+        let compact_bytes: usize = compact.iter().map(Vec::len).sum();
+        println!(
+            "scenario={name} entries={} datagrams(merged/compact)={}/{} bytes={}/{} saved={}",
+            entries.len(),
+            merged.len(),
+            compact.len(),
+            merged_bytes,
+            compact_bytes,
+            merged_bytes.saturating_sub(compact_bytes),
+        );
+
+        for datagrams in [&merged, &compact] {
+            for _ in 0..WARMUP {
+                run_tick(&client, datagrams).await;
+            }
+        }
+
+        let mut merged_rounds = Vec::with_capacity(ROUNDS);
+        let mut compact_rounds = Vec::with_capacity(ROUNDS);
+        for _ in 0..ROUNDS {
+            let start = std::time::Instant::now();
+            for _ in 0..MEASURED {
+                run_tick(&client, &merged).await;
+            }
+            merged_rounds.push(start.elapsed());
+            let start = std::time::Instant::now();
+            for _ in 0..MEASURED {
+                run_tick(&client, &compact).await;
+            }
+            compact_rounds.push(start.elapsed());
+        }
+        merged_rounds.sort();
+        compact_rounds.sort();
+        let merged_best = merged_rounds[0];
+        let compact_best = compact_rounds[0];
+        let per_entry = |elapsed: std::time::Duration| {
+            elapsed.as_nanos() as f64 / (MEASURED * entries.len()) as f64
+        };
+        println!(
+            "  merged : {:>10.1} ns/tick  {:>8.1} ns/entry (min of {ROUNDS} rounds x {MEASURED} ticks)",
+            merged_best.as_nanos() as f64 / MEASURED as f64,
+            per_entry(merged_best),
+        );
+        println!(
+            "  compact: {:>10.1} ns/tick  {:>8.1} ns/entry (min of {ROUNDS} rounds x {MEASURED} ticks)",
+            compact_best.as_nanos() as f64 / MEASURED as f64,
+            per_entry(compact_best),
+        );
+        println!(
+            "  delta  : {:+.1} ns/entry ({:+.1}% vs merged)",
+            per_entry(compact_best) - per_entry(merged_best),
+            100.0 * (compact_best.as_nanos() as f64 / merged_best.as_nanos() as f64 - 1.0),
+        );
+    }
+}
+
+/// Full-population soak: 750 live `BasisClient` instances each process one
+/// avatar tick's datagrams per simulated server tick, in both framings, and
+/// the aggregate receive CPU is compared. Ticks are packed at the server MTU
+/// cap, so a tick may span datagrams exactly as on the wire.
+///
+/// Run explicitly (ignored by default, release mode for representative
+/// numbers):
+///   cargo test -p basis-client-core --release profile_750_clients -- --ignored --nocapture
+///
+/// Methodology notes: clients are driven sequentially (no Tokio fan-out) so
+/// the numbers isolate receive-path CPU from scheduler/sleep noise; payload
+/// bytes are fixed per entry because no framing branch depends on content.
+/// `avatar_observer` is unset (as in `test_client`), so per-entry application
+/// work is identical between framings and only framing + dispatch is timed.
+#[tokio::test]
+#[ignore]
+async fn profile_750_clients_framing_cpu() {
+    const CLIENTS: usize = 750;
+    const TICKS: usize = 250;
+    const ROUNDS: usize = 3;
+
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let mut clients = Vec::with_capacity(CLIENTS);
+    for index in 0..CLIENTS {
+        clients.push(test_client(index, server_addr).await);
+    }
+
+    // Same 10-entry avatar tick shape as the framing profiler.
+    let entries: Vec<Vec<u8>> = [60, 84, 108, 132, 156, 180, 204, 228, 252, 276]
+        .iter()
+        .enumerate()
+        .map(|(i, &len)| {
+            let fill = (i as u8).wrapping_mul(37).wrapping_add(11);
+            profile_full_unreliable(channels::AVATAR, &vec![fill; len])
+        })
+        .collect();
+    let merged = profile_build_merged(&entries);
+    let compact = profile_build_compact(&entries);
+    println!(
+        "clients={CLIENTS} ticks={TICKS} entries/tick={} datagrams/tick(merged/compact)={}/{}",
+        entries.len(),
+        merged.len(),
+        compact.len(),
+    );
+
+    // Warmup: one tick per client in both framings (sockets, allocator, code).
+    for client in &clients {
+        for datagram in merged.iter().chain(compact.iter()) {
+            client.handle_packet(datagram).await.unwrap();
+        }
+    }
+
+    async fn run_soak(clients: &[Arc<BasisClient>], datagrams: &[Vec<u8>], ticks: usize) {
+        for _ in 0..ticks {
+            for client in clients {
+                for datagram in datagrams {
+                    client.handle_packet(datagram).await.unwrap();
+                }
+            }
+        }
+    }
+
+    let mut merged_rounds = Vec::with_capacity(ROUNDS);
+    let mut compact_rounds = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let start = std::time::Instant::now();
+        run_soak(&clients, &merged, TICKS).await;
+        merged_rounds.push(start.elapsed());
+        let start = std::time::Instant::now();
+        run_soak(&clients, &compact, TICKS).await;
+        compact_rounds.push(start.elapsed());
+    }
+    merged_rounds.sort();
+    compact_rounds.sort();
+    let merged_best = merged_rounds[0];
+    let compact_best = compact_rounds[0];
+    let total_packets = (CLIENTS * TICKS) as f64;
+    let total_entries = total_packets * entries.len() as f64;
+    println!(
+        "  merged : {:>8.1} ms total  {:>8.1} us/client-tick  {:>6.1} ns/entry",
+        merged_best.as_secs_f64() * 1000.0,
+        merged_best.as_nanos() as f64 / total_packets / 1000.0,
+        merged_best.as_nanos() as f64 / total_entries,
+    );
+    println!(
+        "  compact: {:>8.1} ms total  {:>8.1} us/client-tick  {:>6.1} ns/entry",
+        compact_best.as_secs_f64() * 1000.0,
+        compact_best.as_nanos() as f64 / total_packets / 1000.0,
+        compact_best.as_nanos() as f64 / total_entries,
+    );
+    println!(
+        "  delta  : {:+.1} ms total ({:+.1}% vs merged), {:+.1} extra us per client-tick",
+        (compact_best.as_secs_f64() - merged_best.as_secs_f64()) * 1000.0,
+        100.0 * (compact_best.as_secs_f64() / merged_best.as_secs_f64() - 1.0),
+        (compact_best.as_nanos() as f64 - merged_best.as_nanos() as f64) / total_packets / 1000.0,
+    );
+}

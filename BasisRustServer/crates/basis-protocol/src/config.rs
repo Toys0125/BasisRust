@@ -62,6 +62,10 @@ pub struct ServerConfig {
     pub ipv6_enabled: bool,
     pub mtu_override: i32,
     pub mtu_discovery: bool,
+    /// Send-side CompactMerged toggle, matching BasisVR `LNLTransportConfig`.
+    /// Defaults to true; when false the server packs qualifying batches as
+    /// classic LiteNetLib Merged datagrams instead.
+    pub compact_merged: bool,
     pub disconnect_on_unreachable: bool,
     pub allow_peer_address_change: bool,
     pub has_file_support: bool,
@@ -214,6 +218,7 @@ impl Default for ServerConfig {
             ipv6_enabled: true,
             mtu_override: 0,
             mtu_discovery: true,
+            compact_merged: true,
             disconnect_on_unreachable: false,
             allow_peer_address_change: true,
             has_file_support: true,
@@ -412,6 +417,7 @@ impl ServerConfig {
         override_field!("IPv6Enabled", ipv6_enabled, bool);
         override_field!("MtuOverride", mtu_override, i32);
         override_field!("MtuDiscovery", mtu_discovery, bool);
+        override_field!("CompactMerged", compact_merged, bool);
         override_field!("DisconnectOnUnreachable", disconnect_on_unreachable, bool);
         override_field!("AllowPeerAddressChange", allow_peer_address_change, bool);
         override_field!("HasFileSupport", has_file_support, bool);
@@ -793,6 +799,33 @@ mod tests {
 
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn compact_merged_toggle_defaults_true_with_xml_and_env_roundtrip() {
+        // BasisVR parity default: CompactMerged send is on unless disabled.
+        assert!(ServerConfig::default().compact_merged);
+        // Missing element in older config files falls back to the default.
+        let config: ServerConfig =
+            quick_xml::de::from_str("<Configuration><GifsLocked>true</GifsLocked></Configuration>")
+                .unwrap();
+        assert!(config.compact_merged);
+        // Explicit BasisVR-style element disables it.
+        let config: ServerConfig = quick_xml::de::from_str(
+            "<Configuration><CompactMerged>false</CompactMerged></Configuration>",
+        )
+        .unwrap();
+        assert!(!config.compact_merged);
+        let mut config = ServerConfig::default();
+        config
+            .process_environment_overrides_with(|name| {
+                (name == "CompactMerged")
+                    .then_some("false".to_owned())
+                    .ok_or(env::VarError::NotPresent)
+            })
+            .unwrap();
+        assert!(!config.compact_merged);
+        assert_eq!(config.get_field("CompactMerged").unwrap(), "false");
+    }
 
     #[test]
     fn password_environment_precedence_and_rejection() {
