@@ -18,6 +18,8 @@ The Windows workload uses 1,000 authenticated headless clients, colocated inside
 
 The current-main comparison uses `f78dfa4`; it already includes bounded control-handler admission. The [earlier memory investigation](voice-memory-growth.md) measured `09cf74f`, which predates that fix.
 
+The subsequent [C# comparison](voice-csharp-comparison.md) uses the same frozen client and audio workload. The tested protocol-v55 C# build also fails the full voice capacity screen; actual offered rates differ in the all-speaking runs and are reported explicitly.
+
 Measurements use frozen binaries from `ac17492`; the final branch has identical server and client runtime code. Raw captures, frozen binaries, and source snapshots are retained locally under `captures/voice-isolation-20261005`. The [machine-readable results](results/voice-isolation-20261005-summary.json) include binary/configuration hashes, audio verification, queue counters, memory observations, and capacity checks.
 
 | Workload | Marked window | Voice send cadence, nominal | Expected voice fanout received | Observer voice gap p95 | Server peak working set | Avatar gap p95 |
