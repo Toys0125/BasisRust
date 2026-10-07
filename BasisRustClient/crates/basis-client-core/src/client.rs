@@ -478,10 +478,7 @@ impl BasisClient {
             {
                 let remote_peer = i32::from_le_bytes(bytes[11..15].try_into().unwrap());
                 *self.remote_peer_id.lock().await = Some(remote_peer);
-                if self.index != 0
-                    && self.avatar_observer.is_none()
-                    && load_sink_filter_enabled()
-                {
+                if self.index != 0 && self.avatar_observer.is_none() && load_sink_filter_enabled() {
                     if let Err(err) = configure_load_sink_socket(&self.socket) {
                         warn!(
                             "client {} failed to enable load-sink receive filter: {err}",
