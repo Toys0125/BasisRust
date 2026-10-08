@@ -57,7 +57,7 @@ Host: Windows 11 build 26100, Ryzen 7 9800X3D, 8 physical / 16 logical cores, ab
 
 Each large run used 45 seconds of warmup after readiness. CPU and bandwidth rates use endpoint counter deltas across 58.3, 118.7, and 98.5 seconds within their respective observer windows. One CPU core means one process CPU-second per elapsed second. UDP rates include avatar and voice payload before IP/link overhead and do not measure physical NIC traffic. Memory peaks are maxima of sampled working sets, not process high-water marks. No 1,000-way audio playback/mixing, Unity client, headset, physical-network, or remote-host test was performed. This is one run per condition, without repeat-based confidence estimates.
 
-Raw evidence is retained locally under **`captures/voice-1000-20261005/`**: frozen binaries, source/encoded audio hashes, encoded clips, exact launch commands, effective configs, health/CPU/memory CSVs, per-client voice counters, observer sequence/gap data, received Ogg samples, and per-run validation JSON. [Machine-readable results](results/voice-1000-20261005-summary.json) contain all checks and measurements.
+Raw evidence is retained locally under **`captures/voice-1000-20261005/`**: frozen binaries, source/encoded audio hashes, encoded clips, exact launch commands, effective configs, health/CPU/memory CSVs, per-client voice counters, observer sequence/gap data, received Ogg samples, and per-run validation JSON. The tables and validation notes above retain the summary; detailed results are archived locally under `captures/pr31-results-history-cleanup-20261008/results/voice-1000-20261005-summary.json`.
 
 ## Reproduction and next investigation
 

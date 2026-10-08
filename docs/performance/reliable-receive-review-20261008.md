@@ -1,6 +1,6 @@
 # Reliable receive loss and reordering comparison
 
-This controlled transport experiment compares `6009c2bc556cd483e02e07d4b07030147645b548` with the bounded reorder-window implementation committed with this report. The [results JSON](results/reliable-receive-20261008.json) records source and binary hashes, all 36 observations, and summary ranges.
+This controlled transport experiment compares `6009c2bc556cd483e02e07d4b07030147645b548` with the bounded reorder-window implementation committed with this report. The table below summarizes all 36 observations. Exact samples, source and binary hashes, and per-run ranges are archived locally under `captures/pr31-results-history-cleanup-20261008/results/reliable-receive-20261008.json`. Historical commit IDs identify the captured builds; the baseline's equivalent runtime source after the artifact-only history rewrite is `8079fa33fa47`.
 
 ## Method
 
