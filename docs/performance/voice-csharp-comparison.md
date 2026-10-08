@@ -38,8 +38,8 @@ The avatar-only C# baseline passes all validation checks with no reported queue 
 Run `scripts/perf/run-windows-avatar-workload.py` with a published, protocol-compatible C# executable and the same client/audio fixtures:
 
 ```powershell
-rtk proxy python scripts/perf/run-windows-avatar-workload.py --server <BasisNetworkConsole.exe> --server-kind csharp --client <frozen-client.exe> --server-config docs/performance/fixtures/avatar-cpu-only-server.xml --clients 1000 --workers 4 --warmup-seconds 30 --window-seconds 180 --post-client-seconds 15 --voice-audio-folder <encoded-audio-folder> --voice-speaker-percent 100 --no-voice-reencode --output <new-capture-folder>
-rtk proxy python scripts/perf/analyze-windows-voice.py <capture-folder> --audio-folder <encoded-audio-folder>
+python scripts/perf/run-windows-avatar-workload.py --server <BasisNetworkConsole.exe> --server-kind csharp --client <frozen-client.exe> --server-config docs/performance/fixtures/avatar-cpu-only-server.xml --clients 1000 --workers 4 --warmup-seconds 30 --window-seconds 180 --post-client-seconds 15 --voice-audio-folder <encoded-audio-folder> --voice-speaker-percent 100 --no-voice-reencode --output <new-capture-folder>
+python scripts/perf/analyze-windows-voice.py <capture-folder> --audio-folder <encoded-audio-folder>
 ```
 
 Use `--voice-speaker-percent 10 --window-seconds 120` for the 100-speaker workload. Omit voice options and use a 60-second window for the avatar-only baseline.

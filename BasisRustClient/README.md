@@ -91,7 +91,7 @@ Voice settings include `VoiceEnabled`, `VoiceAudioFolder`, `VoiceSpeakerPercent`
 `VoiceHearingDistance`, and `VoiceFrameDurationMs`.
 
 For a measured Windows voice/avatar load test, build the release server and
-client, then run `rtk proxy python scripts/perf/run-windows-voice-workload.py
+client, then run `python scripts/perf/run-windows-voice-workload.py
 --audio-folder <Ogg-Opus-folder> --output <new-capture-directory>` from the
 repository root. The default suite uses 1,000 local clients: a voice preflight,
 an avatar-only baseline, 10% simultaneous speakers, then 100% speakers. It
