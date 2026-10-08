@@ -14,6 +14,40 @@ use tracing::info;
 
 static WINDOW_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+#[cfg(test)]
+static DIAGNOSTICS_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+#[cfg(test)]
+pub(crate) struct WindowActiveTestGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: bool,
+}
+
+#[cfg(test)]
+impl WindowActiveTestGuard {
+    pub(crate) fn new(active: bool) -> Self {
+        let lock = DIAGNOSTICS_TEST_LOCK
+            .lock()
+            .expect("diagnostics test lock poisoned");
+        let previous = WINDOW_ACTIVE.swap(active, Ordering::Relaxed);
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+
+    pub(crate) fn set_active(&self, active: bool) {
+        WINDOW_ACTIVE.store(active, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+impl Drop for WindowActiveTestGuard {
+    fn drop(&mut self) {
+        WINDOW_ACTIVE.store(self.previous, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct VoiceDiagnostics {
     sent: AtomicU64,
@@ -257,6 +291,17 @@ impl VoiceDiagnostics {
                     std::time::Instant::now(),
                 );
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn receive_counts_for_test(&self, peer: u16) -> (u64, u64) {
+        let duplicate_count = self
+            .sequence_peers
+            .lock()
+            .expect("voice sequence tracker mutex poisoned")
+            .get(&peer)
+            .map_or(0, |state| state.duplicates);
+        (self.received.load(Ordering::Relaxed), duplicate_count)
     }
 }
 
@@ -667,14 +712,14 @@ mod tests {
     fn receive_checks_small_large_headers_and_rejects_invalid_frames() {
         let diagnostics = VoiceDiagnostics::new(0);
         diagnostics.own_peer.store(300, Ordering::Relaxed);
-        WINDOW_ACTIVE.store(true, Ordering::Relaxed);
+        let window = WindowActiveTestGuard::new(true);
         diagnostics.receive(channels::VOICE, &[7, 1, 0, 0xf8, 0]);
         diagnostics.receive(channels::VOICE_LARGE, &[44, 1, 2, 0, 0xf8, 0]);
         diagnostics.receive(channels::VOICE_LARGE, &[44]);
         diagnostics.receive(channels::VOICE, &[7, 3, 0, 0x18]); // 60 ms is incompatible.
         diagnostics.receive(channels::VOICE, &[7, 4, 0]); // Missing Opus packet.
         diagnostics.receive(channels::AVATAR, &[7, 5, 0, 0xf8]);
-        WINDOW_ACTIVE.store(false, Ordering::Relaxed);
+        window.set_active(false);
         diagnostics.receive(channels::VOICE, &[7, 6, 0, 0xf8, 0]);
         assert_eq!(diagnostics.received.load(Ordering::Relaxed), 2);
         assert_eq!(diagnostics.received_bytes.load(Ordering::Relaxed), 4);

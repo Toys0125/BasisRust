@@ -373,6 +373,9 @@ struct PeerState {
     next_reliable_sequence: parking_lot::Mutex<HashMap<u8, u16>>,
     next_sequenced_sequence: parking_lot::Mutex<HashMap<u8, u16>>,
     remote_sequenced_sequence: parking_lot::Mutex<HashMap<u8, u16>>,
+    /// Per-channel ordered receive cursors. The fixed 128-entry history lets an
+    /// already admitted duplicate be re-ACKed without ACKing an uncommitted old value.
+    remote_ordered_sequence: parking_lot::Mutex<HashMap<u8, OrderedReceiveState>>,
     next_fragment_id: AtomicU16,
     /// In-flight reliable packets grouped by channel id. Each channel is an ordered deque so
     /// that (a) the number of unacknowledged packets is `len()` in O(1) instead of a
@@ -556,6 +559,33 @@ struct PendingRequestInfo {
     expires_at: Instant,
 }
 
+#[derive(Debug)]
+struct OrderedReceiveState {
+    expected: u16,
+    committed: [Option<u16>; DEFAULT_WINDOW_SIZE],
+}
+
+impl Default for OrderedReceiveState {
+    fn default() -> Self {
+        Self {
+            expected: 0,
+            committed: [None; DEFAULT_WINDOW_SIZE],
+        }
+    }
+}
+
+impl OrderedReceiveState {
+    fn is_committed(&self, sequence: u16) -> bool {
+        self.committed[sequence as usize % DEFAULT_WINDOW_SIZE] == Some(sequence)
+    }
+
+    fn commit(&mut self, sequence: u16) {
+        debug_assert_eq!(sequence, self.expected);
+        self.committed[sequence as usize % DEFAULT_WINDOW_SIZE] = Some(sequence);
+        self.expected = sequence.wrapping_add(1) % MAX_SEQUENCE;
+    }
+}
+
 #[derive(Clone)]
 pub struct TransportHandle {
     socket: Arc<UdpSocket>,
@@ -580,6 +610,12 @@ pub struct TransportHandle {
     test_blocked_send_addrs: Arc<parking_lot::RwLock<HashSet<SocketAddr>>>,
     #[cfg(test)]
     test_event_full_count: Arc<AtomicUsize>,
+    #[cfg(test)]
+    test_ordered_rejected_count: Arc<AtomicUsize>,
+    #[cfg(test)]
+    test_ordered_duplicate_count: Arc<AtomicUsize>,
+    #[cfg(test)]
+    test_stale_connection_count: Arc<AtomicUsize>,
 }
 
 /// An incarnation of a connection, so queued work cannot target a reused peer ID.
@@ -658,6 +694,12 @@ impl TransportHandle {
             test_blocked_send_addrs: Arc::new(parking_lot::RwLock::new(HashSet::new())),
             #[cfg(test)]
             test_event_full_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            test_ordered_rejected_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            test_ordered_duplicate_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            test_stale_connection_count: Arc::new(AtomicUsize::new(0)),
         };
         for _ in 0..receive_workers {
             tokio::spawn(read_loop(handle.clone(), tx.clone()));
@@ -701,15 +743,29 @@ impl TransportHandle {
             .is_some_and(|state| Arc::ptr_eq(&state, &session.state))
     }
 
-    fn route_realtime(&self, event: &ServerEvent) -> bool {
+    fn is_current_peer_state(&self, peer: PeerId, expected: &Arc<PeerState>) -> bool {
+        self.peers
+            .get(&peer)
+            .is_some_and(|state| Arc::ptr_eq(&state, expected))
+    }
+
+    fn route_realtime(&self, event: &ServerEvent, expected: &Arc<PeerState>) -> bool {
         let ServerEvent::Message { peer, .. } = event else {
             return false;
         };
-        let handler = self.realtime_handler.read().clone();
-        match (handler, self.peer_session(*peer)) {
-            (Some(handler), Some(session)) => handler(event, session),
-            _ => false,
+        if *peer != expected.id || !self.is_current_peer_state(*peer, expected) {
+            return false;
         }
+        let handler = self.realtime_handler.read().clone();
+        handler.is_some_and(|handler| {
+            handler(
+                event,
+                PeerSession {
+                    peer: *peer,
+                    state: expected.clone(),
+                },
+            )
+        })
     }
 
     pub fn connected_peers_count(&self) -> usize {
@@ -974,6 +1030,7 @@ impl TransportHandle {
                 next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),
                 next_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
                 remote_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
+                remote_ordered_sequence: parking_lot::Mutex::new(HashMap::new()),
                 next_fragment_id: AtomicU16::new(0),
                 pending_reliable: parking_lot::Mutex::new(HashMap::new()),
                 pending_total: AtomicUsize::new(0),
@@ -2018,6 +2075,16 @@ async fn process_packet(
     remote_addr: SocketAddr,
     bytes: &[u8],
 ) -> Result<()> {
+    process_packet_for_peer(handle, tx, remote_addr, bytes, None).await
+}
+
+async fn process_packet_for_peer(
+    handle: &TransportHandle,
+    tx: &mpsc::Sender<ServerEvent>,
+    remote_addr: SocketAddr,
+    bytes: &[u8],
+    expected_peer: Option<&Arc<PeerState>>,
+) -> Result<()> {
     if let Some(server_info_payload) = server_info_payload(bytes) {
         if server_info_payload.len() >= SERVER_INFO_MIN_REQUEST_BYTES {
             if !handle.pre_auth_limiter.lock().allow(
@@ -2048,6 +2115,43 @@ async fn process_packet(
     let Some(property) = PacketProperty::from_byte(header) else {
         trace!("unknown packet property: {header}");
         return Ok(());
+    };
+    let active_peer = if matches!(
+        property,
+        PacketProperty::Ack
+            | PacketProperty::Ping
+            | PacketProperty::Pong
+            | PacketProperty::Disconnect
+            | PacketProperty::MtuCheck
+            | PacketProperty::MtuOk
+            | PacketProperty::Merged
+            | PacketProperty::CompactMerged
+            | PacketProperty::Channeled
+            | PacketProperty::Unreliable
+    ) {
+        let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|peer| *peer) else {
+            return Ok(());
+        };
+        let Some(peer) = handle.peers.get(&peer_id).map(|peer| peer.clone()) else {
+            return Ok(());
+        };
+        if expected_peer.is_some_and(|expected| !Arc::ptr_eq(expected, &peer)) {
+            return Ok(());
+        }
+        // LiteNetLib's two-bit connection number rejects delayed datagrams from a
+        // replaced connection before touching its state or dispatching its payload.
+        // A stale number can alias again after four connection allocations; this limit
+        // is inherent in the wire header and cannot distinguish older generations.
+        if peer.connection_number != connection_number {
+            #[cfg(test)]
+            handle
+                .test_stale_connection_count
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        Some((peer_id, peer))
+    } else {
+        None
     };
 
     match property {
@@ -2145,14 +2249,10 @@ async fn process_packet(
             }
         }
         PacketProperty::Disconnect => {
-            let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) else {
+            let Some((peer_id, peer)) = active_peer.as_ref() else {
                 return Ok(());
             };
-            if !handle
-                .peers
-                .get(&peer_id)
-                .is_some_and(|peer| disconnect_matches(&peer, bytes, connection_number))
-            {
+            if !disconnect_matches(peer, bytes, connection_number) {
                 return Ok(());
             }
             // Reserve outside the lock, then publish removal and its event together.
@@ -2170,72 +2270,66 @@ async fn process_packet(
             };
             {
                 let _allocation = handle.peer_allocation.lock();
-                if handle.by_addr.get(&remote_addr).map(|p| *p) != Some(peer_id)
-                    || !handle
-                        .peers
-                        .get(&peer_id)
-                        .is_some_and(|peer| disconnect_matches(&peer, bytes, connection_number))
+                if handle.by_addr.get(&remote_addr).map(|p| *p) != Some(*peer_id)
+                    || !handle.peers.get(peer_id).is_some_and(|current| {
+                        Arc::ptr_eq(&current, peer)
+                            && disconnect_matches(&current, bytes, connection_number)
+                    })
                 {
                     return Ok(());
                 }
-                handle.peers.remove(&peer_id);
+                handle.peers.remove(peer_id);
                 handle.by_addr.remove(&remote_addr);
-                handle.retire_peer_id(peer_id);
+                handle.retire_peer_id(*peer_id);
                 permit.send(ServerEvent::PeerDisconnected {
-                    peer: peer_id,
+                    peer: *peer_id,
                     reason: DisconnectReason::Remote,
                 });
             }
             send_simple_property(handle, remote_addr, PacketProperty::ShutdownOk).await?;
         }
         PacketProperty::Ping => {
-            if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
-                if let Some(peer) = handle.peers.get(&peer_id) {
-                    *peer.last_seen.lock() = Instant::now();
-                }
-            }
+            let Some((_, peer)) = active_peer.as_ref() else {
+                return Ok(());
+            };
+            *peer.last_seen.lock() = Instant::now();
             if bytes.len() >= 3 {
                 let sequence = u16::from_le_bytes([bytes[1], bytes[2]]);
                 send_pong(handle, remote_addr, connection_number, sequence).await?;
             }
         }
         PacketProperty::Merged => {
-            if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
-                if let Some(peer) = handle.peers.get(&peer_id) {
-                    *peer.last_seen.lock() = Instant::now();
-                }
-            }
-            process_merged_packet(handle, tx, remote_addr, bytes).await?;
+            let Some((_, peer)) = active_peer.as_ref() else {
+                return Ok(());
+            };
+            *peer.last_seen.lock() = Instant::now();
+            process_merged_packet(handle, tx, remote_addr, bytes, peer).await?;
         }
         PacketProperty::CompactMerged => {
-            if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
-                if let Some(peer) = handle.peers.get(&peer_id) {
-                    *peer.last_seen.lock() = Instant::now();
-                }
-            }
-            process_compact_merged_packet(handle, tx, remote_addr, connection_number, bytes)
+            let Some((_, peer)) = active_peer.as_ref() else {
+                return Ok(());
+            };
+            *peer.last_seen.lock() = Instant::now();
+            process_compact_merged_packet(handle, tx, remote_addr, connection_number, bytes, peer)
                 .await?;
         }
         PacketProperty::MtuCheck => {
-            if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
-                if let Some(peer) = handle.peers.get(&peer_id) {
-                    *peer.last_seen.lock() = Instant::now();
-                }
-            }
+            let Some((_, peer)) = active_peer.as_ref() else {
+                return Ok(());
+            };
+            *peer.last_seen.lock() = Instant::now();
             send_mtu_ok(handle, remote_addr, bytes).await?;
         }
         PacketProperty::MtuOk => {
-            if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
-                if let Some(peer) = handle.peers.get(&peer_id) {
-                    if let Some(mtu) = peer
-                        .mtu_probe
-                        .lock()
-                        .accept_response(bytes, peer.connection_number)
-                    {
-                        peer.confirmed_mtu
-                            .store(mtu.max(MAX_MERGED_PACKET_SIZE), Ordering::Relaxed);
-                        *peer.last_seen.lock() = Instant::now();
-                    }
+            if let Some((_, peer)) = active_peer.as_ref() {
+                if let Some(mtu) = peer
+                    .mtu_probe
+                    .lock()
+                    .accept_response(bytes, peer.connection_number)
+                {
+                    peer.confirmed_mtu
+                        .store(mtu.max(MAX_MERGED_PACKET_SIZE), Ordering::Relaxed);
+                    *peer.last_seen.lock() = Instant::now();
                 }
             }
         }
@@ -2261,18 +2355,14 @@ async fn process_packet(
             }
         }
         PacketProperty::Ack => {
-            if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
-                if let Some(peer) = handle.peers.get(&peer_id) {
-                    *peer.last_seen.lock() = Instant::now();
-                    process_ack(&peer, bytes, Some(&handle.stats));
-                }
+            if let Some((_, peer)) = active_peer.as_ref() {
+                *peer.last_seen.lock() = Instant::now();
+                process_ack(peer, bytes, Some(&handle.stats));
             }
         }
         PacketProperty::Channeled | PacketProperty::Unreliable => {
-            if let Some(peer_id) = handle.by_addr.get(&remote_addr).map(|p| *p) {
-                if let Some(peer) = handle.peers.get(&peer_id) {
-                    *peer.last_seen.lock() = Instant::now();
-                }
+            if let Some((peer_id, peer)) = active_peer.as_ref() {
+                *peer.last_seen.lock() = Instant::now();
                 if let Some((channel, delivery, payload)) = parse_message_packet(property, bytes) {
                     let reliable = matches!(
                         delivery,
@@ -2284,11 +2374,23 @@ async fn process_packet(
                         return Ok(());
                     }
                     let event = ServerEvent::Message {
-                        peer: peer_id,
+                        peer: *peer_id,
                         channel,
                         delivery,
                         payload: Bytes::copy_from_slice(payload),
                     };
+                    if delivery == DeliveryMethod::ReliableOrdered {
+                        admit_reliable_ordered(
+                            handle,
+                            tx,
+                            *peer_id,
+                            peer,
+                            bytes[3],
+                            u16::from_le_bytes([bytes[1], bytes[2]]),
+                            event,
+                        )?;
+                        return Ok(());
+                    }
                     // ReliableSequenced must deduplicate before invoking a consuming
                     // handler. Other realtime deliveries can be offered first because
                     // their receive path has no dedup cursor to commit.
@@ -2296,7 +2398,7 @@ async fn process_packet(
                     let realtime_consumed = if sequenced_reliable {
                         false
                     } else {
-                        handle.route_realtime(&event)
+                        handle.route_realtime(&event, peer)
                     };
                     // Reliable receive state and ACKs are committed only after an ordinary
                     // event slot is reserved. If full, do not ACK: the sender retransmits.
@@ -2306,11 +2408,10 @@ async fn process_packet(
                             Err(mpsc::error::TrySendError::Full(())) if sequenced_reliable => {
                                 #[cfg(test)]
                                 handle.test_event_full_count.fetch_add(1, Ordering::Relaxed);
-                                let Some(peer) =
-                                    handle.peers.get(&peer_id).map(|peer| peer.clone())
-                                else {
+                                if !handle.is_current_peer_state(*peer_id, peer) {
                                     return Ok(());
-                                };
+                                }
+                                let peer = peer.clone();
                                 let sequence = u16::from_le_bytes([bytes[1], bytes[2]]);
                                 let ack_sequence = {
                                     let mut sequences = peer.remote_sequenced_sequence.lock();
@@ -2320,7 +2421,7 @@ async fn process_packet(
                                         // Duplicate/old retransmissions re-ACK without a
                                         // second realtime admission.
                                         current
-                                    } else if handle.route_realtime(&event) {
+                                    } else if handle.route_realtime(&event, &peer) {
                                         sequences.insert(bytes[3], sequence);
                                         sequence
                                     } else {
@@ -2349,34 +2450,34 @@ async fn process_packet(
                     } else {
                         None
                     };
+                    if !handle.is_current_peer_state(*peer_id, peer) {
+                        return Ok(());
+                    }
                     let mut deliver_event = true;
                     if reliable {
                         let sequence = u16::from_le_bytes([bytes[1], bytes[2]]);
                         let channel_id = bytes[3];
                         if delivery == DeliveryMethod::ReliableSequenced {
-                            if let Some(peer) = handle.peers.get(&peer_id).map(|peer| peer.clone())
+                            if let Some((ack_sequence, is_new)) =
+                                queue_reliable_sequenced_ack(peer, channel_id, sequence)
                             {
-                                if let Some((ack_sequence, is_new)) =
-                                    queue_reliable_sequenced_ack(&peer, channel_id, sequence)
-                                {
-                                    deliver_event = is_new;
-                                    let ack = build_reliable_sequenced_ack(
-                                        peer.connection_number,
-                                        channel_id,
-                                        ack_sequence,
-                                    );
-                                    handle.send_raw_to(&ack, peer.addr).await?;
-                                }
+                                deliver_event = is_new;
+                                let ack = build_reliable_sequenced_ack(
+                                    peer.connection_number,
+                                    channel_id,
+                                    ack_sequence,
+                                );
+                                handle.send_raw_to(&ack, peer.addr).await?;
                             }
-                        } else if let Some(peer) = handle.peers.get(&peer_id) {
-                            queue_ack(&peer, channel_id, sequence);
+                        } else {
+                            queue_ack(peer, channel_id, sequence);
                         }
                     }
                     if !deliver_event {
                         return Ok(());
                     }
                     let realtime_consumed = if sequenced_reliable {
-                        handle.route_realtime(&event)
+                        handle.route_realtime(&event, peer)
                     } else {
                         realtime_consumed
                     };
@@ -2393,6 +2494,68 @@ async fn process_packet(
         }
         _ => debug!("ignored packet property {property:?} from {remote_addr}"),
     }
+    Ok(())
+}
+
+fn admit_reliable_ordered(
+    handle: &TransportHandle,
+    tx: &mpsc::Sender<ServerEvent>,
+    peer_id: PeerId,
+    peer: &Arc<PeerState>,
+    channel_id: u8,
+    sequence: u16,
+    event: ServerEvent,
+) -> Result<()> {
+    let permit = match tx.try_reserve() {
+        Ok(permit) => Some(permit),
+        Err(mpsc::error::TrySendError::Full(())) => {
+            #[cfg(test)]
+            handle.test_event_full_count.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+        Err(mpsc::error::TrySendError::Closed(())) => {
+            return Err(TransportError::EventChannelClosed)
+        }
+    };
+
+    if !handle.is_current_peer_state(peer_id, peer) {
+        return Ok(());
+    }
+    let mut receive = peer.remote_ordered_sequence.lock();
+    let state = receive.entry(channel_id).or_default();
+    if sequence == state.expected {
+        // The callback is nonblocking and receives the captured connection session. Keep
+        // the channel lock across it so concurrent UDP workers cannot admit sequence N+1
+        // before N finishes realtime admission.
+        let consumed = handle.route_realtime(&event, peer);
+        if !handle.is_current_peer_state(peer_id, peer) {
+            return Ok(());
+        }
+        if permit.is_none() && !consumed {
+            // Full queue and no realtime owner: leave the cursor and ACK bitmap unchanged.
+            return Ok(());
+        }
+        state.commit(sequence);
+        queue_ack(peer, channel_id, sequence);
+        if !consumed {
+            permit.expect("reserved reliable event permit").send(event);
+        }
+    } else if state.is_committed(sequence) {
+        queue_ack(peer, channel_id, sequence);
+        #[cfg(test)]
+        handle
+            .test_ordered_duplicate_count
+            .fetch_add(1, Ordering::Relaxed);
+        // Only values in committed history may be re-ACKed. In particular, an initial
+        // wrapped value of MAX_SEQUENCE - 1 is not a duplicate of the initial expected 0.
+    } else {
+        #[cfg(test)]
+        handle
+            .test_ordered_rejected_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    // Future packets and old values outside the committed history are dropped without
+    // ACK, causing the sender's bounded reliable window to retry them in order.
     Ok(())
 }
 
@@ -3008,6 +3171,7 @@ async fn process_merged_packet(
     tx: &mpsc::Sender<ServerEvent>,
     remote_addr: SocketAddr,
     bytes: &[u8],
+    expected_peer: &Arc<PeerState>,
 ) -> Result<()> {
     let mut position = 1;
     while position < bytes.len() {
@@ -3024,7 +3188,14 @@ async fn process_merged_packet(
         }
         let packet = &bytes[position..position + size];
         if is_valid_merged_packet(packet) {
-            Box::pin(process_packet(handle, tx, remote_addr, packet)).await?;
+            Box::pin(process_packet_for_peer(
+                handle,
+                tx,
+                remote_addr,
+                packet,
+                Some(expected_peer),
+            ))
+            .await?;
         }
         position += size;
     }
@@ -3037,6 +3208,7 @@ async fn process_compact_merged_packet(
     remote_addr: SocketAddr,
     connection_number: u8,
     bytes: &[u8],
+    expected_peer: &Arc<PeerState>,
 ) -> Result<()> {
     const LONG_LENGTH_FLAG: u8 = 0x80;
     const RAW_PACKET_FLAG: u8 = 0x40;
@@ -3091,13 +3263,27 @@ async fn process_compact_merged_packet(
             if !matches!(property, PacketProperty::Ack | PacketProperty::Channeled) {
                 break;
             }
-            Box::pin(process_packet(handle, tx, remote_addr, payload)).await?;
+            Box::pin(process_packet_for_peer(
+                handle,
+                tx,
+                remote_addr,
+                payload,
+                Some(expected_peer),
+            ))
+            .await?;
         } else {
             let mut packet = Vec::with_capacity(payload_len + 2);
             packet.push(PacketProperty::Unreliable as u8 | (connection_number << 5));
             packet.push(channel);
             packet.extend_from_slice(payload);
-            Box::pin(process_packet(handle, tx, remote_addr, &packet)).await?;
+            Box::pin(process_packet_for_peer(
+                handle,
+                tx,
+                remote_addr,
+                &packet,
+                Some(expected_peer),
+            ))
+            .await?;
         }
     }
     Ok(())
@@ -5463,6 +5649,7 @@ mod tests {
             next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),
             next_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
             remote_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
+            remote_ordered_sequence: parking_lot::Mutex::new(HashMap::new()),
             next_fragment_id: AtomicU16::new(0),
             pending_reliable: parking_lot::Mutex::new(HashMap::new()),
             pending_total: AtomicUsize::new(0),
@@ -5855,6 +6042,498 @@ mod tests {
         })
         .await
         .expect("disconnect retry should receive ShutdownOk");
+        handle.set_realtime_handler(None);
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ordered_receive_retries_gaps_without_inverting_events_and_wraps() {
+        let (handle, tx, mut events) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 1, 2)
+                .await
+                .unwrap();
+        let server_addr = handle.local_addr().unwrap();
+        let client = UdpSocket::bind(loopback_addr(0)).await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let peer_id = handle
+            .accept(&ConnectionRequest {
+                remote_addr: client_addr,
+                payload: Bytes::new(),
+                connection_number: 2,
+                connect_time: 42,
+                local_peer_id: 0,
+            })
+            .await
+            .unwrap();
+        let peer = handle.peers.get(&peer_id).unwrap().clone();
+        let mut buf = vec![0; 2048];
+        let _ = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let send_sequence = |sequence: u16| {
+            let mut packet = vec![PacketProperty::Channeled as u8 | (2 << 5)];
+            packet.extend_from_slice(&sequence.to_le_bytes());
+            packet.push(channel_id);
+            packet.push(sequence as u8);
+            packet
+        };
+        let recv_sequence = |event: ServerEvent, sequence: u16| {
+            matches!(event,
+                ServerEvent::Message {
+                    peer,
+                    channel: channels::CHAT,
+                    delivery: DeliveryMethod::ReliableOrdered,
+                    payload,
+                } if peer == peer_id && payload.as_ref() == [sequence as u8])
+        };
+        let ack_has = |sequence: u16| {
+            peer.outgoing_acks
+                .lock()
+                .get(&channel_id)
+                .is_some_and(|ack| ack_bit(&ack.bits, sequence as usize % DEFAULT_WINDOW_SIZE))
+        };
+
+        // Establish the sender's initial receive cursor and history.
+        for sequence in 0..10 {
+            client
+                .send_to(&send_sequence(sequence), server_addr)
+                .await
+                .unwrap();
+            assert!(recv_sequence(
+                tokio::time::timeout(Duration::from_secs(1), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                sequence
+            ));
+        }
+
+        // Sequence 10 cannot be committed while the ordinary event queue is full.
+        tx.try_send(ServerEvent::PeerConnected(peer_id)).unwrap();
+        client
+            .send_to(&send_sequence(10), server_addr)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.test_event_full_count.load(Ordering::Relaxed) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sequence 10 should reach full-queue admission");
+        assert!(!ack_has(10));
+
+        // A later sequence is not ACKed or dispatched before its missing predecessor.
+        assert!(
+            matches!(events.recv().await, Some(ServerEvent::PeerConnected(id)) if id == peer_id)
+        );
+        client
+            .send_to(&send_sequence(11), server_addr)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.test_ordered_rejected_count.load(Ordering::Relaxed) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("future sequence 11 should be rejected for retransmission");
+        assert!(!ack_has(11));
+        assert!(events.try_recv().is_err());
+
+        client
+            .send_to(&send_sequence(10), server_addr)
+            .await
+            .unwrap();
+        assert!(recv_sequence(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            10
+        ));
+        assert!(ack_has(10));
+        client
+            .send_to(&send_sequence(11), server_addr)
+            .await
+            .unwrap();
+        assert!(recv_sequence(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            11
+        ));
+        assert!(ack_has(11));
+
+        // A committed duplicate is ACKed again but never emitted twice.
+        client
+            .send_to(&send_sequence(10), server_addr)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.test_ordered_duplicate_count.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("committed duplicate should be recognized");
+        assert!(ack_has(10));
+        assert!(events.try_recv().is_err());
+
+        // An old-looking initial sequence is not history and cannot be ACKed.
+        let wrap_channel =
+            DeliveryMethod::channel_id(channels::META_DATA, DeliveryMethod::ReliableOrdered);
+        let mut packet = vec![PacketProperty::Channeled as u8 | (2 << 5)];
+        packet.extend_from_slice(&(MAX_SEQUENCE - 1).to_le_bytes());
+        packet.push(wrap_channel);
+        packet.push(0x7f);
+        client.send_to(&packet, server_addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.test_ordered_rejected_count.load(Ordering::Relaxed) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("uncommitted pre-wrap value should be rejected");
+        assert!(!peer.outgoing_acks.lock().contains_key(&wrap_channel));
+
+        peer.remote_ordered_sequence.lock().insert(
+            wrap_channel,
+            OrderedReceiveState {
+                expected: MAX_SEQUENCE - 1,
+                committed: [None; DEFAULT_WINDOW_SIZE],
+            },
+        );
+        peer.outgoing_acks.lock().insert(
+            wrap_channel,
+            AckState {
+                window_start: MAX_SEQUENCE - DEFAULT_WINDOW_SIZE as u16,
+                bits: vec![0; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2],
+                dirty: false,
+            },
+        );
+        for (sequence, payload) in [(MAX_SEQUENCE - 1, 0x7f), (0, 0x00)] {
+            let mut packet = vec![PacketProperty::Channeled as u8 | (2 << 5)];
+            packet.extend_from_slice(&sequence.to_le_bytes());
+            packet.push(wrap_channel);
+            packet.push(payload);
+            client.send_to(&packet, server_addr).await.unwrap();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                ServerEvent::Message {
+                    peer,
+                    channel: channels::META_DATA,
+                    delivery: DeliveryMethod::ReliableOrdered,
+                    payload: ref body,
+                } if peer == peer_id && body.as_ref() == [payload]
+            ));
+        }
+        assert!(peer
+            .outgoing_acks
+            .lock()
+            .get(&wrap_channel)
+            .is_some_and(|ack| ack_bit(
+                &ack.bits,
+                (MAX_SEQUENCE - 1) as usize % DEFAULT_WINDOW_SIZE
+            )));
+        assert!(peer
+            .outgoing_acks
+            .lock()
+            .get(&wrap_channel)
+            .is_some_and(|ack| ack_bit(&ack.bits, 0)));
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn stale_connection_numbers_are_rejected_for_packets_and_wrappers() {
+        let (handle, _tx, mut events) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 8, 2)
+                .await
+                .unwrap();
+        let server_addr = handle.local_addr().unwrap();
+        let client = UdpSocket::bind(loopback_addr(0)).await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let peer_id = handle
+            .accept(&ConnectionRequest {
+                remote_addr: client_addr,
+                payload: Bytes::new(),
+                connection_number: 2,
+                connect_time: 42,
+                local_peer_id: 0,
+            })
+            .await
+            .unwrap();
+        let peer = handle.peers.get(&peer_id).unwrap().clone();
+        let mut buf = vec![0; 2048];
+        let _ = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_counter = delivered.clone();
+        handle.set_realtime_handler(Some(Arc::new(move |event, _| {
+            if matches!(
+                event,
+                ServerEvent::Message {
+                    channel: channels::VOICE,
+                    ..
+                }
+            ) {
+                delivered_counter.fetch_add(1, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        })));
+        let mut stale_count = 0;
+        let stale_counter = handle.test_stale_connection_count.clone();
+        let wait_for_stale = |expected: usize| {
+            let stale_counter = stale_counter.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while stale_counter.load(Ordering::Relaxed) < expected {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("stale connection packet should be rejected");
+            }
+        };
+
+        // A delayed direct packet cannot refresh the replacement peer's liveness or
+        // deliver its payload through a handler that looks up the current session.
+        let old_seen = Instant::now() - Duration::from_secs(20);
+        *peer.last_seen.lock() = old_seen;
+        client
+            .send_to(
+                &[
+                    PacketProperty::Unreliable as u8 | (1 << 5),
+                    channels::VOICE,
+                    7,
+                    0,
+                    0xf8,
+                ],
+                server_addr,
+            )
+            .await
+            .unwrap();
+        stale_count += 1;
+        wait_for_stale(stale_count).await;
+        assert_eq!(*peer.last_seen.lock(), old_seen);
+        assert_eq!(delivered.load(Ordering::Relaxed), 0);
+
+        let ordered_channel =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let mut stale_ordered = vec![PacketProperty::Channeled as u8 | (1 << 5), 0, 0];
+        stale_ordered.push(ordered_channel);
+        stale_ordered.extend_from_slice(b"stale");
+        client.send_to(&stale_ordered, server_addr).await.unwrap();
+        stale_count += 1;
+        wait_for_stale(stale_count).await;
+        assert!(!peer
+            .remote_ordered_sequence
+            .lock()
+            .contains_key(&ordered_channel));
+        assert!(events.try_recv().is_err());
+
+        client
+            .send_to(
+                &[
+                    PacketProperty::Unreliable as u8 | (2 << 5),
+                    channels::VOICE,
+                    7,
+                    0,
+                    0xf8,
+                ],
+                server_addr,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while delivered.load(Ordering::Relaxed) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("current connection voice should reach its callback");
+
+        // Old ACKs are rejected before they can retire the active connection's
+        // reliable send window.
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let built = build_outbound_packet(
+            &peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"pending",
+        );
+        let (pending_channel, pending_sequence) = built.reliable_key.unwrap();
+        record_pending_reliable(&peer, pending_channel, pending_sequence, built.bytes, None);
+        let mut ack_bits = vec![0; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
+        let pending_bit = pending_sequence as usize % DEFAULT_WINDOW_SIZE;
+        ack_bits[pending_bit / 8] |= 1 << (pending_bit % 8);
+        let stale_ack = build_ack_packet(1, channel_id, 0, &ack_bits);
+        let old_seen = Instant::now() - Duration::from_secs(20);
+        *peer.last_seen.lock() = old_seen;
+        client.send_to(&stale_ack, server_addr).await.unwrap();
+        stale_count += 1;
+        wait_for_stale(stale_count).await;
+        assert_eq!(peer.total_pending(), 1);
+        assert_eq!(*peer.last_seen.lock(), old_seen);
+        let current_ack = build_ack_packet(2, channel_id, 0, &ack_bits);
+        client.send_to(&current_ack, server_addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while peer.total_pending() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("current connection ACK should retire pending reliable data");
+
+        // Stale outer wrappers are rejected; current wrappers still validate each
+        // inner raw packet's connection number before dispatching it.
+        let mut stale_merged = vec![PacketProperty::Merged as u8 | (1 << 5)];
+        stale_merged.extend_from_slice(&[5, 0]);
+        stale_merged.extend_from_slice(&[
+            PacketProperty::Unreliable as u8 | (2 << 5),
+            channels::VOICE,
+            7,
+            0,
+            0xf8,
+        ]);
+        client.send_to(&stale_merged, server_addr).await.unwrap();
+        stale_count += 1;
+        wait_for_stale(stale_count).await;
+        assert_eq!(delivered.load(Ordering::Relaxed), 1);
+
+        let mut current_merged_with_stale_child = vec![PacketProperty::Merged as u8 | (2 << 5)];
+        current_merged_with_stale_child.extend_from_slice(&[5, 0]);
+        current_merged_with_stale_child.extend_from_slice(&[
+            PacketProperty::Unreliable as u8 | (1 << 5),
+            channels::VOICE,
+            7,
+            0,
+            0xf8,
+        ]);
+        client
+            .send_to(&current_merged_with_stale_child, server_addr)
+            .await
+            .unwrap();
+        stale_count += 1;
+        wait_for_stale(stale_count).await;
+        assert_eq!(delivered.load(Ordering::Relaxed), 1);
+
+        let mut current_merged = vec![PacketProperty::Merged as u8 | (2 << 5)];
+        current_merged.extend_from_slice(&[5, 0]);
+        current_merged.extend_from_slice(&[
+            PacketProperty::Unreliable as u8 | (2 << 5),
+            channels::VOICE,
+            7,
+            0,
+            0xf8,
+        ]);
+        client.send_to(&current_merged, server_addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while delivered.load(Ordering::Relaxed) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("current classic merged child should route");
+
+        // Compact non-raw entries inherit the wrapper connection number. Compact raw
+        // entries retain their own header, so both forms must be checked.
+        let stale_compact = [
+            PacketProperty::CompactMerged as u8 | (1 << 5),
+            channels::VOICE,
+            3,
+            7,
+            0,
+            0xf8,
+        ];
+        client.send_to(&stale_compact, server_addr).await.unwrap();
+        stale_count += 1;
+        wait_for_stale(stale_count).await;
+        assert_eq!(delivered.load(Ordering::Relaxed), 2);
+
+        let mut stale_raw_ordered = vec![PacketProperty::Channeled as u8 | (1 << 5), 0, 0];
+        stale_raw_ordered.push(ordered_channel);
+        stale_raw_ordered.extend_from_slice(b"stale-compact");
+        let mut compact_raw = vec![PacketProperty::CompactMerged as u8 | (2 << 5), 0x40];
+        compact_raw.push(stale_raw_ordered.len() as u8);
+        compact_raw.extend_from_slice(&stale_raw_ordered);
+        client.send_to(&compact_raw, server_addr).await.unwrap();
+        stale_count += 1;
+        wait_for_stale(stale_count).await;
+        assert!(!peer
+            .remote_ordered_sequence
+            .lock()
+            .contains_key(&ordered_channel));
+        assert_eq!(peer.total_pending(), 0);
+
+        // Compact raw ACKs keep their own connection header, independent of the
+        // current outer wrapper. A stale inner ACK cannot retire active send state.
+        let built = build_outbound_packet(
+            &peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"compact-pending",
+        );
+        let (pending_channel, pending_sequence) = built.reliable_key.unwrap();
+        record_pending_reliable(&peer, pending_channel, pending_sequence, built.bytes, None);
+        let mut compact_ack_bits = vec![0; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
+        let pending_bit = pending_sequence as usize % DEFAULT_WINDOW_SIZE;
+        compact_ack_bits[pending_bit / 8] |= 1 << (pending_bit % 8);
+        let stale_raw_ack = build_ack_packet(1, channel_id, 0, &compact_ack_bits);
+        let mut compact_raw_ack = vec![PacketProperty::CompactMerged as u8 | (2 << 5), 0x40];
+        compact_raw_ack.push(stale_raw_ack.len() as u8);
+        compact_raw_ack.extend_from_slice(&stale_raw_ack);
+        client.send_to(&compact_raw_ack, server_addr).await.unwrap();
+        stale_count += 1;
+        wait_for_stale(stale_count).await;
+        assert_eq!(peer.total_pending(), 1);
+
+        let current_raw_ack = build_ack_packet(2, channel_id, 0, &compact_ack_bits);
+        let mut compact_current_ack = vec![PacketProperty::CompactMerged as u8 | (2 << 5), 0x40];
+        compact_current_ack.push(current_raw_ack.len() as u8);
+        compact_current_ack.extend_from_slice(&current_raw_ack);
+        client
+            .send_to(&compact_current_ack, server_addr)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while peer.total_pending() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("current compact raw ACK should retire pending reliable data");
+
+        // Current compact voice remains routable.
+        let current_compact = [
+            PacketProperty::CompactMerged as u8 | (2 << 5),
+            channels::VOICE,
+            3,
+            7,
+            0,
+            0xf8,
+        ];
+        client.send_to(&current_compact, server_addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while delivered.load(Ordering::Relaxed) != 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("current compact entry should route");
+        assert!(events.try_recv().is_err());
         handle.set_realtime_handler(None);
         handle.shutdown();
     }
@@ -6338,6 +7017,7 @@ mod tests {
             next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),
             next_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
             remote_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
+            remote_ordered_sequence: parking_lot::Mutex::new(HashMap::new()),
             next_fragment_id: AtomicU16::new(0),
             pending_reliable: parking_lot::Mutex::new(HashMap::new()),
             pending_total: AtomicUsize::new(0),
@@ -6428,6 +7108,7 @@ mod tests {
             local_peer_id: 0,
         };
         let peer = handle.accept(&request).await.unwrap();
+        let peer_state = handle.peers.get(&peer).unwrap().clone();
         let (tx, mut rx) = mpsc::channel(4);
 
         let packet = [
@@ -6438,7 +7119,7 @@ mod tests {
             2,
             3,
         ];
-        process_compact_merged_packet(&handle, &tx, remote_addr, 0, &packet)
+        process_compact_merged_packet(&handle, &tx, remote_addr, 0, &packet, &peer_state)
             .await
             .unwrap();
 
@@ -6474,6 +7155,7 @@ mod tests {
             local_peer_id: 0,
         };
         let peer = handle.accept(&request).await.unwrap();
+        let peer_state = handle.peers.get(&peer).unwrap().clone();
         let (tx, mut rx) = mpsc::channel(8);
 
         let unreliable = |channel: u8, payload: Vec<u8>| {
@@ -6494,7 +7176,7 @@ mod tests {
         assert!(!datagrams.is_empty());
         for datagram in &datagrams {
             assert_eq!(datagram[0] & 0x1f, PacketProperty::CompactMerged as u8);
-            process_compact_merged_packet(&handle, &tx, remote_addr, 0, datagram)
+            process_compact_merged_packet(&handle, &tx, remote_addr, 0, datagram, &peer_state)
                 .await
                 .unwrap();
         }
@@ -6533,6 +7215,7 @@ mod tests {
             local_peer_id: 0,
         };
         let peer = handle.accept(&request).await.unwrap();
+        let peer_state = handle.peers.get(&peer).unwrap().clone();
         let (tx, mut rx) = mpsc::channel(8);
 
         let channel_id =
@@ -6544,7 +7227,7 @@ mod tests {
         let datagrams = build_send_datagrams(0, true, vec![unreliable.clone(), channeled.clone()]);
         assert_eq!(datagrams.len(), 1);
         assert_eq!(datagrams[0][0] & 0x1f, PacketProperty::CompactMerged as u8);
-        process_compact_merged_packet(&handle, &tx, remote_addr, 0, &datagrams[0])
+        process_compact_merged_packet(&handle, &tx, remote_addr, 0, &datagrams[0], &peer_state)
             .await
             .unwrap();
 

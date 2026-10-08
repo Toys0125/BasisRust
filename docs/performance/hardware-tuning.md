@@ -71,6 +71,13 @@ window is useful for a smoke check, not a tuning conclusion.
 
 ## Controls, defaults and workload
 
+The default workload stays fixed at 250 clients. Use `--auto-calibrate` to opt
+into calibration toward `--network-capacity-mbps` (1,000 Mbps by default);
+it cannot be combined with `--clients`. Calibration adds up to four pilot
+runs before the comparison, and the selected population stays fixed across
+settings. Rates use the recorded monotonic window endpoints; invalid
+intervals fail calibration.
+
 Use `--help` for all controls. `--lanes 0,6` includes the existing Rayon flush
 scheduling (`0`) and bounded flush jobs (`1..8`). Values outside `0..8`, duplicate
 values and single-setting comparisons are rejected. Keep the shortlist small;

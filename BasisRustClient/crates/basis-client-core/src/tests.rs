@@ -495,6 +495,14 @@ fn rust_delta_roundtrips_the_unity_shared_csharp_codec_fixture() {
 }
 
 pub(super) async fn test_client(index: usize, server_addr: SocketAddr) -> Arc<BasisClient> {
+    test_client_with_voice_diagnostics(index, server_addr, false).await
+}
+
+async fn test_client_with_voice_diagnostics(
+    index: usize,
+    server_addr: SocketAddr,
+    enable_voice_diagnostics: bool,
+) -> Arc<BasisClient> {
     let socket = bind_udp_socket(any_local_addr(server_addr)).unwrap();
     socket.connect(server_addr).await.unwrap();
     Arc::new(BasisClient {
@@ -526,9 +534,118 @@ pub(super) async fn test_client(index: usize, server_addr: SocketAddr) -> Arc<Ba
         avatar_observer: None,
         packet_diagnostics: PacketDiagnostics::default(),
         avatar_diagnostics: None,
-        voice_diagnostics: None,
+        voice_diagnostics: enable_voice_diagnostics
+            .then(|| crate::voice_diagnostics::VoiceDiagnostics::new(index)),
         identity: Identity::random(),
     })
+}
+
+#[tokio::test]
+async fn reliable_voice_diagnostics_skip_duplicates_on_direct_merged_and_compact_merged() {
+    use crate::voice_diagnostics::WindowActiveTestGuard;
+
+    let _window = WindowActiveTestGuard::new(true);
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let client = test_client_with_voice_diagnostics(0, server_addr, true).await;
+
+    let cases = [
+        (DeliveryMethod::ReliableOrdered, 20u16, 1u8),
+        (DeliveryMethod::ReliableUnordered, 21u16, 2u8),
+        (DeliveryMethod::ReliableOrdered, 22u16, 3u8),
+    ];
+    for (index, (delivery, transport_sequence, voice_sequence)) in cases.into_iter().enumerate() {
+        let channel_id = DeliveryMethod::channel_id(channels::VOICE, delivery);
+        let payload = [7, voice_sequence, 0, 0xf8, 0];
+        let mut raw = vec![PacketProperty::Channeled as u8];
+        raw.extend_from_slice(&transport_sequence.to_le_bytes());
+        raw.push(channel_id);
+        raw.extend_from_slice(&payload);
+
+        let ingress = match index {
+            0 => raw.clone(),
+            1 => {
+                let mut merged = vec![PacketProperty::Merged as u8];
+                merged.extend_from_slice(&(raw.len() as u16).to_le_bytes());
+                merged.extend_from_slice(&raw);
+                merged
+            }
+            _ => {
+                let mut compact = vec![PacketProperty::CompactMerged as u8, 0x40, raw.len() as u8];
+                compact.extend_from_slice(&raw);
+                compact
+            }
+        };
+
+        client.handle_packet(&ingress).await.unwrap();
+        assert_eq!(
+            client
+                .voice_diagnostics
+                .as_ref()
+                .unwrap()
+                .receive_counts_for_test(7),
+            (index as u64 + 1, 0),
+            "new reliable packet should be counted once"
+        );
+
+        // Simulate the ACK flush taking the current dirty channel, then replay
+        // the exact raw packet. Duplicate rejection must still schedule an ACK.
+        client
+            .reliable_receive_state()
+            .unwrap()
+            .take_dirty_channels();
+        client.ack_pending.store(false, Ordering::Relaxed);
+        client.handle_packet(&ingress).await.unwrap();
+        assert!(client.ack_pending.load(Ordering::Relaxed));
+        assert_eq!(
+            client
+                .reliable_receive_state()
+                .unwrap()
+                .take_dirty_channels(),
+            vec![channel_id]
+        );
+        assert_eq!(
+            client
+                .voice_diagnostics
+                .as_ref()
+                .unwrap()
+                .receive_counts_for_test(7),
+            (index as u64 + 1, 0),
+            "transport retransmission should not be counted as another voice receive"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unreliable_voice_repeats_remain_counted() {
+    use crate::voice_diagnostics::WindowActiveTestGuard;
+
+    let _window = WindowActiveTestGuard::new(true);
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let client = test_client_with_voice_diagnostics(0, server_addr, true).await;
+    let packet = [
+        PacketProperty::Unreliable as u8,
+        channels::VOICE,
+        7,
+        4,
+        0,
+        0xf8,
+        0,
+    ];
+
+    client.handle_packet(&packet).await.unwrap();
+    client.handle_packet(&packet).await.unwrap();
+
+    assert_eq!(
+        client
+            .voice_diagnostics
+            .as_ref()
+            .unwrap()
+            .receive_counts_for_test(7),
+        (2, 1),
+        "unreliable repeats have no transport deduplication and remain observable"
+    );
 }
 
 #[test]

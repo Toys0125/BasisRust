@@ -20,13 +20,13 @@ import sys
 import tempfile
 
 from avatar_benchmark import ROOT, cpu_list, relevant_env, run_workload, select_port, write_json
-from avatar_tuning import (csv_rows, interpolate_health_counter, rank, report, run_order,
-                           sha256, summarize, validate_series, xml_values)
+from avatar_tuning import csv_rows, rank, report, run_order, sha256, summarize, validate_series, xml_values
 
 FIXTURES = ROOT / 'docs/performance/fixtures'
 PRESETS = {'quick': (5, 15, 2), 'screen': (15, 60, 2), 'confirm': (30, 60, 4)}
 CALIBRATION_WARMUP_SECONDS = 5
 CALIBRATION_WINDOW_SECONDS = 10
+DEFAULT_CLIENTS = 250
 
 
 def lane_values(text):
@@ -49,8 +49,11 @@ def parser():
     result.add_argument('--client-config', type=pathlib.Path, default=FIXTURES / 'avatar-1500-client.xml')
     result.add_argument('--lanes', type=lane_values, default=lane_values('0,6'), help='only sweep dimension; default 0,6; range 0..8')
     result.add_argument('--mode', choices=PRESETS, default='screen')
-    result.add_argument('--clients', type=int,
-                        help='fixed offered user count; omit to calibrate a population for the requested server TX target')
+    workload = result.add_mutually_exclusive_group()
+    workload.add_argument('--clients', type=int,
+                          help=f'fixed offered user count; defaults to {DEFAULT_CLIENTS}')
+    workload.add_argument('--auto-calibrate', action='store_true',
+                          help='opt in to selecting a fixed population near --network-capacity-mbps')
     result.add_argument('--network-capacity-mbps', type=float, default=1000,
                         help='measured server TX target/capacity reference; default 1000 Mbps; auto calibration uses this target')
     result.add_argument('--warmup-seconds', type=int)
@@ -77,6 +80,7 @@ def validate(args):
     for index, key in enumerate(('warmup_seconds', 'window_seconds', 'repeats')):
         if getattr(args, key) is None:
             setattr(args, key, PRESETS[args.mode][index])
+    resolve_client_selection(args)
     if (args.clients is not None and args.clients < 2) or args.warmup_seconds < 0 or args.window_seconds < 2 or not math.isfinite(args.network_capacity_mbps) or args.network_capacity_mbps <= 0:
         raise ValueError('Require clients >=2 when specified, warmup >=0, window >=2, and network target >0 Mbps')
     if args.repeats < 2 or args.repeats % 2:
@@ -122,6 +126,37 @@ def validate(args):
     args.output = args.output.resolve()
 
 
+def resolve_client_selection(args):
+    """Resolve omission to the compatible fixed default; calibration stays opt-in."""
+    if args.auto_calibrate and args.clients is not None:
+        raise ValueError('--auto-calibrate cannot be combined with --clients')
+    if args.clients is None and not args.auto_calibrate:
+        args.clients = DEFAULT_CLIENTS
+    return args
+
+
+def interpolate_health_counter(samples, boundary, group, key):
+    """Interpolate one cumulative health counter at a monotonic boundary."""
+    section = 'transport' if group == 'transport' else 'extended'
+
+    def value(sample):
+        data = sample['health'][section]
+        if section == 'extended':
+            data = data[group]
+        return float(data[key])
+
+    for first, last in zip(samples, samples[1:]):
+        start, end = float(first['monotonic_seconds']), float(last['monotonic_seconds'])
+        if start <= boundary <= end:
+            if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+                raise ValueError('Health samples have a nonpositive monotonic interval')
+            first_value, last_value = value(first), value(last)
+            if not math.isfinite(first_value) or not math.isfinite(last_value):
+                raise ValueError(f'Invalid health counter: {group}.{key}')
+            return first_value + (last_value - first_value) * (boundary - start) / (end - start)
+    raise ValueError('Health samples do not bracket the calibration measurement window')
+
+
 def clean_environment(server_config, client_config):
     # Server supports PascalCase overrides, including fields absent in fixtures.
     source = ROOT / 'BasisRustServer/crates/basis-protocol/src/config.rs'
@@ -144,9 +179,20 @@ def next_calibration_clients(current, target_mbps, measured_mbps, maximum):
     return candidate
 
 
+def calibration_tx_mbps(byte_delta, window_start_monotonic, window_end_monotonic):
+    """Convert transmitted bytes to Mbps over the recorded monotonic interval."""
+    elapsed = float(window_end_monotonic) - float(window_start_monotonic)
+    byte_delta = float(byte_delta)
+    if not math.isfinite(elapsed) or elapsed <= 0:
+        raise ValueError('Calibration measurement interval must be finite and positive')
+    if not math.isfinite(byte_delta) or byte_delta <= 0:
+        raise ValueError('Calibration measured no positive server TX bytes')
+    return byte_delta * 8 / elapsed / 1_000_000
+
+
 def calibrate_clients(args, server_env, client_env, output, maximum):
     """Use short loopback runs to select a fixed population near target TX."""
-    if args.clients is not None:
+    if not args.auto_calibrate:
         return {'mode': 'fixed_clients', 'selected_clients': args.clients, 'target_tx_mbps': args.network_capacity_mbps,
                 'attempts': []}
     if maximum < 2:
@@ -173,7 +219,7 @@ def calibrate_clients(args, server_env, client_env, output, maximum):
             end = interpolate_health_counter(samples, meta['window_end_monotonic'], 'rawUdp', 'bytesOut')
             if end < begin:
                 raise ValueError('rawUdp.bytesOut reset during calibration')
-            measured = (end - begin) * 8 / CALIBRATION_WINDOW_SECONDS / 1_000_000
+            measured = calibration_tx_mbps(end - begin, meta['window_start_monotonic'], meta['window_end_monotonic'])
             pilot_errors = {}
             for group, key in (('appMessages', 'protocolErrors'), ('rawUdp', 'wouldBlock'),
                                ('reliable', 'retransmits'), ('transport', 'nonReliableDroppedDatagrams')):
