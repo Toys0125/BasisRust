@@ -48,7 +48,9 @@ use basis_server_resources::{
     ContentShareState, NetIdState, OwnershipState, PipState, ResourceState,
 };
 use basis_server_storage::PersistentDatabase;
-use basis_transport::{DeliveryMethod, DisconnectReason, PeerId, ServerEvent, TransportHandle};
+use basis_transport::{
+    DeliveryMethod, DisconnectReason, PeerId, PeerSession, ServerEvent, TransportHandle,
+};
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
@@ -75,9 +77,13 @@ pub struct ConnectedPeer {
     pub id: PeerId,
     pub metadata: ClientMetaDataMessage,
     pub ready: ReadyMessage,
+    // Present for live connections. Unit fixtures that exercise app state without a
+    // transport session may leave this absent.
+    pub session: Option<PeerSession>,
 }
 
 struct PendingIdentity {
+    session: PeerSession,
     ready: ReadyMessage,
     challenge: Vec<u8>,
     expires_at: Instant,
@@ -467,6 +473,8 @@ pub struct ServerState {
     shutdown: Arc<AtomicBool>,
     tick_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     workers: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    disconnect_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    identity_timer_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     realtime_threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 }
 
@@ -615,6 +623,8 @@ impl ServerState {
             shutdown: Arc::new(AtomicBool::new(false)),
             tick_thread: Arc::new(Mutex::new(None)),
             workers: Arc::new(Mutex::new(Vec::new())),
+            disconnect_tasks: Arc::new(Mutex::new(Vec::new())),
+            identity_timer_tasks: Arc::new(Mutex::new(Vec::new())),
             realtime_threads: Arc::new(Mutex::new(Vec::new())),
         };
         let tick_thread = state
@@ -881,16 +891,48 @@ impl ServerState {
                 worker_result = Err(anyhow::anyhow!("server worker failed to join: {err}"));
             }
         }
-        // Accepted event handlers have now finished; persist their final changes.
+        // Workers can no longer create identity timers. Dropping pending entries
+        // cancels timers that have not started disconnecting; join every timer so
+        // any cleanup it already claimed is visible before draining cleanup tasks.
+        self.pending_identity.clear();
+        let identity_timer_tasks = std::mem::take(&mut *self.identity_timer_tasks.lock());
+        for task in identity_timer_tasks {
+            if let Err(err) = task.await {
+                warn!("identity timer failed to join: {err}");
+                worker_result = Err(anyhow::anyhow!("identity timer failed to join: {err}"));
+            }
+        }
+        // Retire every transport session, including accepted peers still waiting
+        // for identity verification. No admission worker remains to add sessions.
+        let sessions = self
+            .transport
+            .peer_snapshots()
+            .into_iter()
+            .filter_map(|peer| self.transport.peer_session(peer.id))
+            .collect::<Vec<_>>();
+        for session in sessions {
+            if self
+                .transport
+                .disconnect_session(&session, "Server shutting down")
+                .await?
+            {
+                session.wait_for_read_leases().await;
+                handle_disconnect(self, &session, DisconnectReason::Remote).await;
+            }
+        }
+        let disconnect_tasks = std::mem::take(&mut *self.disconnect_tasks.lock());
+        for task in disconnect_tasks {
+            if let Err(err) = task.await {
+                warn!("disconnect cleanup task failed to join: {err}");
+                worker_result = Err(anyhow::anyhow!(
+                    "disconnect cleanup task failed to join: {err}"
+                ));
+            }
+        }
+        // Accepted event handlers and all disconnect cleanup have now finished.
         let final_save = self.flush_shutdown_state();
         if let Err(err) = &final_save {
             error!("final shutdown persistence failed: {err:#}");
-        }
-        for peer in self.authenticated_peers.iter() {
-            let _ = self
-                .transport
-                .disconnect(*peer.key(), "Server shutting down")
-                .await;
         }
         let tick_thread = self.tick_thread.lock().take();
         let realtime_threads = std::mem::take(&mut *self.realtime_threads.lock());
@@ -1200,16 +1242,46 @@ async fn handle_event(state: &ServerState, event: ServerEvent) -> Result<()> {
             let payload = request.payload.clone();
             handle_connection_request(state, remote_addr, payload, request).await
         }
-        ServerEvent::PeerDisconnected { peer, reason } => {
-            handle_disconnect(state, peer, reason).await;
+        ServerEvent::PeerDisconnected {
+            peer,
+            session,
+            reason,
+        } => {
+            if peer != session.peer_id() || !state.transport.close_session_admission(&session) {
+                return Ok(());
+            }
+            session.wait_for_read_leases().await;
+            handle_disconnect(state, &session, reason).await;
             Ok(())
         }
         ServerEvent::Message {
             peer,
+            session,
             channel,
             delivery,
             payload,
-        } => handle_message(state, peer, channel, delivery, payload, true, false).await,
+        } => {
+            if peer != session.peer_id() {
+                return Ok(());
+            }
+            let Some(_lease) = session.try_read_lease() else {
+                return Ok(());
+            };
+            if !state.transport.is_current_session(&session) {
+                return Ok(());
+            }
+            handle_message(
+                state,
+                peer,
+                Some(&session),
+                channel,
+                delivery,
+                payload,
+                true,
+                false,
+            )
+            .await
+        }
         ServerEvent::UnconnectedRequest {
             remote_addr, nonce, ..
         } => {
@@ -1432,8 +1504,13 @@ async fn handle_connection_request(
         .await?;
         return Ok(());
     };
-    let peer_id = match state.transport.accept(&request).await {
-        Ok(peer) => peer,
+    // Validation can await storage and policy work. A newer ConnectRequest for
+    // this address may have superseded this queued event in the meantime.
+    if !state.transport.is_pending_request(&request) {
+        return Ok(());
+    }
+    let session = match state.transport.accept_session(&request).await {
+        Ok(session) => session,
         Err(basis_transport::TransportError::PeerIdExhausted) => {
             reject_structured(
                 state,
@@ -1449,6 +1526,13 @@ async fn handle_connection_request(
         Err(basis_transport::TransportError::StaleAdmission) => return Ok(()),
         Err(error) => return Err(error.into()),
     };
+    let peer_id = session.peer_id();
+    let Some(_session_lease) = session.try_read_lease() else {
+        return Ok(());
+    };
+    if !state.transport.is_current_session(&session) {
+        return Ok(());
+    }
     if config.use_auth_identity {
         let challenge_ttl = identity_challenge_ttl(
             state.player_count(),
@@ -1461,6 +1545,7 @@ async fn handle_connection_request(
         state.pending_identity.insert(
             peer_id,
             PendingIdentity {
+                session: session.clone(),
                 ready,
                 challenge: challenge.clone(),
                 expires_at,
@@ -1471,22 +1556,34 @@ async fn handle_connection_request(
         let timeout_challenge = challenge.clone();
         let pending_identity = state.pending_identity.clone();
         let timeout_state = state.clone();
-        tokio::spawn(async move {
+        let timeout_session = session.clone();
+        let timer_task = tokio::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(challenge_ttl) => {
                     if pending_identity
                         .remove_if(&peer_id, |_, pending| {
-                            pending.challenge == timeout_challenge
+                            pending.session.same_connection(&timeout_session)
+                                && pending.challenge == timeout_challenge
                                 && pending.expires_at <= Instant::now()
                         })
                         .is_some()
                     {
-                        disconnect_admission(&timeout_state, peer_id, "Authentication timeout").await;
+                        disconnect_admission(
+                            &timeout_state,
+                            &timeout_session,
+                            "Authentication timeout",
+                        )
+                        .await;
                     }
                 }
                 _ = &mut timeout_cancelled => {}
             }
         });
+        {
+            let mut timer_tasks = state.identity_timer_tasks.lock();
+            timer_tasks.retain(|task| !task.is_finished());
+            timer_tasks.push(timer_task);
+        }
         let mut writer = NetWriter::new();
         BytesMessage {
             data: challenge.clone(),
@@ -1494,15 +1591,15 @@ async fn handle_connection_request(
         .serialize(&mut writer)?;
         state
             .transport
-            .send(
-                peer_id,
+            .send_session(
+                &session,
                 channels::AUTH_IDENTITY,
                 DeliveryMethod::ReliableOrdered,
                 writer.as_slice(),
             )
             .await?;
     } else {
-        finalize_accept(state, peer_id, ready, false).await?;
+        finalize_accept(state, &session, ready, false).await?;
     }
     Ok(())
 }
@@ -1517,17 +1614,46 @@ fn password_matches(server_password: &str, auth_bytes: &[u8]) -> bool {
     bool::from(auth_bytes.ct_eq(server_password.as_bytes()))
 }
 
-async fn disconnect_admission(state: &ServerState, peer: PeerId, reason: &str) {
-    let _ = state.transport.disconnect(peer, reason).await;
-    handle_disconnect(state, peer, DisconnectReason::Remote).await;
+async fn disconnect_admission(state: &ServerState, session: &PeerSession, reason: &str) {
+    if let Err(error) = request_disconnect(state, session, reason).await {
+        warn!(
+            peer = session.peer_id(),
+            "failed to request peer disconnect: {error:#}"
+        );
+    }
+}
+
+/// Remove the exact connection and defer keyed cleanup until its message leases drain.
+/// This function may be called by a message handler that holds the session's own lease,
+/// so it must never await `wait_for_read_leases` itself.
+pub(crate) async fn request_disconnect(
+    state: &ServerState,
+    session: &PeerSession,
+    reason: &str,
+) -> Result<()> {
+    if !state.transport.disconnect_session(session, reason).await? {
+        return Ok(());
+    }
+    let disconnect_tasks = state.disconnect_tasks.clone();
+    let cleanup_state = state.clone();
+    let session = session.clone();
+    let task = tokio::spawn(async move {
+        session.wait_for_read_leases().await;
+        handle_disconnect(&cleanup_state, &session, DisconnectReason::Remote).await;
+    });
+    let mut tasks = disconnect_tasks.lock();
+    tasks.retain(|task| !task.is_finished());
+    tasks.push(task);
+    Ok(())
 }
 
 async fn finalize_accept(
     state: &ServerState,
-    peer_id: PeerId,
+    session: &PeerSession,
     ready: ReadyMessage,
     identity_verified: bool,
 ) -> Result<()> {
+    let peer_id = session.peer_id();
     let uuid = ready.player_meta_data_message.player_uuid.clone();
     let config = state.config.read().clone();
     if config.basis_user_restriction_mode == BasisUserRestrictionMode::RejoinOnly
@@ -1535,14 +1661,14 @@ async fn finalize_accept(
     {
         disconnect_admission(
             state,
-            peer_id,
+            session,
             "Rejoin-only mode requires authenticated identity.",
         )
         .await;
         return Ok(());
     }
     if let Some(reason) = admission_rejection(state, &ready) {
-        disconnect_admission(state, peer_id, reason).await;
+        disconnect_admission(state, session, reason).await;
         return Ok(());
     }
     let metadata = ready.player_meta_data_message.clone();
@@ -1550,6 +1676,7 @@ async fn finalize_accept(
         id: peer_id,
         metadata: metadata.clone(),
         ready: ready.clone(),
+        session: Some(session.clone()),
     };
     let existing_players = {
         let _commit = state.admission_commit.lock();
@@ -1568,7 +1695,7 @@ async fn finalize_accept(
     let Some(existing_players) = existing_players else {
         disconnect_admission(
             state,
-            peer_id,
+            session,
             "This server is full. Please try again later.",
         )
         .await;
@@ -1815,7 +1942,8 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
     }
 }
 
-async fn handle_disconnect(state: &ServerState, peer: PeerId, reason: DisconnectReason) {
+async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: DisconnectReason) {
+    let peer = session.peer_id();
     // Close avatar admission before any asynchronous disconnect cleanup.
     state.avatar_sync.remove_player(peer);
     state.admin_runtime.remove_peer(peer);
@@ -2045,9 +2173,11 @@ async fn handle_uplink_avatar_delta(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_message(
     state: &ServerState,
     peer: PeerId,
+    session: Option<&PeerSession>,
     channel: u8,
     delivery: DeliveryMethod,
     payload: Bytes,
@@ -2083,9 +2213,18 @@ async fn handle_message(
     }
     match channel {
         channels::AUTH_IDENTITY => {
-            if let Some((_, pending)) = state.pending_identity.remove(&peer) {
+            let Some(session) = session else {
+                return Ok(());
+            };
+            if let Some((_, pending)) = state
+                .pending_identity
+                .remove_if(&peer, |_, pending| pending.session.same_connection(session))
+            {
                 if pending.expires_at <= Instant::now() {
-                    disconnect_admission(state, peer, "Authentication timeout").await;
+                    disconnect_admission(state, session, "Authentication timeout").await;
+                    return Ok(());
+                }
+                if !pending.session.same_connection(session) {
                     return Ok(());
                 }
                 let identity_check = (|| -> Result<()> {
@@ -2103,13 +2242,13 @@ async fn handle_message(
                 if let Err(error) = identity_check {
                     disconnect_admission(
                         state,
-                        peer,
+                        session,
                         &format!("Identity verification failed: {error}"),
                     )
                     .await;
                     return Ok(());
                 }
-                finalize_accept(state, peer, pending.ready, true).await?;
+                finalize_accept(state, session, pending.ready, true).await?;
             }
         }
         channels::PLAYER_AVATAR_HIGH | channels::PLAYER_AVATAR_HIGH_ADDITIONAL => {
@@ -4899,20 +5038,36 @@ fn peer_by_uuid(state: &ServerState, uuid: &str) -> Option<PeerId> {
         .find_map(|peer| (peer.metadata.player_uuid == uuid).then_some(*peer.key()))
 }
 
+fn peer_session_by_uuid(state: &ServerState, uuid: &str) -> Option<(PeerId, PeerSession)> {
+    state.authenticated_peers.iter().find_map(|peer| {
+        if peer.metadata.player_uuid == uuid {
+            peer.session.clone().map(|session| (*peer.key(), session))
+        } else {
+            None
+        }
+    })
+}
+
 async fn disconnect_headless_peers(state: &ServerState) {
     let peers = state
         .authenticated_peers
         .iter()
         .filter_map(|peer| {
             let platform = &peer.metadata.player_platform;
-            is_headless_platform(platform).then_some(*peer.key())
+            (is_headless_platform(platform))
+                .then(|| peer.session.clone())
+                .flatten()
         })
         .collect::<Vec<_>>();
-    for peer in peers {
-        let _ = state
-            .transport
-            .disconnect(peer, "Headless client disallowed by server.")
-            .await;
+    for session in peers {
+        if let Err(error) =
+            request_disconnect(state, &session, "Headless client disallowed by server.").await
+        {
+            warn!(
+                peer = session.peer_id(),
+                "failed to disconnect headless peer: {error:#}"
+            );
+        }
     }
 }
 
@@ -5245,6 +5400,7 @@ mod tests {
             id: peer_id,
             metadata: test_ready_message().player_meta_data_message,
             ready: test_ready_message(),
+            session: None,
         }
     }
 

@@ -220,6 +220,13 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
                             let pending = std::mem::take(&mut *avatar_input.lock());
                             for (peer, mut pending) in pending {
                                 for input in pending.drain() {
+                                    let Some(_lease) = input.session.try_read_lease() else {
+                                        avatar_state
+                                            .statistics
+                                            .avatar_rejected
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        continue;
+                                    };
                                     if !avatar_state.transport.is_current_session(&input.session)
                                         || !avatar_state.authenticated_peers.contains_key(&peer)
                                     {
@@ -232,6 +239,7 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
                                     if let Err(error) = runtime.block_on(handle_message(
                                         &avatar_state,
                                         peer,
+                                        Some(&input.session),
                                         input.channel,
                                         input.delivery,
                                         input.payload,
@@ -270,6 +278,7 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
                 channel,
                 delivery,
                 payload,
+                ..
             } = event
             else {
                 return false;
@@ -833,10 +842,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn keyframe_control_requests_bypass_avatar_coalescing() {
+    #[tokio::test]
+    async fn keyframe_control_requests_bypass_avatar_coalescing() {
+        let (_transport, peer, session) = session().await;
         assert!(!is_avatar_input(&ServerEvent::Message {
-            peer: 1,
+            peer,
+            session,
             channel: channels::DELTA_AVATAR,
             delivery: DeliveryMethod::ReliableOrdered,
             payload: Bytes::from_static(&[channels::DELTA_CONTROL_KEYFRAME_REQUEST, 2, 0]),

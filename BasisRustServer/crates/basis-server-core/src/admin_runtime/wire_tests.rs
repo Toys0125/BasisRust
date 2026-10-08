@@ -292,6 +292,168 @@ async fn voice_continues_while_avatar_input_is_blocked() {
     let _ = shutdown.send(());
 }
 
+fn session_for_uuid(state: &ServerState, uuid: &str) -> (PeerId, PeerSession) {
+    let peer = state
+        .authenticated_peers
+        .iter()
+        .find(|entry| entry.metadata.player_uuid == uuid)
+        .expect("authenticated peer");
+    (
+        *peer.key(),
+        peer.session.clone().expect("live peer session"),
+    )
+}
+
+fn registry_subscribe_event(peer: PeerId, session: PeerSession) -> ServerEvent {
+    let mut payload = NetWriter::new();
+    payload.put_u8(channels::REGISTRY_SUB_SUBSCRIBE);
+    BasisMessageSubscribe { ids: vec![42] }
+        .serialize(&mut payload)
+        .unwrap();
+    ServerEvent::Message {
+        peer,
+        session,
+        channel: channels::REGISTRY_CONTROL,
+        delivery: DeliveryMethod::ReliableOrdered,
+        payload: Bytes::from(payload.as_slice().to_vec()),
+    }
+}
+
+async fn wait_for_disconnect_cleanups(state: &ServerState) {
+    let tasks = std::mem::take(&mut *state.disconnect_tasks.lock());
+    for task in tasks {
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn queued_old_control_event_cannot_mutate_reused_peer_id() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let mut old_client = Client::connect(&state, "old-control-session").await;
+    let (old_peer, old_session) = session_for_uuid(&state, "old-control-session");
+    let stale = registry_subscribe_event(old_peer, old_session.clone());
+
+    request_disconnect(&state, &old_session, "test disconnect")
+        .await
+        .unwrap();
+    old_client.receive_disconnect().await;
+    wait_for_disconnect_cleanups(&state).await;
+    assert!(!state.authenticated_peers.contains_key(&old_peer));
+
+    let _replacement = Client::connect(&state, "replacement-session").await;
+    let (replacement_peer, replacement_session) = session_for_uuid(&state, "replacement-session");
+    assert_eq!(
+        replacement_peer, old_peer,
+        "the transport should recycle the old id"
+    );
+    assert!(!old_session.same_connection(&replacement_session));
+
+    // Represents an event queued before disconnect whose worker starts only
+    // after the replacement has authenticated.
+    crate::handle_event(&state, stale).await.unwrap();
+    assert!(!state.message_subscriptions.contains_key(&replacement_peer));
+
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn active_old_control_lease_delays_cleanup_and_id_reuse() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let mut old_client = Client::connect(&state, "leased-old-session").await;
+    let (old_peer, old_session) = session_for_uuid(&state, "leased-old-session");
+    let event = registry_subscribe_event(old_peer, old_session.clone());
+    let ServerEvent::Message {
+        payload,
+        channel,
+        delivery,
+        ..
+    } = event
+    else {
+        unreachable!()
+    };
+
+    let (started_tx, started_rx) = oneshot::channel();
+    let (resume_tx, resume_rx) = oneshot::channel();
+    let handler_state = state.clone();
+    let handler_session = old_session.clone();
+    let handler = tokio::spawn(async move {
+        let _lease = handler_session.try_read_lease().expect("session is live");
+        started_tx.send(()).unwrap();
+        resume_rx.await.unwrap();
+        crate::handle_message(
+            &handler_state,
+            old_peer,
+            Some(&handler_session),
+            channel,
+            delivery,
+            payload,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    });
+    started_rx.await.unwrap();
+
+    request_disconnect(&state, &old_session, "test disconnect")
+        .await
+        .unwrap();
+    old_client.receive_disconnect().await;
+    assert!(state.authenticated_peers.contains_key(&old_peer));
+
+    let _replacement = Client::connect(&state, "while-old-handler-paused").await;
+    let (replacement_peer, _) = session_for_uuid(&state, "while-old-handler-paused");
+    assert_ne!(
+        replacement_peer, old_peer,
+        "old id must stay retired while leased"
+    );
+
+    resume_tx.send(()).unwrap();
+    handler.await.unwrap();
+    wait_for_disconnect_cleanups(&state).await;
+    assert!(!state.authenticated_peers.contains_key(&old_peer));
+    assert!(!state.message_subscriptions.contains_key(&old_peer));
+
+    let _next = Client::connect(&state, "after-old-handler-drained").await;
+    let (recycled_peer, _) = session_for_uuid(&state, "after-old-handler-drained");
+    assert_eq!(recycled_peer, old_peer);
+
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn self_disconnect_defers_drain_until_current_lease_returns() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let mut client = Client::connect(&state, "self-disconnecting-session").await;
+    let (peer, session) = session_for_uuid(&state, "self-disconnecting-session");
+    let handler_state = state.clone();
+    let handler_session = session.clone();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::spawn(async move {
+            let _lease = handler_session.try_read_lease().expect("session is live");
+            request_disconnect(&handler_state, &handler_session, "self disconnect")
+                .await
+                .unwrap();
+        }),
+    )
+    .await
+    .expect("self disconnect must not wait on its own lease")
+    .unwrap();
+    client.receive_disconnect().await;
+    wait_for_disconnect_cleanups(&state).await;
+    assert!(!state.authenticated_peers.contains_key(&peer));
+
+    let _replacement = Client::connect(&state, "self-disconnect-replacement").await;
+    let (replacement_peer, _) = session_for_uuid(&state, "self-disconnect-replacement");
+    assert_eq!(replacement_peer, peer);
+
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
 #[tokio::test]
 async fn client_packets_verify_snapshot_gate_queries_mutes_and_live_permission_updates() {
     let (state, shutdown, _) = super::tests::test_server(false).await;
@@ -525,6 +687,33 @@ async fn pending_capacity_rejection_is_clean_and_timeout_allows_reconnect() {
         .await;
     assert!(peer_by_uuid(&state, &did).is_some());
     state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn shutdown_cancels_and_joins_pending_identity_timers() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    state.config.write().use_auth_identity = true;
+    state.config.write().auth_validation_time_out_miliseconds = 60_000;
+    let key = SigningKey::from_bytes(&[94; 32]);
+    let did = client_did(&key);
+    let mut pending = Client::connect_pending(&state, &did).await;
+    pending.receive_identity_challenge().await;
+    assert_eq!(state.pending_identity.len(), 1);
+    assert_eq!(state.transport.connected_peers_count(), 1);
+    assert_eq!(state.identity_timer_tasks.lock().len(), 1);
+
+    state.shutdown().await.unwrap();
+    assert!(state.pending_identity.is_empty());
+    assert_eq!(state.transport.connected_peers_count(), 0);
+    assert_eq!(
+        state.admission_slots.available_permits(),
+        MAX_PENDING_ADMISSIONS
+    );
+    assert!(state.identity_timer_tasks.lock().is_empty());
+    assert!(state.disconnect_tasks.lock().is_empty());
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(state.disconnect_tasks.lock().is_empty());
     let _ = shutdown.send(());
 }
 
