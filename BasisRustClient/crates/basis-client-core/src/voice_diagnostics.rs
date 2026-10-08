@@ -25,7 +25,119 @@ pub(super) struct VoiceDiagnostics {
     malformed: AtomicU64,
     self_received: AtomicU64,
     own_peer: AtomicU16,
+    sequence_peers: StdMutex<HashMap<u16, SequencePeer>>,
     observer: Option<StdMutex<VoiceObserver>>,
+}
+
+#[derive(Debug)]
+struct SequencePeer {
+    high_sequence: Option<u8>,
+    last_time: Option<std::time::Instant>,
+    seen_window: u128,
+    history_depth: u8,
+    unique_packets: u64,
+    duplicates: u64,
+    reordered: u64,
+    wrapped: u64,
+    ambiguous: u64,
+    unique_available: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequenceObservation {
+    Unique,
+    Duplicate,
+    Reordered,
+    Ambiguous,
+}
+
+fn unique_counts_available(peers: &HashMap<u16, SequencePeer>) -> bool {
+    !peers.is_empty() && peers.values().all(|peer| peer.unique_available)
+}
+
+impl Default for SequencePeer {
+    fn default() -> Self {
+        Self {
+            high_sequence: None,
+            last_time: None,
+            seen_window: 0,
+            history_depth: 0,
+            unique_packets: 0,
+            duplicates: 0,
+            reordered: 0,
+            wrapped: 0,
+            ambiguous: 0,
+            unique_available: true,
+        }
+    }
+}
+
+impl SequencePeer {
+    fn receive(
+        &mut self,
+        sequence: u8,
+        duration_ms: u8,
+        now: std::time::Instant,
+    ) -> SequenceObservation {
+        if self.high_sequence.is_none() {
+            self.high_sequence = Some(sequence);
+            self.last_time = Some(now);
+            self.seen_window = 1;
+            self.unique_packets += 1;
+            return SequenceObservation::Unique;
+        }
+
+        let previous_time = self
+            .last_time
+            .replace(now)
+            .expect("sequence baseline has a timestamp");
+        let long_silence =
+            now.duration_since(previous_time).as_millis() > u128::from(duration_ms.max(1)) * 127;
+        let previous_sequence = self.high_sequence.expect("sequence baseline exists");
+        let forward = sequence.wrapping_sub(previous_sequence);
+        if long_silence || forward == 128 {
+            self.ambiguous += 1;
+            self.unique_available = false;
+            self.high_sequence = Some(sequence);
+            self.seen_window = 1;
+            self.history_depth = 0;
+            return SequenceObservation::Ambiguous;
+        }
+
+        if (1..=127).contains(&forward) {
+            if sequence < previous_sequence {
+                self.wrapped += 1;
+            }
+            self.high_sequence = Some(sequence);
+            self.seen_window = (self.seen_window << forward) | 1;
+            self.history_depth = self.history_depth.saturating_add(forward).min(127);
+            self.unique_packets += 1;
+            return SequenceObservation::Unique;
+        }
+
+        if forward == 0 {
+            self.duplicates += 1;
+            SequenceObservation::Duplicate
+        } else {
+            let behind = 256 - i64::from(forward);
+            let seen = self.seen_window & (1u128 << behind) != 0;
+            if seen {
+                self.duplicates += 1;
+                SequenceObservation::Duplicate
+            } else if behind <= i64::from(self.history_depth) {
+                self.seen_window |= 1u128 << behind;
+                self.reordered += 1;
+                self.unique_packets += 1;
+                SequenceObservation::Reordered
+            } else {
+                // The sequence could be an unseen old frame or a long forward
+                // loss; without a wider wire counter, do not assert uniqueness.
+                self.ambiguous += 1;
+                self.unique_available = false;
+                SequenceObservation::Ambiguous
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -63,6 +175,7 @@ impl VoiceDiagnostics {
     pub(super) fn new(index: usize) -> Self {
         Self {
             own_peer: AtomicU16::new(u16::MAX),
+            sequence_peers: StdMutex::new(HashMap::new()),
             observer: (index == 0).then(|| StdMutex::new(VoiceObserver::default())),
             ..Self::default()
         }
@@ -121,8 +234,16 @@ impl VoiceDiagnostics {
         self.received.fetch_add(1, Ordering::Relaxed);
         self.received_bytes
             .fetch_add(opus.len() as u64, Ordering::Relaxed);
-        if peer == self.own_peer.load(Ordering::Relaxed) {
+        let self_packet = peer == self.own_peer.load(Ordering::Relaxed);
+        if self_packet {
             self.self_received.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.sequence_peers
+                .lock()
+                .expect("voice sequence tracker mutex poisoned")
+                .entry(peer)
+                .or_default()
+                .receive(sequence, duration as u8, std::time::Instant::now());
         }
         if let Some(observer) = &self.observer {
             observer
@@ -200,8 +321,8 @@ pub(super) async fn capture_window(
     let elapsed = started.elapsed();
     // Give receive handlers already in progress a chance to finish their counters.
     time::sleep(Duration::from_millis(50)).await;
-    let mut csv = String::from("client_index,remote_peer_id,connected,sent_packets,sent_opus_bytes,send_errors,skipped_packets,received_packets,received_opus_bytes,malformed_packets,self_received_packets\n");
-    let mut totals = [0u64; 8];
+    let mut csv = String::from("client_index,remote_peer_id,connected,sent_packets,sent_opus_bytes,send_errors,skipped_packets,received_packets,received_opus_bytes,malformed_packets,self_received_packets,received_unique_packets,duplicate_packets,reordered_packets,wrapped_sequence_packets,ambiguous_sequence_packets,unique_count_available\n");
+    let mut totals = [0u64; 14];
     for client in &snapshot {
         let Some(d) = &client.voice_diagnostics else {
             continue;
@@ -217,20 +338,82 @@ pub(super) async fn capture_window(
             &d.self_received,
         ]
         .map(|counter| counter.load(Ordering::Relaxed));
-        for (total, value) in totals.iter_mut().zip(values) {
+        let (unique, duplicates, reordered, wrapped, ambiguous, available) = {
+            let peers = d
+                .sequence_peers
+                .lock()
+                .expect("voice sequence tracker mutex poisoned");
+            (
+                peers.values().map(|peer| peer.unique_packets).sum(),
+                peers.values().map(|peer| peer.duplicates).sum(),
+                peers.values().map(|peer| peer.reordered).sum(),
+                peers.values().map(|peer| peer.wrapped).sum(),
+                peers.values().map(|peer| peer.ambiguous).sum(),
+                unique_counts_available(&peers),
+            )
+        };
+        let row_values = [
+            values[0],
+            values[1],
+            values[2],
+            values[3],
+            values[4],
+            values[5],
+            values[6],
+            values[7],
+            unique,
+            duplicates,
+            reordered,
+            wrapped,
+            ambiguous,
+            u64::from(available),
+        ];
+        for (total, value) in totals.iter_mut().zip(row_values) {
             *total += value;
         }
+        let serialized_values = row_values[..13]
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         csv.push_str(&format!(
-            "{},{},{},{}\n",
+            "{},{},{},{},{}\n",
             client.index,
             d.own_peer.load(Ordering::Relaxed),
             client.connected.load(Ordering::Relaxed),
-            values.map(|value| value.to_string()).join(",")
+            serialized_values,
+            available
         ));
     }
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let mut sequence_peers = String::from("client_index,remote_peer_id,received_unique_packets,duplicates,reordered,wrapped_sequence_packets,ambiguous,unique_count_available\n");
+    for client in &snapshot {
+        let Some(d) = &client.voice_diagnostics else {
+            continue;
+        };
+        let peers = d
+            .sequence_peers
+            .lock()
+            .expect("voice sequence tracker mutex poisoned");
+        let mut sorted = peers.iter().collect::<Vec<_>>();
+        sorted.sort_unstable_by_key(|(id, _)| **id);
+        for (id, peer) in sorted {
+            sequence_peers.push_str(&format!(
+                "{},{},{},{},{},{},{},{}\n",
+                client.index,
+                id,
+                peer.unique_packets,
+                peer.duplicates,
+                peer.reordered,
+                peer.wrapped,
+                peer.ambiguous,
+                peer.unique_available
+            ));
+        }
+    }
+    std::fs::write(output.with_extension("unique-peers.csv"), sequence_peers)?;
     std::fs::write(&output, csv)?;
     let mut summary = format!(
         "metric,value\nwindow_ms,{}\nclients,{}\n",
@@ -246,6 +429,12 @@ pub(super) async fn capture_window(
         "received_opus_bytes",
         "malformed_packets",
         "self_received_packets",
+        "received_unique_packets",
+        "duplicate_packets",
+        "reordered_packets",
+        "wrapped_sequence_packets",
+        "ambiguous_sequence_packets",
+        "unique_count_available_clients",
     ]
     .iter()
     .zip(totals)
@@ -305,6 +494,137 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unique_counts_require_an_observed_source() {
+        let mut peers = HashMap::new();
+        assert!(!unique_counts_available(&peers));
+        let mut peer = SequencePeer::default();
+        peer.receive(1, 20, std::time::Instant::now());
+        peers.insert(7, peer);
+        assert!(unique_counts_available(&peers));
+        peers.get_mut(&7).unwrap().unique_available = false;
+        assert!(!unique_counts_available(&peers));
+    }
+
+    #[test]
+    fn sequence_tracker_counts_wraps_nonadjacent_duplicates_and_reordered_frames() {
+        let mut tracker = SequencePeer::default();
+        let now = std::time::Instant::now();
+        let observations = [254, 255, 0, 2, 2, 1]
+            .into_iter()
+            .enumerate()
+            .map(|(i, sequence)| {
+                tracker.receive(sequence, 20, now + Duration::from_millis(i as u64 * 20))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observations,
+            [
+                SequenceObservation::Unique,
+                SequenceObservation::Unique,
+                SequenceObservation::Unique,
+                SequenceObservation::Unique,
+                SequenceObservation::Duplicate,
+                SequenceObservation::Reordered,
+            ]
+        );
+        assert_eq!(tracker.unique_packets, 5);
+        assert_eq!(tracker.duplicates, 1);
+        assert_eq!(tracker.reordered, 1);
+        assert_eq!(tracker.wrapped, 1);
+        assert_eq!(tracker.ambiguous, 0);
+        assert!(tracker.unique_available);
+    }
+
+    #[test]
+    fn sequence_tracker_preserves_unique_frames_across_multiple_wraps() {
+        let mut tracker = SequencePeer::default();
+        let now = std::time::Instant::now();
+        for frame in 0..300u16 {
+            let result = tracker.receive(
+                frame as u8,
+                20,
+                now + Duration::from_millis(u64::from(frame) * 20),
+            );
+            assert_eq!(result, SequenceObservation::Unique);
+        }
+        assert_eq!(tracker.unique_packets, 300);
+        assert_eq!(tracker.wrapped, 1);
+        assert_eq!(tracker.duplicates, 0);
+        assert!(tracker.unique_available);
+        assert_eq!(tracker.seen_window.count_ones(), 128);
+    }
+
+    #[test]
+    fn sequence_tracker_handles_half_range_and_neighboring_deltas_conservatively() {
+        let now = std::time::Instant::now();
+        let mut forward_127 = SequencePeer::default();
+        forward_127.receive(0, 20, now);
+        assert_eq!(
+            forward_127.receive(127, 20, now + Duration::from_millis(20)),
+            SequenceObservation::Unique
+        );
+        assert!(forward_127.unique_available);
+
+        let mut half_range = SequencePeer::default();
+        half_range.receive(0, 20, now);
+        assert_eq!(
+            half_range.receive(128, 20, now + Duration::from_millis(20)),
+            SequenceObservation::Ambiguous
+        );
+        assert_eq!(half_range.ambiguous, 1);
+        assert!(!half_range.unique_available);
+
+        let mut forward_129_without_history = SequencePeer::default();
+        forward_129_without_history.receive(0, 20, now);
+        assert_eq!(
+            forward_129_without_history.receive(129, 20, now + Duration::from_millis(20)),
+            SequenceObservation::Ambiguous
+        );
+        assert!(!forward_129_without_history.unique_available);
+
+        let mut reordered_129 = SequencePeer::default();
+        for sequence in (0..=127).chain(129..=255) {
+            reordered_129.receive(
+                sequence,
+                20,
+                now + Duration::from_millis(u64::from(sequence) * 20),
+            );
+        }
+        assert_eq!(
+            reordered_129.receive(128, 20, now + Duration::from_millis(256 * 20)),
+            SequenceObservation::Reordered
+        );
+        assert_eq!(reordered_129.reordered, 1);
+        assert!(reordered_129.unique_available);
+    }
+
+    #[test]
+    fn sequence_tracker_marks_long_silence_ambiguous_and_resets_bounded_history() {
+        let mut tracker = SequencePeer::default();
+        let now = std::time::Instant::now();
+        tracker.receive(10, 20, now);
+        assert_eq!(
+            tracker.receive(11, 20, now + Duration::from_millis(2541)),
+            SequenceObservation::Ambiguous
+        );
+        assert_eq!(tracker.ambiguous, 1);
+        assert!(!tracker.unique_available);
+        assert_eq!(tracker.seen_window.count_ones(), 1);
+        assert_eq!(tracker.history_depth, 0);
+    }
+
+    #[test]
+    fn sequence_tracker_window_has_constant_bounded_storage() {
+        let mut tracker = SequencePeer::default();
+        let now = std::time::Instant::now();
+        for frame in 0..10_000u64 {
+            tracker.receive(frame as u8, 20, now + Duration::from_millis(frame * 20));
+        }
+        assert_eq!(tracker.seen_window.count_ones(), 128);
+        assert_eq!(std::mem::size_of_val(&tracker.seen_window), 16);
+    }
+
+    #[test]
     fn observer_handles_wrap_loss_duplicate_and_ambiguous_sequence() {
         let mut observer = VoiceObserver::default();
         let now = std::time::Instant::now();
@@ -360,6 +680,16 @@ mod tests {
         assert_eq!(diagnostics.received_bytes.load(Ordering::Relaxed), 4);
         assert_eq!(diagnostics.self_received.load(Ordering::Relaxed), 1);
         assert_eq!(diagnostics.malformed.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            diagnostics
+                .sequence_peers
+                .lock()
+                .unwrap()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
         assert_eq!(
             diagnostics
                 .observer

@@ -178,6 +178,15 @@ def population(status, server_log, client_log, server_kind):
     return int(status.get("players_online", 0)), int(match.group(1)) if match else -1, None
 
 
+def client_receive_overrides(voice_enabled, all_clients, no_shared, platform_name):
+    overrides = {}
+    if no_shared or (voice_enabled and platform_name != "nt"):
+        overrides["BASIS_CLIENT_SHARED_RECEIVE"] = "0"
+    if all_clients or voice_enabled:
+        overrides["BASIS_CLIENT_LOAD_SINK_FILTER"] = "0"
+    return overrides
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", type=pathlib.Path, default=ROOT / ("BasisRustServer/target/release/basis-server-console.exe" if WINDOWS else "BasisRustServer/target/release/basis-server-console"))
@@ -204,10 +213,8 @@ def main():
                         help="force per-client receive tasks; on Linux the shared epoll receiver defaults on and "
                              "discards unreliable payloads for non-observer clients, which silently starves voice")
     parser.add_argument("--client-voice-all-clients", action="store_true",
-                        help="measure voice reception on every client instead of observer candidates only. On Linux the "
-                             "load-sink receive filter drops top-level Unreliable and CompactMerged for non-observer "
-                             "clients, so the Rust server (Merged) reaches all clients while LiteNetLib (CompactMerged) "
-                             "reaches only observers; disable it so both server legs measure the same population")
+                        help="disable the Linux bulk-unreliable receive filter for every client; automatic when "
+                             "--voice-audio-folder is supplied, optional for the avatar baseline")
     parser.add_argument("--max-server-working-set-mib", type=int, help="stop measurement at this server working set; voice default=24576 MiB, otherwise unlimited; 0 disables")
     parser.add_argument("--post-client-seconds", type=int, default=0, help="observe server memory/health after clients exit before stopping the server")
     args = parser.parse_args()
@@ -332,10 +339,8 @@ def main():
         client_env = dict(os.environ)
         client_env.update({"BASIS_CLIENT_TOKIO_WORKERS": str(args.workers), "BASIS_AVATAR_DIAGNOSTICS": "true"})
         client_env.pop("BASIS_VOICE_DIAGNOSTIC_CSV", None)
-        if args.no_client_shared_receive:
-            client_env["BASIS_CLIENT_SHARED_RECEIVE"] = "0"
-        if args.client_voice_all_clients:
-            client_env["BASIS_CLIENT_LOAD_SINK_FILTER"] = "0"
+        client_env.update(client_receive_overrides(
+            bool(args.voice_audio_folder), args.client_voice_all_clients, args.no_client_shared_receive, os.name))
         if args.voice_audio_folder:
             client_env["BASIS_VOICE_DIAGNOSTIC_CSV"] = str(output / "voice.csv")
         remote_root = pathlib.PurePosixPath(args.remote_root) if args.remote_ssh else None

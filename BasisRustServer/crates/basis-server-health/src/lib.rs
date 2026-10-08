@@ -133,6 +133,10 @@ pub struct AppMessageMetrics {
     pub inbound: u64,
     pub outbound: u64,
     pub protocol_errors: u64,
+    pub avatar_received: u64,
+    pub avatar_coalesced: u64,
+    pub avatar_rejected: u64,
+    pub avatar_processed: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -531,6 +535,28 @@ mod tests {
 
         assert!(response.extended.is_some());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn health_extended_json_exposes_avatar_input_pipeline_counts() {
+        let metrics = ExtendedHealthMetrics {
+            app_messages: AppMessageMetrics {
+                inbound: 11,
+                outbound: 12,
+                protocol_errors: 13,
+                avatar_received: 14,
+                avatar_coalesced: 3,
+                avatar_rejected: 2,
+                avatar_processed: 9,
+            },
+            ..ExtendedHealthMetrics::default()
+        };
+        let json = serde_json::to_value(metrics).unwrap();
+
+        assert_eq!(json["appMessages"]["avatarReceived"], 14);
+        assert_eq!(json["appMessages"]["avatarCoalesced"], 3);
+        assert_eq!(json["appMessages"]["avatarRejected"], 2);
+        assert_eq!(json["appMessages"]["avatarProcessed"], 9);
     }
 
     #[test]

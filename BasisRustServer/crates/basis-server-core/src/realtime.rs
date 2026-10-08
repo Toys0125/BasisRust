@@ -18,6 +18,7 @@ struct Input {
     delivery: DeliveryMethod,
     payload: Bytes,
     received: Instant,
+    arrival_order: u64,
 }
 
 #[derive(Default)]
@@ -75,28 +76,38 @@ struct AvatarPending {
 }
 
 impl AvatarPending {
-    fn push(&mut self, input: Input) {
+    fn push(&mut self, input: Input) -> (u64, u64) {
+        let mut coalesced = 0;
+        let mut rejected = 0;
         let previous = self
             .high_pose
             .as_ref()
             .or(self.pose.as_ref())
             .or(self.delta.as_ref());
         if previous.is_some_and(|old| !old.session.same_connection(&input.session)) {
+            rejected = self.len() as u64;
             *self = Self::default();
         }
         if input.channel != channels::DELTA_AVATAR {
             if channels::quality_from_channel(input.channel) == BitQuality::High as u8 {
                 // Keep the delta baseline even when a lower-quality pose follows it.
-                self.high_pose = Some(input);
-                self.delta = None;
+                coalesced += self.high_pose.replace(input).is_some() as u64;
+                coalesced += self.delta.take().is_some() as u64;
             } else {
                 // Coalesce lower-quality poses independently of the HIGH baseline.
-                self.pose = Some(input);
+                coalesced += self.pose.replace(input).is_some() as u64;
             }
         } else {
             // Deltas reference the full keyframe, never the preceding delta.
-            self.delta = Some(input);
+            coalesced += self.delta.replace(input).is_some() as u64;
         }
+        (coalesced, rejected)
+    }
+
+    fn len(&self) -> usize {
+        self.high_pose.is_some() as usize
+            + self.pose.is_some() as usize
+            + self.delta.is_some() as usize
     }
 
     fn drain(&mut self) -> Vec<Input> {
@@ -104,7 +115,7 @@ impl AvatarPending {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-        inputs.sort_by_key(|input| input.received);
+        inputs.sort_by_key(|input| input.arrival_order);
         inputs
     }
 }
@@ -212,6 +223,10 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
                                     if !avatar_state.transport.is_current_session(&input.session)
                                         || !avatar_state.authenticated_peers.contains_key(&peer)
                                     {
+                                        avatar_state
+                                            .statistics
+                                            .avatar_rejected
+                                            .fetch_add(1, Ordering::Relaxed);
                                         continue;
                                     }
                                     if let Err(error) = runtime.block_on(handle_message(
@@ -220,7 +235,15 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
                                         input.channel,
                                         input.delivery,
                                         input.payload,
+                                        false,
+                                        true,
                                     )) {
+                                        // Handled avatar rejections return Ok; only
+                                        // failures escaping processing reach this path.
+                                        avatar_state
+                                            .statistics
+                                            .avatar_rejected
+                                            .fetch_add(1, Ordering::Relaxed);
                                         warn!("avatar input failed: {error:#}");
                                     }
                                 }
@@ -236,7 +259,9 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
         return Err(error);
     }
     let authenticated = state.authenticated_peers.clone();
-    let inbound_packets = state.statistics.inbound_packets.clone();
+    let statistics = state.statistics.clone();
+    let next_arrival_order = Arc::new(AtomicU64::new(0));
+    let input_arrival_order = Arc::clone(&next_arrival_order);
     state
         .transport
         .set_realtime_handler(Some(Arc::new(move |event, session| {
@@ -256,13 +281,19 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
             if !is_voice && !is_avatar_input(event) {
                 return false;
             }
-            if is_voice {
-                inbound_packets.fetch_add(1, Ordering::Relaxed);
+            if is_voice || is_avatar_input(event) {
+                statistics.inbound_packets.fetch_add(1, Ordering::Relaxed);
+            }
+            if is_avatar_input(event) {
+                statistics.avatar_received.fetch_add(1, Ordering::Relaxed);
             }
             // Do not allocate queues for unauthenticated senders.
             if !authenticated.contains_key(peer)
                 || (is_voice && (payload.is_empty() || payload.len() > MAX_VOICE_PAYLOAD))
             {
+                if is_avatar_input(event) {
+                    statistics.avatar_rejected.fetch_add(1, Ordering::Relaxed);
+                }
                 return true;
             }
             let input = Input {
@@ -271,11 +302,21 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
                 delivery: *delivery,
                 payload: payload.clone(),
                 received: Instant::now(),
+                arrival_order: 0,
             };
             if is_voice {
                 voice.push(*peer, input);
             } else {
-                avatars.lock().entry(*peer).or_default().push(input);
+                let mut avatars = avatars.lock();
+                let mut input = input;
+                input.arrival_order = input_arrival_order.fetch_add(1, Ordering::Relaxed);
+                let (coalesced, rejected) = avatars.entry(*peer).or_default().push(input);
+                statistics
+                    .avatar_coalesced
+                    .fetch_add(coalesced, Ordering::Relaxed);
+                statistics
+                    .avatar_rejected
+                    .fetch_add(rejected, Ordering::Relaxed);
             }
             true
         })));
@@ -665,6 +706,7 @@ mod tests {
             delivery: DeliveryMethod::Unreliable,
             payload: Bytes::from(vec![sequence, 0, 0]),
             received,
+            arrival_order: sequence as u64,
         }
     }
 
@@ -735,6 +777,60 @@ mod tests {
         assert_eq!(pending.delta.as_ref().unwrap().payload[0], 3);
         pending.push(input(&session, channels::PLAYER_AVATAR_HIGH, 4, now));
         assert!(pending.delta.is_none());
+    }
+
+    #[tokio::test]
+    async fn avatar_pending_counts_replacements_and_rejects_old_session_inputs() {
+        let (_, _, old_session) = session().await;
+        let (_, _, new_session) = session().await;
+        let now = Instant::now();
+        let mut pending = AvatarPending::default();
+
+        assert_eq!(
+            pending.push(input(&old_session, channels::PLAYER_AVATAR_LOW, 1, now)),
+            (0, 0)
+        );
+        assert_eq!(
+            pending.push(input(&old_session, channels::PLAYER_AVATAR_LOW, 2, now)),
+            (1, 0)
+        );
+        assert_eq!(
+            pending.push(input(&old_session, channels::PLAYER_AVATAR_HIGH, 3, now)),
+            (0, 0)
+        );
+        assert_eq!(
+            pending.push(input(&old_session, channels::DELTA_AVATAR, 4, now)),
+            (0, 0)
+        );
+        assert_eq!(
+            pending.push(input(&old_session, channels::PLAYER_AVATAR_HIGH, 5, now)),
+            (2, 0)
+        );
+        assert_eq!(
+            pending.push(input(&new_session, channels::PLAYER_AVATAR_LOW, 6, now)),
+            (0, 2)
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.pose.as_ref().unwrap().payload[0], 6);
+    }
+
+    #[tokio::test]
+    async fn avatar_pending_preserves_admission_order_when_receive_times_tie() {
+        let (_, _, session) = session().await;
+        let now = Instant::now();
+        let mut pending = AvatarPending::default();
+        pending.push(input(&session, channels::PLAYER_AVATAR_LOW, 7, now));
+        pending.push(input(&session, channels::PLAYER_AVATAR_HIGH, 8, now));
+
+        let drained = pending.drain();
+        assert_eq!(
+            drained.iter().map(|i| i.payload[0]).collect::<Vec<_>>(),
+            [7, 8]
+        );
+        assert_eq!(
+            drained.last().unwrap().channel,
+            channels::PLAYER_AVATAR_HIGH
+        );
     }
 
     #[test]

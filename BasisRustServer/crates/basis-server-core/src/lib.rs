@@ -330,6 +330,14 @@ pub struct StatisticsSnapshot {
     pub inbound_packets: u64,
     pub outbound_packets: u64,
     pub protocol_errors: u64,
+    /// Avatar input packets intercepted by the realtime handler.
+    pub avatar_received: u64,
+    /// Received avatar packets superseded by per-peer coalescing.
+    pub avatar_coalesced: u64,
+    /// Avatar packets discarded for authentication, session, registration, or protocol reasons.
+    pub avatar_rejected: u64,
+    /// Avatar packets accepted by avatar input processing.
+    pub avatar_processed: u64,
 }
 
 #[derive(Debug)]
@@ -373,6 +381,10 @@ pub struct Statistics {
     inbound_packets: Arc<GatedCounter>,
     outbound_packets: Arc<GatedCounter>,
     protocol_errors: Arc<GatedCounter>,
+    avatar_received: Arc<GatedCounter>,
+    avatar_coalesced: Arc<GatedCounter>,
+    avatar_rejected: Arc<GatedCounter>,
+    avatar_processed: Arc<GatedCounter>,
 }
 
 impl Statistics {
@@ -383,6 +395,10 @@ impl Statistics {
             inbound_packets: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
             outbound_packets: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
             protocol_errors: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
+            avatar_received: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
+            avatar_coalesced: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
+            avatar_rejected: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
+            avatar_processed: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
         }
     }
 
@@ -396,6 +412,10 @@ impl Statistics {
             self.inbound_packets.store(0, Ordering::Relaxed);
             self.outbound_packets.store(0, Ordering::Relaxed);
             self.protocol_errors.store(0, Ordering::Relaxed);
+            self.avatar_received.store(0, Ordering::Relaxed);
+            self.avatar_coalesced.store(0, Ordering::Relaxed);
+            self.avatar_rejected.store(0, Ordering::Relaxed);
+            self.avatar_processed.store(0, Ordering::Relaxed);
         }
         self.enabled.store(enabled, Ordering::Relaxed);
     }
@@ -405,6 +425,10 @@ impl Statistics {
             inbound_packets: self.inbound_packets.load(Ordering::Relaxed),
             outbound_packets: self.outbound_packets.load(Ordering::Relaxed),
             protocol_errors: self.protocol_errors.load(Ordering::Relaxed),
+            avatar_received: self.avatar_received.load(Ordering::Relaxed),
+            avatar_coalesced: self.avatar_coalesced.load(Ordering::Relaxed),
+            avatar_rejected: self.avatar_rejected.load(Ordering::Relaxed),
+            avatar_processed: self.avatar_processed.load(Ordering::Relaxed),
         }
     }
 }
@@ -776,7 +800,7 @@ impl ServerState {
         let app = self.statistics.snapshot();
         if !verbose {
             return format!(
-                "Server is running and healthy. Players: {} PendingReliable: {} QueuedReliable: {} AppIn: {} AppOut: {} RawIn: {} RawOut: {} AvatarIn: {} AvatarOut: {} ProtocolErrors: {}",
+                "Server is running and healthy. Players: {} PendingReliable: {} QueuedReliable: {} AppIn: {} AppOut: {} RawIn: {} RawOut: {} AvatarIn: {} AvatarOut: {} ProtocolErrors: {} AvatarReceived: {} AvatarCoalesced: {} AvatarRejected: {} AvatarProcessed: {}",
                 players,
                 self.transport.pending_reliable_count(),
                 self.transport.queued_reliable_count(),
@@ -787,10 +811,14 @@ impl ServerState {
                 avatar.inbound_updates,
                 avatar.outbound_messages,
                 app.protocol_errors,
+                app.avatar_received,
+                app.avatar_coalesced,
+                app.avatar_rejected,
+                app.avatar_processed,
             );
         }
         format!(
-            "Server is running and healthy\nPlayers: {}\nReliable: pending={} queued={} window_fills={} retransmits={} dispatch_passes={} peers_visited={} acks_in={} acks_released={} acks_unknown_chan={} window_stalls={}\nApp messages: inbound={} outbound={} protocol_errors={}\nRaw UDP: packets_in={} packets_out={} bytes_in={} bytes_out={} would_block={}\nAvatar sync: inbound_updates={} outbound_messages={} outbound_logical_avatar_sends={} outbound_batches={} active_states={} pending_updates={} receiver_slices={}\nAvatar timing: ticks={} avg_tick_us={} smooth_tick_us={} avg_build_us={} avg_flush_us={} max_tick_us={} receiver_cycle_ms={} cycle_budget_ms={} tick_budget_ms={}",
+            "Server is running and healthy\nPlayers: {}\nReliable: pending={} queued={} window_fills={} retransmits={} dispatch_passes={} peers_visited={} acks_in={} acks_released={} acks_unknown_chan={} window_stalls={}\nApp messages: inbound={} outbound={} protocol_errors={}\nAvatar input: received={} coalesced={} rejected={} processed={}\nRaw UDP: packets_in={} packets_out={} bytes_in={} bytes_out={} would_block={}\nAvatar sync: inbound_updates={} outbound_messages={} outbound_logical_avatar_sends={} outbound_batches={} active_states={} pending_updates={} receiver_slices={}\nAvatar timing: ticks={} avg_tick_us={} smooth_tick_us={} avg_build_us={} avg_flush_us={} max_tick_us={} receiver_cycle_ms={} cycle_budget_ms={} tick_budget_ms={}",
             players,
             self.transport.pending_reliable_count(),
             self.transport.queued_reliable_count(),
@@ -805,6 +833,10 @@ impl ServerState {
             app.inbound_packets,
             app.outbound_packets,
             app.protocol_errors,
+            app.avatar_received,
+            app.avatar_coalesced,
+            app.avatar_rejected,
+            app.avatar_processed,
             transport.raw_packets_received,
             transport.raw_packets_sent,
             transport.raw_bytes_received,
@@ -1177,7 +1209,7 @@ async fn handle_event(state: &ServerState, event: ServerEvent) -> Result<()> {
             channel,
             delivery,
             payload,
-        } => handle_message(state, peer, channel, delivery, payload).await,
+        } => handle_message(state, peer, channel, delivery, payload, true, false).await,
         ServerEvent::UnconnectedRequest {
             remote_addr, nonce, ..
         } => {
@@ -1937,9 +1969,9 @@ async fn handle_uplink_avatar_delta(
     state: &ServerState,
     peer: PeerId,
     payload: &[u8],
-) -> Result<()> {
+) -> Result<bool> {
     if payload.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let header = payload[0];
     if header & channels::DELTA_HEADER_CONTROL_BIT != 0 {
@@ -1947,10 +1979,10 @@ async fn handle_uplink_avatar_delta(
             let sender_id = u16::from_le_bytes([payload[1], payload[2]]);
             state.avatar_sync.request_keyframe(sender_id, peer);
         }
-        return Ok(());
+        return Ok(false);
     }
     if header & channels::DELTA_HEADER_QUALITY_MASK != BitQuality::High as u8 {
-        return Ok(());
+        return Ok(false);
     }
     if payload.len() < 3 {
         anyhow::bail!("uplink avatar delta missing sequence header");
@@ -1982,7 +2014,7 @@ async fn handle_uplink_avatar_delta(
         if should_nack {
             send_uplink_keyframe_request(state, peer).await?;
         }
-        return Ok(());
+        return Ok(false);
     };
 
     let (full_payload, delta_body_len) = apply_delta(&baseline, &payload[3..], BitQuality::High)?;
@@ -2010,7 +2042,7 @@ async fn handle_uplink_avatar_delta(
     state
         .avatar_sync
         .upsert_from_channel_payload(peer, channel, &full_frame)?;
-    Ok(())
+    Ok(true)
 }
 
 async fn handle_message(
@@ -2019,18 +2051,34 @@ async fn handle_message(
     channel: u8,
     delivery: DeliveryMethod,
     payload: Bytes,
+    count_inbound: bool,
+    count_avatar: bool,
 ) -> Result<()> {
-    state
-        .statistics
-        .inbound_packets
-        .fetch_add(1, Ordering::Relaxed);
+    if count_inbound {
+        state
+            .statistics
+            .inbound_packets
+            .fetch_add(1, Ordering::Relaxed);
+    }
     if channel != channels::AUTH_IDENTITY && !state.authenticated_peers.contains_key(&peer) {
+        if count_avatar {
+            state
+                .statistics
+                .avatar_rejected
+                .fetch_add(1, Ordering::Relaxed);
+        }
         return Ok(());
     }
     if (channels::PLAYER_AVATAR_QUALITY_CHANNELS.contains(&channel)
         || channel == channels::DELTA_AVATAR)
         && !state.avatar_sync.is_player_registered(peer)
     {
+        if count_avatar {
+            state
+                .statistics
+                .avatar_rejected
+                .fetch_add(1, Ordering::Relaxed);
+        }
         return Ok(());
     }
     match channel {
@@ -2078,17 +2126,40 @@ async fn handle_message(
             } else {
                 payload.as_ref()
             };
+            if ingest_payload.is_empty() {
+                if count_avatar {
+                    state
+                        .statistics
+                        .avatar_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(());
+            }
             match state.avatar_sync.upsert_from_channel_payload(
                 peer,
                 ingest_channel,
                 ingest_payload,
             ) {
-                Ok(()) => capture_uplink_delta_baseline(state, peer, ingest_payload),
+                Ok(()) => {
+                    capture_uplink_delta_baseline(state, peer, ingest_payload);
+                    if count_avatar {
+                        state
+                            .statistics
+                            .avatar_processed
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 Err(err) => {
                     state
                         .statistics
                         .protocol_errors
                         .fetch_add(1, Ordering::Relaxed);
+                    if count_avatar {
+                        state
+                            .statistics
+                            .avatar_rejected
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     warn!("invalid avatar update from peer {peer}: {err}");
                 }
             }
@@ -2126,6 +2197,15 @@ async fn handle_message(
             } else {
                 payload.as_ref()
             };
+            if ingest_payload.is_empty() {
+                if count_avatar {
+                    state
+                        .statistics
+                        .avatar_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(());
+            }
             match state.avatar_sync.upsert_from_channel_payload(
                 peer,
                 ingest_channel,
@@ -2139,25 +2219,59 @@ async fn handle_message(
                     ) {
                         capture_uplink_delta_baseline(state, peer, ingest_payload);
                     }
+                    if count_avatar {
+                        state
+                            .statistics
+                            .avatar_processed
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Err(err) => {
                     state
                         .statistics
                         .protocol_errors
                         .fetch_add(1, Ordering::Relaxed);
+                    if count_avatar {
+                        state
+                            .statistics
+                            .avatar_rejected
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     warn!("invalid avatar update from peer {peer}: {err}");
                 }
             }
         }
-        channels::DELTA_AVATAR => {
-            if let Err(err) = handle_uplink_avatar_delta(state, peer, &payload).await {
+        channels::DELTA_AVATAR => match handle_uplink_avatar_delta(state, peer, &payload).await {
+            Ok(true) => {
+                if count_avatar {
+                    state
+                        .statistics
+                        .avatar_processed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Ok(false) => {
+                if count_avatar {
+                    state
+                        .statistics
+                        .avatar_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Err(err) => {
                 state
                     .statistics
                     .protocol_errors
                     .fetch_add(1, Ordering::Relaxed);
+                if count_avatar {
+                    state
+                        .statistics
+                        .avatar_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 warn!("invalid avatar delta from peer {peer}: {err}");
             }
-        }
+        },
         channels::CHAT => {
             if admin_runtime::is_text_muted(state, peer) {
                 return Ok(());
@@ -5069,23 +5183,41 @@ mod tests {
         statistics.inbound_packets.fetch_add(1, Ordering::Relaxed);
         statistics.outbound_packets.fetch_add(1, Ordering::Relaxed);
         statistics.protocol_errors.fetch_add(1, Ordering::Relaxed);
+        statistics.avatar_received.fetch_add(1, Ordering::Relaxed);
+        statistics.avatar_coalesced.fetch_add(1, Ordering::Relaxed);
+        statistics.avatar_rejected.fetch_add(1, Ordering::Relaxed);
+        statistics.avatar_processed.fetch_add(1, Ordering::Relaxed);
         assert_eq!(statistics.snapshot().inbound_packets, 0);
         assert_eq!(statistics.snapshot().outbound_packets, 0);
         assert_eq!(statistics.snapshot().protocol_errors, 0);
+        assert_eq!(statistics.snapshot().avatar_received, 0);
 
         statistics.set_enabled(true);
         statistics.inbound_packets.fetch_add(2, Ordering::Relaxed);
         statistics.outbound_packets.fetch_add(3, Ordering::Relaxed);
         statistics.protocol_errors.fetch_add(4, Ordering::Relaxed);
+        statistics.avatar_received.fetch_add(5, Ordering::Relaxed);
+        statistics.avatar_coalesced.fetch_add(2, Ordering::Relaxed);
+        statistics.avatar_rejected.fetch_add(1, Ordering::Relaxed);
+        statistics.avatar_processed.fetch_add(2, Ordering::Relaxed);
         let snapshot = statistics.snapshot();
         assert_eq!(snapshot.inbound_packets, 2);
         assert_eq!(snapshot.outbound_packets, 3);
         assert_eq!(snapshot.protocol_errors, 4);
+        assert_eq!(snapshot.avatar_received, 5);
+        assert_eq!(snapshot.avatar_coalesced, 2);
+        assert_eq!(snapshot.avatar_rejected, 1);
+        assert_eq!(snapshot.avatar_processed, 2);
 
         statistics.set_enabled(false);
         statistics.inbound_packets.fetch_add(10, Ordering::Relaxed);
         statistics.set_enabled(true);
-        assert_eq!(statistics.snapshot().inbound_packets, 0);
+        let reset = statistics.snapshot();
+        assert_eq!(reset.inbound_packets, 0);
+        assert_eq!(reset.avatar_received, 0);
+        assert_eq!(reset.avatar_coalesced, 0);
+        assert_eq!(reset.avatar_rejected, 0);
+        assert_eq!(reset.avatar_processed, 0);
     }
 
     fn test_ready_message() -> ReadyMessage {

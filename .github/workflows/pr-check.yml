@@ -10,6 +10,15 @@ permissions:
   contents: read
 
 jobs:
+  voice-benchmark-validation:
+    name: Voice benchmark validation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Test voice analyzer and workload receive configuration
+        run: python3 -m unittest discover -s scripts/perf -p 'test_*voice*.py'
+
   client-windows:
     name: Client check, test, clippy (Windows)
     runs-on: windows-latest

@@ -47,6 +47,24 @@ def ogg_packets(path):
     return packets
 
 
+def workload_command(rtk, binaries, output, encoded, name, clients, percent, warmup, window, platform_name):
+    executable = ".exe" if platform_name == "nt" else ""
+    command = [rtk, "proxy", sys.executable, str(ROOT / "scripts/perf/run-windows-avatar-workload.py"),
+               "--server", str(binaries / f"server{executable}"), "--client", str(binaries / f"client{executable}"),
+               "--server-config", str(ROOT / "docs/performance/fixtures/avatar-cpu-only-server.xml"),
+               "--clients", str(clients), "--workers", "4", "--warmup-seconds", str(warmup),
+               "--window-seconds", str(window), "--no-server-avatar-diagnostics", "--output", str(output / name),
+               "--client-voice-all-clients"]
+    # Every suite run uses the same receive population, including the avatar baseline.
+    # The child flag explicitly disables the Linux bulk-unreliable socket filter.
+    if percent:
+        command.extend(["--voice-audio-folder", str(encoded), "--voice-speaker-percent", str(percent), "--no-voice-reencode"])
+    if platform_name != "nt":
+        # The Linux shared epoll receiver currently discards unreliable voice payloads.
+        command.append("--no-client-shared-receive")
+    return command
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audio-folder", type=pathlib.Path, required=True)
@@ -57,8 +75,7 @@ def main():
     parser.add_argument("--normal-seconds", type=int, default=120)
     parser.add_argument("--stress-seconds", type=int, default=180)
     parser.add_argument("--client-voice-all-clients", action="store_true",
-                        help="measure voice reception on every client instead of observer candidates only, so Rust and "
-                             "C# legs measure the same client population (see run-windows-avatar-workload.py)")
+                        help="compatibility flag; the suite always measures voice reception on every client")
     args = parser.parse_args()
     output = args.output.resolve()
     source = args.audio_folder.resolve()
@@ -116,19 +133,7 @@ def main():
             ("voice-100pct", args.clients, 100, args.warmup_seconds, args.stress_seconds)]
     results = []
     for name, clients, percent, warmup, window in runs:
-        command = [rtk, "proxy", sys.executable, str(ROOT / "scripts/perf/run-windows-avatar-workload.py"),
-                   "--server", str(binaries / f"server{executable}"), "--client", str(binaries / f"client{executable}"),
-                   "--server-config", str(ROOT / "docs/performance/fixtures/avatar-cpu-only-server.xml"),
-                   "--clients", str(clients), "--workers", "4", "--warmup-seconds", str(warmup),
-                   "--window-seconds", str(window), "--no-server-avatar-diagnostics", "--output", str(output / name)]
-        if percent:
-            command.extend(["--voice-audio-folder", str(encoded), "--voice-speaker-percent", str(percent), "--no-voice-reencode"])
-        if os.name != "nt":
-            # Linux defaults the client to the shared epoll receiver, which drops unreliable
-            # payloads for non-observer clients and silently starves voice reception.
-            command.append("--no-client-shared-receive")
-        if args.client_voice_all_clients:
-            command.append("--client-voice-all-clients")
+        command = workload_command(rtk, binaries, output, encoded, name, clients, percent, warmup, window, os.name)
         print(f"Starting {name}: {clients} clients, {percent}% speaking, {window}s measurement", flush=True)
         with (output / f"{name}-harness.log").open("w", encoding="utf-8") as log:
             process = subprocess.run(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)

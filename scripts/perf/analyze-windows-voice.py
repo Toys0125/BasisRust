@@ -86,6 +86,65 @@ def validate_samples(path, audio_folder):
             "valid": bool(results) and mismatches == 0 and all(result["valid"] for result in results)}
 
 
+def analyze_receipt_metrics(voice, voice_rows, clients):
+    """Summarize raw arrivals and bounded sequence-tracked unique frames.
+
+    Old captures have no per-client unique fields. Their raw ratio remains
+    available for comparison, while unique delivery stays unavailable so an
+    old capture cannot pass a unique-frame capacity check.
+    """
+    required = ("received_unique_packets", "duplicate_packets", "reordered_packets",
+                "wrapped_sequence_packets", "ambiguous_sequence_packets", "unique_count_available")
+    fields_present = bool(voice_rows) and all(all(key in row for key in required) for row in voice_rows)
+    all_clients_present = len(voice_rows) == clients and fields_present
+    available = all_clients_present and all(row["unique_count_available"].lower() == "true" for row in voice_rows)
+    expected = voice["sent_packets"] * (clients - 1)
+    raw_ratio = voice["received_packets"] / expected if expected else 0
+    if fields_present:
+        unique_received = sum(int(row["received_unique_packets"]) for row in voice_rows)
+        duplicates = sum(int(row["duplicate_packets"]) for row in voice_rows)
+        reordered = sum(int(row["reordered_packets"]) for row in voice_rows)
+        wrapped = sum(int(row["wrapped_sequence_packets"]) for row in voice_rows)
+        ambiguous = sum(int(row["ambiguous_sequence_packets"]) for row in voice_rows)
+    else:
+        unique_received = duplicates = reordered = wrapped = ambiguous = None
+    unique_ratio = unique_received / expected if available and expected else None
+    checks = {
+        "voice_unique_receipt_metrics_available": available,
+        "zero_voice_duplicate_packets": available and duplicates == 0,
+        "zero_voice_reordered_packets": available and reordered == 0,
+        "zero_voice_ambiguous_sequences": available and ambiguous == 0,
+        "voice_sequence_wraps_reported": available and wrapped is not None,
+    }
+    metrics = {
+        "voice_raw_received_packets": voice["received_packets"],
+        "voice_unique_received_packets": unique_received,
+        "voice_duplicate_packets": duplicates,
+        "voice_reordered_packets": reordered,
+        "voice_wrapped_sequence_packets": wrapped,
+        "voice_ambiguous_sequence_packets": ambiguous,
+        "voice_unique_receipt_metrics_available": available,
+        "voice_raw_receipt_to_expected_fanout_ratio": raw_ratio,
+        "voice_unique_receipt_to_expected_fanout_ratio": unique_ratio,
+        # Compatibility alias; this remains the duplicate-inclusive raw ratio.
+        "voice_receipt_to_expected_fanout_ratio": raw_ratio,
+    }
+    return metrics, checks, unique_ratio
+
+
+def voice_capacity_checks(send_fraction, unique_ratio, gap_p95_ms, receipt_checks, workload_validation_passed=True):
+    return {
+        "at_least_95pct_nominal_voice_send_rate": send_fraction >= 0.95,
+        "at_least_99pct_unique_expected_fanout_received": unique_ratio is not None and unique_ratio >= 0.99,
+        "unique_receipt_metrics_available": receipt_checks["voice_unique_receipt_metrics_available"],
+        "zero_voice_duplicates": receipt_checks["zero_voice_duplicate_packets"],
+        "zero_voice_reordering": receipt_checks["zero_voice_reordered_packets"],
+        "zero_voice_sequence_ambiguity": receipt_checks["zero_voice_ambiguous_sequences"],
+        "observer_voice_p95_under_40ms": gap_p95_ms < 40,
+        "workload_validation_passed": workload_validation_passed,
+    }
+
+
 def summarize(path, audio_folder):
     meta = json.loads((path / "workload.json").read_text())
     csharp = meta.get("server_kind") == "csharp"
@@ -145,7 +204,7 @@ def summarize(path, audio_folder):
         checks["zero_server_protocol_errors"] = all(item["extended"]["appMessages"]["protocolErrors"] == 0 for item in health)
     for key in ("missing_expected_peers", "stale_peers_500ms", "decode_errors", "unapplied_deltas", "malformed_items", "non_newer_sequences"):
         checks["zero_avatar_" + key] = int(observer.get(key, 0)) == 0
-    voice, audio_validation, capacity = None, None, {}
+    voice, audio_validation, capacity, voice_delivery_checks = None, None, {}, {}
     if meta["voice"]:
         voice_rows = rows(path / "voice.csv")
         voice = {row["metric"]: int(row["value"]) for row in rows(path / "voice.summary.csv")}
@@ -171,11 +230,11 @@ def summarize(path, audio_folder):
                        voice_min_received_packets=min(received_counts), voice_max_received_packets=max(received_counts),
                        voice_min_sent_packets=min(sent_counts),
                        voice_forward_missing_mod256=sum(int(row["forward_missing_mod256"]) for row in peers),
-                       voice_duplicate_packets=sum(int(row["duplicates"]) for row in peers),
+                       voice_observer_duplicate_packets=sum(int(row["duplicates"]) for row in peers),
                        voice_reordered_or_ambiguous=sum(int(row["reordered_or_ambiguous"]) for row in peers),
                        voice_max_gap_ms=max((float(row["max_gap_ms"]) for row in peers), default=0))
-        fanout_expected = voice["sent_packets"] * (meta["clients"] - 1)
-        metrics["voice_receipt_to_expected_fanout_ratio"] = voice["received_packets"] / fanout_expected if fanout_expected else 0
+        receipt_metrics, receipt_checks, unique_ratio = analyze_receipt_metrics(voice, voice_rows, meta["clients"])
+        metrics.update(receipt_metrics)
         target_speakers = math.ceil(meta["clients"] * meta["voice_speaker_percent"] / 100)
         metrics["voice_target_speakers"] = target_speakers
         metrics["voice_nominal_send_packets_s"] = target_speakers * 50
@@ -190,14 +249,25 @@ def summarize(path, audio_folder):
                       zero_malformed_voice_packets=voice["malformed_packets"] == 0,
                       zero_self_voice_packets=voice["self_received_packets"] == 0,
                       received_audio_matches_and_decodes=audio_validation["valid"])
+        voice_delivery_checks = receipt_checks
+        checks["all_clients_unique_receipt_records_complete"] = len(voice_rows) == meta["clients"] and all(
+            all(key in row for key in ("received_unique_packets", "duplicate_packets", "reordered_packets",
+                                       "wrapped_sequence_packets", "ambiguous_sequence_packets", "unique_count_available"))
+            for row in voice_rows
+        )
         if meta["voice_speaker_percent"] == 100:
             checks["all_clients_sent_voice"] = all(value > 0 for value in sent_counts)
-        capacity = {"at_least_95pct_nominal_voice_send_rate": metrics["voice_send_cadence_fraction"] >= 0.95,
-                    "at_least_99pct_expected_fanout_received": metrics["voice_receipt_to_expected_fanout_ratio"] >= 0.99,
-                    "observer_voice_p95_under_40ms": metrics.get("voice_gap_p95_floor_ms", 10000) < 40}
+        capacity = voice_capacity_checks(
+            metrics["voice_send_cadence_fraction"],
+            unique_ratio,
+            metrics.get("voice_gap_p95_floor_ms", 10000),
+            receipt_checks,
+            all(checks.values()),
+        )
     return {"name": path.name, "capture": str(path), "valid": all(checks.values()), "checks": checks,
             "unavailable_checks": unavailable_checks,
             "capacity_pass": all(capacity.values()) if capacity else None, "capacity_checks": capacity,
+            "voice_delivery_checks": voice_delivery_checks,
             "metrics": metrics, "voice": voice, "audio_validation": audio_validation,
             "avatar_observer": observer, "readiness_samples": len(process), "metadata": meta}
 
