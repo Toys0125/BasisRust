@@ -1,5 +1,13 @@
 # Transport cold-path layout and branch-miss testing
 
+**Historical report — follow-up review:** see
+[the laptop handoff](branch-optimization-handoff.md) and
+[measured counters](results/branch-review-20261007-summary.json). WSL counters
+were subsequently measured. The original decoder already compiled to a
+branchless compare/conditional move in the inspected probe; the jump-table
+rationale below is incorrect for Rust 1.99.0. The timing/layout interpretation
+below is unproven, and subsequent counter/timing results are mixed.
+
 Branch: `performance/branch-optimization`, cut from `fix/dedicated-voice-processing` at
 `1e45b3b`. Benchmark harness and checks are in
 `BasisRustServer/crates/basis-transport/src/bench_branches.rs` and

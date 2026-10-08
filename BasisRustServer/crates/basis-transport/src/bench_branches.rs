@@ -24,6 +24,10 @@ use std::hint::black_box;
 
 use super::*;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "bench_pmc.rs"]
+mod pmc;
+
 /// Deterministic PRNG so every run sees identical inputs and runs stay comparable.
 struct XorShift64(u64);
 
@@ -54,16 +58,35 @@ const ACK_OPS: usize = 200_000;
 const CHANNEL_ID: u8 = 6;
 const RELEASE_PER_ACK: usize = 16;
 
-/// Times `PASSES` executions of `f` and returns the median ns/op. Inputs are precomputed
-/// outside the timed closure by each phase; the closure only runs the code under test.
+/// Times `PASSES` executions of `f` and returns the median ns/op. Some phases also
+/// include allocation/refill bookkeeping; see each phase's description.
 fn measure(label: &str, ops_per_pass: usize, mut f: impl FnMut() -> u64) -> f64 {
+    let pmc_requested = std::env::var_os("BASIS_BRANCH_PMC").is_some();
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let mut counters =
+        pmc_requested.then(|| pmc::Counters::open().expect("hardware branch counters"));
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    assert!(!pmc_requested, "BASIS_BRANCH_PMC requires Linux x86-64");
     // Warm caches and predictors once; keep the result alive so nothing is elided.
     let mut checksum = black_box(f());
     let mut times = Vec::with_capacity(PASSES);
-    for _ in 0..PASSES {
+    for pass in 0..PASSES {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if let Some(counters) = &counters {
+            counters.start().expect("enable perf group");
+        }
         let start = Instant::now();
         checksum = checksum.wrapping_add(black_box(f()));
-        times.push(start.elapsed());
+        let elapsed = start.elapsed();
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if let Some(counters) = &mut counters {
+            let counts = counters.stop().expect("read perf group");
+            println!("  sample {label} pass={pass} ns={} ops={ops_per_pass} branches={} misses={} enabled_ns={} running_ns={}",
+                elapsed.as_nanos(), counts.branches, counts.misses, counts.enabled_ns, counts.running_ns);
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        let _ = pass;
+        times.push(elapsed);
     }
     times.sort_unstable();
     let median = times[PASSES / 2];
@@ -124,7 +147,9 @@ fn parse_property_dispatch_phase() {
         }
         parsed_valid ^ parsed_invalid
     });
-    println!("    branch counts: valid={parsed_valid} invalid={parsed_invalid}");
+    println!(
+        "    workload outcomes (including warmup): valid={parsed_valid} invalid={parsed_invalid}"
+    );
 }
 
 /// Channeled message parsing. 1% of packets are truncated below the 4-byte header.
@@ -162,7 +187,7 @@ fn parse_message_phase() {
         }
         parsed_ok ^ parsed_none
     });
-    println!("    branch counts: parsed={parsed_ok} rejected={parsed_none}");
+    println!("    workload outcomes (including warmup): payload_checksum={parsed_ok} rejected={parsed_none}");
 }
 
 /// Outbound packet building across every delivery method the send path serves.
@@ -299,7 +324,7 @@ fn process_ack_phase() {
         }
         released_total ^ malformed_count
     });
-    println!("    branch counts: released_total={released_total} malformed={malformed_count}");
+    println!("    workload outcomes (including warmup): released_total={released_total} malformed={malformed_count}");
 }
 
 /// Per-ACK hot path without refill churn: every ACK is valid (window start at the current
@@ -350,7 +375,7 @@ fn process_ack_noop_phase() {
         }
         front_total ^ malformed_count
     });
-    println!("    branch counts: malformed={malformed_count}");
+    println!("    workload outcomes (including warmup): malformed={malformed_count}");
 }
 
 #[test]
