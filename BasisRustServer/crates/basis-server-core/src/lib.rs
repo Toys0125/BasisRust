@@ -549,6 +549,7 @@ impl ServerState {
             config.health_include_extended_metrics,
         )
         .await?;
+        let ordered_events = transport.enable_ordered_event_queue(MAX_ORDERED_INGRESS_EVENTS)?;
         transport.set_compact_merge_send(config.compact_merged);
         info!("server listening on {}", transport.local_addr()?);
 
@@ -646,7 +647,12 @@ impl ServerState {
         state.workers.lock().extend([
             spawn_leave_broadcast_loop(state.clone()),
             admin_runtime::spawn_permission_updates(state.clone()),
-            tokio::spawn(event_loop(state.clone(), events, shutdown_rx)),
+            tokio::spawn(event_loop(
+                state.clone(),
+                events,
+                ordered_events,
+                shutdown_rx,
+            )),
         ]);
         Ok((state, shutdown_tx))
     }
@@ -1151,9 +1157,30 @@ async fn flush_join_batches(state: &ServerState) -> Result<()> {
 
 async fn event_loop(
     state: ServerState,
-    mut events: mpsc::Receiver<ServerEvent>,
-    mut shutdown: oneshot::Receiver<()>,
+    events: mpsc::Receiver<ServerEvent>,
+    ordered_events: mpsc::Receiver<ServerEvent>,
+    shutdown: oneshot::Receiver<()>,
 ) {
+    event_loop_with_handler(
+        state,
+        events,
+        ordered_events,
+        shutdown,
+        |state, event| async move { handle_event(&state, event).await },
+    )
+    .await;
+}
+
+async fn event_loop_with_handler<F, Fut>(
+    state: ServerState,
+    mut events: mpsc::Receiver<ServerEvent>,
+    mut ordered_events: mpsc::Receiver<ServerEvent>,
+    mut shutdown: oneshot::Receiver<()>,
+    handle: F,
+) where
+    F: Fn(ServerState, ServerEvent) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
     let worker_limit = std::thread::available_parallelism()
         .map(|count| (count.get() * 4).clamp(8, 256))
         .unwrap_or(32);
@@ -1164,10 +1191,12 @@ async fn event_loop(
     let mut ordered_sessions = HashMap::<(PeerId, u8), (PeerSession, u64)>::new();
     let mut next_session_generation = 1u64;
     let mut ordered_queue = OrderedHandlerQueue::default();
+    let mut ingress_open = [true, true];
     let mut join_flush = tokio::time::interval(JOIN_BATCH_FLUSH_INTERVAL);
     join_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     join_flush.tick().await;
     while !state.shutdown.load(Ordering::Relaxed) {
+        let ordered_has_capacity = ordered_queue.pending() < MAX_PENDING_ORDERED_EVENTS;
         tokio::select! {
             completed = handlers.join_next_with_id(), if !handlers.is_empty() => {
                 if let Some(completed) = completed {
@@ -1193,6 +1222,7 @@ async fn event_loop(
                     workers.clone(),
                     &state,
                     diagnostics.as_ref(),
+                    handle.clone(),
                 );
             }
             _ = join_flush.tick() => {
@@ -1206,10 +1236,13 @@ async fn event_loop(
             _ = &mut shutdown => {
                 break;
             }
-            maybe_event = events.recv(), if ordered_queue.pending() < MAX_PENDING_ORDERED_EVENTS => {
+            maybe_event = receive_control_event(&mut events, &mut ordered_events, &mut ingress_open, ordered_has_capacity) => {
                 let Some(event) = maybe_event else { break; };
                 if let Some(diagnostics) = &diagnostics {
                     diagnostics.record_queue_depth(events.len());
+                }
+                if let ServerEvent::PeerDisconnected { session, .. } = &event {
+                    discard_ordered_session(&mut ordered_queue, &mut ordered_sessions, session);
                 }
                 if is_high_frequency_inline_event(&event)
                     && !matches!(
@@ -1220,7 +1253,7 @@ async fn event_loop(
                         }
                     )
                 {
-                    if let Err(err) = handle_event(&state, event).await {
+                    if let Err(err) = handle(state.clone(), event).await {
                         error!("server event failed: {err:#}");
                     }
                     continue;
@@ -1233,9 +1266,14 @@ async fn event_loop(
                     ..
                 } = &event
                 {
+                    if !state.transport.is_current_session(session) {
+                        discard_ordered_session(&mut ordered_queue, &mut ordered_sessions, session);
+                        continue;
+                    }
+                    let session = session.clone();
                     let base = (*peer, *channel);
                     let generation = match ordered_sessions.get(&base) {
-                        Some((old_session, generation)) if old_session.same_connection(session) => *generation,
+                        Some((old_session, generation)) if old_session.same_connection(&session) => *generation,
                         _ => {
                             let generation = next_session_generation;
                             next_session_generation = next_session_generation.wrapping_add(1).max(1);
@@ -1243,7 +1281,18 @@ async fn event_loop(
                             generation
                         }
                     };
-                    ordered_queue.enqueue((base.0, base.1, generation), event);
+                    let key = (base.0, base.1, generation);
+                    if ordered_queue.local_limit_reached(key) {
+                        // Transport already ACKed this event. End this incarnation explicitly
+                        // rather than dropping a message while allowing its session to continue.
+                        disconnect_admission(&state, &session, "Ordered control backlog exceeded").await;
+                        discard_ordered_session(&mut ordered_queue, &mut ordered_sessions, &session);
+                    } else {
+                        // Only ordered ingress is paused at the global cap. The separate
+                        // lifecycle/control receiver stays live, and transport handles retries.
+                        ordered_queue.enqueue(key, event)
+                            .expect("ordered ingress selected with global capacity");
+                    }
                     spawn_ready_ordered(
                         &mut ordered_queue,
                         &mut handlers,
@@ -1251,6 +1300,7 @@ async fn event_loop(
                         workers.clone(),
                         &state,
                         diagnostics.as_ref(),
+                        handle.clone(),
                     );
                     continue;
                 }
@@ -1262,10 +1312,11 @@ async fn event_loop(
                 let Ok(permit) = permit else { break; };
                 let mut diagnostic_guard = diagnostics.as_ref().map(|d| d.spawned(&event));
                 let state = state.clone();
+                let handle = handle.clone();
                 let task = async move {
                     let _permit = permit;
                     if let Some(guard) = &mut diagnostic_guard { guard.started(); }
-                    if let Err(err) = handle_event(&state, event).await {
+                    if let Err(err) = handle(state.clone(), event).await {
                         error!("server event failed: {err:#}");
                     }
                 };
@@ -1278,6 +1329,7 @@ async fn event_loop(
     }
     // Stop admission, then finish accepted handlers before final persistence.
     events.close();
+    ordered_events.close();
     while !handlers.is_empty() || ordered_queue.pending() > 0 {
         spawn_ready_ordered(
             &mut ordered_queue,
@@ -1286,6 +1338,7 @@ async fn event_loop(
             workers.clone(),
             &state,
             diagnostics.as_ref(),
+            handle.clone(),
         );
         if let Some(result) = handlers.join_next_with_id().await {
             match result {
@@ -1305,13 +1358,43 @@ async fn event_loop(
     }
 }
 
+async fn receive_control_event(
+    events: &mut mpsc::Receiver<ServerEvent>,
+    ordered_events: &mut mpsc::Receiver<ServerEvent>,
+    open: &mut [bool; 2],
+    ordered_has_capacity: bool,
+) -> Option<ServerEvent> {
+    loop {
+        if !open[0] && !open[1] {
+            return None;
+        }
+        tokio::select! {
+            event = events.recv(), if open[0] => match event {
+                Some(event) => return Some(event),
+                None => open[0] = false,
+            },
+            event = ordered_events.recv(), if open[1] && ordered_has_capacity => match event {
+                Some(event) => return Some(event),
+                None => open[1] = false,
+            },
+            // A closed regular ingress must not end or spin the loop while ordered
+            // ingress is backpressured. Handler completion can cancel this wait.
+            else => std::future::pending::<()>().await,
+        }
+    }
+}
+
+const MAX_ORDERED_INGRESS_EVENTS: usize = 128;
 const MAX_PENDING_ORDERED_EVENTS: usize = 4096;
+const MAX_PENDING_ORDERED_PER_LANE: usize = 128;
+const MAX_PENDING_ORDERED_PER_PEER: usize = 256;
 type OrderedLaneKey = (PeerId, u8, u64);
 
 struct OrderedHandlerQueue<E = ServerEvent> {
     lanes: HashMap<OrderedLaneKey, OrderedLane<E>>,
     ready: VecDeque<OrderedLaneKey>,
     pending: usize,
+    pending_by_peer: HashMap<PeerId, usize>,
 }
 
 struct OrderedLane<E> {
@@ -1325,6 +1408,7 @@ impl<E> Default for OrderedHandlerQueue<E> {
             lanes: HashMap::new(),
             ready: VecDeque::new(),
             pending: 0,
+            pending_by_peer: HashMap::new(),
         }
     }
 }
@@ -1339,13 +1423,26 @@ impl<E> Default for OrderedLane<E> {
 }
 
 impl<E> OrderedHandlerQueue<E> {
-    fn enqueue(&mut self, key: OrderedLaneKey, event: E) {
+    fn enqueue(&mut self, key: OrderedLaneKey, event: E) -> std::result::Result<(), E> {
+        if self.pending >= MAX_PENDING_ORDERED_EVENTS || self.local_limit_reached(key) {
+            return Err(event);
+        }
         let lane = self.lanes.entry(key).or_default();
         if !lane.running && lane.events.is_empty() {
             self.ready.push_back(key);
         }
         lane.events.push_back(event);
         self.pending += 1;
+        *self.pending_by_peer.entry(key.0).or_default() += 1;
+        Ok(())
+    }
+
+    fn local_limit_reached(&self, key: OrderedLaneKey) -> bool {
+        self.pending_by_peer.get(&key.0).copied().unwrap_or(0) >= MAX_PENDING_ORDERED_PER_PEER
+            || self
+                .lanes
+                .get(&key)
+                .is_some_and(|lane| lane.events.len() >= MAX_PENDING_ORDERED_PER_LANE)
     }
 
     fn start_next(&mut self) -> Option<(OrderedLaneKey, E)> {
@@ -1361,7 +1458,7 @@ impl<E> OrderedHandlerQueue<E> {
                 continue;
             };
             lane.running = true;
-            self.pending -= 1;
+            self.remove_pending(key.0, 1);
             return Some((key, event));
         }
         None
@@ -1379,6 +1476,32 @@ impl<E> OrderedHandlerQueue<E> {
         }
     }
 
+    fn remove_pending(&mut self, peer: PeerId, count: usize) {
+        self.pending -= count;
+        if let Some(pending) = self.pending_by_peer.get_mut(&peer) {
+            *pending -= count;
+            if *pending == 0 {
+                self.pending_by_peer.remove(&peer);
+            }
+        }
+    }
+
+    fn discard_matching(&mut self, mut matches: impl FnMut(&E) -> bool) {
+        let keys: Vec<_> = self.lanes.keys().copied().collect();
+        for key in keys {
+            let lane = self.lanes.get_mut(&key).unwrap();
+            let before = lane.events.len();
+            lane.events.retain(|event| !matches(event));
+            let removed = before - lane.events.len();
+            let empty = lane.events.is_empty() && !lane.running;
+            self.remove_pending(key.0, removed);
+            if empty {
+                self.lanes.remove(&key);
+            }
+        }
+        self.ready.retain(|key| self.lanes.contains_key(key));
+    }
+
     fn pending(&self) -> usize {
         self.pending
     }
@@ -1388,23 +1511,41 @@ impl<E> OrderedHandlerQueue<E> {
     }
 }
 
-fn spawn_ready_ordered(
+fn discard_ordered_session(
+    queue: &mut OrderedHandlerQueue,
+    sessions: &mut HashMap<(PeerId, u8), (PeerSession, u64)>,
+    session: &PeerSession,
+) {
+    queue.discard_matching(|event| {
+        matches!(event,
+            ServerEvent::Message { session: queued, .. } if queued.same_connection(session)
+        )
+    });
+    sessions.retain(|_, (queued, _)| !queued.same_connection(session));
+}
+
+fn spawn_ready_ordered<F, Fut>(
     queue: &mut OrderedHandlerQueue<ServerEvent>,
     handlers: &mut tokio::task::JoinSet<()>,
     task_keys: &mut HashMap<tokio::task::Id, OrderedLaneKey>,
     workers: Arc<Semaphore>,
     state: &ServerState,
     diagnostics: Option<&Arc<event_diagnostics::EventDiagnostics>>,
-) {
+    handle: F,
+) where
+    F: Fn(ServerState, ServerEvent) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
     spawn_ready_ordered_with(queue, handlers, task_keys, workers, |event, permit| {
         let state = state.clone();
+        let handle = handle.clone();
         let mut diagnostic_guard = diagnostics.map(|d| d.spawned(&event));
         let task = async move {
             let _permit = permit;
             if let Some(guard) = &mut diagnostic_guard {
                 guard.started();
             }
-            if let Err(err) = handle_event(&state, event).await {
+            if let Err(err) = handle(state, event).await {
                 error!("server event failed: {err:#}");
             }
         };
@@ -5484,11 +5625,11 @@ mod tests {
         let mut queue = OrderedHandlerQueue::<u8>::default();
         let lane = (17, 3, 1);
         for event in [1, 2, 3] {
-            queue.enqueue(lane, event);
+            queue.enqueue(lane, event).unwrap();
         }
-        queue.enqueue((17, 4, 1), 4); // Independent channel.
-        queue.enqueue((18, 3, 1), 5); // Independent peer.
-        queue.enqueue((17, 3, 2), 6); // Replacement incarnation.
+        queue.enqueue((17, 4, 1), 4).unwrap(); // Independent channel.
+        queue.enqueue((18, 3, 1), 5).unwrap(); // Independent peer.
+        queue.enqueue((17, 3, 2), 6).unwrap(); // Replacement incarnation.
         let workers = Arc::new(Semaphore::new(2));
         let mut handlers = tokio::task::JoinSet::new();
         let mut keys = HashMap::new();
@@ -5573,8 +5714,8 @@ mod tests {
     async fn reliable_ordered_handler_panic_releases_its_lane() {
         let mut queue = OrderedHandlerQueue::<u8>::default();
         let lane = (17, 3, 1);
-        queue.enqueue(lane, 1);
-        queue.enqueue(lane, 2);
+        queue.enqueue(lane, 1).unwrap();
+        queue.enqueue(lane, 2).unwrap();
         let workers = Arc::new(Semaphore::new(1));
         let mut handlers = tokio::task::JoinSet::new();
         let mut keys = HashMap::new();
@@ -5614,19 +5755,126 @@ mod tests {
     }
 
     #[test]
-    fn reliable_ordered_pending_budget_tracks_waiting_event_data() {
+    fn reliable_ordered_budgets_and_pruning_preserve_other_lanes() {
         let mut queue = OrderedHandlerQueue::<u8>::default();
         let lane = (17, 3, 1);
-        for _ in 0..MAX_PENDING_ORDERED_EVENTS {
-            queue.enqueue(lane, 1);
+        for _ in 0..MAX_PENDING_ORDERED_PER_LANE {
+            queue.enqueue(lane, 1).unwrap();
+        }
+        assert_eq!(queue.enqueue(lane, 1), Err(1));
+        let other_channel = (17, 4, 1);
+        for _ in 0..MAX_PENDING_ORDERED_PER_LANE {
+            queue.enqueue(other_channel, 2).unwrap();
+        }
+        assert_eq!(queue.enqueue((17, 5, 1), 3), Err(3)); // Aggregate peer budget.
+        queue.enqueue((18, 3, 1), 4).unwrap();
+        assert_eq!(queue.start_next(), Some((lane, 1)));
+        queue.discard_matching(|event| *event == 1 || *event == 2);
+        assert_eq!(queue.pending(), 1);
+        assert!(!queue.pending_by_peer.contains_key(&17));
+        assert_eq!(queue.start_next(), Some(((18, 3, 1), 4)));
+        queue.complete(lane); // In-flight head survives pruning until completion.
+        assert!(!queue.contains(lane));
+    }
+
+    #[test]
+    fn reliable_ordered_global_budget_remains_bounded() {
+        let mut queue = OrderedHandlerQueue::<u8>::default();
+        for peer in 0..(MAX_PENDING_ORDERED_EVENTS / MAX_PENDING_ORDERED_PER_LANE) {
+            for _ in 0..MAX_PENDING_ORDERED_PER_LANE {
+                queue.enqueue((peer as PeerId, 3, 1), 1).unwrap();
+            }
         }
         assert_eq!(queue.pending(), MAX_PENDING_ORDERED_EVENTS);
+        assert_eq!(queue.enqueue((100, 3, 1), 1), Err(1));
         assert!(queue.start_next().is_some());
-        assert_eq!(queue.pending(), MAX_PENDING_ORDERED_EVENTS - 1);
-        assert!(queue.start_next().is_none()); // One running head per lane.
-        queue.complete(lane);
-        assert!(queue.start_next().is_some());
-        assert_eq!(queue.pending(), MAX_PENDING_ORDERED_EVENTS - 2);
+        queue.enqueue((100, 3, 1), 1).unwrap();
+        assert_eq!(queue.pending(), MAX_PENDING_ORDERED_EVENTS);
+    }
+
+    #[tokio::test]
+    async fn global_ordered_backpressure_keeps_regular_event_admission_open() {
+        let mut queue = OrderedHandlerQueue::<u8>::default();
+        for peer in 0..(MAX_PENDING_ORDERED_EVENTS / MAX_PENDING_ORDERED_PER_LANE) {
+            for _ in 0..MAX_PENDING_ORDERED_PER_LANE {
+                queue.enqueue((peer as PeerId, 3, 1), 1).unwrap();
+            }
+        }
+        let (control_tx, mut control) = mpsc::channel(1);
+        let (ordered_tx, mut ordered) = mpsc::channel(1);
+        ordered_tx
+            .send(ServerEvent::NetworkError("ordered waiting".into()))
+            .await
+            .unwrap();
+        control_tx
+            .send(ServerEvent::NetworkError("lifecycle admitted".into()))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            receive_control_event(
+                &mut control,
+                &mut ordered,
+                &mut [true, true],
+                queue.pending() < MAX_PENDING_ORDERED_EVENTS,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(event, ServerEvent::NetworkError(value) if value == "lifecycle admitted"));
+        assert_eq!(ordered.len(), 1); // Already admitted ordered data is retained, not dropped.
+        queue.start_next().unwrap();
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            receive_control_event(
+                &mut control,
+                &mut ordered,
+                &mut [true, true],
+                queue.pending() < MAX_PENDING_ORDERED_EVENTS,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(event, ServerEvent::NetworkError(value) if value == "ordered waiting"));
+    }
+
+    #[tokio::test]
+    async fn closing_one_ingress_preserves_the_other_buffered_events() {
+        let (control_tx, mut control) = mpsc::channel(1);
+        let (ordered_tx, mut ordered) = mpsc::channel(1);
+        let mut open = [true, true];
+        ordered_tx
+            .send(ServerEvent::NetworkError("retained ordered".into()))
+            .await
+            .unwrap();
+        drop(control_tx);
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            receive_control_event(&mut control, &mut ordered, &mut open, false,)
+        )
+        .await
+        .is_err());
+        assert!(!open[0]);
+        assert_eq!(ordered.len(), 1);
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            receive_control_event(&mut control, &mut ordered, &mut open, true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(event, ServerEvent::NetworkError(value) if value == "retained ordered"));
+        drop(ordered_tx);
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            receive_control_event(&mut control, &mut ordered, &mut open, true,)
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(open, [false, false]);
     }
 
     #[tokio::test]

@@ -50,7 +50,11 @@ cargo test --release --manifest-path BasisRustServer/Cargo.toml \
   -p basis-transport peer_snapshot_microbench -- --ignored --nocapture
 ```
 
-Application handler ordering is covered separately by `reliable_ordered_handlers_wait_for_the_previous_handler`: a blocked first handler prevents the next handler on the same session/channel from starting, while independent lanes can proceed. Ordered followers remain in a bounded 4,096-event queue; only runnable lane heads take control worker permits. When that queue is full, control admission pauses until a handler frees capacity.
+Application handler ordering is covered by `reliable_ordered_handlers_wait_for_the_previous_handler`: a blocked first handler prevents the next handler on the same session/channel from starting, while independent lanes can proceed. Only runnable lane heads take control worker permits.
+
+Ordered backlog has limits of 128 waiting events per session/channel, 256 per peer, and 4,096 globally. A session exceeding its local limit is explicitly disconnected and its waiting events are pruned. Accepted control messages are not silently dropped while that session continues. At aggregate saturation, only the separate ordered ingress receiver pauses; the regular control/lifecycle receiver remains enabled. The ordered ingress holds at most 128 events, and a full ingress queue leaves new ordered sequence admission and ACK state unchanged until retries succeed. Already acknowledged reorder entries remain protected by the existing transport budgets. Global pressure does not disconnect an unrelated arriving peer.
+
+`saturated_ordered_lane_does_not_block_other_control_or_disconnects` injects events through the production receivers/scheduler with real connected sessions. One handler holds a blocked read lease while 4,096 arrivals flood its lane, and another peer's control handler and disconnect request still finish. Separate tests fill the global pending budget and verify regular event admission remains open, and fill transport ordered ingress to verify independent control admission plus cursor/ACK preservation on retry. These are dispatcher and transport regressions, not a new 1,000-user performance measurement.
 
 ## Reproduce reliable receive measurements
 

@@ -868,3 +868,120 @@ async fn identity_admission_rejects_spoofed_rejoin_and_editor_claims_and_replay(
     state.shutdown().await.unwrap();
     let _ = shutdown.send(());
 }
+
+#[tokio::test]
+async fn saturated_ordered_lane_does_not_block_other_control_or_disconnects() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let mut saturated = Client::connect(&state, "saturated-control").await;
+    let _other = Client::connect(&state, "independent-control").await;
+    let mut leaving = Client::connect(&state, "independent-disconnect").await;
+    let (a, a_session) = session_for_uuid(&state, "saturated-control");
+    let (b, b_session) = session_for_uuid(&state, "independent-control");
+    let (c, c_session) = session_for_uuid(&state, "independent-disconnect");
+    let release = Arc::new(tokio::sync::Notify::new());
+    let a_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (progress, mut observed) = mpsc::unbounded_channel();
+    let (events, receiver) = mpsc::channel(8);
+    let (ordered, ordered_receiver) = mpsc::channel(crate::MAX_PENDING_ORDERED_EVENTS + 8);
+    let (stop, stopping) = oneshot::channel();
+    let handler_release = release.clone();
+    let handler_calls = a_calls.clone();
+    // Exercise the production event receiver/scheduler with real connected sessions.
+    // Only the handler is injected, so the first session can be paused deterministically.
+    let dispatcher = tokio::spawn(crate::event_loop_with_handler(
+        state.clone(),
+        receiver,
+        ordered_receiver,
+        stopping,
+        move |state, event| {
+            let release = handler_release.clone();
+            let calls = handler_calls.clone();
+            let progress = progress.clone();
+            async move {
+                match &event {
+                    ServerEvent::Message { peer, session, .. } if *peer == a => {
+                        let _lease = session.try_read_lease().expect("first handler is live");
+                        assert_eq!(calls.fetch_add(1, Ordering::Relaxed), 0);
+                        progress.send("blocked").unwrap();
+                        release.notified().await;
+                        return Ok(());
+                    }
+                    ServerEvent::PeerDisconnected { peer, session, .. } if *peer == c => {
+                        // This supplied lifecycle event initiates actual transport retirement
+                        // and deferred core cleanup, as an internal disconnect request does.
+                        request_disconnect(&state, session, "independent disconnect").await?;
+                        progress.send("disconnect").unwrap();
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                let other_control =
+                    matches!(&event, ServerEvent::Message { peer, .. } if *peer == b);
+                crate::handle_event(&state, event).await?;
+                if other_control {
+                    progress.send("control").unwrap();
+                }
+                Ok(())
+            }
+        },
+    ));
+    ordered
+        .send(registry_subscribe_event(a, a_session.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), observed.recv())
+            .await
+            .unwrap(),
+        Some("blocked")
+    );
+    // The former global admission gate would stop here at 4,096 waiting messages.
+    for _ in 0..crate::MAX_PENDING_ORDERED_EVENTS {
+        ordered
+            .send(registry_subscribe_event(a, a_session.clone()))
+            .await
+            .unwrap();
+    }
+    ordered
+        .send(registry_subscribe_event(b, b_session.clone()))
+        .await
+        .unwrap();
+    events
+        .send(ServerEvent::PeerDisconnected {
+            peer: c,
+            session: c_session,
+            reason: DisconnectReason::Remote,
+        })
+        .await
+        .unwrap();
+    let mut signals = Vec::new();
+    for _ in 0..2 {
+        signals.push(
+            tokio::time::timeout(Duration::from_secs(3), observed.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    signals.sort_unstable();
+    assert_eq!(signals, ["control", "disconnect"]);
+    assert!(state.message_subscriptions.contains_key(&b));
+    assert!(!state.transport.is_current_session(&a_session));
+    assert_eq!(a_calls.load(Ordering::Relaxed), 1);
+    // A's cleanup is still waiting on its blocked lease; B and C progressed anyway.
+    assert!(state.authenticated_peers.contains_key(&a));
+    saturated.receive_disconnect().await;
+    leaving.receive_disconnect().await;
+    release.notify_one();
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), dispatcher)
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for_disconnect_cleanups(&state).await;
+    assert!(!state.authenticated_peers.contains_key(&a));
+    assert!(!state.authenticated_peers.contains_key(&c));
+    assert!(state.transport.is_current_session(&b_session));
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}

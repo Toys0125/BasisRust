@@ -918,6 +918,7 @@ pub struct TransportHandle {
     stats: Arc<TransportStats>,
     reorder_budget: Arc<ReorderBudget>,
     realtime_handler: Arc<parking_lot::RwLock<Option<Arc<RealtimeHandler>>>>,
+    ordered_event_sender: Arc<parking_lot::RwLock<Option<mpsc::Sender<ServerEvent>>>>,
     /// Send-side CompactMerged toggle (BasisVR `LNLTransportConfig` parity).
     /// Defaults to true; when false, qualifying batches pack as classic
     /// LiteNetLib Merged datagrams instead.
@@ -1019,6 +1020,7 @@ impl TransportHandle {
             )),
             reorder_budget: Arc::new(ReorderBudget::default()),
             realtime_handler: Arc::new(parking_lot::RwLock::new(None)),
+            ordered_event_sender: Arc::new(parking_lot::RwLock::new(None)),
             compact_merge_send: Arc::new(AtomicBool::new(true)),
             #[cfg(test)]
             test_blocked_send_addrs: Arc::new(parking_lot::RwLock::new(HashSet::new())),
@@ -1058,6 +1060,32 @@ impl TransportHandle {
         let mut handle = self.clone();
         handle.synchronous_sender = Some(Arc::new(socket));
         Ok(handle)
+    }
+
+    /// Install a bounded ordered ingress queue once, before application dispatch starts.
+    /// A full queue withholds new ordered admission/ACKs without blocking lifecycle traffic.
+    pub fn enable_ordered_event_queue(
+        &self,
+        capacity: usize,
+    ) -> Result<mpsc::Receiver<ServerEvent>> {
+        if capacity == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ordered event capacity must be positive",
+            )
+            .into());
+        }
+        let mut configured = self.ordered_event_sender.write();
+        if configured.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "ordered event queue already installed",
+            )
+            .into());
+        }
+        let (sender, receiver) = mpsc::channel(capacity);
+        *configured = Some(sender);
+        Ok(receiver)
     }
 
     pub fn peer_session(&self, peer: PeerId) -> Option<PeerSession> {
@@ -3138,6 +3166,8 @@ fn deliver_ordered_event(
     state: &mut OrderedReceiveState,
     event: ServerEvent,
 ) -> Result<bool> {
+    let ordered_sender = handle.ordered_event_sender.read().clone();
+    let tx = ordered_sender.as_ref().unwrap_or(tx);
     let permit = match tx.try_reserve() {
         Ok(permit) => Some(permit),
         Err(mpsc::error::TrySendError::Full(())) => {
@@ -6456,6 +6486,89 @@ mod tests {
             confirmed_mtu: AtomicUsize::new(MAX_MERGED_PACKET_SIZE),
             mtu_probe: parking_lot::Mutex::new(MtuProbeState::new(Instant::now())),
         })
+    }
+
+    #[tokio::test]
+    async fn full_ordered_ingress_preserves_control_queue_and_retry_ack_state() {
+        let (handle, tx, mut control) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 2, 1)
+                .await
+                .unwrap();
+        handle.shutdown();
+        assert!(handle.enable_ordered_event_queue(0).is_err());
+        let mut ordered = handle.enable_ordered_event_queue(1).unwrap();
+        assert!(handle.enable_ordered_event_queue(1).is_err());
+        let peer = test_peer_state(0);
+        handle.peers.insert(0, peer.clone());
+        let mut receive = OrderedReceiveState {
+            expected: 0,
+            committed: [None; DEFAULT_WINDOW_SIZE],
+            future: HashMap::new(),
+        };
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let event = || ServerEvent::Message {
+            peer: 0,
+            session: PeerSession {
+                peer: 0,
+                state: peer.clone(),
+            },
+            channel: channels::CHAT,
+            delivery: DeliveryMethod::ReliableOrdered,
+            payload: Bytes::from_static(b"ordered"),
+        };
+        assert!(deliver_ordered_event(
+            &handle,
+            &tx,
+            0,
+            &peer,
+            channel_id,
+            0,
+            &mut receive,
+            event()
+        )
+        .unwrap());
+        assert!(!deliver_ordered_event(
+            &handle,
+            &tx,
+            0,
+            &peer,
+            channel_id,
+            1,
+            &mut receive,
+            event()
+        )
+        .unwrap());
+        assert_eq!(receive.expected, 1);
+        assert!(!receive.is_committed(1));
+        assert!(!ack_bit(&peer.outgoing_acks.lock()[&channel_id].bits, 1));
+        tx.try_send(ServerEvent::NetworkError("control still admitted".into()))
+            .unwrap();
+        assert!(matches!(
+            control.recv().await,
+            Some(ServerEvent::NetworkError(_))
+        ));
+        assert!(matches!(
+            ordered.recv().await,
+            Some(ServerEvent::Message { .. })
+        ));
+        assert!(deliver_ordered_event(
+            &handle,
+            &tx,
+            0,
+            &peer,
+            channel_id,
+            1,
+            &mut receive,
+            event()
+        )
+        .unwrap());
+        assert!(receive.is_committed(1));
+        assert!(ack_bit(&peer.outgoing_acks.lock()[&channel_id].bits, 1));
+        assert!(matches!(
+            ordered.recv().await,
+            Some(ServerEvent::Message { .. })
+        ));
     }
 
     #[test]
