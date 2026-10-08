@@ -27,6 +27,14 @@ CPU per million built sends by 4.96% in this workload; cadence varied. Productio
 source and default build settings are unchanged. Both reports retain all runs,
 controls, commands, hashes and delivery/error checks.
 
+The [1,500-client PGO follow-up](pgo-client1500-20261008.md) retained eight
+corrected process runs plus all preliminary attempts. Median observed p95 gaps
+were 426 ms ordinary / 416 ms PGO, with PGO CPU per built send 2.32% lower.
+Paired directions varied. All observer/coverage/error gates passed except the
+original absolute-zero retransmit gate: counts accumulated before measurement
+and stayed constant during it. A post-measurement shutdown grace now prevents
+late-starting observer windows from being truncated.
+
 ## Source and state
 
 - Production baseline: `1e45b3b8b74c76ec21324724e5de920032189b13`.

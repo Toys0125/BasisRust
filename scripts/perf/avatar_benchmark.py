@@ -269,6 +269,17 @@ def run_workload(args, output, server_env, client_env):
                     if time.monotonic() >= deadline:
                         raise RuntimeError('Sender diagnostic window did not finish')
                     time.sleep(.1)
+            # Observer timing starts with its first inbound avatar after the
+            # marker, whereas sender timing starts from the marker itself.
+            # Keep receiving after the fixed CPU/counter window so shutdown
+            # does not truncate a late-starting observer under heavy load.
+            meta['observer_shutdown_grace_seconds'] = 2
+            grace_end = time.monotonic() + meta['observer_shutdown_grace_seconds']
+            while time.monotonic() < grace_end:
+                _, players, active = population()
+                if players != args.clients or active != args.clients:
+                    raise RuntimeError('Population dropped during observer shutdown grace')
+                time.sleep(min(.2, max(0, grace_end - time.monotonic())))
             # The client supports a clean console stop on Windows and Linux.
             client.stdin.write(b'quit 100 0\n')
             client.stdin.flush()

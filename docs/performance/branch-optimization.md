@@ -25,6 +25,14 @@ on two validated 250-client runs and evaluated eight fresh processes. PGO reduce
 median server CPU by 4.53% and CPU per million built sends by 4.96%, with all
 delivery gates passing. Cadence varied; no reliable latency improvement is claimed.
 
+The [1,500-client PGO follow-up](pgo-client1500-20261008.md) retained eight
+corrected process runs plus all preliminary attempts. Median observed p95 gaps
+were 426 ms ordinary / 416 ms PGO, with PGO CPU per built send 2.32% lower.
+Paired directions varied. All observer/coverage/error gates passed except the
+original absolute-zero retransmit gate: counts accumulated before measurement
+and stayed constant during it. A post-measurement shutdown grace now prevents
+late-starting observer windows from being truncated.
+
 Branch: `performance/branch-optimization`, cut from `fix/dedicated-voice-processing` at
 `1e45b3b`. Benchmark harness and checks are in
 `BasisRustServer/crates/basis-transport/src/bench_branches.rs` and
