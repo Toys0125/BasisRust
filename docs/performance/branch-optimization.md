@@ -20,6 +20,11 @@ passing. Candidate median p95 gaps rose 0.39%, built work fell 0.50%, and server
 CPU was essentially unchanged. Paired directions varied; this runtime workload
 does not demonstrate a speedup.
 
+The subsequent [same-source PGO experiment](pgo-client250-20261008.md) trained
+on two validated 250-client runs and evaluated eight fresh processes. PGO reduced
+median server CPU by 4.53% and CPU per million built sends by 4.96%, with all
+delivery gates passing. Cadence varied; no reliable latency improvement is claimed.
+
 Branch: `performance/branch-optimization`, cut from `fix/dedicated-voice-processing` at
 `1e45b3b`. Benchmark harness and checks are in
 `BasisRustServer/crates/basis-transport/src/bench_branches.rs` and
@@ -160,9 +165,9 @@ shedding or ID allocation. `allocate_peer_id` first tries reusable IDs, then cal
 `allocate_fresh_peer_id` when none is available, including during initial connections
 and churn. Cold extractions have not been isolated for
 attributing ACK changes to a helper. Representative runtime checks, application latency,
-throughput and coverage would be needed for an application-level win claim. PGO and
-end-to-end multi-client throughput remain unmeasured. Desktop findings do not establish
-laptop or Windows release performance.
+throughput and coverage would be needed for an application-level win claim. The
+linked 250-client runtime and PGO reports now measure this synthetic laptop workload; they do not establish maximum client capacity or real-world end-to-end
+throughput. Desktop findings do not establish laptop or Windows release performance.
 
 ## Checks
 

@@ -17,6 +17,16 @@ Report claims and the runner's missing-executable diagnostic were corrected.
 No desktop benchmark was resumed. The instructions below preserve the original
 handoff context and reproducible baseline/candidate references.
 
+## Completed 250-client runtime and PGO follow-up
+
+The [250-client branch A/B](branch-client250-20261008.md) retained eight valid runs
+and found no demonstrated speedup from the branch changes. The subsequent
+[same-source PGO A/B](pgo-client250-20261008.md) used two separate training runs
+and eight valid evaluation runs. PGO reduced median server CPU by 4.53% and
+CPU per million built sends by 4.96% in this workload; cadence varied. Production
+source and default build settings are unchanged. Both reports retain all runs,
+controls, commands, hashes and delivery/error checks.
+
 ## Source and state
 
 - Production baseline: `1e45b3b8b74c76ec21324724e5de920032189b13`.
