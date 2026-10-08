@@ -31,6 +31,131 @@ use tracing::{debug, trace, warn};
 
 pub type PeerId = u16;
 
+/// Capacities and outstanding-admission quotas for opt-in ordered dispatch.
+#[derive(Debug, Clone, Copy)]
+pub struct OrderedAdmissionConfig {
+    pub regular_capacity: usize,
+    pub critical_capacity: usize,
+    pub per_lane: usize,
+    pub per_peer: usize,
+    pub critical_channel: u8,
+}
+
+/// Ordered event with an admission lease covering ingress, queued, and running work.
+pub struct OrderedEvent {
+    pub event: ServerEvent,
+    pub admission: Option<OrderedAdmissionPermit>,
+}
+
+impl std::fmt::Debug for OrderedEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrderedEvent")
+            .field("event", &self.event)
+            .field("has_admission", &self.admission.is_some())
+            .finish()
+    }
+}
+
+impl From<ServerEvent> for OrderedEvent {
+    fn from(event: ServerEvent) -> Self {
+        Self {
+            event,
+            admission: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct OrderedAdmissionPermit {
+    state: Arc<OrderedAdmissionState>,
+    peer: Arc<PeerState>,
+    channel: u8,
+    critical: bool,
+}
+
+#[derive(Debug, Default)]
+struct OrderedAdmissionCounts {
+    regular: OrderedAdmissionClassCounts,
+    critical: OrderedAdmissionClassCounts,
+}
+
+#[derive(Debug, Default)]
+struct OrderedAdmissionClassCounts {
+    total: usize,
+    peers: HashMap<usize, usize>,
+    lanes: HashMap<(usize, u8), usize>,
+}
+
+#[derive(Debug)]
+struct OrderedAdmissionState {
+    limits: OrderedAdmissionConfig,
+    counts: parking_lot::Mutex<OrderedAdmissionCounts>,
+}
+
+#[derive(Debug)]
+struct OrderedAdmissionQueues {
+    regular: mpsc::Sender<OrderedEvent>,
+    critical: mpsc::Sender<OrderedEvent>,
+    budget: Arc<OrderedAdmissionState>,
+}
+
+impl Drop for OrderedAdmissionPermit {
+    fn drop(&mut self) {
+        let ptr = Arc::as_ptr(&self.peer) as usize;
+        let mut counts = self.state.counts.lock();
+        let class = if self.critical {
+            &mut counts.critical
+        } else {
+            &mut counts.regular
+        };
+        class.total -= 1;
+        decrement_admission_count(&mut class.peers, ptr);
+        decrement_admission_count(&mut class.lanes, (ptr, self.channel));
+    }
+}
+
+fn decrement_admission_count<K: std::hash::Hash + Eq>(map: &mut HashMap<K, usize>, key: K) {
+    if let Some(value) = map.get_mut(&key) {
+        *value -= 1;
+        if *value == 0 {
+            map.remove(&key);
+        }
+    }
+}
+
+impl OrderedAdmissionState {
+    fn reserve(
+        self: &Arc<Self>,
+        peer: &Arc<PeerState>,
+        channel: u8,
+    ) -> Option<OrderedAdmissionPermit> {
+        let ptr = Arc::as_ptr(peer) as usize;
+        let critical = channel == self.limits.critical_channel;
+        let mut counts = self.counts.lock();
+        let (class, global_limit) = if critical {
+            (&mut counts.critical, self.limits.critical_capacity)
+        } else {
+            (&mut counts.regular, self.limits.regular_capacity)
+        };
+        let lane = (ptr, channel);
+        if class.total >= global_limit
+            || class.peers.get(&ptr).copied().unwrap_or(0) >= self.limits.per_peer
+            || class.lanes.get(&lane).copied().unwrap_or(0) >= self.limits.per_lane
+        {
+            return None;
+        }
+        class.total += 1;
+        *class.peers.entry(ptr).or_default() += 1;
+        *class.lanes.entry(lane).or_default() += 1;
+        Some(OrderedAdmissionPermit {
+            state: self.clone(),
+            peer: peer.clone(),
+            channel,
+            critical,
+        })
+    }
+}
+
 pub const DEFAULT_WINDOW_SIZE: usize = 128;
 pub const MAX_SEQUENCE: u16 = 32768;
 const MAX_PENDING_RELIABLE_PER_PEER: usize = 4096;
@@ -919,6 +1044,7 @@ pub struct TransportHandle {
     reorder_budget: Arc<ReorderBudget>,
     realtime_handler: Arc<parking_lot::RwLock<Option<Arc<RealtimeHandler>>>>,
     ordered_event_sender: Arc<parking_lot::RwLock<Option<mpsc::Sender<ServerEvent>>>>,
+    ordered_admission: Arc<parking_lot::RwLock<Option<Arc<OrderedAdmissionQueues>>>>,
     /// Send-side CompactMerged toggle (BasisVR `LNLTransportConfig` parity).
     /// Defaults to true; when false, qualifying batches pack as classic
     /// LiteNetLib Merged datagrams instead.
@@ -1021,6 +1147,7 @@ impl TransportHandle {
             reorder_budget: Arc::new(ReorderBudget::default()),
             realtime_handler: Arc::new(parking_lot::RwLock::new(None)),
             ordered_event_sender: Arc::new(parking_lot::RwLock::new(None)),
+            ordered_admission: Arc::new(parking_lot::RwLock::new(None)),
             compact_merge_send: Arc::new(AtomicBool::new(true)),
             #[cfg(test)]
             test_blocked_send_addrs: Arc::new(parking_lot::RwLock::new(HashSet::new())),
@@ -1076,7 +1203,8 @@ impl TransportHandle {
             .into());
         }
         let mut configured = self.ordered_event_sender.write();
-        if configured.is_some() {
+        let admission = self.ordered_admission.write();
+        if configured.is_some() || admission.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "ordered event queue already installed",
@@ -1086,6 +1214,46 @@ impl TransportHandle {
         let (sender, receiver) = mpsc::channel(capacity);
         *configured = Some(sender);
         Ok(receiver)
+    }
+
+    /// Install independent bounded regular and critical ordered queues with outstanding-work quotas.
+    pub fn enable_ordered_admission(
+        &self,
+        config: OrderedAdmissionConfig,
+    ) -> Result<(mpsc::Receiver<OrderedEvent>, mpsc::Receiver<OrderedEvent>)> {
+        if config.regular_capacity == 0
+            || config.critical_capacity == 0
+            || config.per_lane == 0
+            || config.per_peer == 0
+            || config.critical_channel > 63
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ordered admission limits must be positive",
+            )
+            .into());
+        }
+        let legacy = self.ordered_event_sender.write();
+        let mut configured = self.ordered_admission.write();
+        if legacy.is_some() || configured.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "ordered event queue already installed",
+            )
+            .into());
+        }
+        let (regular_tx, regular_rx) = mpsc::channel(config.regular_capacity);
+        let (critical_tx, critical_rx) = mpsc::channel(config.critical_capacity);
+        let state = Arc::new(OrderedAdmissionState {
+            limits: config,
+            counts: parking_lot::Mutex::new(OrderedAdmissionCounts::default()),
+        });
+        *configured = Some(Arc::new(OrderedAdmissionQueues {
+            regular: regular_tx,
+            critical: critical_tx,
+            budget: state,
+        }));
+        Ok((regular_rx, critical_rx))
     }
 
     pub fn peer_session(&self, peer: PeerId) -> Option<PeerSession> {
@@ -3166,6 +3334,48 @@ fn deliver_ordered_event(
     state: &mut OrderedReceiveState,
     event: ServerEvent,
 ) -> Result<bool> {
+    let admission = handle.ordered_admission.read().clone();
+    if let Some(queues) = admission {
+        // Realtime consumers take ownership without an application admission lease.
+        let consumed = handle.route_realtime(&event, peer);
+        if peer.read_gate.is_closed() || !handle.is_current_peer_state(peer_id, peer) {
+            return Ok(false);
+        }
+        if consumed {
+            state.commit(sequence);
+            queue_ack(peer, channel_id, sequence);
+            return Ok(true);
+        }
+        let channel = match &event {
+            ServerEvent::Message { channel, .. } => *channel,
+            _ => return Ok(false),
+        };
+        let Some(lease) = queues.budget.reserve(peer, channel) else {
+            return Ok(false);
+        };
+        let sender = if channel == queues.budget.limits.critical_channel {
+            &queues.critical
+        } else {
+            &queues.regular
+        };
+        let permit = match sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(())) => return Ok(false),
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                return Err(TransportError::EventChannelClosed)
+            }
+        };
+        if peer.read_gate.is_closed() || !handle.is_current_peer_state(peer_id, peer) {
+            return Ok(false);
+        }
+        state.commit(sequence);
+        queue_ack(peer, channel_id, sequence);
+        permit.send(OrderedEvent {
+            event,
+            admission: Some(lease),
+        });
+        return Ok(true);
+    }
     let ordered_sender = handle.ordered_event_sender.read().clone();
     let tx = ordered_sender.as_ref().unwrap_or(tx);
     let permit = match tx.try_reserve() {
@@ -6569,6 +6779,367 @@ mod tests {
             ordered.recv().await,
             Some(ServerEvent::Message { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn ordered_admission_withholds_ack_at_quota_and_releases_on_drop() {
+        let (handle, tx, _control) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 2, 1)
+                .await
+                .unwrap();
+        let peer = test_peer_state(0);
+        handle.peers.insert(0, peer.clone());
+        let (mut regular, mut critical) = handle
+            .enable_ordered_admission(OrderedAdmissionConfig {
+                regular_capacity: 4,
+                critical_capacity: 1,
+                per_lane: 1,
+                per_peer: 1,
+                critical_channel: channels::REGISTRY_CONTROL,
+            })
+            .unwrap();
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let event = |sequence: u16| ServerEvent::Message {
+            peer: 0,
+            session: PeerSession {
+                peer: 0,
+                state: peer.clone(),
+            },
+            channel: channels::CHAT,
+            delivery: DeliveryMethod::ReliableOrdered,
+            payload: Bytes::from(sequence.to_le_bytes().to_vec()),
+        };
+        let mut receive = OrderedReceiveState::default();
+        assert!(deliver_ordered_event(
+            &handle,
+            &tx,
+            0,
+            &peer,
+            channel_id,
+            0,
+            &mut receive,
+            event(0)
+        )
+        .unwrap());
+        assert_eq!(receive.expected, 1);
+        assert!(matches!(
+            critical.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let first = regular.try_recv().unwrap();
+        assert!(first.admission.is_some());
+        assert!(!deliver_ordered_event(
+            &handle,
+            &tx,
+            0,
+            &peer,
+            channel_id,
+            1,
+            &mut receive,
+            event(1)
+        )
+        .unwrap());
+        assert_eq!(receive.expected, 1);
+        assert_eq!(peer.outgoing_acks.lock()[&channel_id].bits[0] & 2, 0);
+        drop(first);
+        assert!(deliver_ordered_event(
+            &handle,
+            &tx,
+            0,
+            &peer,
+            channel_id,
+            1,
+            &mut receive,
+            event(1)
+        )
+        .unwrap());
+        assert_eq!(receive.expected, 2);
+        let critical_event = ServerEvent::Message {
+            peer: 0,
+            session: PeerSession {
+                peer: 0,
+                state: peer.clone(),
+            },
+            channel: channels::REGISTRY_CONTROL,
+            delivery: DeliveryMethod::ReliableOrdered,
+            payload: Bytes::new(),
+        };
+        let critical_channel_id =
+            DeliveryMethod::channel_id(channels::REGISTRY_CONTROL, DeliveryMethod::ReliableOrdered);
+        let mut critical_receive = OrderedReceiveState::default();
+        assert!(deliver_ordered_event(
+            &handle,
+            &tx,
+            0,
+            &peer,
+            critical_channel_id,
+            0,
+            &mut critical_receive,
+            critical_event
+        )
+        .unwrap());
+        assert!(regular.try_recv().is_ok());
+        assert!(critical.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn ordered_admission_separates_peers_and_session_incarnations() {
+        let (handle, tx, _control) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 2, 1)
+                .await
+                .unwrap();
+        let first = test_peer_state(0);
+        let other = test_peer_state(1);
+        handle.peers.insert(0, first.clone());
+        handle.peers.insert(1, other.clone());
+        let (mut regular, _critical) = handle
+            .enable_ordered_admission(OrderedAdmissionConfig {
+                regular_capacity: 4,
+                critical_capacity: 1,
+                per_lane: 1,
+                per_peer: 1,
+                critical_channel: channels::REGISTRY_CONTROL,
+            })
+            .unwrap();
+        let make_event = |id, peer: &Arc<PeerState>| ServerEvent::Message {
+            peer: id,
+            session: PeerSession {
+                peer: id,
+                state: peer.clone(),
+            },
+            channel: channels::CHAT,
+            delivery: DeliveryMethod::ReliableOrdered,
+            payload: Bytes::new(),
+        };
+        let cid = DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let mut a = OrderedReceiveState::default();
+        let mut b = OrderedReceiveState::default();
+        assert!(deliver_ordered_event(
+            &handle,
+            &tx,
+            0,
+            &first,
+            cid,
+            0,
+            &mut a,
+            make_event(0, &first)
+        )
+        .unwrap());
+        assert!(deliver_ordered_event(
+            &handle,
+            &tx,
+            1,
+            &other,
+            cid,
+            0,
+            &mut b,
+            make_event(1, &other)
+        )
+        .unwrap());
+        let old_session_event = regular.try_recv().unwrap();
+        drop(regular.try_recv().unwrap());
+        let replacement = test_peer_state(0);
+        handle.peers.insert(0, replacement.clone());
+        let mut c = OrderedReceiveState::default();
+        assert!(deliver_ordered_event(
+            &handle,
+            &tx,
+            0,
+            &replacement,
+            cid,
+            0,
+            &mut c,
+            make_event(0, &replacement)
+        )
+        .unwrap());
+        let replacement_event = regular.try_recv().unwrap();
+        drop(old_session_event);
+        assert_eq!(
+            handle
+                .ordered_admission
+                .read()
+                .as_ref()
+                .unwrap()
+                .budget
+                .counts
+                .lock()
+                .regular
+                .total,
+            1
+        );
+        drop(replacement_event);
+    }
+
+    #[tokio::test]
+    async fn ordered_global_regular_budget_does_not_block_critical_auth_admission() {
+        let (handle, tx, _control) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 2, 1)
+                .await
+                .unwrap();
+        let ordinary = test_peer_state(0);
+        let auth = test_peer_state(1);
+        handle.peers.insert(0, ordinary.clone());
+        handle.peers.insert(1, auth.clone());
+        let (mut regular, mut critical) = handle
+            .enable_ordered_admission(OrderedAdmissionConfig {
+                regular_capacity: 1,
+                critical_capacity: 1,
+                per_lane: 1,
+                per_peer: 1,
+                critical_channel: channels::AUTH_IDENTITY,
+            })
+            .unwrap();
+        let event = |id, peer: &Arc<PeerState>, channel| ServerEvent::Message {
+            peer: id,
+            session: PeerSession {
+                peer: id,
+                state: peer.clone(),
+            },
+            channel,
+            delivery: DeliveryMethod::ReliableOrdered,
+            payload: Bytes::new(),
+        };
+        let mut ordinary_receive = OrderedReceiveState::default();
+        let mut blocked_receive = OrderedReceiveState::default();
+        let ordinary_channel =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        assert!(deliver_ordered_event(
+            &handle,
+            &tx,
+            0,
+            &ordinary,
+            ordinary_channel,
+            0,
+            &mut ordinary_receive,
+            event(0, &ordinary, channels::CHAT)
+        )
+        .unwrap());
+        assert!(!deliver_ordered_event(
+            &handle,
+            &tx,
+            1,
+            &auth,
+            ordinary_channel,
+            0,
+            &mut blocked_receive,
+            event(1, &auth, channels::CHAT)
+        )
+        .unwrap());
+        assert_eq!(blocked_receive.expected, 0);
+        let mut auth_receive = OrderedReceiveState::default();
+        let auth_channel =
+            DeliveryMethod::channel_id(channels::AUTH_IDENTITY, DeliveryMethod::ReliableOrdered);
+        assert!(deliver_ordered_event(
+            &handle,
+            &tx,
+            1,
+            &auth,
+            auth_channel,
+            0,
+            &mut auth_receive,
+            event(1, &auth, channels::AUTH_IDENTITY)
+        )
+        .unwrap());
+        assert!(regular.try_recv().is_ok());
+        assert!(critical.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn future_reorder_uses_reorder_budget_then_drains_after_admission_frees() {
+        let (handle, tx, _control) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 2, 1)
+                .await
+                .unwrap();
+        let peer = test_peer_state(0);
+        handle.peers.insert(0, peer.clone());
+        let (mut regular, _critical) = handle
+            .enable_ordered_admission(OrderedAdmissionConfig {
+                regular_capacity: 4,
+                critical_capacity: 1,
+                per_lane: 1,
+                per_peer: 1,
+                critical_channel: channels::REGISTRY_CONTROL,
+            })
+            .unwrap();
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let event = |sequence: u16| ServerEvent::Message {
+            peer: 0,
+            session: PeerSession {
+                peer: 0,
+                state: peer.clone(),
+            },
+            channel: channels::CHAT,
+            delivery: DeliveryMethod::ReliableOrdered,
+            payload: Bytes::from(sequence.to_le_bytes().to_vec()),
+        };
+        admit_reliable_ordered(&handle, &tx, 0, &peer, channel_id, 0, event(0)).unwrap();
+        let first = regular.try_recv().unwrap();
+        admit_reliable_ordered(&handle, &tx, 0, &peer, channel_id, 2, event(2)).unwrap();
+        assert_eq!(
+            peer.remote_ordered_sequence.lock()[&channel_id]
+                .future
+                .len(),
+            1
+        );
+        drop(first);
+        admit_reliable_ordered(&handle, &tx, 0, &peer, channel_id, 1, event(1)).unwrap();
+        assert_eq!(
+            peer.remote_ordered_sequence.lock()[&channel_id]
+                .future
+                .len(),
+            1
+        );
+        drop(regular.try_recv().unwrap());
+        assert_eq!(drain_ordered_peer(&handle, &tx, 0, &peer, 8).unwrap(), 1);
+        let drained = regular.try_recv().unwrap();
+        assert!(
+            matches!(drained.event, ServerEvent::Message { payload, .. } if payload.as_ref() == 2u16.to_le_bytes())
+        );
+        assert_eq!(
+            peer.remote_ordered_sequence.lock()[&channel_id]
+                .future
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_ordered_reservations_cannot_overbook_last_slot() {
+        let peer = test_peer_state(0);
+        let state = Arc::new(OrderedAdmissionState {
+            limits: OrderedAdmissionConfig {
+                regular_capacity: 1,
+                critical_capacity: 1,
+                per_lane: 1,
+                per_peer: 1,
+                critical_channel: channels::REGISTRY_CONTROL,
+            },
+            counts: parking_lot::Mutex::new(OrderedAdmissionCounts::default()),
+        });
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let threads: Vec<_> = [channels::CHAT, channels::PLAYER_AVATAR_HIGH]
+            .into_iter()
+            .map(|channel| {
+                let state = state.clone();
+                let peer = peer.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state.reserve(&peer, channel)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let permits: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(permits.iter().filter(|permit| permit.is_some()).count(), 1);
+        assert_eq!(state.counts.lock().regular.total, 1);
+        drop(permits);
+        assert_eq!(state.counts.lock().regular.total, 0);
     }
 
     #[test]

@@ -169,7 +169,9 @@ impl Client {
             for (channel, sequence, mut payload, fragment) in frames {
                 if let Some((channel_id, sequence)) = sequence {
                     let mut ack = vec![PacketProperty::Ack as u8, 0, 0, channel_id];
-                    ack.extend_from_slice(&[0; 16]);
+                    // LiteNetLib's ACK shape carries one trailing bitmap byte beyond
+                    // the 128 sequence bits; the transport tests use the same 17-byte form.
+                    ack.extend_from_slice(&[0; 17]);
                     ack[4 + (sequence as usize % 128) / 8] |= 1 << (sequence % 8);
                     self.socket.send(&ack).await.unwrap();
                     if !self.received.insert((channel_id, sequence)) {
@@ -872,7 +874,7 @@ async fn identity_admission_rejects_spoofed_rejoin_and_editor_claims_and_replay(
 #[tokio::test]
 async fn saturated_ordered_lane_does_not_block_other_control_or_disconnects() {
     let (state, shutdown, _) = super::tests::test_server(false).await;
-    let mut saturated = Client::connect(&state, "saturated-control").await;
+    let _saturated = Client::connect(&state, "saturated-control").await;
     let _other = Client::connect(&state, "independent-control").await;
     let mut leaving = Client::connect(&state, "independent-disconnect").await;
     let (a, a_session) = session_for_uuid(&state, "saturated-control");
@@ -882,7 +884,8 @@ async fn saturated_ordered_lane_does_not_block_other_control_or_disconnects() {
     let a_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (progress, mut observed) = mpsc::unbounded_channel();
     let (events, receiver) = mpsc::channel(8);
-    let (ordered, ordered_receiver) = mpsc::channel(crate::MAX_PENDING_ORDERED_EVENTS + 8);
+    let (ordered, ordered_receiver) = mpsc::channel(crate::MAX_PENDING_ORDERED_EVENTS);
+    let (_critical, critical_receiver) = mpsc::channel(crate::MAX_CRITICAL_ORDERED_EVENTS);
     let (stop, stopping) = oneshot::channel();
     let handler_release = release.clone();
     let handler_calls = a_calls.clone();
@@ -892,6 +895,7 @@ async fn saturated_ordered_lane_does_not_block_other_control_or_disconnects() {
         state.clone(),
         receiver,
         ordered_receiver,
+        critical_receiver,
         stopping,
         move |state, event| {
             let release = handler_release.clone();
@@ -899,9 +903,10 @@ async fn saturated_ordered_lane_does_not_block_other_control_or_disconnects() {
             let progress = progress.clone();
             async move {
                 match &event {
-                    ServerEvent::Message { peer, session, .. } if *peer == a => {
+                    ServerEvent::Message { peer, session, .. }
+                        if *peer == a && calls.fetch_add(1, Ordering::Relaxed) == 0 =>
+                    {
                         let _lease = session.try_read_lease().expect("first handler is live");
-                        assert_eq!(calls.fetch_add(1, Ordering::Relaxed), 0);
                         progress.send("blocked").unwrap();
                         release.notified().await;
                         return Ok(());
@@ -926,7 +931,7 @@ async fn saturated_ordered_lane_does_not_block_other_control_or_disconnects() {
         },
     ));
     ordered
-        .send(registry_subscribe_event(a, a_session.clone()))
+        .send(registry_subscribe_event(a, a_session.clone()).into())
         .await
         .unwrap();
     assert_eq!(
@@ -935,15 +940,16 @@ async fn saturated_ordered_lane_does_not_block_other_control_or_disconnects() {
             .unwrap(),
         Some("blocked")
     );
-    // The former global admission gate would stop here at 4,096 waiting messages.
-    for _ in 0..crate::MAX_PENDING_ORDERED_EVENTS {
+    // Keep this injected lane within the same 128-event admission bound as transport.
+    // Pre-ACK overload and retry behavior are covered at the transport boundary.
+    for _ in 0..crate::MAX_PENDING_ORDERED_PER_LANE - 1 {
         ordered
-            .send(registry_subscribe_event(a, a_session.clone()))
+            .send(registry_subscribe_event(a, a_session.clone()).into())
             .await
             .unwrap();
     }
     ordered
-        .send(registry_subscribe_event(b, b_session.clone()))
+        .send(registry_subscribe_event(b, b_session.clone()).into())
         .await
         .unwrap();
     events
@@ -966,11 +972,10 @@ async fn saturated_ordered_lane_does_not_block_other_control_or_disconnects() {
     signals.sort_unstable();
     assert_eq!(signals, ["control", "disconnect"]);
     assert!(state.message_subscriptions.contains_key(&b));
-    assert!(!state.transport.is_current_session(&a_session));
+    assert!(state.transport.is_current_session(&a_session));
     assert_eq!(a_calls.load(Ordering::Relaxed), 1);
-    // A's cleanup is still waiting on its blocked lease; B and C progressed anyway.
+    // A's first handler remains blocked while B and C progress independently.
     assert!(state.authenticated_peers.contains_key(&a));
-    saturated.receive_disconnect().await;
     leaving.receive_disconnect().await;
     release.notify_one();
     stop.send(()).unwrap();
@@ -979,9 +984,265 @@ async fn saturated_ordered_lane_does_not_block_other_control_or_disconnects() {
         .unwrap()
         .unwrap();
     wait_for_disconnect_cleanups(&state).await;
-    assert!(!state.authenticated_peers.contains_key(&a));
+    assert!(state.transport.is_current_session(&a_session));
+    assert_eq!(
+        a_calls.load(Ordering::Relaxed),
+        crate::MAX_PENDING_ORDERED_PER_LANE
+    );
     assert!(!state.authenticated_peers.contains_key(&c));
     assert!(state.transport.is_current_session(&b_session));
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn signed_identity_uses_reserved_workers_when_ordinary_workers_are_full() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    state.config.write().use_auth_identity = true;
+    let key = SigningKey::from_bytes(&[117; 32]);
+    let did = client_did(&key);
+    let mut client = Client::connect_pending(&state, &did).await;
+    let challenge = client.receive_identity_challenge().await;
+    let (peer, pending) = state
+        .pending_identity
+        .iter()
+        .next()
+        .map(|entry| (*entry.key(), entry.value().session.clone()))
+        .expect("identity challenge reserves a pending session");
+
+    let worker_limit = std::thread::available_parallelism()
+        .map(|count| (count.get() * 4).clamp(8, 256))
+        .unwrap_or(32);
+    let (events, event_receiver) = mpsc::channel(worker_limit);
+    let (_ordered, ordered_receiver) = mpsc::channel(crate::MAX_PENDING_ORDERED_EVENTS);
+    let (_critical, critical_receiver) = mpsc::channel(crate::MAX_CRITICAL_ORDERED_EVENTS);
+    let (stop, stopping) = oneshot::channel();
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handler_release = release.clone();
+    let dispatcher = tokio::spawn(crate::event_loop_with_handler(
+        state.clone(),
+        event_receiver,
+        ordered_receiver,
+        critical_receiver,
+        stopping,
+        move |state, event| {
+            let release = handler_release.clone();
+            let started = started_tx.clone();
+            async move {
+                match event {
+                    ServerEvent::NetworkError(_) => {
+                        started.send(()).unwrap();
+                        release.notified().await;
+                        Ok(())
+                    }
+                    event => crate::handle_event(&state, event).await,
+                }
+            }
+        },
+    ));
+
+    for _ in 0..worker_limit {
+        events
+            .send(ServerEvent::NetworkError("hold ordinary worker".into()))
+            .await
+            .unwrap();
+    }
+    for _ in 0..worker_limit {
+        tokio::time::timeout(Duration::from_secs(3), started_rx.recv())
+            .await
+            .expect("ordinary handler started")
+            .expect("ordinary worker signal");
+    }
+    // Queue ordinary ordered work behind the exhausted worker pool. Identity ingress
+    // must still reach its reserved handler while this lane waits.
+    let mut queued_ordinary = NetWriter::new();
+    queued_ordinary.put_u8(channels::REGISTRY_SUB_SUBSCRIBE);
+    BasisMessageSubscribe { ids: vec![42] }
+        .serialize(&mut queued_ordinary)
+        .unwrap();
+    _ordered
+        .send(
+            ServerEvent::Message {
+                peer,
+                session: pending.clone(),
+                channel: channels::REGISTRY_CONTROL,
+                delivery: DeliveryMethod::ReliableOrdered,
+                payload: Bytes::from(queued_ordinary.as_slice().to_vec()),
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+
+    let mut payload = NetWriter::new();
+    DidResponse {
+        signature: key.sign(&challenge).to_bytes().to_vec(),
+        fragment: "N/A".to_owned(),
+    }
+    .serialize(&mut payload)
+    .unwrap();
+    let critical = _critical;
+    critical
+        .send(
+            ServerEvent::Message {
+                peer,
+                session: pending,
+                channel: channels::AUTH_IDENTITY,
+                delivery: DeliveryMethod::ReliableOrdered,
+                payload: Bytes::from(payload.as_slice().to_vec()),
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+
+    client
+        .receive(|channel, _| channel == channels::META_DATA)
+        .await;
+    assert!(state.authenticated_peers.contains_key(&peer));
+    assert!(!state.pending_identity.contains_key(&peer));
+
+    release.notify_waiters();
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), dispatcher)
+        .await
+        .unwrap()
+        .unwrap();
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn ordered_udp_burst_backpressures_and_retries_in_fifo_order() {
+    let (mut state, shutdown, _) = super::tests::test_server(false).await;
+    let (transport, events) = basis_transport::TransportHandle::bind_with_statistics_options(
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+        true,
+        true,
+    )
+    .await
+    .unwrap();
+    let (ordered_receiver, critical_receiver) = transport
+        .enable_ordered_admission(basis_transport::OrderedAdmissionConfig {
+            regular_capacity: crate::MAX_PENDING_ORDERED_EVENTS,
+            critical_capacity: crate::MAX_CRITICAL_ORDERED_EVENTS,
+            per_lane: crate::MAX_PENDING_ORDERED_PER_LANE,
+            per_peer: crate::MAX_PENDING_ORDERED_PER_PEER,
+            critical_channel: channels::AUTH_IDENTITY,
+        })
+        .unwrap();
+    state.transport = transport.clone();
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handler_release = release.clone();
+    let (blocked_tx, mut blocked_rx) = mpsc::unbounded_channel();
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+    let (stop, stopping) = oneshot::channel();
+    let dispatcher = tokio::spawn(crate::event_loop_with_handler(
+        state.clone(),
+        events,
+        ordered_receiver,
+        critical_receiver,
+        stopping,
+        move |state, event| {
+            let release = handler_release.clone();
+            let blocked = blocked_tx.clone();
+            let seen = seen_tx.clone();
+            async move {
+                if let ServerEvent::Message {
+                    channel: channels::REGISTRY_CONTROL,
+                    payload,
+                    ..
+                } = &event
+                {
+                    let mut reader = NetReader::new(payload);
+                    assert_eq!(reader.get_u8().unwrap(), channels::REGISTRY_SUB_SUBSCRIBE);
+                    let subscription = BasisMessageSubscribe::deserialize(&mut reader).unwrap();
+                    let id = subscription.ids[0];
+                    if id == 0 {
+                        let _ = blocked.send(());
+                        release.notified().await;
+                    }
+                    seen.send(id).unwrap();
+                }
+                crate::handle_event(&state, event).await
+            }
+        },
+    ));
+    let client = Client::connect(&state, "ordered-retry-burst").await;
+    let (peer, session) = session_for_uuid(&state, "ordered-retry-burst");
+
+    const BURST: u16 = 400;
+    let mut packets = Vec::with_capacity(BURST as usize);
+    for sequence in 0..BURST {
+        let mut payload = NetWriter::new();
+        payload.put_u8(channels::REGISTRY_SUB_SUBSCRIBE);
+        BasisMessageSubscribe {
+            ids: vec![sequence],
+        }
+        .serialize(&mut payload)
+        .unwrap();
+        let mut packet = NetWriter::new();
+        packet.put_u8(PacketProperty::Channeled as u8);
+        packet.put_u16(sequence);
+        packet.put_u8(DeliveryMethod::channel_id(
+            channels::REGISTRY_CONTROL,
+            DeliveryMethod::ReliableOrdered,
+        ));
+        packet.put_bytes(payload.as_slice());
+        packets.push(packet.as_slice().to_vec());
+    }
+    for packet in &packets {
+        client.socket.send(packet).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(3), blocked_rx.recv())
+        .await
+        .expect("first registry handler blocks");
+    // Let the receiver reach its bounded outstanding quota before releasing the head.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(state.transport.is_current_session(&session));
+    release.notify_one();
+
+    let mut seen = Vec::with_capacity(BURST as usize);
+    if let Some(id) = seen_rx.recv().await {
+        seen.push(id);
+    }
+    for _ in 0..8 {
+        for packet in &packets {
+            client.socket.send(packet).await.unwrap();
+        }
+        while seen.len() < BURST as usize {
+            match tokio::time::timeout(Duration::from_millis(30), seen_rx.recv()).await {
+                Ok(Some(id)) => seen.push(id),
+                _ => break,
+            }
+        }
+        if seen.len() == BURST as usize {
+            break;
+        }
+    }
+    while seen.len() < BURST as usize {
+        seen.push(
+            tokio::time::timeout(Duration::from_secs(3), seen_rx.recv())
+                .await
+                .expect("retransmitted reliable ordered packet is dispatched")
+                .expect("handler remains connected"),
+        );
+    }
+    assert_eq!(seen, (0..BURST).collect::<Vec<_>>());
+    assert!(state.transport.is_current_session(&session));
+    assert!(state
+        .message_subscriptions
+        .get(&peer)
+        .unwrap()
+        .contains(&(BURST - 1)));
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), dispatcher)
+        .await
+        .unwrap()
+        .unwrap();
     state.shutdown().await.unwrap();
     let _ = shutdown.send(());
 }
