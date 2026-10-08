@@ -4110,6 +4110,9 @@ async fn reliable_dispatch_loop(handle: TransportHandle, tx: mpsc::Sender<Server
     let mut tick = time::interval(RELIABLE_DISPATCH_INTERVAL);
     tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut builder = MergedDatagramBuilder::new();
+    // Reuse the snapshot allocation across passes. Only retain strong peer references for
+    // peers that currently have work; the map scan itself keeps its guards short-lived.
+    let mut peers: Vec<(PeerId, Arc<PeerState>)> = Vec::new();
     while !handle.shutdown.load(Ordering::Relaxed) {
         tick.tick().await;
         if handle.extended_statistics_enabled() {
@@ -4121,18 +4124,15 @@ async fn reliable_dispatch_loop(handle: TransportHandle, tx: mpsc::Sender<Server
 
         // Do not retain DashMap references while invoking realtime callbacks or looking the
         // peer up again: a pending removal writer could otherwise deadlock on the same shard.
-        let peers: Vec<(PeerId, Arc<PeerState>)> = handle
-            .peers
-            .iter()
-            .map(|peer| (*peer.key(), Arc::clone(peer.value())))
-            .collect();
-        for (peer_id, peer_state) in peers {
+        snapshot_active_peers(&handle.peers, &mut peers);
+        for (peer_id, peer_state) in peers.iter() {
+            let peer_id = *peer_id;
             if peer_state.ordered_reorder_active.load(Ordering::Acquire) {
                 match drain_ordered_peer(
                     &handle,
                     &tx,
                     peer_id,
-                    &peer_state,
+                    peer_state,
                     MAX_ORDERED_DRAIN_PER_PEER_PER_PASS,
                 ) {
                     Ok(_) => {}
@@ -4150,7 +4150,7 @@ async fn reliable_dispatch_loop(handle: TransportHandle, tx: mpsc::Sender<Server
             if !peer_state.reliable_active.load(Ordering::Acquire) {
                 continue;
             }
-            let Some(_send_turn) = try_peer_send_turn(&peer_state) else {
+            let Some(_send_turn) = try_peer_send_turn(peer_state) else {
                 continue;
             };
             if handle.extended_statistics_enabled() {
@@ -4162,7 +4162,7 @@ async fn reliable_dispatch_loop(handle: TransportHandle, tx: mpsc::Sender<Server
             let addr = peer_state.addr;
             let connection_number = peer_state.connection_number;
             builder.reset(connection_number);
-            if !retry_peer_datagrams(&peer_state, &handle, addr) {
+            if !retry_peer_datagrams(peer_state, &handle, addr) {
                 continue;
             }
 
@@ -4234,10 +4234,10 @@ async fn reliable_dispatch_loop(handle: TransportHandle, tx: mpsc::Sender<Server
 
             if !newly_queued.is_empty() {
                 for (channel_id, payload) in newly_queued {
-                    let built = build_queued_reliable_packet(&peer_state, channel_id, payload);
+                    let built = build_queued_reliable_packet(peer_state, channel_id, payload);
                     let bytes = built.bytes;
                     record_pending_reliable(
-                        &peer_state,
+                        peer_state,
                         channel_id,
                         built.sequence,
                         bytes.clone(),
@@ -4260,7 +4260,24 @@ async fn reliable_dispatch_loop(handle: TransportHandle, tx: mpsc::Sender<Server
 
             // A single UDP send must not park the global dispatcher. Preserve unsent datagrams
             // on this peer and let later peers progress; the next pass retries this peer first.
-            builder.flush_for_peer(&peer_state, &handle, addr);
+            builder.flush_for_peer(peer_state, &handle, addr);
+        }
+    }
+}
+
+/// Copy only peers with dispatchable work. DashMap guards are dropped before this returns,
+/// so callers can safely invoke callbacks and perform further peer-map lookups.
+fn snapshot_active_peers(
+    peers: &DashMap<PeerId, Arc<PeerState>>,
+    snapshot: &mut Vec<(PeerId, Arc<PeerState>)>,
+) {
+    snapshot.clear();
+    for peer in peers.iter() {
+        let state = peer.value();
+        if state.ordered_reorder_active.load(Ordering::Acquire)
+            || state.reliable_active.load(Ordering::Acquire)
+        {
+            snapshot.push((*peer.key(), Arc::clone(state)));
         }
     }
 }
@@ -6439,6 +6456,159 @@ mod tests {
             confirmed_mtu: AtomicUsize::new(MAX_MERGED_PACKET_SIZE),
             mtu_probe: parking_lot::Mutex::new(MtuProbeState::new(Instant::now())),
         })
+    }
+
+    #[test]
+    fn reliable_dispatch_snapshot_reuses_storage_and_skips_idle_peers() {
+        let peers = DashMap::new();
+        for id in 0..100 {
+            peers.insert(id, test_peer_state(id));
+        }
+        let reliable = test_peer_state(100);
+        reliable.reliable_active.store(true, Ordering::Release);
+        let ordered = test_peer_state(101);
+        ordered
+            .ordered_reorder_active
+            .store(true, Ordering::Release);
+        peers.insert(100, reliable);
+        peers.insert(101, ordered);
+
+        let mut snapshot = Vec::with_capacity(4);
+        let capacity = snapshot.capacity();
+        snapshot_active_peers(&peers, &mut snapshot);
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot.iter().any(|(id, _)| *id == 100));
+        assert!(snapshot.iter().any(|(id, _)| *id == 101));
+        assert_eq!(snapshot.capacity(), capacity);
+
+        // A second pass with no active peers reuses the same allocation and retains no refs.
+        peers
+            .get(&100)
+            .unwrap()
+            .reliable_active
+            .store(false, Ordering::Release);
+        peers
+            .get(&101)
+            .unwrap()
+            .ordered_reorder_active
+            .store(false, Ordering::Release);
+        snapshot_active_peers(&peers, &mut snapshot);
+        assert!(snapshot.is_empty());
+        assert_eq!(snapshot.capacity(), capacity);
+    }
+
+    /// Manual microbenchmark for the peer enumeration cost only. Run with:
+    /// `cargo test -p basis-transport peer_snapshot_microbench -- --ignored --nocapture`.
+    /// It does not invoke network sends, callbacks, locks, or full dispatch work.
+    #[test]
+    #[ignore = "manual peer snapshot microbenchmark"]
+    fn peer_snapshot_microbench() {
+        use std::{hint::black_box, time::Instant};
+
+        const PASSES: usize = 5000;
+        const SAMPLES: usize = 6;
+        let peers = DashMap::new();
+        for id in 0..1000 {
+            peers.insert(id, test_peer_state(id));
+        }
+
+        println!("{{\"benchmark\":\"peer_snapshot_only\",\"passes_per_sample\":{PASSES},\"samples\":{SAMPLES},\"peer_count\":1000}}");
+        for active_count in [0usize, 100, 1000] {
+            for peer in peers.iter() {
+                peer.value()
+                    .reliable_active
+                    .store((*peer.key() as usize) < active_count, Ordering::Release);
+            }
+            let mut reusable = Vec::with_capacity(1000);
+            let mut elapsed_ns = [
+                Vec::with_capacity(SAMPLES),
+                Vec::with_capacity(SAMPLES),
+                Vec::with_capacity(SAMPLES),
+            ];
+            // Reverse order on alternating rounds to reduce systematic cache/thermal bias.
+            for sample in 0..SAMPLES {
+                let order = if sample % 2 == 0 {
+                    [0, 1, 2]
+                } else {
+                    [2, 1, 0]
+                };
+                for strategy_index in order {
+                    let start = Instant::now();
+                    let mut visited = 0usize;
+                    for _ in 0..PASSES {
+                        match strategy_index {
+                            0 => {
+                                for peer in peers.iter() {
+                                    if peer.reliable_active.load(Ordering::Acquire) {
+                                        visited += 1;
+                                    }
+                                }
+                            }
+                            1 => {
+                                let snapshot = peers
+                                    .iter()
+                                    .map(|peer| (*peer.key(), Arc::clone(peer.value())))
+                                    .collect::<Vec<_>>();
+                                visited += snapshot
+                                    .iter()
+                                    .filter(|(_, peer)| {
+                                        peer.reliable_active.load(Ordering::Acquire)
+                                    })
+                                    .count();
+                                black_box(snapshot);
+                            }
+                            _ => {
+                                snapshot_active_peers(&peers, &mut reusable);
+                                visited += reusable
+                                    .iter()
+                                    .filter(|(_, peer)| {
+                                        peer.reliable_active.load(Ordering::Acquire)
+                                    })
+                                    .count();
+                                black_box(&reusable);
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        visited,
+                        active_count * PASSES,
+                        "strategy {strategy_index} changed active-peer work"
+                    );
+                    black_box(visited);
+                    elapsed_ns[strategy_index].push(start.elapsed().as_nanos());
+                }
+            }
+            print!("{{\"active_peers\":{active_count},\"strategies\":[");
+            for (strategy_index, strategy) in [
+                "main_guard_scan",
+                "dc122ac_fresh_all_snapshot",
+                "filtered_reused_snapshot",
+            ]
+            .iter()
+            .enumerate()
+            {
+                if strategy_index > 0 {
+                    print!(",");
+                }
+                let clones_per_sample = if strategy_index == 1 {
+                    1000 * PASSES
+                } else if strategy_index == 2 {
+                    active_count * PASSES
+                } else {
+                    0
+                };
+                let fresh_vectors_per_sample = if strategy_index == 1 { PASSES } else { 0 };
+                print!("{{\"name\":\"{strategy}\",\"passes_per_sample\":{PASSES},\"arc_clones_per_sample\":{clones_per_sample},\"fresh_vectors_per_sample\":{fresh_vectors_per_sample},\"elapsed_ns\":[");
+                for (sample, elapsed) in elapsed_ns[strategy_index].iter().enumerate() {
+                    if sample > 0 {
+                        print!(",");
+                    }
+                    print!("{elapsed}");
+                }
+                print!("]}}");
+            }
+            println!("]}}");
+        }
     }
 
     #[tokio::test]

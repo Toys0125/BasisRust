@@ -55,7 +55,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, OpenOptions},
     io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -862,8 +862,14 @@ impl ServerState {
             avatar.tick_count,
             avatar.avg_tick_micros,
             avatar.smoothed_tick_micros,
-            avatar.build_micros.checked_div(avatar.tick_count).unwrap_or(0),
-            avatar.flush_micros.checked_div(avatar.tick_count).unwrap_or(0),
+            avatar
+                .build_micros
+                .checked_div(avatar.tick_count)
+                .unwrap_or(0),
+            avatar
+                .flush_micros
+                .checked_div(avatar.tick_count)
+                .unwrap_or(0),
             avatar.max_tick_micros,
             avatar.receiver_cycle_micros / 1000,
             avatar.receiver_cycle_budget_micros / 1000,
@@ -1153,14 +1159,46 @@ async fn event_loop(
         .unwrap_or(32);
     let workers = Arc::new(Semaphore::new(worker_limit));
     let diagnostics = event_diagnostics::EventDiagnostics::start_from_env(&state, worker_limit);
-    let mut handlers = tokio::task::JoinSet::new();
+    let mut handlers = tokio::task::JoinSet::<()>::new();
+    let mut ordered_task_keys = HashMap::<tokio::task::Id, OrderedLaneKey>::new();
+    let mut ordered_sessions = HashMap::<(PeerId, u8), (PeerSession, u64)>::new();
+    let mut next_session_generation = 1u64;
+    let mut ordered_queue = OrderedHandlerQueue::default();
     let mut join_flush = tokio::time::interval(JOIN_BATCH_FLUSH_INTERVAL);
     join_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     join_flush.tick().await;
     while !state.shutdown.load(Ordering::Relaxed) {
         tokio::select! {
-            _ = handlers.join_next(), if !handlers.is_empty() => {}
+            completed = handlers.join_next_with_id(), if !handlers.is_empty() => {
+                if let Some(completed) = completed {
+                    let id = match completed {
+                        Ok((id, ())) => id,
+                        Err(err) => { warn!("event handler failed to join: {err}"); err.id() },
+                    };
+                    if let Some(key) = ordered_task_keys.remove(&id) {
+                        ordered_queue.complete(key);
+                        if !ordered_queue.contains(key)
+                            && ordered_sessions
+                                .get(&(key.0, key.1))
+                                .is_some_and(|(_, generation)| *generation == key.2)
+                        {
+                            ordered_sessions.remove(&(key.0, key.1));
+                        }
+                    }
+                }
+                spawn_ready_ordered(
+                    &mut ordered_queue,
+                    &mut handlers,
+                    &mut ordered_task_keys,
+                    workers.clone(),
+                    &state,
+                    diagnostics.as_ref(),
+                );
+            }
             _ = join_flush.tick() => {
+                ordered_sessions.retain(|base, (_, generation)| {
+                    ordered_queue.contains((base.0, base.1, *generation))
+                });
                 if let Err(err) = flush_join_batches(&state).await {
                     error!("join batch serialization failed: {err:#}");
                 }
@@ -1168,15 +1206,52 @@ async fn event_loop(
             _ = &mut shutdown => {
                 break;
             }
-            maybe_event = events.recv() => {
+            maybe_event = events.recv(), if ordered_queue.pending() < MAX_PENDING_ORDERED_EVENTS => {
                 let Some(event) = maybe_event else { break; };
                 if let Some(diagnostics) = &diagnostics {
                     diagnostics.record_queue_depth(events.len());
                 }
-                if is_high_frequency_inline_event(&event) {
+                if is_high_frequency_inline_event(&event)
+                    && !matches!(
+                        &event,
+                        ServerEvent::Message {
+                            delivery: DeliveryMethod::ReliableOrdered,
+                            ..
+                        }
+                    )
+                {
                     if let Err(err) = handle_event(&state, event).await {
                         error!("server event failed: {err:#}");
                     }
+                    continue;
+                }
+                if let ServerEvent::Message {
+                    peer,
+                    session,
+                    channel,
+                    delivery: DeliveryMethod::ReliableOrdered,
+                    ..
+                } = &event
+                {
+                    let base = (*peer, *channel);
+                    let generation = match ordered_sessions.get(&base) {
+                        Some((old_session, generation)) if old_session.same_connection(session) => *generation,
+                        _ => {
+                            let generation = next_session_generation;
+                            next_session_generation = next_session_generation.wrapping_add(1).max(1);
+                            ordered_sessions.insert(base, (session.clone(), generation));
+                            generation
+                        }
+                    };
+                    ordered_queue.enqueue((base.0, base.1, generation), event);
+                    spawn_ready_ordered(
+                        &mut ordered_queue,
+                        &mut handlers,
+                        &mut ordered_task_keys,
+                        workers.clone(),
+                        &state,
+                        diagnostics.as_ref(),
+                    );
                     continue;
                 }
                 // Acquire before spawning, so a flood cannot create unbounded waiting tasks.
@@ -1203,10 +1278,165 @@ async fn event_loop(
     }
     // Stop admission, then finish accepted handlers before final persistence.
     events.close();
-    while let Some(result) = handlers.join_next().await {
-        if let Err(err) = result {
-            warn!("event handler failed to join: {err}");
+    while !handlers.is_empty() || ordered_queue.pending() > 0 {
+        spawn_ready_ordered(
+            &mut ordered_queue,
+            &mut handlers,
+            &mut ordered_task_keys,
+            workers.clone(),
+            &state,
+            diagnostics.as_ref(),
+        );
+        if let Some(result) = handlers.join_next_with_id().await {
+            match result {
+                Ok((id, ())) => {
+                    if let Some(key) = ordered_task_keys.remove(&id) {
+                        ordered_queue.complete(key);
+                    }
+                }
+                Err(err) => {
+                    if let Some(key) = ordered_task_keys.remove(&err.id()) {
+                        ordered_queue.complete(key);
+                    }
+                    warn!("event handler failed to join: {err}");
+                }
+            }
         }
+    }
+}
+
+const MAX_PENDING_ORDERED_EVENTS: usize = 4096;
+type OrderedLaneKey = (PeerId, u8, u64);
+
+struct OrderedHandlerQueue<E = ServerEvent> {
+    lanes: HashMap<OrderedLaneKey, OrderedLane<E>>,
+    ready: VecDeque<OrderedLaneKey>,
+    pending: usize,
+}
+
+struct OrderedLane<E> {
+    events: VecDeque<E>,
+    running: bool,
+}
+
+impl<E> Default for OrderedHandlerQueue<E> {
+    fn default() -> Self {
+        Self {
+            lanes: HashMap::new(),
+            ready: VecDeque::new(),
+            pending: 0,
+        }
+    }
+}
+
+impl<E> Default for OrderedLane<E> {
+    fn default() -> Self {
+        Self {
+            events: VecDeque::new(),
+            running: false,
+        }
+    }
+}
+
+impl<E> OrderedHandlerQueue<E> {
+    fn enqueue(&mut self, key: OrderedLaneKey, event: E) {
+        let lane = self.lanes.entry(key).or_default();
+        if !lane.running && lane.events.is_empty() {
+            self.ready.push_back(key);
+        }
+        lane.events.push_back(event);
+        self.pending += 1;
+    }
+
+    fn start_next(&mut self) -> Option<(OrderedLaneKey, E)> {
+        while let Some(key) = self.ready.pop_front() {
+            let Some(lane) = self.lanes.get_mut(&key) else {
+                continue;
+            };
+            if lane.running {
+                continue;
+            }
+            let Some(event) = lane.events.pop_front() else {
+                self.lanes.remove(&key);
+                continue;
+            };
+            lane.running = true;
+            self.pending -= 1;
+            return Some((key, event));
+        }
+        None
+    }
+
+    fn complete(&mut self, key: OrderedLaneKey) {
+        let Some(lane) = self.lanes.get_mut(&key) else {
+            return;
+        };
+        lane.running = false;
+        if lane.events.is_empty() {
+            self.lanes.remove(&key);
+        } else {
+            self.ready.push_back(key);
+        }
+    }
+
+    fn pending(&self) -> usize {
+        self.pending
+    }
+
+    fn contains(&self, key: OrderedLaneKey) -> bool {
+        self.lanes.contains_key(&key)
+    }
+}
+
+fn spawn_ready_ordered(
+    queue: &mut OrderedHandlerQueue<ServerEvent>,
+    handlers: &mut tokio::task::JoinSet<()>,
+    task_keys: &mut HashMap<tokio::task::Id, OrderedLaneKey>,
+    workers: Arc<Semaphore>,
+    state: &ServerState,
+    diagnostics: Option<&Arc<event_diagnostics::EventDiagnostics>>,
+) {
+    spawn_ready_ordered_with(queue, handlers, task_keys, workers, |event, permit| {
+        let state = state.clone();
+        let mut diagnostic_guard = diagnostics.map(|d| d.spawned(&event));
+        let task = async move {
+            let _permit = permit;
+            if let Some(guard) = &mut diagnostic_guard {
+                guard.started();
+            }
+            if let Err(err) = handle_event(&state, event).await {
+                error!("server event failed: {err:#}");
+            }
+        };
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.record_task_size(std::mem::size_of_val(&task));
+        }
+        task
+    });
+}
+
+// Waiting lane followers stay as event data; only runnable heads become tasks.
+fn spawn_ready_ordered_with<E, F, Fut>(
+    queue: &mut OrderedHandlerQueue<E>,
+    handlers: &mut tokio::task::JoinSet<()>,
+    task_keys: &mut HashMap<tokio::task::Id, OrderedLaneKey>,
+    workers: Arc<Semaphore>,
+    mut handle: F,
+) where
+    E: Send + 'static,
+    F: FnMut(E, OwnedSemaphorePermit) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    loop {
+        let Ok(permit) = workers.clone().try_acquire_owned() else {
+            break;
+        };
+        let Some((key, event)) = queue.start_next() else {
+            drop(permit);
+            break;
+        };
+        let id = handlers.spawn(handle(event, permit)).id();
+        task_keys.insert(id, key);
     }
 }
 
@@ -5248,6 +5478,156 @@ pub fn migrate_legacy_resource_dirs(base_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reliable_ordered_handlers_wait_for_the_previous_handler() {
+        let mut queue = OrderedHandlerQueue::<u8>::default();
+        let lane = (17, 3, 1);
+        for event in [1, 2, 3] {
+            queue.enqueue(lane, event);
+        }
+        queue.enqueue((17, 4, 1), 4); // Independent channel.
+        queue.enqueue((18, 3, 1), 5); // Independent peer.
+        queue.enqueue((17, 3, 2), 6); // Replacement incarnation.
+        let workers = Arc::new(Semaphore::new(2));
+        let mut handlers = tokio::task::JoinSet::new();
+        let mut keys = HashMap::new();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let handle = |event, permit| {
+            let release = release.clone();
+            let started = started.clone();
+            async move {
+                let _permit = permit;
+                started.send(event).unwrap();
+                if event == 1 {
+                    release.notified().await;
+                }
+            }
+        };
+        spawn_ready_ordered_with(
+            &mut queue,
+            &mut handlers,
+            &mut keys,
+            workers.clone(),
+            handle,
+        );
+        // Only the blocked head and an independent lane can occupy the two slots.
+        assert_eq!(handlers.len(), 2);
+        for expected in [4, 5, 6] {
+            let (id, ()) =
+                tokio::time::timeout(Duration::from_secs(2), handlers.join_next_with_id())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            let finished_lane = keys.remove(&id).unwrap();
+            assert_ne!(finished_lane, lane);
+            queue.complete(finished_lane);
+            spawn_ready_ordered_with(
+                &mut queue,
+                &mut handlers,
+                &mut keys,
+                workers.clone(),
+                handle,
+            );
+            assert!(queue.contains(lane));
+            // Consume the starts deterministically, without assuming executor poll order.
+            if expected == 4 {
+                let mut initial = [starts.recv().await.unwrap(), starts.recv().await.unwrap()];
+                initial.sort_unstable();
+                assert_eq!(initial, [1, 4]);
+            } else {
+                assert_eq!(starts.recv().await.unwrap(), expected);
+            }
+        }
+        assert_eq!(workers.available_permits(), 1);
+        assert_eq!(queue.pending(), 2);
+        assert!(starts.try_recv().is_err()); // Neither follower started while head blocked.
+        release.notify_one();
+        // Drain accepted lane data using the same scheduling primitive as shutdown.
+        while !handlers.is_empty() || queue.pending() > 0 {
+            let (id, ()) =
+                tokio::time::timeout(Duration::from_secs(2), handlers.join_next_with_id())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            queue.complete(keys.remove(&id).unwrap());
+            spawn_ready_ordered_with(
+                &mut queue,
+                &mut handlers,
+                &mut keys,
+                workers.clone(),
+                handle,
+            );
+        }
+        assert_eq!(starts.recv().await.unwrap(), 2);
+        assert_eq!(starts.recv().await.unwrap(), 3);
+        assert!(queue.lanes.is_empty());
+        assert!(keys.is_empty());
+        assert_eq!(workers.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn reliable_ordered_handler_panic_releases_its_lane() {
+        let mut queue = OrderedHandlerQueue::<u8>::default();
+        let lane = (17, 3, 1);
+        queue.enqueue(lane, 1);
+        queue.enqueue(lane, 2);
+        let workers = Arc::new(Semaphore::new(1));
+        let mut handlers = tokio::task::JoinSet::new();
+        let mut keys = HashMap::new();
+        let handle = |event, permit| async move {
+            let _permit = permit;
+            assert_ne!(event, 1, "deliberately failing first handler");
+        };
+        spawn_ready_ordered_with(
+            &mut queue,
+            &mut handlers,
+            &mut keys,
+            workers.clone(),
+            handle,
+        );
+        let error = tokio::time::timeout(Duration::from_secs(2), handlers.join_next_with_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.is_panic());
+        queue.complete(keys.remove(&error.id()).unwrap());
+        spawn_ready_ordered_with(
+            &mut queue,
+            &mut handlers,
+            &mut keys,
+            workers.clone(),
+            handle,
+        );
+        let (id, ()) = tokio::time::timeout(Duration::from_secs(2), handlers.join_next_with_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        queue.complete(keys.remove(&id).unwrap());
+        assert!(queue.lanes.is_empty());
+        assert_eq!(workers.available_permits(), 1);
+    }
+
+    #[test]
+    fn reliable_ordered_pending_budget_tracks_waiting_event_data() {
+        let mut queue = OrderedHandlerQueue::<u8>::default();
+        let lane = (17, 3, 1);
+        for _ in 0..MAX_PENDING_ORDERED_EVENTS {
+            queue.enqueue(lane, 1);
+        }
+        assert_eq!(queue.pending(), MAX_PENDING_ORDERED_EVENTS);
+        assert!(queue.start_next().is_some());
+        assert_eq!(queue.pending(), MAX_PENDING_ORDERED_EVENTS - 1);
+        assert!(queue.start_next().is_none()); // One running head per lane.
+        queue.complete(lane);
+        assert!(queue.start_next().is_some());
+        assert_eq!(queue.pending(), MAX_PENDING_ORDERED_EVENTS - 2);
+    }
 
     #[tokio::test]
     async fn shutdown_saves_before_worker_wait_and_again_after_final_updates() {

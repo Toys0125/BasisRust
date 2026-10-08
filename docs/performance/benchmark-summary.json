@@ -1,0 +1,290 @@
+{
+  "schema_version": 1,
+  "purpose": "PR #31 benchmark summary; raw captures are local.",
+  "reviewed_revision": "dc122ac",
+  "reliable_receive": {
+    "report": "reliable-receive-review-20261008.md",
+    "baseline_revision": "6009c2bc556cd483e02e07d4b07030147645b548",
+    "baseline_runtime_source_revision_after_history_rewrite": "8079fa33fa47",
+    "candidate_revision": "ac25b59",
+    "harness_sha256": "af6b4e9937ac1d70166d756c0ec86717f09e2a701cfb667b5c9c89e1999b7795",
+    "binary_sha256": {
+      "baseline": "c7018bc26066819d8dde17f9b0eadfb7447a9a0e0bf9f66e4eeec77909f539f2",
+      "candidate": "12e5c110c8f062dbfe4dc1f0fd54d0abd0933e954f586c114972a47df51b4053"
+    },
+    "configuration": {
+      "messages_per_trial": 512,
+      "payload_bytes": 16,
+      "udp_receive_workers_per_transport": 2,
+      "samples_per_revision_per_scenario": 6,
+      "order": "ABBA x3 per scenario (baseline/candidate/candidate/baseline repeated three times)",
+      "rustc_version": "1.95.0 (59807616e 2026-04-14)",
+      "build_targets": "separate Cargo target directories, binary reorder symbols validated before measurement",
+      "host_cpu": "AMD Ryzen 9 5900HX with Radeon Graphics",
+      "logical_processors": 16,
+      "ram_bytes": 33492484096,
+      "gpu": "NVIDIA GeForce RTX 3080 Mobile",
+      "cpu_scope": "whole benchmark child process, including both transports and proxy",
+      "scenarios": {
+        "loss": "Drop first transmission of sequence 10 and each sequence congruent to 7 modulo 20 (27 packets of 512).",
+        "reorder": "Forward sequence 11 and its datagram before sequence 10, then send sequence 10 after a 10 ms delay.",
+        "nofault": "No proxy fault; concurrent receiver workers can still process datagrams out of order."
+      }
+    },
+    "validation": {
+      "samples": 36,
+      "all_delivered_512": true,
+      "zero_duplicates": true,
+      "zero_ordering_or_payload_errors": true,
+      "summary_consistent_with_published_report": true
+    },
+    "limits": ["Single host/process, small 16-byte control payloads; not a voice capacity or many-peer test.", "Six observations per revision per scenario; medians/ranges are descriptive, not significance estimates.", "CPU and RSS include benchmark process and measurement wrapper."],
+    "published_medians": [
+      {
+        "scenario": "nofault",
+        "revision": "baseline",
+        "metrics": {
+          "retransmissions": 571.0,
+          "receiver_completion_ms": 1576.215,
+          "first_transmission_to_delivery_p95_ms": 596.005,
+          "cpu_ms": 95.786,
+          "peak_rss_kib": 3976.0
+        }
+      },
+      {
+        "scenario": "nofault",
+        "revision": "candidate",
+        "metrics": {
+          "retransmissions": 0.0,
+          "receiver_completion_ms": 13.288,
+          "first_transmission_to_delivery_p95_ms": 0.291,
+          "cpu_ms": 14.186,
+          "peak_rss_kib": 4014.0
+        }
+      },
+      {
+        "scenario": "loss",
+        "revision": "baseline",
+        "metrics": {
+          "retransmissions": 709.5,
+          "receiver_completion_ms": 1801.109,
+          "first_transmission_to_delivery_p95_ms": 596.527,
+          "cpu_ms": 113.752,
+          "peak_rss_kib": 4038.0
+        }
+      },
+      {
+        "scenario": "loss",
+        "revision": "candidate",
+        "metrics": {
+          "retransmissions": 27.0,
+          "receiver_completion_ms": 1200.787,
+          "first_transmission_to_delivery_p95_ms": 299.191,
+          "cpu_ms": 81.826,
+          "peak_rss_kib": 3962.0
+        }
+      },
+      {
+        "scenario": "reorder",
+        "revision": "baseline",
+        "metrics": {
+          "retransmissions": 709.5,
+          "receiver_completion_ms": 1801.086,
+          "first_transmission_to_delivery_p95_ms": 596.483,
+          "cpu_ms": 113.772,
+          "peak_rss_kib": 4038.0
+        }
+      },
+      {
+        "scenario": "reorder",
+        "revision": "candidate",
+        "metrics": {
+          "retransmissions": 0.0,
+          "receiver_completion_ms": 25.462,
+          "first_transmission_to_delivery_p95_ms": 11.706,
+          "cpu_ms": 15.517,
+          "peak_rss_kib": 3928.0
+        }
+      }
+    ],
+    "sample_columns": ["scenario", "revision", "sample", "retransmissions", "delivered", "duplicates", "ordering_or_payload_errors", "receiver_completion_ms", "first_transmission_to_delivery_p95_ms", "cpu_ms", "peak_rss_kib"],
+    "samples": [
+      ["nofault", "baseline", 0, 612, 512, 0, 0, 1501.908, 596.213, 97.452, 3884],
+      ["nofault", "candidate", 1, 0, 512, 0, 0, 15.21, 0.363, 14.26899999999999, 3876],
+      ["nofault", "candidate", 2, 0, 512, 0, 0, 13.102, 0.217, 14.104000000000006, 4032],
+      ["nofault", "baseline", 3, 536, 512, 0, 0, 1500.93, 596.03, 94.12, 4148],
+      ["nofault", "baseline", 4, 564, 512, 0, 0, 1650.622, 595.858, 91.99099999999999, 4064],
+      ["nofault", "candidate", 5, 0, 512, 0, 0, 15.416, 0.361, 15.492999999999979, 4076],
+      ["nofault", "candidate", 6, 0, 512, 0, 0, 13.198, 0.238, 14.346000000000025, 4312],
+      ["nofault", "baseline", 7, 578, 512, 0, 0, 1650.523, 595.981, 116.27300000000001, 3940],
+      ["nofault", "baseline", 8, 598, 512, 0, 0, 1801.167, 596.968, 123.16799999999995, 3932],
+      ["nofault", "candidate", 9, 0, 512, 0, 0, 13.214, 0.238, 13.900999999999941, 3996],
+      ["nofault", "candidate", 10, 0, 512, 0, 0, 13.363, 0.345, 13.835000000000042, 3740],
+      ["nofault", "baseline", 11, 470, 512, 0, 0, 1500.37, 595.487, 91.12600000000003, 4012],
+      ["loss", "baseline", 0, 692, 512, 0, 0, 1801.529, 596.689, 98.21000000000002, 4236],
+      ["loss", "candidate", 1, 27, 512, 0, 0, 1200.576, 299.981, 65.88899999999998, 3956],
+      ["loss", "candidate", 2, 27, 512, 0, 0, 1201.25, 298.395, 81.15399999999995, 3808],
+      ["loss", "baseline", 3, 780, 512, 0, 0, 1951.048, 596.502, 129.34899999999993, 4020],
+      ["loss", "baseline", 4, 612, 512, 0, 0, 1500.897, 450.825, 104.827, 3856],
+      ["loss", "candidate", 5, 27, 512, 0, 0, 1200.532, 299.177, 82.49799999999996, 4140],
+      ["loss", "candidate", 6, 27, 512, 0, 0, 1200.998, 298.593, 84.12200000000003, 4028],
+      ["loss", "baseline", 7, 727, 512, 0, 0, 1801.133, 596.553, 122.53100000000016, 4148],
+      ["loss", "baseline", 8, 780, 512, 0, 0, 1801.084, 596.675, 120.16500000000008, 4056],
+      ["loss", "candidate", 9, 27, 512, 0, 0, 1201.12, 300.201, 70.06399999999991, 3952],
+      ["loss", "candidate", 10, 27, 512, 0, 0, 1200.491, 299.205, 88.48100000000004, 3968],
+      ["loss", "baseline", 11, 605, 512, 0, 0, 1800.399, 596.047, 107.33899999999986, 3824],
+      ["reorder", "baseline", 0, 644, 512, 0, 0, 1800.852, 596.428, 105.81299999999993, 4020],
+      ["reorder", "candidate", 1, 0, 512, 0, 0, 25.734, 11.684, 15.789000000000053, 3920],
+      ["reorder", "candidate", 2, 0, 512, 0, 0, 24.665, 10.849, 15.970999999999957, 3936],
+      ["reorder", "baseline", 3, 807, 512, 0, 0, 1951.11, 596.464, 128.76299999999995, 4056],
+      ["reorder", "baseline", 4, 644, 512, 0, 0, 1800.661, 596.502, 100.03700000000038, 4064],
+      ["reorder", "candidate", 5, 0, 512, 0, 0, 25.328, 12.008, 14.499999999999513, 4056],
+      ["reorder", "candidate", 6, 0, 512, 0, 0, 25.595, 11.666, 14.54800000000045, 3800],
+      ["reorder", "baseline", 7, 812, 512, 0, 0, 1801.321, 738.281, 121.73199999999973, 4000],
+      ["reorder", "baseline", 8, 775, 512, 0, 0, 2101.071, 735.863, 136.00199999999995, 3800],
+      ["reorder", "candidate", 9, 0, 512, 0, 0, 25.107, 12.007, 16.326000000000285, 3712],
+      ["reorder", "candidate", 10, 0, 512, 0, 0, 26.729, 11.727, 15.24599999999987, 3944],
+      ["reorder", "baseline", 11, 584, 512, 0, 0, 1650.616, 446.681, 105.18500000000009, 4080]
+    ]
+  },
+  "historical_voice_benchmarks": [
+    {
+      "report": "voice-1000-clients.md",
+      "archive_summary": "voice-1000-20261005-summary.json",
+      "revision": "09cf74f6168a02d3a8355dcfbed389fcd530ddb6",
+      "finding": "Both large voice cases failed stated capacity screens; 100% case stopped at the 24 GiB working-set limit.",
+      "limitations": "Single run per condition, shared Windows loopback host; no repeat-based confidence estimate.",
+      "key_results": {
+        "columns": ["case", "sent_packets_s", "send_cadence_fraction", "fanout_receipt_fraction", "gap_p50_floor_ms", "gap_p95_floor_ms", "max_gap_ms", "server_peak_mib", "working_set_growth_mib_s"],
+        "rows": [
+      ["10pct_speakers", 4341.107361579802, 0.8682214723159605, 0.3946229116959139, 47, 126, 2104.599, 24904.1875, 153.43219927542697],
+      ["100pct_speakers", 9760.151459779916, 0.19520302919559832, 0.17934056841834964, 102, 418, 32184.189, 24779.6875, 168.89745897238566]
+    ],
+        "full_speaker_window_ms": 98508,
+        "full_speaker_requested_window_ms": 180000,
+        "full_speaker_stopped_early": true
+      }
+    },
+    {
+      "report": "voice-memory-growth.md",
+      "archive_summary": "voice-memory-growth-20261005-summary.json",
+      "revision": "09cf74f6168a02d3a8355dcfbed389fcd530ddb6",
+      "finding": "Unbounded dispatcher-task backlog caused memory growth; the admission probe bounded tasks but saturated ingress.",
+      "limitations": "One run per condition; local Windows loopback; diagnostic causal study.",
+      "key_results": {
+        "columns": ["case", "peak_waiting_tasks", "peak_allocated_tasks", "delta_waiters", "voice_waiters", "peak_working_set_mib", "growth_mib_s", "max_ingress_queue_depth"],
+        "rows": [
+      ["1000_original_dispatch", 565198, 565261, 506072, 59126, 3222.359375, 152.19919983962316, 333],
+      ["1000_bounded_admission_probe", 22, 64, 8, 14, 198.34765625, 1.3323972757578084, 262143]
+    ],
+        "probe_interpretation": "The queue reached its configured capacity; bounded task allocation came with ingress saturation, not equal-work capacity evidence."
+      }
+    },
+    {
+      "report": "voice-isolation.md",
+      "archive_summary": "voice-isolation-20261005-summary.json",
+      "revision": "ac174920481d7cc39366136ef117ff06984f3d09",
+      "finding": "10% candidate passed validation; 100% case failed stale-avatar validation.",
+      "limitations": "Historical frozen builds; not validation of PR head.",
+      "key_results": {
+        "columns": ["case", "sent_packets_s", "send_cadence_fraction", "fanout_receipt_fraction", "gap_p50_floor_ms", "gap_p95_floor_ms", "server_peak_mib"],
+        "rows": [
+      ["main_10pct", 3551.429904673022, 0.7102859809346044, 0.23921036475236382, 59, 429, 2862.52734375],
+      ["candidate_10pct", 4973.527647235276, 0.9947055294470553, 0.9794816956974365, 20, 39, 227.68359375],
+      ["candidate_100pct", 16796.654704634082, 0.33593309409268163, 0.59180780988421, 23, 187, 267.078125]
+    ],
+        "candidate_100pct_failed_validation_checks": ["zero_avatar_stale_peers_500ms"]
+      },
+      "comparison_baseline_revision": "f78dfa48ff4bcca4737da6b496978548fa7aa775"
+    },
+    {
+      "report": "voice-csharp-comparison.md",
+      "archive_summary": "voice-csharp-20261005-summary.json",
+      "finding": "C# cases failed capacity; source cadence differed sharply between all-speaking Rust and C# runs.",
+      "limitations": "Single runs; differing offered rates limit all-speaking comparison.",
+      "key_results": {
+        "columns": ["case", "sent_packets_s", "send_cadence_fraction", "fanout_receipt_fraction", "gap_p95_floor_ms", "server_peak_mib"],
+        "rows": [
+      ["10pct_speakers", 4996.6754986751985, 0.9993350997350396, 0.6232323927770416, 53, 12922.69921875],
+      ["100pct_speakers", 49964.0958407173, 0.9992819168143461, 0.08847388121399458, 1182, 5829.25390625]
+    ],
+        "csharp_exe_sha256": "6bffac6fd3a4bf1e7a0ef3c405b4244444ab9c4e3c1aa83a420e96f97d9dfebe",
+        "csharp_source_revision": "b28f78f1d2885fd21c4e5ad53307fedf3662fba2"
+      },
+      "comparison_revision": "ac174920481d7cc39366136ef117ff06984f3d09"
+    }
+  ],
+  "provenance": {
+    "reliable_capture": "captures/control-reorder-review-20261008/observations.json",
+    "archived_summary_source": "captures/pr31-results-history-cleanup-20261008/results/reliable-receive-20261008.json",
+    "voice_archived_summaries": "captures/pr31-results-history-cleanup-20261008/results/ (five JSON files; four referenced above plus reliable-receive-20261008.json)",
+    "raw_captures": "Raw captures are local and ignored by Git; no raw logs or audio are included."
+  },
+  "peer_snapshot_microbenchmark": {
+    "base_revision": "dc122ac31894a78bde0ec6581c0a1d780deda847",
+    "measured_source_sha256": "5d04352a35843c495d50e5146d5cb758f4aa22001d76d8839409fca4224b788",
+    "command": "cargo test --release -p basis-transport peer_snapshot_microbench -- --ignored --nocapture",
+    "configuration": {
+      "peer_entries": 1000,
+      "passes_per_sample": 5000,
+      "samples_per_strategy_per_case": 6,
+      "profile": "release test profile",
+      "timing_unit": "ns",
+      "order": "ABC/CBA alternating; A=main-like, B=PR31, C=candidate"
+    },
+    "equal_work_assertion": "All strategies visit identical active work on each pass.",
+    "strategies": ["main_like_guard_scan", "pr31_fresh_vec_arc_clone_all", "filtered_reused_vec_candidate"],
+    "cases": {
+      "idle": [
+      [64337635, 62046481, 62085941, 60533851, 62312578, 65010770],
+      [100264598, 100104312, 98840387, 98200568, 100555419, 105465636],
+      [63917818, 65735376, 63198518, 63643270, 64309699, 72013303]
+    ],
+      "active_100": [
+      [62847006, 60885852, 62114157, 62943946, 62771856, 63943869],
+      [102643265, 100545012, 101068754, 102633766, 103070277, 102932269],
+      [66775948, 66962076, 69323421, 69378317, 69371752, 69164951]
+    ],
+      "active_1000": [
+      [62223529, 61744904, 61947166, 61495850, 61626523, 62811456],
+      [103338538, 103592413, 104063913, 103055750, 104627396, 103755912],
+      [109883678, 109023858, 108573240, 108406598, 109137560, 108822854]
+    ]
+    },
+    "sample_columns": "Within each case, one six-value nanosecond array per strategy in strategy order.",
+    "median_ns_rounded_3dp": {
+      "idle": [62199259.5, 100184455.0, 64113758.5],
+      "active_100": [62809431.0, 102638515.5, 69244186.0],
+      "active_1000": [61846035.0, 103674162.5, 108923356.0]
+    },
+    "operations_per_sample_columns": ["arc_clones", "fresh_vec_instances"],
+    "operations_per_sample": {
+      "main_like_guard_scan": {
+        "idle": [0, 0],
+        "active_100": [0, 0],
+        "active_1000": [0, 0]
+      },
+      "pr31_fresh_vec_arc_clone_all": {
+        "idle": [5000000, 5000],
+        "active_100": [5000000, 5000],
+        "active_1000": [5000000, 5000]
+      },
+      "filtered_reused_vec_candidate": {
+        "idle": [0, 0],
+        "active_100": [500000, 0],
+        "active_1000": [5000000, 0]
+      }
+    },
+    "limits": ["Enumeration microbenchmark only: no socket sends, callbacks, per-peer dispatch locks, or whole-server load or application latency.", "One run with six samples per case/strategy; no independent repeat.", "main_like_guard_scan omits callbacks and is not a full main dispatch-path reproduction.", "Fresh Vec counts are instances created, not allocator malloc calls.", "No whole-server speedup claim is supported."]
+  },
+  "voice_test_configuration": {
+    "applies_to": "Dense 1,000-client capacity/dedicated comparisons; memory report includes 250-client diagnostics.",
+    "clients": 1000,
+    "topology": "Windows UDP loopback; clients colocated and within hearing range; P2P disabled.",
+    "host": "Windows 11 build 26100, AMD Ryzen 7 9800X3D, 16 logical processors.",
+    "audio": "40 local music clips (not recorded conversations), encoded as 48 kHz mono Opus, 20 ms frames, 32 kbit/s target.",
+    "avatar_traffic": "All clients sent avatar poses/deltas; CPU-only fixture.",
+    "verification": "Host/workload details checked against report prose and archive configs; manifest hashes match in Rust/C# summaries.",
+    "audio_manifest_sha256": "3ed7a90224e4fc42dcd30dae35ed83d92178f88684a55f64b0fec2eb59b503c4"
+  }
+}
