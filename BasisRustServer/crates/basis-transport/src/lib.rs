@@ -1,5 +1,8 @@
 mod pre_auth;
 
+#[cfg(test)]
+mod bench_branches;
+
 use basis_protocol::{
     channels,
     io::NetWriter,
@@ -140,29 +143,34 @@ pub enum PacketProperty {
 }
 
 impl PacketProperty {
+    /// Lookup table for the 5-bit property field, so per-datagram dispatch is one masked load
+    /// instead of a jump-table indirect branch. Values above `CompactMerged` stay `None`.
+    const FROM_BYTE_TABLE: [Option<Self>; 32] = {
+        let mut table = [None; 32];
+        table[Self::Unreliable as u8 as usize] = Some(Self::Unreliable);
+        table[Self::Channeled as u8 as usize] = Some(Self::Channeled);
+        table[Self::Ack as u8 as usize] = Some(Self::Ack);
+        table[Self::Ping as u8 as usize] = Some(Self::Ping);
+        table[Self::Pong as u8 as usize] = Some(Self::Pong);
+        table[Self::ConnectRequest as u8 as usize] = Some(Self::ConnectRequest);
+        table[Self::ConnectAccept as u8 as usize] = Some(Self::ConnectAccept);
+        table[Self::Disconnect as u8 as usize] = Some(Self::Disconnect);
+        table[Self::UnconnectedMessage as u8 as usize] = Some(Self::UnconnectedMessage);
+        table[Self::MtuCheck as u8 as usize] = Some(Self::MtuCheck);
+        table[Self::MtuOk as u8 as usize] = Some(Self::MtuOk);
+        table[Self::Broadcast as u8 as usize] = Some(Self::Broadcast);
+        table[Self::Merged as u8 as usize] = Some(Self::Merged);
+        table[Self::ShutdownOk as u8 as usize] = Some(Self::ShutdownOk);
+        table[Self::PeerNotFound as u8 as usize] = Some(Self::PeerNotFound);
+        table[Self::InvalidProtocol as u8 as usize] = Some(Self::InvalidProtocol);
+        table[Self::NatMessage as u8 as usize] = Some(Self::NatMessage);
+        table[Self::Empty as u8 as usize] = Some(Self::Empty);
+        table[Self::CompactMerged as u8 as usize] = Some(Self::CompactMerged);
+        table
+    };
+
     pub fn from_byte(value: u8) -> Option<Self> {
-        Some(match value & 0x1f {
-            0 => Self::Unreliable,
-            1 => Self::Channeled,
-            2 => Self::Ack,
-            3 => Self::Ping,
-            4 => Self::Pong,
-            5 => Self::ConnectRequest,
-            6 => Self::ConnectAccept,
-            7 => Self::Disconnect,
-            8 => Self::UnconnectedMessage,
-            9 => Self::MtuCheck,
-            10 => Self::MtuOk,
-            11 => Self::Broadcast,
-            12 => Self::Merged,
-            13 => Self::ShutdownOk,
-            14 => Self::PeerNotFound,
-            15 => Self::InvalidProtocol,
-            16 => Self::NatMessage,
-            17 => Self::Empty,
-            18 => Self::CompactMerged,
-            _ => return None,
-        })
+        Self::FROM_BYTE_TABLE[(value & 0x1f) as usize]
     }
 }
 
@@ -886,15 +894,22 @@ impl TransportHandle {
                 Ok(true)
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                if self.statistics_enabled() {
-                    self.stats
-                        .raw_send_would_block
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(false)
+                self.cold_send_would_block()
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// Socket backpressure is the only common send refusal and it stays rare per datagram;
+    /// the WouldBlock counter keeps the per-datagram send path linear.
+    #[cold]
+    fn cold_send_would_block(&self) -> Result<bool> {
+        if self.statistics_enabled() {
+            self.stats
+                .raw_send_would_block
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(false)
     }
 
     /// These callers discard a refused datagram. Reliable/ACK/MTU callers use
@@ -975,6 +990,15 @@ impl TransportHandle {
             }
         }
         // Once issued, an ID can only return through the explicit cleanup/recycle path.
+        self.allocate_fresh_peer_id(&retired)
+    }
+
+    /// Fresh ID allocation only runs once the recycle queue is exhausted — connection churn,
+    /// not steady state — so the scan and exhaustion check stay out of the accept path. The
+    /// caller's reuse and retire locks stay held for the whole scan, preserving the
+    /// reuse/retire/allocate order.
+    #[cold]
+    fn allocate_fresh_peer_id(&self, retired: &HashSet<PeerId>) -> Result<PeerId> {
         let mut allocated = self.allocated_peer_ids.lock();
         for _ in 0..=u16::MAX {
             let id = self.next_peer_id.fetch_add(1, Ordering::SeqCst);
@@ -1325,17 +1349,11 @@ impl TransportHandle {
     }
 }
 
-/// Record a freshly built reliable packet as in-flight. The built bytes are moved, not cloned:
-/// the merged datagram is assembled from this copy, so cloning here doubled both the
-/// allocation count and the memcpy volume on the reliable path.
-fn record_pending_reliable(
-    state: &PeerState,
-    channel_id: u8,
-    sequence: u16,
-    bytes: Vec<u8>,
-    stats: Option<&TransportStats>,
-) {
-    let mut pending = state.pending_reliable.lock();
+/// The per-peer in-flight cap is only reached under overload or a stalled ACK stream, so the
+/// oldest-packet shedding loop stays out of the per-message reliable path. The caller holds
+/// the pending map lock for the whole shed.
+#[cold]
+fn shed_oldest_pending(state: &PeerState, pending: &mut HashMap<u8, VecDeque<PendingReliable>>) {
     while state.pending_total.load(Ordering::Relaxed) >= MAX_PENDING_RELIABLE_PER_PEER {
         // Shed exactly the single oldest in-flight packet rather than growing without bound.
         // Inspect each queue front first; popping while searching would discard one packet from
@@ -1362,6 +1380,22 @@ fn record_pending_reliable(
             pending.remove(&oldest_channel);
         }
         state.pending_total.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Record a freshly built reliable packet as in-flight. The built bytes are moved, not cloned:
+/// the merged datagram is assembled from this copy, so cloning here doubled both the
+/// allocation count and the memcpy volume on the reliable path.
+fn record_pending_reliable(
+    state: &PeerState,
+    channel_id: u8,
+    sequence: u16,
+    bytes: Vec<u8>,
+    stats: Option<&TransportStats>,
+) {
+    let mut pending = state.pending_reliable.lock();
+    if state.pending_total.load(Ordering::Relaxed) >= MAX_PENDING_RELIABLE_PER_PEER {
+        shed_oldest_pending(state, &mut pending);
     }
     pending
         .entry(channel_id)
@@ -1412,6 +1446,16 @@ fn dequeue_reliable_window(
     (0..count).filter_map(|_| outgoing.pop_front()).collect()
 }
 
+/// Payloads beyond the LiteNetLib fragment limit never occur on a healthy peer, so the drop
+/// log stays out of the reliable enqueue path.
+#[cold]
+fn cold_drop_oversized_reliable(total_fragments: usize) {
+    warn!(
+        "dropping reliable payload requiring {total_fragments} fragments; LiteNetLib limit is {}",
+        u16::MAX
+    );
+}
+
 fn enqueue_reliable_payload(
     state: &PeerState,
     channel: u8,
@@ -1438,10 +1482,7 @@ fn enqueue_reliable_payload(
 
     let total_fragments = payload.len().div_ceil(RELIABLE_FRAGMENT_PAYLOAD_SIZE);
     if total_fragments > u16::MAX as usize {
-        warn!(
-            "dropping reliable payload requiring {total_fragments} fragments; LiteNetLib limit is {}",
-            u16::MAX
-        );
+        cold_drop_oversized_reliable(total_fragments);
         return;
     }
 
@@ -1608,14 +1649,19 @@ async fn read_loop(handle: TransportHandle, tx: mpsc::Sender<ServerEvent>) {
                     warn!("transport packet processing failed: {err}");
                 }
             }
-            Err(err) => {
-                if err.kind() == std::io::ErrorKind::ConnectionReset {
-                    continue;
-                }
-                let _ = tx.send(ServerEvent::NetworkError(err.to_string())).await;
-            }
+            Err(err) => cold_recv_error(&tx, err).await,
         }
     }
+}
+
+/// Socket receive errors are rare next to per-datagram work; ICMP-driven ConnectionReset
+/// storms still skip the network-error event, matching the historical loop behavior.
+#[cold]
+async fn cold_recv_error(tx: &mpsc::Sender<ServerEvent>, err: std::io::Error) {
+    if err.kind() == std::io::ErrorKind::ConnectionReset {
+        return;
+    }
+    let _ = tx.send(ServerEvent::NetworkError(err.to_string())).await;
 }
 
 async fn process_packet(
@@ -1652,7 +1698,7 @@ async fn process_packet(
     };
     let connection_number = (header & 0x60) >> 5;
     let Some(property) = PacketProperty::from_byte(header) else {
-        trace!("unknown packet property: {header}");
+        cold_unknown_property(header);
         return Ok(());
     };
 
@@ -1927,9 +1973,24 @@ async fn process_packet(
                 }
             }
         }
-        _ => debug!("ignored packet property {property:?} from {remote_addr}"),
+        _ => cold_ignored_property(remote_addr, property).await,
     }
     Ok(())
+}
+
+/// Properties without an explicit receive arm — unconnected server-info probes, shutdown
+/// acknowledgements, peer-not-found, broadcast, empty — are rare on a healthy wire, so their
+/// logging stays out of the per-datagram dispatch path.
+#[cold]
+async fn cold_ignored_property(remote_addr: SocketAddr, property: PacketProperty) {
+    debug!("ignored packet property {property:?} from {remote_addr}");
+}
+
+/// Unknown property bytes come from malformed or foreign traffic; the trace stays out of the
+/// per-datagram dispatch path.
+#[cold]
+fn cold_unknown_property(header: u8) {
+    trace!("unknown packet property: {header}");
 }
 
 fn server_info_payload(bytes: &[u8]) -> Option<&[u8]> {
@@ -1989,11 +2050,8 @@ fn reserve_pre_auth_events(
 async fn enqueue_event(tx: &mpsc::Sender<ServerEvent>, event: ServerEvent) -> Result<()> {
     match tx.try_send(event) {
         Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Full(event)) => tx
-            .send(event)
-            .await
-            .map_err(|_| TransportError::EventChannelClosed),
-        Err(mpsc::error::TrySendError::Closed(_)) => Err(TransportError::EventChannelClosed),
+        Err(mpsc::error::TrySendError::Full(event)) => cold_event_queue_full(tx, event).await,
+        Err(mpsc::error::TrySendError::Closed(_)) => cold_event_channel_closed(),
     }
 }
 
@@ -2001,8 +2059,22 @@ async fn enqueue_lossy_event(tx: &mpsc::Sender<ServerEvent>, event: ServerEvent)
     match tx.try_send(event) {
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
-        Err(mpsc::error::TrySendError::Closed(_)) => Err(TransportError::EventChannelClosed),
+        Err(mpsc::error::TrySendError::Closed(_)) => cold_event_channel_closed(),
     }
+}
+
+/// A full event queue only happens while consumers stall; the blocking send stays out of the
+/// fast enqueue path.
+#[cold]
+async fn cold_event_queue_full(tx: &mpsc::Sender<ServerEvent>, event: ServerEvent) -> Result<()> {
+    tx.send(event)
+        .await
+        .map_err(|_| TransportError::EventChannelClosed)
+}
+
+#[cold]
+fn cold_event_channel_closed() -> Result<()> {
+    Err(TransportError::EventChannelClosed)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2098,21 +2170,28 @@ fn parse_message_packet(
     match property {
         PacketProperty::Unreliable => {
             if bytes.len() < 2 {
-                return None;
+                return cold_rejected_packet();
             }
             Some((bytes[1], DeliveryMethod::Unreliable, &bytes[2..]))
         }
         PacketProperty::Channeled => {
             if bytes.len() < 4 {
-                return None;
+                return cold_rejected_packet();
             }
             let channel_id = bytes[3];
             let channel = channel_id / 4;
             let delivery = DeliveryMethod::from_channel_id(channel_id);
             Some((channel, delivery, &bytes[4..]))
         }
-        _ => None,
+        _ => cold_rejected_packet(),
     }
+}
+
+/// Truncated or non-message datagrams are rare on a healthy wire, so the rejection stays out
+/// of the per-message parse path.
+#[cold]
+fn cold_rejected_packet<T>() -> Option<T> {
+    None
 }
 
 struct BuiltPacket {
@@ -2212,7 +2291,7 @@ fn next_sequenced_channel_sequence(
 /// scanning it is cheap -- and it is per channel, unlike the previous whole-peer scan.
 fn process_ack(peer: &PeerState, bytes: &[u8], stats: Option<&TransportStats>) {
     if bytes.len() < LITENETLIB_CHANNELED_HEADER_SIZE {
-        return;
+        return cold_rejected_ack();
     }
     let channel_id = bytes[3];
     let sequenced = channel_id % 4 == DeliveryMethod::ReliableSequenced as u8;
@@ -2222,22 +2301,22 @@ fn process_ack(peer: &PeerState, bytes: &[u8], stats: Option<&TransportStats>) {
         LITENETLIB_CHANNELED_HEADER_SIZE + (DEFAULT_WINDOW_SIZE - 1) / 8 + 2
     };
     if bytes.len() != expected_size {
-        return;
+        return cold_rejected_ack();
     }
     let ack_window_start = u16::from_le_bytes([bytes[1], bytes[2]]);
     if sequenced {
         if ack_window_start >= MAX_SEQUENCE {
-            return;
+            return cold_rejected_ack();
         }
         let mut pending = peer.pending_reliable.lock();
         let Some(queue) = pending.get_mut(&channel_id) else {
-            return;
+            return cold_rejected_ack();
         };
         let Some(ack_index) = queue
             .iter()
             .position(|item| item.sequence == ack_window_start)
         else {
-            return;
+            return cold_rejected_ack();
         };
         for _ in 0..=ack_index {
             queue.pop_front();
@@ -2260,12 +2339,7 @@ fn process_ack(peer: &PeerState, bytes: &[u8], stats: Option<&TransportStats>) {
     let mut pending = peer.pending_reliable.lock();
     let Some(queue) = pending.get_mut(&channel_id) else {
         drop(pending);
-        if let Some(stats) = stats.filter(|stats| stats.extended_enabled.load(Ordering::Relaxed)) {
-            stats.reliable_acks_received.fetch_add(1, Ordering::Relaxed);
-            stats
-                .reliable_acks_unknown_channel
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        cold_ack_unknown_channel(stats);
         return;
     };
     // LiteNetLib `ReliableChannel.ProcessAck` bounds check, reproduced exactly: the ACK's
@@ -2273,7 +2347,7 @@ fn process_ack(peer: &PeerState, bytes: &[u8], stats: Option<&TransportStats>) {
     // own oldest unacknowledged packet. Anything else is a stale or forged ACK and is dropped
     // whole, rather than partially believed.
     if ack_window_start >= MAX_SEQUENCE {
-        return;
+        return cold_rejected_ack();
     }
     let local_window_start = queue.front().map(|item| item.sequence).unwrap_or(0);
     let window_rel = relative_sequence(local_window_start, ack_window_start);
@@ -2309,6 +2383,23 @@ fn process_ack(peer: &PeerState, bytes: &[u8], stats: Option<&TransportStats>) {
     }
     if released > 0 {
         peer.pending_total.fetch_sub(released, Ordering::Relaxed);
+    }
+}
+
+/// Malformed, forged, or stale ACK datagrams are rare next to valid ACK traffic; the
+/// rejection stays out of the per-ACK path.
+#[cold]
+fn cold_rejected_ack() {}
+
+/// An ACK naming a channel with nothing in flight is rare once a connection is steady; the
+/// unknown-channel counters stay out of the per-ACK path.
+#[cold]
+fn cold_ack_unknown_channel(stats: Option<&TransportStats>) {
+    if let Some(stats) = stats.filter(|stats| stats.extended_enabled.load(Ordering::Relaxed)) {
+        stats.reliable_acks_received.fetch_add(1, Ordering::Relaxed);
+        stats
+            .reliable_acks_unknown_channel
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
