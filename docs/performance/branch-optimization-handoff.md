@@ -5,6 +5,18 @@ Continue reviewing and measuring `performance/branch-optimization` in
 requested stopping desktop benchmark runs, pushing the branch, and moving the
 remaining work to their laptop. Do not resume desktop benchmarks.
 
+## Completed laptop follow-up
+
+The native Linux Ryzen 9 5900HX laptop review is recorded in
+[the laptop report](branch-optimization-laptop.md), including all 16 original
+A/B runs and eight decoder-alternative runs. All 1,296 samples had 100% counter
+scheduling coverage and matched workload outcomes within each series. The
+match-restoration candidate `83a96e9` was measured and rejected; the original
+table/cold-extraction production code is retained with corrected comments.
+Report claims and the runner's missing-executable diagnostic were corrected.
+No desktop benchmark was resumed. The instructions below preserve the original
+handoff context and reproducible baseline/candidate references.
+
 ## Source and state
 
 - Production baseline: `1e45b3b8b74c76ec21324724e5de920032189b13`.

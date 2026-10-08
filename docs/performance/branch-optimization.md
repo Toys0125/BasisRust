@@ -8,6 +8,12 @@ branchless compare/conditional move in the inspected probe; the jump-table
 rationale below is incorrect for Rust 1.99.0. The timing/layout interpretation
 below is unproven, and subsequent counter/timing results are mixed.
 
+The [completed laptop review](branch-optimization-laptop.md) retains both the
+four-block original comparison and a two-block decoder-only alternative. The
+match-restoration candidate was rejected after it failed to improve local
+decoder timing and worsened parse timing. The original production code is
+retained with corrected comments; no general application speedup is established.
+
 Branch: `performance/branch-optimization`, cut from `fix/dedicated-voice-processing` at
 `1e45b3b`. Benchmark harness and checks are in
 `BasisRustServer/crates/basis-transport/src/bench_branches.rs` and
@@ -17,11 +23,11 @@ Branch: `performance/branch-optimization`, cut from `fix/dedicated-voice-process
 
 The transport hot paths — per-datagram property dispatch, message parsing, outbound packet
 building, datagram merging, and ACK window processing — carried their rarely-taken error
-handling inline. Inline error handling bloats the per-datagram code path, hurts instruction
-cache locality, and gives the compiler no weight information for branch placement. Each
-rarely-taken rejection is now extracted into a `#[cold]` helper so the hot path stays inline
-and linear, and the per-datagram property dispatch is a constant lookup table instead of a
-jump-table switch.
+handling inline. The candidate extracts error handling into `#[cold]` helpers and replaces property decoding
+with a lookup table. These are optimization hypotheses: source extraction alone does not
+establish smaller optimized callers or better instruction-cache locality. Empty helpers
+can disappear during optimization. The Rust 1.99.0 decoder probe compiles the original
+match to a compare and conditional move, without an indirect jump.
 
 ## What changed
 
@@ -29,8 +35,9 @@ All changes are in `BasisRustServer/crates/basis-transport/src/lib.rs`. Behavior
 identical; there are no public API changes.
 
 - `PacketProperty::from_byte`: a 32-entry `const` lookup table (`FROM_BYTE_TABLE`) replaces
-  the 19-arm match, so every received datagram's property decode is one masked load instead
-  of a bounds check plus indirect jump.
+  the 19-arm match in candidate `3606a9b`. The isolated optimized probe uses a table load;
+  the original match uses a compare and conditional move. This is not disassembly of every
+  production call site.
 - `process_ack`: malformed-length, forged/stale-window, and wrong-channel rejections now
   return through `#[cold]` `cold_rejected_ack`/`cold_ack_unknown_channel` helpers; the
   unknown-channel counter block (two atomic RMW ops) leaves the per-ACK path.
@@ -62,7 +69,8 @@ runs are comparable:
 
 - `from_byte` property dispatch: 2,000,000 ops/pass, 1% invalid properties
 - `parse_message_packet`: 1,000,000 ops/pass, 1% truncated packets
-- `build_outbound_packet`: 100,000 ops/pass across all four delivery methods
+- `build_outbound_packet`: 100,000 ops/pass across Unreliable, Sequenced, ReliableOrdered
+  and ReliableSequenced; ReliableUnordered is omitted
 - `build_merged_datagrams`: 2,000 batches of 32 packets/pass
 - `process_ack`: 200,000 ops/pass at steady state (each ACK releases 16 in-flight sequences
   and the window is refilled behind them), 1% malformed ACKs
@@ -94,55 +102,61 @@ median across the 3 runs per build.
 Reading of the table:
 
 - `build_merged_datagrams` is the only phase whose baseline and optimized ranges do not
-  overlap. That function was not modified by this branch; the delta is a code-layout effect
-  of the extractions (function placement and instruction cache), which is exactly the class
-  of effect `#[cold]` targets. A 3-run sample on a desktop machine does not pin the
-  mechanism down, and the phase also includes its input-batch construction, so treat it as
-  indicative rather than proven.
-- `from_byte` is loop-overhead-dominated at sub-nanosecond scale; the table-versus-match
-  difference is not resolvable by this harness.
-- Every other phase is flat within run-to-run noise. No phase regressed beyond noise.
+  overlap. That function was not modified by this branch. The variants ran in separate
+  blocks, and these timings do not establish an instruction-cache or code-layout mechanism.
+  The phase also includes input-batch construction. Treat the delta as an observation
+  from this small synthetic experiment.
+- These three-run timings do not establish statistical significance or absence of a
+  regression. The subsequent balanced WSL study found the decoder slower in every block
+  with more misses/op; the remaining phase results were mixed.
 
-## Hardware branch-miss counters: not measured
+## Follow-up hardware counters
 
-Branch-miss counts need hardware performance counters, which were unavailable in this
-environment:
+The later WSL study used direct `perf_event_open`, without needing the `perf` executable.
+Eight processes per variant ran sequentially in four ABBA/BAAB blocks, pinned to CPU 2,
+with nine measured passes per phase after one warmup. All 864 counter samples had 100%
+scheduling coverage and matched workload outcomes. Full per-run timings, samples, totals,
+hashes and assembly probes are retained in
+[the desktop evidence](results/branch-review-20261007-summary.json).
 
-- WSL2 is present (kernel 6.18.40.1-microsoft-standard-WSL2) but has no `perf` binary and no
-  passwordless sudo to install one.
-- `xperf` is installed (`Windows Performance Toolkit` 10.0.26100) and supports hardware
-  counter sampling (`-PmcProfile`), but starting a kernel trace requires an elevated shell.
-  The UAC approval for the elevated trace was canceled twice, so the counters were not
-  sampled.
+The decoder had 36.3% more misses/op and median timing increased from 0.580 to 0.660 ns/op.
+ACK/refill misses/op fell 47.6%, while median timing increased 2.1%. These mixed observations
+do not establish a general speedup. Do not combine rates across phases with different
+units: merge operations are 32-packet batches, while other phases use their own operations.
 
-To rerun with hardware counters on a host that provides them:
+The later approved Windows xperf trace contained zero PMC sample rows. Successful trace
+startup and ETL existence do not establish a counter measurement. The earlier unvalidated
+`BranchMispredicts` commands have been removed. Windows measurements need supported
+sources, actual nonzero events and matched traces, with sampled interrupts distinguished
+from exact event totals.
+
+Use the frozen runner on Linux x86-64 for per-thread user-mode counters:
 
 ```sh
-# Linux (native or a container with perf):
-perf stat -e branches,branch-misses \
-    cargo test --release -p basis-transport -- --ignored bench_branches --nocapture
+RUSTUP_TOOLCHAIN=1.99.0 python3 scripts/perf/review-branches.py \
+  --output captures/laptop-branches --baseline 1e45b3b --candidate 3606a9b \
+  --blocks 4 --cpu 2 --pmc
 ```
 
-```bat
-rem Windows, from an elevated shell; candidate counter names in first-to-last order:
-xperf -on PROC_THREAD+LOADER -PmcProfile BranchMispredicts -SetProfInt 10000
-target\release\deps\basis_transport-*.exe --ignored bench_branches --nocapture
-xperf -d branchmiss.etl
-xperf -i branchmiss.etl -o pmc-summary.csv -a profile -detail
-```
+The runner rejects existing output directories, mismatched workload outcomes, missing
+counters and scheduling coverage below 99.9%. Choose a CPU available on the host. Windows
+mode provides timings only. See [the handoff](branch-optimization-handoff.md) for setup.
 
-The capture script that automates the elevated Windows path is
-`captures/branchmiss/run-pmc-trace.bat`; it tries `BranchMispredicts,BranchInstructions`,
-`BranchMispredicts`, `BranchInstructions`, then `TotalIssues`, and logs which source started.
+## Measurement limits
 
-## What was not measured
+The traffic mix and malformed rates are synthetic, not captured production distributions.
+Workload outcome counts are not hardware branch counts; the parse payload total is a
+checksum. Warmup and fixture construction are excluded; timed allocation/refill and small
+clock/control overhead are included. Counters exclude kernel/hypervisor execution.
 
-- Hardware branch-miss and branch-count deltas (see above).
-- Profile-guided optimization (PGO): instrumented-build + representative-workload + rebuild
-  was out of scope for this branch; `#[cold]` extraction is the static-layout half of what
-  PGO's profile data drives.
-- End-to-end multi-client server throughput: the bench isolates the synchronous hot-path
-  helpers; socket I/O, tokio scheduling, and application-level work are out of its scope.
+The harness does not exercise socket backpressure, event enqueue, receive dispatch,
+shedding or ID allocation. `allocate_peer_id` first tries reusable IDs, then calls
+`allocate_fresh_peer_id` when none is available, including during initial connections
+and churn. Cold extractions have not been isolated for
+attributing ACK changes to a helper. Representative runtime checks, application latency,
+throughput and coverage would be needed for an application-level win claim. PGO and
+end-to-end multi-client throughput remain unmeasured. Desktop findings do not establish
+laptop or Windows release performance.
 
 ## Checks
 

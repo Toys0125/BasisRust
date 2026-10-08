@@ -101,9 +101,11 @@ def main():
             command(["cargo", "test", "--locked", "--release", "-p", "basis-transport", "--lib", "--no-run", "--message-format=json"],
                     cwd=workspace, env=environment, stdout=log, stderr=subprocess.STDOUT)
         artifacts = [json.loads(line) for line in (variant_dir / "build.log").read_text().splitlines() if line.startswith("{")]
-        executable = next(item["executable"] for item in artifacts
+        executable = next((item["executable"] for item in artifacts
                           if item.get("reason") == "compiler-artifact" and item.get("executable")
-                          and item.get("target", {}).get("name") == "basis_transport")
+                          and item.get("target", {}).get("name") == "basis_transport"), None)
+        if executable is None:
+            raise RuntimeError(f"basis_transport test executable missing: {variant_dir / 'build.log'}")
         binary = variant_dir / ("bench.exe" if os.name == "nt" else "bench")
         shutil.copy2(executable, binary)
         binaries[variant] = binary

@@ -190,7 +190,7 @@ fn parse_message_phase() {
     println!("    workload outcomes (including warmup): payload_checksum={parsed_ok} rejected={parsed_none}");
 }
 
-/// Outbound packet building across every delivery method the send path serves.
+/// Outbound packet building across four delivery methods; ReliableUnordered is omitted.
 fn build_outbound_phase() {
     println!("phase: build_outbound_packet ({OUTBOUND_OPS} ops/pass)");
     let state = test_peer_state();

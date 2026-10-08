@@ -1,0 +1,4833 @@
+{
+  "manifest": {
+    "revisions": {
+      "baseline": "3606a9b8ab7c67d77faf1c8aa7c6505d478b3899",
+      "candidate": "83a96e985f5502b34f69a4219fc4d91b1fc6f080"
+    },
+    "benchmark_sha256": {
+      "bench_branches.rs": "b204c7b982cf32d150d58549fd7f48c644a5c01387b762454f2c2453199697d1",
+      "bench_pmc.rs": "1d8f90832edb6910a5fed338d18c3ebeacf227489d0aef187bd2990a757cb1da"
+    },
+    "cpu": 2,
+    "pmc": true,
+    "blocks": 2,
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0\nLLVM version: 23.1.1\n",
+    "kernel": "Linux mgstange-Legion-7-16ACHg6 7.0.0-31-generic #31~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Mon Aug 10 09:38:02 UTC 2 x86_64 x86_64 x86_64 GNU/Linux\n",
+    "inherited_build_environment": {
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_BUILD_JOBS": "2"
+    },
+    "binary_sha256": {
+      "baseline": "1434cb24d410c89def415db109c21737d8703964eb2f1bca42e1a1ecdeb22829",
+      "candidate": "0a72ed9625591699b84eeb86824a8a298d749197af1f78686e3b28215edf7adb"
+    }
+  },
+  "summary": {
+    "from_byte": {
+      "baseline": {
+        "median_ns_per_op": 1.255,
+        "range_ns_per_op": [
+          1.25,
+          1.26
+        ],
+        "ops": 72000000,
+        "branches": 144718939,
+        "misses": 749421,
+        "enabled_ns": 90685378,
+        "running_ns": 90685378,
+        "branches_per_op": 2.009985263888889,
+        "misses_per_op": 0.010408625,
+        "miss_rate_percent": 0.5178458363352153
+      },
+      "candidate": {
+        "median_ns_per_op": 1.26,
+        "range_ns_per_op": [
+          1.26,
+          1.27
+        ],
+        "ops": 72000000,
+        "branches": 215285202,
+        "misses": 784980,
+        "enabled_ns": 91073841,
+        "running_ns": 91073841,
+        "branches_per_op": 2.99007225,
+        "misses_per_op": 0.0109025,
+        "miss_rate_percent": 0.36462329630998047
+      },
+      "timing_change_percent": 0.3984063745019917,
+      "block_timing_change_percent": [
+        0.7968127490040056,
+        0.3984063745019917
+      ]
+    },
+    "parse_message_packet": {
+      "baseline": {
+        "median_ns_per_op": 2.93,
+        "range_ns_per_op": [
+          2.89,
+          3.03
+        ],
+        "ops": 36000000,
+        "branches": 72002085,
+        "misses": 377362,
+        "enabled_ns": 107245494,
+        "running_ns": 107245494,
+        "branches_per_op": 2.0000579166666665,
+        "misses_per_op": 0.010482277777777778,
+        "miss_rate_percent": 0.5240987118636912
+      },
+      "candidate": {
+        "median_ns_per_op": 3.065,
+        "range_ns_per_op": [
+          3.05,
+          3.1
+        ],
+        "ops": 36000000,
+        "branches": 72002090,
+        "misses": 383391,
+        "enabled_ns": 111455327,
+        "running_ns": 111455327,
+        "branches_per_op": 2.0000580555555554,
+        "misses_per_op": 0.01064975,
+        "miss_rate_percent": 0.5324720435198478
+      },
+      "timing_change_percent": 4.607508532423199,
+      "block_timing_change_percent": [
+        3.3444816053511683,
+        5.172413793103425
+      ]
+    },
+    "build_outbound_packet": {
+      "baseline": {
+        "median_ns_per_op": 38.15,
+        "range_ns_per_op": [
+          37.7,
+          39.3
+        ],
+        "ops": 3600000,
+        "branches": 303302155,
+        "misses": 3506,
+        "enabled_ns": 138453129,
+        "running_ns": 138453129,
+        "branches_per_op": 84.25059861111112,
+        "misses_per_op": 0.0009738888888888889,
+        "miss_rate_percent": 0.0011559429902501023
+      },
+      "candidate": {
+        "median_ns_per_op": 39.135000000000005,
+        "range_ns_per_op": [
+          37.84,
+          40.48
+        ],
+        "ops": 3600000,
+        "branches": 303302155,
+        "misses": 1718,
+        "enabled_ns": 140952973,
+        "running_ns": 140952973,
+        "branches_per_op": 84.25059861111112,
+        "misses_per_op": 0.0004772222222222222,
+        "miss_rate_percent": 0.0005664318474756634
+      },
+      "timing_change_percent": 2.5819134993447124,
+      "block_timing_change_percent": [
+        3.480519480519484,
+        0.7994757536041952
+      ]
+    },
+    "build_merged_datagrams": {
+      "baseline": {
+        "median_ns_per_op": 1511.165,
+        "range_ns_per_op": [
+          1440.63,
+          1652.04
+        ],
+        "ops": 72000,
+        "branches": 371951734,
+        "misses": 1132994,
+        "enabled_ns": 110463974,
+        "running_ns": 110463974,
+        "branches_per_op": 5165.996305555555,
+        "misses_per_op": 15.736027777777778,
+        "miss_rate_percent": 0.30460780161331363
+      },
+      "candidate": {
+        "median_ns_per_op": 1507.325,
+        "range_ns_per_op": [
+          1433.57,
+          1531.17
+        ],
+        "ops": 72000,
+        "branches": 371951732,
+        "misses": 1099177,
+        "enabled_ns": 108409712,
+        "running_ns": 108409712,
+        "branches_per_op": 5165.996277777778,
+        "misses_per_op": 15.266347222222223,
+        "miss_rate_percent": 0.2955160321716152
+      },
+      "timing_change_percent": -0.25410858509824497,
+      "block_timing_change_percent": [
+        -5.409476132654678,
+        1.3326839176347471
+      ]
+    },
+    "process_ack": {
+      "baseline": {
+        "median_ns_per_op": 22373.35,
+        "range_ns_per_op": [
+          22341.55,
+          22421.2
+        ],
+        "ops": 7200000,
+        "branches": 17626282857,
+        "misses": 477761843,
+        "enabled_ns": 161061148814,
+        "running_ns": 161061148814,
+        "branches_per_op": 2448.09484125,
+        "misses_per_op": 66.35581152777777,
+        "miss_rate_percent": 2.7105082045717
+      },
+      "candidate": {
+        "median_ns_per_op": 22466.575,
+        "range_ns_per_op": [
+          22412.28,
+          22512.57
+        ],
+        "ops": 7200000,
+        "branches": 17626283236,
+        "misses": 475773200,
+        "enabled_ns": 161700575221,
+        "running_ns": 161700575221,
+        "branches_per_op": 2448.0948938888887,
+        "misses_per_op": 66.0796111111111,
+        "miss_rate_percent": 2.699225886874884
+      },
+      "timing_change_percent": 0.41667877184239366,
+      "block_timing_change_percent": [
+        0.3198194927702236,
+        0.45900591552001657
+      ]
+    },
+    "process_ack_noop": {
+      "baseline": {
+        "median_ns_per_op": 259.18,
+        "range_ns_per_op": [
+          258.45,
+          259.7
+        ],
+        "ops": 7200000,
+        "branches": 4353051884,
+        "misses": 7206212,
+        "enabled_ns": 1866726290,
+        "running_ns": 1866726290,
+        "branches_per_op": 604.5905394444444,
+        "misses_per_op": 1.0008627777777779,
+        "miss_rate_percent": 0.16554390326674084
+      },
+      "candidate": {
+        "median_ns_per_op": 261.595,
+        "range_ns_per_op": [
+          260.15,
+          273.43
+        ],
+        "ops": 7200000,
+        "branches": 4353051953,
+        "misses": 7206526,
+        "enabled_ns": 1905168659,
+        "running_ns": 1905168659,
+        "branches_per_op": 604.5905490277778,
+        "misses_per_op": 1.000906388888889,
+        "miss_rate_percent": 0.16555111397265695
+      },
+      "timing_change_percent": 0.9317848599428968,
+      "block_timing_change_percent": [
+        0.4168677024027678,
+        3.4917817732849743
+      ]
+    }
+  },
+  "runs": [
+    {
+      "run": 1,
+      "block": 1,
+      "variant": "baseline",
+      "start_unix": 1791434432.8389194,
+      "duration_s": 45.668049335479736,
+      "timing_ns_per_op": {
+        "from_byte": 1.25,
+        "parse_message_packet": 2.95,
+        "build_outbound_packet": 37.7,
+        "build_merged_datagrams": 1568.05,
+        "process_ack": 22421.2,
+        "process_ack_noop": 259.7
+      },
+      "samples": [
+        {
+          "phase": "from_byte",
+          "pass": 0,
+          "ns": 2483572,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 21666,
+          "enabled_ns": 2499014,
+          "running_ns": 2499014
+        },
+        {
+          "phase": "from_byte",
+          "pass": 1,
+          "ns": 2476098,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 20812,
+          "enabled_ns": 2484665,
+          "running_ns": 2484665
+        },
+        {
+          "phase": "from_byte",
+          "pass": 2,
+          "ns": 2499076,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 20507,
+          "enabled_ns": 2507386,
+          "running_ns": 2507386
+        },
+        {
+          "phase": "from_byte",
+          "pass": 3,
+          "ns": 2498518,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 20710,
+          "enabled_ns": 2505827,
+          "running_ns": 2505827
+        },
+        {
+          "phase": "from_byte",
+          "pass": 4,
+          "ns": 2527013,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 20650,
+          "enabled_ns": 2534970,
+          "running_ns": 2534970
+        },
+        {
+          "phase": "from_byte",
+          "pass": 5,
+          "ns": 2504873,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 20586,
+          "enabled_ns": 2511838,
+          "running_ns": 2511838
+        },
+        {
+          "phase": "from_byte",
+          "pass": 6,
+          "ns": 2518771,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 20771,
+          "enabled_ns": 2526333,
+          "running_ns": 2526333
+        },
+        {
+          "phase": "from_byte",
+          "pass": 7,
+          "ns": 2531343,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 20551,
+          "enabled_ns": 2527919,
+          "running_ns": 2527919
+        },
+        {
+          "phase": "from_byte",
+          "pass": 8,
+          "ns": 2526664,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 20500,
+          "enabled_ns": 2534378,
+          "running_ns": 2534378
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 0,
+          "ns": 3016324,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10676,
+          "enabled_ns": 3037720,
+          "running_ns": 3037720
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 1,
+          "ns": 3019746,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10509,
+          "enabled_ns": 3031751,
+          "running_ns": 3031751
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 2,
+          "ns": 3134147,
+          "ops": 1000000,
+          "branches": 2000059,
+          "misses": 10474,
+          "enabled_ns": 3105890,
+          "running_ns": 3105890
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 3,
+          "ns": 2946133,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10460,
+          "enabled_ns": 2956548,
+          "running_ns": 2956548
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 4,
+          "ns": 3033086,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10400,
+          "enabled_ns": 3043601,
+          "running_ns": 3043601
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 5,
+          "ns": 2942152,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10391,
+          "enabled_ns": 2951882,
+          "running_ns": 2951882
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 6,
+          "ns": 2920291,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10448,
+          "enabled_ns": 2930437,
+          "running_ns": 2930437
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 7,
+          "ns": 2882298,
+          "ops": 1000000,
+          "branches": 2000057,
+          "misses": 10456,
+          "enabled_ns": 2892198,
+          "running_ns": 2892198
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 8,
+          "ns": 2880342,
+          "ops": 1000000,
+          "branches": 2000057,
+          "misses": 10427,
+          "enabled_ns": 2890291,
+          "running_ns": 2890291
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 0,
+          "ns": 3741490,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 61,
+          "enabled_ns": 3756765,
+          "running_ns": 3756765
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 1,
+          "ns": 3738348,
+          "ops": 100000,
+          "branches": 8425059,
+          "misses": 29,
+          "enabled_ns": 3744050,
+          "running_ns": 3744050
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 2,
+          "ns": 3797224,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 35,
+          "enabled_ns": 3805225,
+          "running_ns": 3805225
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 3,
+          "ns": 3746519,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 27,
+          "enabled_ns": 3753691,
+          "running_ns": 3753691
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 4,
+          "ns": 3770055,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 32,
+          "enabled_ns": 3776859,
+          "running_ns": 3776859
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 5,
+          "ns": 3766633,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 37,
+          "enabled_ns": 3773486,
+          "running_ns": 3773486
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 6,
+          "ns": 3790310,
+          "ops": 100000,
+          "branches": 8425059,
+          "misses": 26,
+          "enabled_ns": 3797672,
+          "running_ns": 3797672
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 7,
+          "ns": 3832634,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 34,
+          "enabled_ns": 3838969,
+          "running_ns": 3838969
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 8,
+          "ns": 3778995,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 33,
+          "enabled_ns": 3786340,
+          "running_ns": 3786340
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 0,
+          "ns": 3159500,
+          "ops": 2000,
+          "branches": 10334741,
+          "misses": 37642,
+          "enabled_ns": 3171655,
+          "running_ns": 3171655
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 1,
+          "ns": 3136102,
+          "ops": 2000,
+          "branches": 10331650,
+          "misses": 32408,
+          "enabled_ns": 3144144,
+          "running_ns": 3144144
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 2,
+          "ns": 3101251,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 31561,
+          "enabled_ns": 3108109,
+          "running_ns": 3108109
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 3,
+          "ns": 3087912,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30646,
+          "enabled_ns": 3095190,
+          "running_ns": 3095190
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 4,
+          "ns": 3082673,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30839,
+          "enabled_ns": 3089412,
+          "running_ns": 3089412
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 5,
+          "ns": 3132750,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30739,
+          "enabled_ns": 3138941,
+          "running_ns": 3138941
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 6,
+          "ns": 3142179,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30439,
+          "enabled_ns": 3150805,
+          "running_ns": 3150805
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 7,
+          "ns": 3159848,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30667,
+          "enabled_ns": 3165875,
+          "running_ns": 3165875
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 8,
+          "ns": 3141410,
+          "ops": 2000,
+          "branches": 10331650,
+          "misses": 30594,
+          "enabled_ns": 3149334,
+          "running_ns": 3149334
+        },
+        {
+          "phase": "process_ack",
+          "pass": 0,
+          "ns": 4484239886,
+          "ops": 200000,
+          "branches": 489618948,
+          "misses": 13271237,
+          "enabled_ns": 4483893944,
+          "running_ns": 4483893944
+        },
+        {
+          "phase": "process_ack",
+          "pass": 1,
+          "ns": 4511769676,
+          "ops": 200000,
+          "branches": 489618965,
+          "misses": 13272355,
+          "enabled_ns": 4511238452,
+          "running_ns": 4511238452
+        },
+        {
+          "phase": "process_ack",
+          "pass": 2,
+          "ns": 4488136220,
+          "ops": 200000,
+          "branches": 489618961,
+          "misses": 13271275,
+          "enabled_ns": 4487443925,
+          "running_ns": 4487443925
+        },
+        {
+          "phase": "process_ack",
+          "pass": 3,
+          "ns": 4488152146,
+          "ops": 200000,
+          "branches": 489619010,
+          "misses": 13271239,
+          "enabled_ns": 4487681640,
+          "running_ns": 4487681640
+        },
+        {
+          "phase": "process_ack",
+          "pass": 4,
+          "ns": 4482632418,
+          "ops": 200000,
+          "branches": 489619035,
+          "misses": 13271233,
+          "enabled_ns": 4482294644,
+          "running_ns": 4482294644
+        },
+        {
+          "phase": "process_ack",
+          "pass": 5,
+          "ns": 4470974441,
+          "ops": 200000,
+          "branches": 489619007,
+          "misses": 13271248,
+          "enabled_ns": 4470627048,
+          "running_ns": 4470627048
+        },
+        {
+          "phase": "process_ack",
+          "pass": 6,
+          "ns": 4479320528,
+          "ops": 200000,
+          "branches": 489619000,
+          "misses": 13271592,
+          "enabled_ns": 4478946073,
+          "running_ns": 4478946073
+        },
+        {
+          "phase": "process_ack",
+          "pass": 7,
+          "ns": 4472134028,
+          "ops": 200000,
+          "branches": 489619013,
+          "misses": 13271120,
+          "enabled_ns": 4471854937,
+          "running_ns": 4471854937
+        },
+        {
+          "phase": "process_ack",
+          "pass": 8,
+          "ns": 4492923603,
+          "ops": 200000,
+          "branches": 489618953,
+          "misses": 13271469,
+          "enabled_ns": 4492615313,
+          "running_ns": 4492615313
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 0,
+          "ns": 52222047,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200182,
+          "enabled_ns": 52234992,
+          "running_ns": 52234992
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 1,
+          "ns": 52468099,
+          "ops": 200000,
+          "branches": 120918109,
+          "misses": 200176,
+          "enabled_ns": 52476860,
+          "running_ns": 52476860
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 2,
+          "ns": 51570353,
+          "ops": 200000,
+          "branches": 120918107,
+          "misses": 200165,
+          "enabled_ns": 51577442,
+          "running_ns": 51577442
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 3,
+          "ns": 51959232,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200166,
+          "enabled_ns": 51959343,
+          "running_ns": 51959343
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 4,
+          "ns": 51744329,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200172,
+          "enabled_ns": 51751059,
+          "running_ns": 51751059
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 5,
+          "ns": 51940235,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200167,
+          "enabled_ns": 51947482,
+          "running_ns": 51947482
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 6,
+          "ns": 51888901,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200171,
+          "enabled_ns": 51889126,
+          "running_ns": 51889126
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 7,
+          "ns": 51585160,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200171,
+          "enabled_ns": 51586046,
+          "running_ns": 51586046
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 8,
+          "ns": 52122033,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200160,
+          "enabled_ns": 52129248,
+          "running_ns": 52129248
+        }
+      ],
+      "workload_outcomes": [
+        "    workload outcomes (including warmup): valid=19800870 invalid=199130",
+        "    workload outcomes (including warmup): payload_checksum=341526400 rejected=100930",
+        "    built bytes total: 515500000",
+        "    datagrams merged total: 72850",
+        "    workload outcomes (including warmup): released_total=31680000 malformed=20000",
+        "    workload outcomes (including warmup): malformed=20000"
+      ]
+    },
+    {
+      "run": 2,
+      "block": 1,
+      "variant": "candidate",
+      "start_unix": 1791434478.5074618,
+      "duration_s": 45.76860189437866,
+      "timing_ns_per_op": {
+        "from_byte": 1.27,
+        "parse_message_packet": 3.08,
+        "build_outbound_packet": 39.2,
+        "build_merged_datagrams": 1531.17,
+        "process_ack": 22493.63,
+        "process_ack_noop": 260.15
+      },
+      "samples": [
+        {
+          "phase": "from_byte",
+          "pass": 0,
+          "ns": 2530505,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 21801,
+          "enabled_ns": 2545681,
+          "running_ns": 2545681
+        },
+        {
+          "phase": "from_byte",
+          "pass": 1,
+          "ns": 2511299,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 22229,
+          "enabled_ns": 2519462,
+          "running_ns": 2519462
+        },
+        {
+          "phase": "from_byte",
+          "pass": 2,
+          "ns": 2536791,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 21704,
+          "enabled_ns": 2544097,
+          "running_ns": 2544097
+        },
+        {
+          "phase": "from_byte",
+          "pass": 3,
+          "ns": 2536511,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21848,
+          "enabled_ns": 2544178,
+          "running_ns": 2544178
+        },
+        {
+          "phase": "from_byte",
+          "pass": 4,
+          "ns": 2553413,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 21706,
+          "enabled_ns": 2560729,
+          "running_ns": 2560729
+        },
+        {
+          "phase": "from_byte",
+          "pass": 5,
+          "ns": 2519330,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21596,
+          "enabled_ns": 2528258,
+          "running_ns": 2528258
+        },
+        {
+          "phase": "from_byte",
+          "pass": 6,
+          "ns": 2551806,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 21682,
+          "enabled_ns": 2559816,
+          "running_ns": 2559816
+        },
+        {
+          "phase": "from_byte",
+          "pass": 7,
+          "ns": 2485527,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 21537,
+          "enabled_ns": 2492893,
+          "running_ns": 2492893
+        },
+        {
+          "phase": "from_byte",
+          "pass": 8,
+          "ns": 2472746,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21785,
+          "enabled_ns": 2479986,
+          "running_ns": 2479986
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 0,
+          "ns": 3127931,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10823,
+          "enabled_ns": 3146393,
+          "running_ns": 3146393
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 1,
+          "ns": 3106071,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10654,
+          "enabled_ns": 3116251,
+          "running_ns": 3116251
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 2,
+          "ns": 3248547,
+          "ops": 1000000,
+          "branches": 2000059,
+          "misses": 10684,
+          "enabled_ns": 3233945,
+          "running_ns": 3233945
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 3,
+          "ns": 3082464,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10685,
+          "enabled_ns": 3091776,
+          "running_ns": 3091776
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 4,
+          "ns": 3078413,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10756,
+          "enabled_ns": 3088126,
+          "running_ns": 3088126
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 5,
+          "ns": 3159919,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10684,
+          "enabled_ns": 3169351,
+          "running_ns": 3169351
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 6,
+          "ns": 3064165,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10728,
+          "enabled_ns": 3073041,
+          "running_ns": 3073041
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 7,
+          "ns": 3061302,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10686,
+          "enabled_ns": 3070583,
+          "running_ns": 3070583
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 8,
+          "ns": 3074851,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10695,
+          "enabled_ns": 3084779,
+          "running_ns": 3084779
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 0,
+          "ns": 3886481,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 80,
+          "enabled_ns": 3891167,
+          "running_ns": 3891167
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 1,
+          "ns": 3885505,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 59,
+          "enabled_ns": 3892440,
+          "running_ns": 3892440
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 2,
+          "ns": 3920216,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 55,
+          "enabled_ns": 3927348,
+          "running_ns": 3927348
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 3,
+          "ns": 3943124,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 51,
+          "enabled_ns": 3949842,
+          "running_ns": 3949842
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 4,
+          "ns": 3936838,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 54,
+          "enabled_ns": 3943536,
+          "running_ns": 3943536
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 5,
+          "ns": 3920844,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 48,
+          "enabled_ns": 3928178,
+          "running_ns": 3928178
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 6,
+          "ns": 3930552,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 57,
+          "enabled_ns": 3937616,
+          "running_ns": 3937616
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 7,
+          "ns": 3913371,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 81,
+          "enabled_ns": 3920516,
+          "running_ns": 3920516
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 8,
+          "ns": 3911625,
+          "ops": 100000,
+          "branches": 8425059,
+          "misses": 89,
+          "enabled_ns": 3919040,
+          "running_ns": 3919040
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 0,
+          "ns": 3096014,
+          "ops": 2000,
+          "branches": 10334741,
+          "misses": 37643,
+          "enabled_ns": 3108835,
+          "running_ns": 3108835
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 1,
+          "ns": 3071918,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 31084,
+          "enabled_ns": 3079893,
+          "running_ns": 3079893
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 2,
+          "ns": 3055086,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 29198,
+          "enabled_ns": 3062970,
+          "running_ns": 3062970
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 3,
+          "ns": 3052083,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 29313,
+          "enabled_ns": 3059222,
+          "running_ns": 3059222
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 4,
+          "ns": 3063956,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 29190,
+          "enabled_ns": 3070816,
+          "running_ns": 3070816
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 5,
+          "ns": 3062350,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 29138,
+          "enabled_ns": 3069563,
+          "running_ns": 3069563
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 6,
+          "ns": 3054807,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 28894,
+          "enabled_ns": 3063099,
+          "running_ns": 3063099
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 7,
+          "ns": 3057810,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 28687,
+          "enabled_ns": 3065344,
+          "running_ns": 3065344
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 8,
+          "ns": 3079740,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 29454,
+          "enabled_ns": 3078630,
+          "running_ns": 3078630
+        },
+        {
+          "phase": "process_ack",
+          "pass": 0,
+          "ns": 4498725568,
+          "ops": 200000,
+          "branches": 489618931,
+          "misses": 13270608,
+          "enabled_ns": 4498408851,
+          "running_ns": 4498408851
+        },
+        {
+          "phase": "process_ack",
+          "pass": 1,
+          "ns": 4494936099,
+          "ops": 200000,
+          "branches": 489619056,
+          "misses": 13271373,
+          "enabled_ns": 4494073303,
+          "running_ns": 4494073303
+        },
+        {
+          "phase": "process_ack",
+          "pass": 2,
+          "ns": 4494405653,
+          "ops": 200000,
+          "branches": 489619024,
+          "misses": 13271190,
+          "enabled_ns": 4493938897,
+          "running_ns": 4493938897
+        },
+        {
+          "phase": "process_ack",
+          "pass": 3,
+          "ns": 4499479586,
+          "ops": 200000,
+          "branches": 489618958,
+          "misses": 13271230,
+          "enabled_ns": 4499119619,
+          "running_ns": 4499119619
+        },
+        {
+          "phase": "process_ack",
+          "pass": 4,
+          "ns": 4491284780,
+          "ops": 200000,
+          "branches": 489618983,
+          "misses": 13270885,
+          "enabled_ns": 4491005999,
+          "running_ns": 4491005999
+        },
+        {
+          "phase": "process_ack",
+          "pass": 5,
+          "ns": 4507594149,
+          "ops": 200000,
+          "branches": 489619034,
+          "misses": 13271698,
+          "enabled_ns": 4507277353,
+          "running_ns": 4507277353
+        },
+        {
+          "phase": "process_ack",
+          "pass": 6,
+          "ns": 4494708076,
+          "ops": 200000,
+          "branches": 489618955,
+          "misses": 13271127,
+          "enabled_ns": 4494358962,
+          "running_ns": 4494358962
+        },
+        {
+          "phase": "process_ack",
+          "pass": 7,
+          "ns": 4499074581,
+          "ops": 200000,
+          "branches": 489618930,
+          "misses": 13270942,
+          "enabled_ns": 4498780859,
+          "running_ns": 4498780859
+        },
+        {
+          "phase": "process_ack",
+          "pass": 8,
+          "ns": 4503631965,
+          "ops": 200000,
+          "branches": 489619015,
+          "misses": 13271464,
+          "enabled_ns": 4503277667,
+          "running_ns": 4503277667
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 0,
+          "ns": 52694386,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200197,
+          "enabled_ns": 52700516,
+          "running_ns": 52700516
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 1,
+          "ns": 52265768,
+          "ops": 200000,
+          "branches": 120918109,
+          "misses": 200184,
+          "enabled_ns": 52267368,
+          "running_ns": 52267368
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 2,
+          "ns": 53785383,
+          "ops": 200000,
+          "branches": 120918129,
+          "misses": 200277,
+          "enabled_ns": 53794825,
+          "running_ns": 53794825
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 3,
+          "ns": 53045830,
+          "ops": 200000,
+          "branches": 120918109,
+          "misses": 200190,
+          "enabled_ns": 53057226,
+          "running_ns": 53057226
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 4,
+          "ns": 52030680,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200186,
+          "enabled_ns": 52027039,
+          "running_ns": 52027039
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 5,
+          "ns": 51517693,
+          "ops": 200000,
+          "branches": 120918107,
+          "misses": 200167,
+          "enabled_ns": 51524833,
+          "running_ns": 51524833
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 6,
+          "ns": 51839524,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200173,
+          "enabled_ns": 51846495,
+          "running_ns": 51846495
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 7,
+          "ns": 51747751,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200167,
+          "enabled_ns": 51748152,
+          "running_ns": 51748152
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 8,
+          "ns": 51624411,
+          "ops": 200000,
+          "branches": 120918107,
+          "misses": 200177,
+          "enabled_ns": 51632113,
+          "running_ns": 51632113
+        }
+      ],
+      "workload_outcomes": [
+        "    workload outcomes (including warmup): valid=19800870 invalid=199130",
+        "    workload outcomes (including warmup): payload_checksum=341526400 rejected=100930",
+        "    built bytes total: 515500000",
+        "    datagrams merged total: 72850",
+        "    workload outcomes (including warmup): released_total=31680000 malformed=20000",
+        "    workload outcomes (including warmup): malformed=20000"
+      ]
+    },
+    {
+      "run": 3,
+      "block": 1,
+      "variant": "candidate",
+      "start_unix": 1791434524.2769988,
+      "duration_s": 45.618982791900635,
+      "timing_ns_per_op": {
+        "from_byte": 1.26,
+        "parse_message_packet": 3.1,
+        "build_outbound_packet": 40.48,
+        "build_merged_datagrams": 1514.73,
+        "process_ack": 22412.28,
+        "process_ack_noop": 260.16
+      },
+      "samples": [
+        {
+          "phase": "from_byte",
+          "pass": 0,
+          "ns": 2518702,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21811,
+          "enabled_ns": 2532828,
+          "running_ns": 2532828
+        },
+        {
+          "phase": "from_byte",
+          "pass": 1,
+          "ns": 2501101,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 21857,
+          "enabled_ns": 2508860,
+          "running_ns": 2508860
+        },
+        {
+          "phase": "from_byte",
+          "pass": 2,
+          "ns": 2517026,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21778,
+          "enabled_ns": 2524681,
+          "running_ns": 2524681
+        },
+        {
+          "phase": "from_byte",
+          "pass": 3,
+          "ns": 2542028,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 21782,
+          "enabled_ns": 2550130,
+          "running_ns": 2550130
+        },
+        {
+          "phase": "from_byte",
+          "pass": 4,
+          "ns": 2539863,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 21969,
+          "enabled_ns": 2551330,
+          "running_ns": 2551330
+        },
+        {
+          "phase": "from_byte",
+          "pass": 5,
+          "ns": 2526384,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21824,
+          "enabled_ns": 2538829,
+          "running_ns": 2538829
+        },
+        {
+          "phase": "from_byte",
+          "pass": 6,
+          "ns": 2539584,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 21658,
+          "enabled_ns": 2547482,
+          "running_ns": 2547482
+        },
+        {
+          "phase": "from_byte",
+          "pass": 7,
+          "ns": 2545172,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21606,
+          "enabled_ns": 2552545,
+          "running_ns": 2552545
+        },
+        {
+          "phase": "from_byte",
+          "pass": 8,
+          "ns": 2526524,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 22014,
+          "enabled_ns": 2534419,
+          "running_ns": 2534419
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 0,
+          "ns": 3150769,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10883,
+          "enabled_ns": 3168131,
+          "running_ns": 3168131
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 1,
+          "ns": 3252319,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10772,
+          "enabled_ns": 3253881,
+          "running_ns": 3253881
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 2,
+          "ns": 3192674,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10617,
+          "enabled_ns": 3202583,
+          "running_ns": 3202583
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 3,
+          "ns": 3103137,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10617,
+          "enabled_ns": 3112714,
+          "running_ns": 3112714
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 4,
+          "ns": 3098039,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10571,
+          "enabled_ns": 3105675,
+          "running_ns": 3105675
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 5,
+          "ns": 3097550,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10704,
+          "enabled_ns": 3106923,
+          "running_ns": 3106923
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 6,
+          "ns": 3056273,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10606,
+          "enabled_ns": 3066594,
+          "running_ns": 3066594
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 7,
+          "ns": 3078343,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10590,
+          "enabled_ns": 3087574,
+          "running_ns": 3087574
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 8,
+          "ns": 3025892,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10642,
+          "enabled_ns": 3035169,
+          "running_ns": 3035169
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 0,
+          "ns": 4063251,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 62,
+          "enabled_ns": 4086719,
+          "running_ns": 4086719
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 1,
+          "ns": 4023581,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 38,
+          "enabled_ns": 4031614,
+          "running_ns": 4031614
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 2,
+          "ns": 4084134,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 37,
+          "enabled_ns": 4089804,
+          "running_ns": 4089804
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 3,
+          "ns": 4048445,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 43,
+          "enabled_ns": 4057133,
+          "running_ns": 4057133
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 4,
+          "ns": 3939352,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 37,
+          "enabled_ns": 3946211,
+          "running_ns": 3946211
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 5,
+          "ns": 4042788,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 30,
+          "enabled_ns": 4049997,
+          "running_ns": 4049997
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 6,
+          "ns": 4084273,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 36,
+          "enabled_ns": 4090979,
+          "running_ns": 4090979
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 7,
+          "ns": 4060109,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 39,
+          "enabled_ns": 4068773,
+          "running_ns": 4068773
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 8,
+          "ns": 4045930,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 32,
+          "enabled_ns": 4052959,
+          "running_ns": 4052959
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 0,
+          "ns": 3029454,
+          "ops": 2000,
+          "branches": 10334741,
+          "misses": 37813,
+          "enabled_ns": 3041921,
+          "running_ns": 3041921
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 1,
+          "ns": 3041258,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 29625,
+          "enabled_ns": 3048683,
+          "running_ns": 3048683
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 2,
+          "ns": 3014439,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 29211,
+          "enabled_ns": 3021232,
+          "running_ns": 3021232
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 3,
+          "ns": 3003822,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30085,
+          "enabled_ns": 3010759,
+          "running_ns": 3010759
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 4,
+          "ns": 3000470,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30069,
+          "enabled_ns": 3007808,
+          "running_ns": 3007808
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 5,
+          "ns": 3225011,
+          "ops": 2000,
+          "branches": 10331650,
+          "misses": 30498,
+          "enabled_ns": 3234240,
+          "running_ns": 3234240
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 6,
+          "ns": 3118363,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 31248,
+          "enabled_ns": 3126643,
+          "running_ns": 3126643
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 7,
+          "ns": 3029594,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30099,
+          "enabled_ns": 3036221,
+          "running_ns": 3036221
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 8,
+          "ns": 2996140,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 29956,
+          "enabled_ns": 3003147,
+          "running_ns": 3003147
+        },
+        {
+          "phase": "process_ack",
+          "pass": 0,
+          "ns": 4482455612,
+          "ops": 200000,
+          "branches": 489618946,
+          "misses": 13271169,
+          "enabled_ns": 4482136473,
+          "running_ns": 4482136473
+        },
+        {
+          "phase": "process_ack",
+          "pass": 1,
+          "ns": 4495627482,
+          "ops": 200000,
+          "branches": 489618972,
+          "misses": 13095276,
+          "enabled_ns": 4494931102,
+          "running_ns": 4494931102
+        },
+        {
+          "phase": "process_ack",
+          "pass": 2,
+          "ns": 4473828838,
+          "ops": 200000,
+          "branches": 489618980,
+          "misses": 13073099,
+          "enabled_ns": 4473395380,
+          "running_ns": 4473395380
+        },
+        {
+          "phase": "process_ack",
+          "pass": 3,
+          "ns": 4486263178,
+          "ops": 200000,
+          "branches": 489618944,
+          "misses": 13073254,
+          "enabled_ns": 4485895940,
+          "running_ns": 4485895940
+        },
+        {
+          "phase": "process_ack",
+          "pass": 4,
+          "ns": 4487091992,
+          "ops": 200000,
+          "branches": 489618974,
+          "misses": 13073234,
+          "enabled_ns": 4486834047,
+          "running_ns": 4486834047
+        },
+        {
+          "phase": "process_ack",
+          "pass": 5,
+          "ns": 4487969905,
+          "ops": 200000,
+          "branches": 489619063,
+          "misses": 13073364,
+          "enabled_ns": 4487603760,
+          "running_ns": 4487603760
+        },
+        {
+          "phase": "process_ack",
+          "pass": 6,
+          "ns": 4475594723,
+          "ops": 200000,
+          "branches": 489618962,
+          "misses": 13073401,
+          "enabled_ns": 4475264355,
+          "running_ns": 4475264355
+        },
+        {
+          "phase": "process_ack",
+          "pass": 7,
+          "ns": 4478339713,
+          "ops": 200000,
+          "branches": 489618953,
+          "misses": 13073081,
+          "enabled_ns": 4478051849,
+          "running_ns": 4478051849
+        },
+        {
+          "phase": "process_ack",
+          "pass": 8,
+          "ns": 4478277347,
+          "ops": 200000,
+          "branches": 489618957,
+          "misses": 13073293,
+          "enabled_ns": 4478001075,
+          "running_ns": 4478001075
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 0,
+          "ns": 51692018,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200195,
+          "enabled_ns": 51707096,
+          "running_ns": 51707096
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 1,
+          "ns": 51757040,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200169,
+          "enabled_ns": 51757511,
+          "running_ns": 51757511
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 2,
+          "ns": 52055405,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200175,
+          "enabled_ns": 52062926,
+          "running_ns": 52062926
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 3,
+          "ns": 52031589,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200181,
+          "enabled_ns": 52032980,
+          "running_ns": 52032980
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 4,
+          "ns": 51647948,
+          "ops": 200000,
+          "branches": 120918107,
+          "misses": 200165,
+          "enabled_ns": 51654893,
+          "running_ns": 51654893
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 5,
+          "ns": 52729866,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200174,
+          "enabled_ns": 52729608,
+          "running_ns": 52729608
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 6,
+          "ns": 52673922,
+          "ops": 200000,
+          "branches": 120918109,
+          "misses": 200178,
+          "enabled_ns": 52682689,
+          "running_ns": 52682689
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 7,
+          "ns": 52165335,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200180,
+          "enabled_ns": 52168970,
+          "running_ns": 52168970
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 8,
+          "ns": 51632653,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200170,
+          "enabled_ns": 51632854,
+          "running_ns": 51632854
+        }
+      ],
+      "workload_outcomes": [
+        "    workload outcomes (including warmup): valid=19800870 invalid=199130",
+        "    workload outcomes (including warmup): payload_checksum=341526400 rejected=100930",
+        "    built bytes total: 515500000",
+        "    datagrams merged total: 72850",
+        "    workload outcomes (including warmup): released_total=31680000 malformed=20000",
+        "    workload outcomes (including warmup): malformed=20000"
+      ]
+    },
+    {
+      "run": 4,
+      "block": 1,
+      "variant": "baseline",
+      "start_unix": 1791434569.8972301,
+      "duration_s": 45.50165581703186,
+      "timing_ns_per_op": {
+        "from_byte": 1.26,
+        "parse_message_packet": 3.03,
+        "build_outbound_packet": 39.3,
+        "build_merged_datagrams": 1652.04,
+        "process_ack": 22341.55,
+        "process_ack_noop": 258.45
+      },
+      "samples": [
+        {
+          "phase": "from_byte",
+          "pass": 0,
+          "ns": 2580162,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 21643,
+          "enabled_ns": 2573732,
+          "running_ns": 2573732
+        },
+        {
+          "phase": "from_byte",
+          "pass": 1,
+          "ns": 2476308,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 20839,
+          "enabled_ns": 2484195,
+          "running_ns": 2484195
+        },
+        {
+          "phase": "from_byte",
+          "pass": 2,
+          "ns": 2529597,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 20672,
+          "enabled_ns": 2538036,
+          "running_ns": 2538036
+        },
+        {
+          "phase": "from_byte",
+          "pass": 3,
+          "ns": 2490555,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 20565,
+          "enabled_ns": 2496969,
+          "running_ns": 2496969
+        },
+        {
+          "phase": "from_byte",
+          "pass": 4,
+          "ns": 2528969,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 20525,
+          "enabled_ns": 2536344,
+          "running_ns": 2536344
+        },
+        {
+          "phase": "from_byte",
+          "pass": 5,
+          "ns": 2499845,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 20610,
+          "enabled_ns": 2507319,
+          "running_ns": 2507319
+        },
+        {
+          "phase": "from_byte",
+          "pass": 6,
+          "ns": 2559280,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 20539,
+          "enabled_ns": 2567030,
+          "running_ns": 2567030
+        },
+        {
+          "phase": "from_byte",
+          "pass": 7,
+          "ns": 2525197,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 20508,
+          "enabled_ns": 2532825,
+          "running_ns": 2532825
+        },
+        {
+          "phase": "from_byte",
+          "pass": 8,
+          "ns": 2502778,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 20564,
+          "enabled_ns": 2510335,
+          "running_ns": 2510335
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 0,
+          "ns": 3154751,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10665,
+          "enabled_ns": 3150455,
+          "running_ns": 3150455
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 1,
+          "ns": 3034832,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10508,
+          "enabled_ns": 3043955,
+          "running_ns": 3043955
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 2,
+          "ns": 2953676,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10479,
+          "enabled_ns": 2963984,
+          "running_ns": 2963984
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 3,
+          "ns": 2890819,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10431,
+          "enabled_ns": 2900962,
+          "running_ns": 2900962
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 4,
+          "ns": 2880412,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10436,
+          "enabled_ns": 2890133,
+          "running_ns": 2890133
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 5,
+          "ns": 2949485,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10428,
+          "enabled_ns": 2958945,
+          "running_ns": 2958945
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 6,
+          "ns": 3352682,
+          "ops": 1000000,
+          "branches": 2000059,
+          "misses": 10454,
+          "enabled_ns": 3364281,
+          "running_ns": 3364281
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 7,
+          "ns": 3142388,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10443,
+          "enabled_ns": 3153190,
+          "running_ns": 3153190
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 8,
+          "ns": 3145251,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10448,
+          "enabled_ns": 3155145,
+          "running_ns": 3155145
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 0,
+          "ns": 3896190,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 284,
+          "enabled_ns": 3910532,
+          "running_ns": 3910532
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 1,
+          "ns": 3957372,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 266,
+          "enabled_ns": 3964750,
+          "running_ns": 3964750
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 2,
+          "ns": 3865390,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 273,
+          "enabled_ns": 3872205,
+          "running_ns": 3872205
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 3,
+          "ns": 3911066,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 261,
+          "enabled_ns": 3918248,
+          "running_ns": 3918248
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 4,
+          "ns": 3915396,
+          "ops": 100000,
+          "branches": 8425059,
+          "misses": 246,
+          "enabled_ns": 3922378,
+          "running_ns": 3922378
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 5,
+          "ns": 3949409,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 292,
+          "enabled_ns": 3956482,
+          "running_ns": 3956482
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 6,
+          "ns": 3929574,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 238,
+          "enabled_ns": 3935661,
+          "running_ns": 3935661
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 7,
+          "ns": 4045512,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 290,
+          "enabled_ns": 4052558,
+          "running_ns": 4052558
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 8,
+          "ns": 4110465,
+          "ops": 100000,
+          "branches": 8425061,
+          "misses": 300,
+          "enabled_ns": 4117395,
+          "running_ns": 4117395
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 0,
+          "ns": 3328307,
+          "ops": 2000,
+          "branches": 10334741,
+          "misses": 36562,
+          "enabled_ns": 3339903,
+          "running_ns": 3339903
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 1,
+          "ns": 3327329,
+          "ops": 2000,
+          "branches": 10331650,
+          "misses": 35603,
+          "enabled_ns": 3335375,
+          "running_ns": 3335375
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 2,
+          "ns": 3305888,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30406,
+          "enabled_ns": 3314559,
+          "running_ns": 3314559
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 3,
+          "ns": 3293945,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30889,
+          "enabled_ns": 3301291,
+          "running_ns": 3301291
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 4,
+          "ns": 3305329,
+          "ops": 2000,
+          "branches": 10331650,
+          "misses": 31658,
+          "enabled_ns": 3312724,
+          "running_ns": 3312724
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 5,
+          "ns": 3297926,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 31604,
+          "enabled_ns": 3304586,
+          "running_ns": 3304586
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 6,
+          "ns": 3298275,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 31484,
+          "enabled_ns": 3305292,
+          "running_ns": 3305292
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 7,
+          "ns": 3295970,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 31409,
+          "enabled_ns": 3303343,
+          "running_ns": 3303343
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 8,
+          "ns": 3304071,
+          "ops": 2000,
+          "branches": 10331650,
+          "misses": 31226,
+          "enabled_ns": 3311081,
+          "running_ns": 3311081
+        },
+        {
+          "phase": "process_ack",
+          "pass": 0,
+          "ns": 4464618266,
+          "ops": 200000,
+          "branches": 489619001,
+          "misses": 13270843,
+          "enabled_ns": 4464333220,
+          "running_ns": 4464333220
+        },
+        {
+          "phase": "process_ack",
+          "pass": 1,
+          "ns": 4473416438,
+          "ops": 200000,
+          "branches": 489618971,
+          "misses": 13271478,
+          "enabled_ns": 4472641012,
+          "running_ns": 4472641012
+        },
+        {
+          "phase": "process_ack",
+          "pass": 2,
+          "ns": 4468309823,
+          "ops": 200000,
+          "branches": 489618991,
+          "misses": 13271477,
+          "enabled_ns": 4467736654,
+          "running_ns": 4467736654
+        },
+        {
+          "phase": "process_ack",
+          "pass": 3,
+          "ns": 4460250929,
+          "ops": 200000,
+          "branches": 489619007,
+          "misses": 13271048,
+          "enabled_ns": 4459965064,
+          "running_ns": 4459965064
+        },
+        {
+          "phase": "process_ack",
+          "pass": 4,
+          "ns": 4468917101,
+          "ops": 200000,
+          "branches": 489618977,
+          "misses": 13271058,
+          "enabled_ns": 4468622705,
+          "running_ns": 4468622705
+        },
+        {
+          "phase": "process_ack",
+          "pass": 5,
+          "ns": 4466561900,
+          "ops": 200000,
+          "branches": 489618971,
+          "misses": 13271567,
+          "enabled_ns": 4466243246,
+          "running_ns": 4466243246
+        },
+        {
+          "phase": "process_ack",
+          "pass": 6,
+          "ns": 4459408155,
+          "ops": 200000,
+          "branches": 489618963,
+          "misses": 13270938,
+          "enabled_ns": 4459138477,
+          "running_ns": 4459138477
+        },
+        {
+          "phase": "process_ack",
+          "pass": 7,
+          "ns": 4471890616,
+          "ops": 200000,
+          "branches": 489618959,
+          "misses": 13271018,
+          "enabled_ns": 4471604231,
+          "running_ns": 4471604231
+        },
+        {
+          "phase": "process_ack",
+          "pass": 8,
+          "ns": 4479375066,
+          "ops": 200000,
+          "branches": 489618939,
+          "misses": 13271342,
+          "enabled_ns": 4478998494,
+          "running_ns": 4478998494
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 0,
+          "ns": 52429687,
+          "ops": 200000,
+          "branches": 120918109,
+          "misses": 200187,
+          "enabled_ns": 52442617,
+          "running_ns": 52442617
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 1,
+          "ns": 51690622,
+          "ops": 200000,
+          "branches": 120918107,
+          "misses": 200177,
+          "enabled_ns": 51691132,
+          "running_ns": 51691132
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 2,
+          "ns": 51437725,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200189,
+          "enabled_ns": 51443920,
+          "running_ns": 51443920
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 3,
+          "ns": 51834006,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200167,
+          "enabled_ns": 51824229,
+          "running_ns": 51824229
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 4,
+          "ns": 51672533,
+          "ops": 200000,
+          "branches": 120918107,
+          "misses": 200164,
+          "enabled_ns": 51672589,
+          "running_ns": 51672589
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 5,
+          "ns": 51790984,
+          "ops": 200000,
+          "branches": 120918109,
+          "misses": 200184,
+          "enabled_ns": 51792744,
+          "running_ns": 51792744
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 6,
+          "ns": 51898122,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200166,
+          "enabled_ns": 51905254,
+          "running_ns": 51905254
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 7,
+          "ns": 51580901,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200170,
+          "enabled_ns": 51588307,
+          "running_ns": 51588307
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 8,
+          "ns": 51482912,
+          "ops": 200000,
+          "branches": 120918107,
+          "misses": 200165,
+          "enabled_ns": 51489598,
+          "running_ns": 51489598
+        }
+      ],
+      "workload_outcomes": [
+        "    workload outcomes (including warmup): valid=19800870 invalid=199130",
+        "    workload outcomes (including warmup): payload_checksum=341526400 rejected=100930",
+        "    built bytes total: 515500000",
+        "    datagrams merged total: 72850",
+        "    workload outcomes (including warmup): released_total=31680000 malformed=20000",
+        "    workload outcomes (including warmup): malformed=20000"
+      ]
+    },
+    {
+      "run": 5,
+      "block": 2,
+      "variant": "candidate",
+      "start_unix": 1791434615.4002066,
+      "duration_s": 45.68882346153259,
+      "timing_ns_per_op": {
+        "from_byte": 1.26,
+        "parse_message_packet": 3.05,
+        "build_outbound_packet": 39.07,
+        "build_merged_datagrams": 1499.92,
+        "process_ack": 22439.52,
+        "process_ack_noop": 263.03
+      },
+      "samples": [
+        {
+          "phase": "from_byte",
+          "pass": 0,
+          "ns": 2500194,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21703,
+          "enabled_ns": 2510252,
+          "running_ns": 2510252
+        },
+        {
+          "phase": "from_byte",
+          "pass": 1,
+          "ns": 2529737,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 22077,
+          "enabled_ns": 2537307,
+          "running_ns": 2537307
+        },
+        {
+          "phase": "from_byte",
+          "pass": 2,
+          "ns": 2512347,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21851,
+          "enabled_ns": 2520504,
+          "running_ns": 2520504
+        },
+        {
+          "phase": "from_byte",
+          "pass": 3,
+          "ns": 2504734,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 21909,
+          "enabled_ns": 2512346,
+          "running_ns": 2512346
+        },
+        {
+          "phase": "from_byte",
+          "pass": 4,
+          "ns": 2531413,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21813,
+          "enabled_ns": 2540331,
+          "running_ns": 2540331
+        },
+        {
+          "phase": "from_byte",
+          "pass": 5,
+          "ns": 2523172,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 21756,
+          "enabled_ns": 2529218,
+          "running_ns": 2529218
+        },
+        {
+          "phase": "from_byte",
+          "pass": 6,
+          "ns": 2511228,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21950,
+          "enabled_ns": 2518840,
+          "running_ns": 2518840
+        },
+        {
+          "phase": "from_byte",
+          "pass": 7,
+          "ns": 2511717,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 21670,
+          "enabled_ns": 2519291,
+          "running_ns": 2519291
+        },
+        {
+          "phase": "from_byte",
+          "pass": 8,
+          "ns": 2496492,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21628,
+          "enabled_ns": 2503350,
+          "running_ns": 2503350
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 0,
+          "ns": 3126534,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10751,
+          "enabled_ns": 3141489,
+          "running_ns": 3141489
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 1,
+          "ns": 3137499,
+          "ops": 1000000,
+          "branches": 2000059,
+          "misses": 10765,
+          "enabled_ns": 3136380,
+          "running_ns": 3136380
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 2,
+          "ns": 3117594,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10663,
+          "enabled_ns": 3126250,
+          "running_ns": 3126250
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 3,
+          "ns": 3046217,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10600,
+          "enabled_ns": 3055084,
+          "running_ns": 3055084
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 4,
+          "ns": 3061093,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10661,
+          "enabled_ns": 3069486,
+          "running_ns": 3069486
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 5,
+          "ns": 3039232,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10573,
+          "enabled_ns": 3048772,
+          "running_ns": 3048772
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 6,
+          "ns": 3024775,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10577,
+          "enabled_ns": 3033906,
+          "running_ns": 3033906
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 7,
+          "ns": 3028616,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10661,
+          "enabled_ns": 3037972,
+          "running_ns": 3037972
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 8,
+          "ns": 3020166,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10607,
+          "enabled_ns": 3029358,
+          "running_ns": 3029358
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 0,
+          "ns": 3781370,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 58,
+          "enabled_ns": 3796460,
+          "running_ns": 3796460
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 1,
+          "ns": 3817129,
+          "ops": 100000,
+          "branches": 8425059,
+          "misses": 35,
+          "enabled_ns": 3813267,
+          "running_ns": 3813267
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 2,
+          "ns": 3887739,
+          "ops": 100000,
+          "branches": 8425059,
+          "misses": 32,
+          "enabled_ns": 3895061,
+          "running_ns": 3895061
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 3,
+          "ns": 3900380,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 36,
+          "enabled_ns": 3907589,
+          "running_ns": 3907589
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 4,
+          "ns": 3935441,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 55,
+          "enabled_ns": 3943236,
+          "running_ns": 3943236
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 5,
+          "ns": 3917072,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 56,
+          "enabled_ns": 3924741,
+          "running_ns": 3924741
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 6,
+          "ns": 3924197,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 52,
+          "enabled_ns": 3931827,
+          "running_ns": 3931827
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 7,
+          "ns": 3907365,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 33,
+          "enabled_ns": 3914632,
+          "running_ns": 3914632
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 8,
+          "ns": 3925244,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 39,
+          "enabled_ns": 3932739,
+          "running_ns": 3932739
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 0,
+          "ns": 3052222,
+          "ops": 2000,
+          "branches": 10334741,
+          "misses": 37709,
+          "enabled_ns": 3064685,
+          "running_ns": 3064685
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 1,
+          "ns": 3014438,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 31649,
+          "enabled_ns": 3021949,
+          "running_ns": 3021949
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 2,
+          "ns": 2990622,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 31294,
+          "enabled_ns": 2998138,
+          "running_ns": 2998138
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 3,
+          "ns": 2999842,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30441,
+          "enabled_ns": 3007415,
+          "running_ns": 3007415
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 4,
+          "ns": 2992508,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30236,
+          "enabled_ns": 2999661,
+          "running_ns": 2999661
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 5,
+          "ns": 2991809,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 29984,
+          "enabled_ns": 2999330,
+          "running_ns": 2999330
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 6,
+          "ns": 3008711,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 32095,
+          "enabled_ns": 3016572,
+          "running_ns": 3016572
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 7,
+          "ns": 2996908,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 29145,
+          "enabled_ns": 3005089,
+          "running_ns": 3005089
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 8,
+          "ns": 3002845,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 29460,
+          "enabled_ns": 3013534,
+          "running_ns": 3013534
+        },
+        {
+          "phase": "process_ack",
+          "pass": 0,
+          "ns": 4483940413,
+          "ops": 200000,
+          "branches": 489618979,
+          "misses": 13271208,
+          "enabled_ns": 4483447621,
+          "running_ns": 4483447621
+        },
+        {
+          "phase": "process_ack",
+          "pass": 1,
+          "ns": 4489612120,
+          "ops": 200000,
+          "branches": 489618997,
+          "misses": 13271104,
+          "enabled_ns": 4489065067,
+          "running_ns": 4489065067
+        },
+        {
+          "phase": "process_ack",
+          "pass": 2,
+          "ns": 4499666047,
+          "ops": 200000,
+          "branches": 489618965,
+          "misses": 13271540,
+          "enabled_ns": 4499170413,
+          "running_ns": 4499170413
+        },
+        {
+          "phase": "process_ack",
+          "pass": 3,
+          "ns": 4486427830,
+          "ops": 200000,
+          "branches": 489618974,
+          "misses": 13271102,
+          "enabled_ns": 4486069705,
+          "running_ns": 4486069705
+        },
+        {
+          "phase": "process_ack",
+          "pass": 4,
+          "ns": 4493747942,
+          "ops": 200000,
+          "branches": 489618946,
+          "misses": 13270993,
+          "enabled_ns": 4493387502,
+          "running_ns": 4493387502
+        },
+        {
+          "phase": "process_ack",
+          "pass": 5,
+          "ns": 4496154409,
+          "ops": 200000,
+          "branches": 489619007,
+          "misses": 13271027,
+          "enabled_ns": 4495847129,
+          "running_ns": 4495847129
+        },
+        {
+          "phase": "process_ack",
+          "pass": 6,
+          "ns": 4479718001,
+          "ops": 200000,
+          "branches": 489618972,
+          "misses": 13271501,
+          "enabled_ns": 4479415087,
+          "running_ns": 4479415087
+        },
+        {
+          "phase": "process_ack",
+          "pass": 7,
+          "ns": 4487904640,
+          "ops": 200000,
+          "branches": 489618967,
+          "misses": 13271348,
+          "enabled_ns": 4487559338,
+          "running_ns": 4487559338
+        },
+        {
+          "phase": "process_ack",
+          "pass": 8,
+          "ns": 4485346409,
+          "ops": 200000,
+          "branches": 489618947,
+          "misses": 13270789,
+          "enabled_ns": 4485085592,
+          "running_ns": 4485085592
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 0,
+          "ns": 52697949,
+          "ops": 200000,
+          "branches": 120918109,
+          "misses": 200187,
+          "enabled_ns": 52681135,
+          "running_ns": 52681135
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 1,
+          "ns": 52530678,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200170,
+          "enabled_ns": 52537513,
+          "running_ns": 52537513
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 2,
+          "ns": 53764851,
+          "ops": 200000,
+          "branches": 120918110,
+          "misses": 200172,
+          "enabled_ns": 53763522,
+          "running_ns": 53763522
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 3,
+          "ns": 52541712,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200172,
+          "enabled_ns": 52543825,
+          "running_ns": 52543825
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 4,
+          "ns": 52606317,
+          "ops": 200000,
+          "branches": 120918109,
+          "misses": 200167,
+          "enabled_ns": 52613275,
+          "running_ns": 52613275
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 5,
+          "ns": 52723162,
+          "ops": 200000,
+          "branches": 120918109,
+          "misses": 200180,
+          "enabled_ns": 52714622,
+          "running_ns": 52714622
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 6,
+          "ns": 52343782,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200171,
+          "enabled_ns": 52350994,
+          "running_ns": 52350994
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 7,
+          "ns": 52409572,
+          "ops": 200000,
+          "branches": 120918109,
+          "misses": 200164,
+          "enabled_ns": 52416762,
+          "running_ns": 52416762
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 8,
+          "ns": 52718902,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200168,
+          "enabled_ns": 52726106,
+          "running_ns": 52726106
+        }
+      ],
+      "workload_outcomes": [
+        "    workload outcomes (including warmup): valid=19800870 invalid=199130",
+        "    workload outcomes (including warmup): payload_checksum=341526400 rejected=100930",
+        "    built bytes total: 515500000",
+        "    datagrams merged total: 72850",
+        "    workload outcomes (including warmup): released_total=31680000 malformed=20000",
+        "    workload outcomes (including warmup): malformed=20000"
+      ]
+    },
+    {
+      "run": 6,
+      "block": 2,
+      "variant": "baseline",
+      "start_unix": 1791434661.0907817,
+      "duration_s": 45.459532737731934,
+      "timing_ns_per_op": {
+        "from_byte": 1.25,
+        "parse_message_packet": 2.91,
+        "build_outbound_packet": 38.48,
+        "build_merged_datagrams": 1454.28,
+        "process_ack": 22342.25,
+        "process_ack_noop": 258.94
+      },
+      "samples": [
+        {
+          "phase": "from_byte",
+          "pass": 0,
+          "ns": 2551807,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 21708,
+          "enabled_ns": 2549898,
+          "running_ns": 2549898
+        },
+        {
+          "phase": "from_byte",
+          "pass": 1,
+          "ns": 2525058,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 20778,
+          "enabled_ns": 2532546,
+          "running_ns": 2532546
+        },
+        {
+          "phase": "from_byte",
+          "pass": 2,
+          "ns": 2505223,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 20816,
+          "enabled_ns": 2512609,
+          "running_ns": 2512609
+        },
+        {
+          "phase": "from_byte",
+          "pass": 3,
+          "ns": 2546080,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 20795,
+          "enabled_ns": 2553845,
+          "running_ns": 2553845
+        },
+        {
+          "phase": "from_byte",
+          "pass": 4,
+          "ns": 2517305,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 20799,
+          "enabled_ns": 2525724,
+          "running_ns": 2525724
+        },
+        {
+          "phase": "from_byte",
+          "pass": 5,
+          "ns": 2459267,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 20805,
+          "enabled_ns": 2466253,
+          "running_ns": 2466253
+        },
+        {
+          "phase": "from_byte",
+          "pass": 6,
+          "ns": 2462409,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 20817,
+          "enabled_ns": 2470246,
+          "running_ns": 2470246
+        },
+        {
+          "phase": "from_byte",
+          "pass": 7,
+          "ns": 2506689,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 20828,
+          "enabled_ns": 2514302,
+          "running_ns": 2514302
+        },
+        {
+          "phase": "from_byte",
+          "pass": 8,
+          "ns": 2462549,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 20808,
+          "enabled_ns": 2469899,
+          "running_ns": 2469899
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 0,
+          "ns": 3004730,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10669,
+          "enabled_ns": 3022175,
+          "running_ns": 3022175
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 1,
+          "ns": 3105582,
+          "ops": 1000000,
+          "branches": 2000059,
+          "misses": 10551,
+          "enabled_ns": 3103495,
+          "running_ns": 3103495
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 2,
+          "ns": 2924622,
+          "ops": 1000000,
+          "branches": 2000057,
+          "misses": 10502,
+          "enabled_ns": 2933686,
+          "running_ns": 2933686
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 3,
+          "ns": 2908070,
+          "ops": 1000000,
+          "branches": 2000057,
+          "misses": 10477,
+          "enabled_ns": 2904822,
+          "running_ns": 2904822
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 4,
+          "ns": 2878247,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10473,
+          "enabled_ns": 2886687,
+          "running_ns": 2886687
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 5,
+          "ns": 2905974,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10430,
+          "enabled_ns": 2915843,
+          "running_ns": 2915843
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 6,
+          "ns": 2886069,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10428,
+          "enabled_ns": 2895812,
+          "running_ns": 2895812
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 7,
+          "ns": 2897593,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10444,
+          "enabled_ns": 2906557,
+          "running_ns": 2906557
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 8,
+          "ns": 2901364,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10438,
+          "enabled_ns": 2910491,
+          "running_ns": 2910491
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 0,
+          "ns": 3783255,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 65,
+          "enabled_ns": 3797642,
+          "running_ns": 3797642
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 1,
+          "ns": 3802532,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 37,
+          "enabled_ns": 3809482,
+          "running_ns": 3809482
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 2,
+          "ns": 3821948,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 43,
+          "enabled_ns": 3828641,
+          "running_ns": 3828641
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 3,
+          "ns": 3884456,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 60,
+          "enabled_ns": 3891489,
+          "running_ns": 3891489
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 4,
+          "ns": 3808608,
+          "ops": 100000,
+          "branches": 8425059,
+          "misses": 44,
+          "enabled_ns": 3815283,
+          "running_ns": 3815283
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 5,
+          "ns": 3862107,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 34,
+          "enabled_ns": 3868810,
+          "running_ns": 3868810
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 6,
+          "ns": 3871187,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 35,
+          "enabled_ns": 3878541,
+          "running_ns": 3878541
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 7,
+          "ns": 3868673,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 32,
+          "enabled_ns": 3875932,
+          "running_ns": 3875932
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 8,
+          "ns": 3848139,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 40,
+          "enabled_ns": 3855627,
+          "running_ns": 3855627
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 0,
+          "ns": 2945435,
+          "ops": 2000,
+          "branches": 10334741,
+          "misses": 35326,
+          "enabled_ns": 2957981,
+          "running_ns": 2957981
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 1,
+          "ns": 2913447,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 32841,
+          "enabled_ns": 2920713,
+          "running_ns": 2920713
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 2,
+          "ns": 2908558,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 31102,
+          "enabled_ns": 2914674,
+          "running_ns": 2914674
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 3,
+          "ns": 2924761,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30796,
+          "enabled_ns": 2933370,
+          "running_ns": 2933370
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 4,
+          "ns": 2887606,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30672,
+          "enabled_ns": 2895003,
+          "running_ns": 2895003
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 5,
+          "ns": 2896405,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30622,
+          "enabled_ns": 2903718,
+          "running_ns": 2903718
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 6,
+          "ns": 2895149,
+          "ops": 2000,
+          "branches": 10331648,
+          "misses": 30751,
+          "enabled_ns": 2902204,
+          "running_ns": 2902204
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 7,
+          "ns": 2882298,
+          "ops": 2000,
+          "branches": 10331648,
+          "misses": 30793,
+          "enabled_ns": 2889071,
+          "running_ns": 2889071
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 8,
+          "ns": 2940406,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30754,
+          "enabled_ns": 2947233,
+          "running_ns": 2947233
+        },
+        {
+          "phase": "process_ack",
+          "pass": 0,
+          "ns": 4471585778,
+          "ops": 200000,
+          "branches": 489618965,
+          "misses": 13270844,
+          "enabled_ns": 4471287921,
+          "running_ns": 4471287921
+        },
+        {
+          "phase": "process_ack",
+          "pass": 1,
+          "ns": 4470367949,
+          "ops": 200000,
+          "branches": 489618939,
+          "misses": 13270614,
+          "enabled_ns": 4469702583,
+          "running_ns": 4469702583
+        },
+        {
+          "phase": "process_ack",
+          "pass": 2,
+          "ns": 4458725187,
+          "ops": 200000,
+          "branches": 489618926,
+          "misses": 13271072,
+          "enabled_ns": 4458180244,
+          "running_ns": 4458180244
+        },
+        {
+          "phase": "process_ack",
+          "pass": 3,
+          "ns": 4460702249,
+          "ops": 200000,
+          "branches": 489619023,
+          "misses": 13271130,
+          "enabled_ns": 4460344196,
+          "running_ns": 4460344196
+        },
+        {
+          "phase": "process_ack",
+          "pass": 4,
+          "ns": 4468624346,
+          "ops": 200000,
+          "branches": 489619000,
+          "misses": 13271060,
+          "enabled_ns": 4468314791,
+          "running_ns": 4468314791
+        },
+        {
+          "phase": "process_ack",
+          "pass": 5,
+          "ns": 4461040502,
+          "ops": 200000,
+          "branches": 489618999,
+          "misses": 13270841,
+          "enabled_ns": 4460730034,
+          "running_ns": 4460730034
+        },
+        {
+          "phase": "process_ack",
+          "pass": 6,
+          "ns": 4474932193,
+          "ops": 200000,
+          "branches": 489618910,
+          "misses": 13271362,
+          "enabled_ns": 4474575289,
+          "running_ns": 4474575289
+        },
+        {
+          "phase": "process_ack",
+          "pass": 7,
+          "ns": 4465511789,
+          "ops": 200000,
+          "branches": 489618980,
+          "misses": 13270931,
+          "enabled_ns": 4465243213,
+          "running_ns": 4465243213
+        },
+        {
+          "phase": "process_ack",
+          "pass": 8,
+          "ns": 4468450462,
+          "ops": 200000,
+          "branches": 489618957,
+          "misses": 13271537,
+          "enabled_ns": 4468070929,
+          "running_ns": 4468070929
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 0,
+          "ns": 51803588,
+          "ops": 200000,
+          "branches": 120918107,
+          "misses": 200184,
+          "enabled_ns": 51815337,
+          "running_ns": 51815337
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 1,
+          "ns": 51895848,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200173,
+          "enabled_ns": 51896988,
+          "running_ns": 51896988
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 2,
+          "ns": 51685346,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200168,
+          "enabled_ns": 51692430,
+          "running_ns": 51692430
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 3,
+          "ns": 51908141,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200165,
+          "enabled_ns": 51914330,
+          "running_ns": 51914330
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 4,
+          "ns": 52373287,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200173,
+          "enabled_ns": 52380973,
+          "running_ns": 52380973
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 5,
+          "ns": 51779213,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200163,
+          "enabled_ns": 51786738,
+          "running_ns": 51786738
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 6,
+          "ns": 51492931,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200163,
+          "enabled_ns": 51500366,
+          "running_ns": 51500366
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 7,
+          "ns": 51788921,
+          "ops": 200000,
+          "branches": 120918107,
+          "misses": 200170,
+          "enabled_ns": 51790305,
+          "running_ns": 51790305
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 8,
+          "ns": 51672076,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200174,
+          "enabled_ns": 51679598,
+          "running_ns": 51679598
+        }
+      ],
+      "workload_outcomes": [
+        "    workload outcomes (including warmup): valid=19800870 invalid=199130",
+        "    workload outcomes (including warmup): payload_checksum=341526400 rejected=100930",
+        "    built bytes total: 515500000",
+        "    datagrams merged total: 72850",
+        "    workload outcomes (including warmup): released_total=31680000 malformed=20000",
+        "    workload outcomes (including warmup): malformed=20000"
+      ]
+    },
+    {
+      "run": 7,
+      "block": 2,
+      "variant": "baseline",
+      "start_unix": 1791434706.5522614,
+      "duration_s": 45.55552387237549,
+      "timing_ns_per_op": {
+        "from_byte": 1.26,
+        "parse_message_packet": 2.89,
+        "build_outbound_packet": 37.82,
+        "build_merged_datagrams": 1440.63,
+        "process_ack": 22404.45,
+        "process_ack_noop": 259.42
+      },
+      "samples": [
+        {
+          "phase": "from_byte",
+          "pass": 0,
+          "ns": 2529253,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 21618,
+          "enabled_ns": 2537681,
+          "running_ns": 2537681
+        },
+        {
+          "phase": "from_byte",
+          "pass": 1,
+          "ns": 2506205,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 20859,
+          "enabled_ns": 2513974,
+          "running_ns": 2513974
+        },
+        {
+          "phase": "from_byte",
+          "pass": 2,
+          "ns": 2530999,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 20608,
+          "enabled_ns": 2538824,
+          "running_ns": 2538824
+        },
+        {
+          "phase": "from_byte",
+          "pass": 3,
+          "ns": 2525481,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 20894,
+          "enabled_ns": 2532761,
+          "running_ns": 2532761
+        },
+        {
+          "phase": "from_byte",
+          "pass": 4,
+          "ns": 2549018,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 20871,
+          "enabled_ns": 2556337,
+          "running_ns": 2556337
+        },
+        {
+          "phase": "from_byte",
+          "pass": 5,
+          "ns": 2537145,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 20818,
+          "enabled_ns": 2546193,
+          "running_ns": 2546193
+        },
+        {
+          "phase": "from_byte",
+          "pass": 6,
+          "ns": 2535190,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 20816,
+          "enabled_ns": 2542393,
+          "running_ns": 2542393
+        },
+        {
+          "phase": "from_byte",
+          "pass": 7,
+          "ns": 2460319,
+          "ops": 2000000,
+          "branches": 4019970,
+          "misses": 20828,
+          "enabled_ns": 2467885,
+          "running_ns": 2467885
+        },
+        {
+          "phase": "from_byte",
+          "pass": 8,
+          "ns": 2468420,
+          "ops": 2000000,
+          "branches": 4019971,
+          "misses": 20737,
+          "enabled_ns": 2474893,
+          "running_ns": 2474893
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 0,
+          "ns": 3011441,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10639,
+          "enabled_ns": 3023301,
+          "running_ns": 3023301
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 1,
+          "ns": 2979524,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10508,
+          "enabled_ns": 2988836,
+          "running_ns": 2988836
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 2,
+          "ns": 2937549,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10505,
+          "enabled_ns": 2946185,
+          "running_ns": 2946185
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 3,
+          "ns": 2890405,
+          "ops": 1000000,
+          "branches": 2000057,
+          "misses": 10463,
+          "enabled_ns": 2898180,
+          "running_ns": 2898180
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 4,
+          "ns": 2906748,
+          "ops": 1000000,
+          "branches": 2000057,
+          "misses": 10472,
+          "enabled_ns": 2916451,
+          "running_ns": 2916451
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 5,
+          "ns": 2883211,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10466,
+          "enabled_ns": 2892613,
+          "running_ns": 2892613
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 6,
+          "ns": 2884259,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10435,
+          "enabled_ns": 2894246,
+          "running_ns": 2894246
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 7,
+          "ns": 2881326,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10467,
+          "enabled_ns": 2890801,
+          "running_ns": 2890801
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 8,
+          "ns": 2885307,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10462,
+          "enabled_ns": 2893945,
+          "running_ns": 2893945
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 0,
+          "ns": 3765663,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 69,
+          "enabled_ns": 3776590,
+          "running_ns": 3776590
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 1,
+          "ns": 3775650,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 42,
+          "enabled_ns": 3783262,
+          "running_ns": 3783262
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 2,
+          "ns": 3773626,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 38,
+          "enabled_ns": 3781089,
+          "running_ns": 3781089
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 3,
+          "ns": 3776699,
+          "ops": 100000,
+          "branches": 8425059,
+          "misses": 29,
+          "enabled_ns": 3783782,
+          "running_ns": 3783782
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 4,
+          "ns": 3826286,
+          "ops": 100000,
+          "branches": 8425059,
+          "misses": 33,
+          "enabled_ns": 3843254,
+          "running_ns": 3843254
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 5,
+          "ns": 3783822,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 37,
+          "enabled_ns": 3790821,
+          "running_ns": 3790821
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 6,
+          "ns": 3790945,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 34,
+          "enabled_ns": 3797935,
+          "running_ns": 3797935
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 7,
+          "ns": 3795555,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 34,
+          "enabled_ns": 3803261,
+          "running_ns": 3803261
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 8,
+          "ns": 3781657,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 36,
+          "enabled_ns": 3788422,
+          "running_ns": 3788422
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 0,
+          "ns": 2908075,
+          "ops": 2000,
+          "branches": 10334740,
+          "misses": 34598,
+          "enabled_ns": 2915876,
+          "running_ns": 2915876
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 1,
+          "ns": 2896621,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 28840,
+          "enabled_ns": 2904227,
+          "running_ns": 2904227
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 2,
+          "ns": 2872106,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 27858,
+          "enabled_ns": 2878506,
+          "running_ns": 2878506
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 3,
+          "ns": 2880837,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 28280,
+          "enabled_ns": 2887825,
+          "running_ns": 2887825
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 4,
+          "ns": 2870431,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 28026,
+          "enabled_ns": 2877243,
+          "running_ns": 2877243
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 5,
+          "ns": 2881256,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 29150,
+          "enabled_ns": 2888736,
+          "running_ns": 2888736
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 6,
+          "ns": 2997333,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 34880,
+          "enabled_ns": 2994284,
+          "running_ns": 2994284
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 7,
+          "ns": 2917014,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30592,
+          "enabled_ns": 2925338,
+          "running_ns": 2925338
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 8,
+          "ns": 2880069,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30737,
+          "enabled_ns": 2886353,
+          "running_ns": 2886353
+        },
+        {
+          "phase": "process_ack",
+          "pass": 0,
+          "ns": 4468694633,
+          "ops": 200000,
+          "branches": 489619003,
+          "misses": 13270887,
+          "enabled_ns": 4468364870,
+          "running_ns": 4468364870
+        },
+        {
+          "phase": "process_ack",
+          "pass": 1,
+          "ns": 4455417566,
+          "ops": 200000,
+          "branches": 489618986,
+          "misses": 13270798,
+          "enabled_ns": 4454763273,
+          "running_ns": 4454763273
+        },
+        {
+          "phase": "process_ack",
+          "pass": 2,
+          "ns": 4470389502,
+          "ops": 200000,
+          "branches": 489618898,
+          "misses": 13271069,
+          "enabled_ns": 4469913440,
+          "running_ns": 4469913440
+        },
+        {
+          "phase": "process_ack",
+          "pass": 3,
+          "ns": 4480890303,
+          "ops": 200000,
+          "branches": 489618887,
+          "misses": 13270888,
+          "enabled_ns": 4480542529,
+          "running_ns": 4480542529
+        },
+        {
+          "phase": "process_ack",
+          "pass": 4,
+          "ns": 4483297621,
+          "ops": 200000,
+          "branches": 489618946,
+          "misses": 13271446,
+          "enabled_ns": 4482919097,
+          "running_ns": 4482919097
+        },
+        {
+          "phase": "process_ack",
+          "pass": 5,
+          "ns": 4484593406,
+          "ops": 200000,
+          "branches": 489618981,
+          "misses": 13271215,
+          "enabled_ns": 4484300115,
+          "running_ns": 4484300115
+        },
+        {
+          "phase": "process_ack",
+          "pass": 6,
+          "ns": 4479702462,
+          "ops": 200000,
+          "branches": 489618949,
+          "misses": 13270835,
+          "enabled_ns": 4479412804,
+          "running_ns": 4479412804
+        },
+        {
+          "phase": "process_ack",
+          "pass": 7,
+          "ns": 4482693869,
+          "ops": 200000,
+          "branches": 489618941,
+          "misses": 13270837,
+          "enabled_ns": 4482391755,
+          "running_ns": 4482391755
+        },
+        {
+          "phase": "process_ack",
+          "pass": 8,
+          "ns": 4486535322,
+          "ops": 200000,
+          "branches": 489618896,
+          "misses": 13270940,
+          "enabled_ns": 4486212652,
+          "running_ns": 4486212652
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 0,
+          "ns": 51988591,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200192,
+          "enabled_ns": 51991106,
+          "running_ns": 51991106
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 1,
+          "ns": 52113469,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200183,
+          "enabled_ns": 52114137,
+          "running_ns": 52114137
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 2,
+          "ns": 52603549,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200173,
+          "enabled_ns": 52605653,
+          "running_ns": 52605653
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 3,
+          "ns": 51958839,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200177,
+          "enabled_ns": 51966109,
+          "running_ns": 51966109
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 4,
+          "ns": 51528125,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200170,
+          "enabled_ns": 51535415,
+          "running_ns": 51535415
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 5,
+          "ns": 51702660,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200173,
+          "enabled_ns": 51704016,
+          "running_ns": 51704016
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 6,
+          "ns": 51547819,
+          "ops": 200000,
+          "branches": 120918107,
+          "misses": 200174,
+          "enabled_ns": 51543933,
+          "running_ns": 51543933
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 7,
+          "ns": 51509336,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200172,
+          "enabled_ns": 51516860,
+          "running_ns": 51516860
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 8,
+          "ns": 51883340,
+          "ops": 200000,
+          "branches": 120918108,
+          "misses": 200166,
+          "enabled_ns": 51890008,
+          "running_ns": 51890008
+        }
+      ],
+      "workload_outcomes": [
+        "    workload outcomes (including warmup): valid=19800870 invalid=199130",
+        "    workload outcomes (including warmup): payload_checksum=341526400 rejected=100930",
+        "    built bytes total: 515500000",
+        "    datagrams merged total: 72850",
+        "    workload outcomes (including warmup): released_total=31680000 malformed=20000",
+        "    workload outcomes (including warmup): malformed=20000"
+      ]
+    },
+    {
+      "run": 8,
+      "block": 2,
+      "variant": "candidate",
+      "start_unix": 1791434752.1097946,
+      "duration_s": 45.75895285606384,
+      "timing_ns_per_op": {
+        "from_byte": 1.26,
+        "parse_message_packet": 3.05,
+        "build_outbound_packet": 37.84,
+        "build_merged_datagrams": 1433.57,
+        "process_ack": 22512.57,
+        "process_ack_noop": 273.43
+      },
+      "samples": [
+        {
+          "phase": "from_byte",
+          "pass": 0,
+          "ns": 2523037,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21731,
+          "enabled_ns": 2521376,
+          "running_ns": 2521376
+        },
+        {
+          "phase": "from_byte",
+          "pass": 1,
+          "ns": 2521221,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 22206,
+          "enabled_ns": 2529387,
+          "running_ns": 2529387
+        },
+        {
+          "phase": "from_byte",
+          "pass": 2,
+          "ns": 2482389,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21596,
+          "enabled_ns": 2489807,
+          "running_ns": 2489807
+        },
+        {
+          "phase": "from_byte",
+          "pass": 3,
+          "ns": 2549227,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 21867,
+          "enabled_ns": 2556846,
+          "running_ns": 2556846
+        },
+        {
+          "phase": "from_byte",
+          "pass": 4,
+          "ns": 2513888,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21750,
+          "enabled_ns": 2521090,
+          "running_ns": 2521090
+        },
+        {
+          "phase": "from_byte",
+          "pass": 5,
+          "ns": 2523036,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 21515,
+          "enabled_ns": 2531769,
+          "running_ns": 2531769
+        },
+        {
+          "phase": "from_byte",
+          "pass": 6,
+          "ns": 2536097,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21938,
+          "enabled_ns": 2542779,
+          "running_ns": 2542779
+        },
+        {
+          "phase": "from_byte",
+          "pass": 7,
+          "ns": 2537843,
+          "ops": 2000000,
+          "branches": 5980145,
+          "misses": 21926,
+          "enabled_ns": 2545146,
+          "running_ns": 2545146
+        },
+        {
+          "phase": "from_byte",
+          "pass": 8,
+          "ns": 2520313,
+          "ops": 2000000,
+          "branches": 5980144,
+          "misses": 21907,
+          "enabled_ns": 2527998,
+          "running_ns": 2527998
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 0,
+          "ns": 3091689,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10741,
+          "enabled_ns": 3105047,
+          "running_ns": 3105047
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 1,
+          "ns": 3066965,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10628,
+          "enabled_ns": 3077805,
+          "running_ns": 3077805
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 2,
+          "ns": 3027713,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10533,
+          "enabled_ns": 3036013,
+          "running_ns": 3036013
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 3,
+          "ns": 3047828,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10505,
+          "enabled_ns": 3056835,
+          "running_ns": 3056835
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 4,
+          "ns": 3058933,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10567,
+          "enabled_ns": 3067613,
+          "running_ns": 3067613
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 5,
+          "ns": 3056838,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10547,
+          "enabled_ns": 3056743,
+          "running_ns": 3056743
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 6,
+          "ns": 3049365,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10551,
+          "enabled_ns": 3057608,
+          "running_ns": 3057608
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 7,
+          "ns": 3047200,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10546,
+          "enabled_ns": 3056234,
+          "running_ns": 3056234
+        },
+        {
+          "phase": "parse_message_packet",
+          "pass": 8,
+          "ns": 3040355,
+          "ops": 1000000,
+          "branches": 2000058,
+          "misses": 10518,
+          "enabled_ns": 3049243,
+          "running_ns": 3049243
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 0,
+          "ns": 3750787,
+          "ops": 100000,
+          "branches": 8425059,
+          "misses": 55,
+          "enabled_ns": 3764621,
+          "running_ns": 3764621
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 1,
+          "ns": 3762590,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 62,
+          "enabled_ns": 3769827,
+          "running_ns": 3769827
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 2,
+          "ns": 3778584,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 36,
+          "enabled_ns": 3785206,
+          "running_ns": 3785206
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 3,
+          "ns": 3784171,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 35,
+          "enabled_ns": 3791383,
+          "running_ns": 3791383
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 4,
+          "ns": 3787174,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 39,
+          "enabled_ns": 3794032,
+          "running_ns": 3794032
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 5,
+          "ns": 3781168,
+          "ops": 100000,
+          "branches": 8425059,
+          "misses": 33,
+          "enabled_ns": 3788282,
+          "running_ns": 3788282
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 6,
+          "ns": 3795555,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 39,
+          "enabled_ns": 3802478,
+          "running_ns": 3802478
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 7,
+          "ns": 3798628,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 37,
+          "enabled_ns": 3805143,
+          "running_ns": 3805143
+        },
+        {
+          "phase": "build_outbound_packet",
+          "pass": 8,
+          "ns": 3801771,
+          "ops": 100000,
+          "branches": 8425060,
+          "misses": 58,
+          "enabled_ns": 3808577,
+          "running_ns": 3808577
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 0,
+          "ns": 2928469,
+          "ops": 2000,
+          "branches": 10334741,
+          "misses": 35056,
+          "enabled_ns": 2941666,
+          "running_ns": 2941666
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 1,
+          "ns": 2942297,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 30004,
+          "enabled_ns": 2950372,
+          "running_ns": 2950372
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 2,
+          "ns": 2854785,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 29123,
+          "enabled_ns": 2862356,
+          "running_ns": 2862356
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 3,
+          "ns": 2864074,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 28782,
+          "enabled_ns": 2870744,
+          "running_ns": 2870744
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 4,
+          "ns": 2859325,
+          "ops": 2000,
+          "branches": 10331648,
+          "misses": 29068,
+          "enabled_ns": 2866610,
+          "running_ns": 2866610
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 5,
+          "ns": 2860512,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 28774,
+          "enabled_ns": 2867770,
+          "running_ns": 2867770
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 6,
+          "ns": 2867148,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 28203,
+          "enabled_ns": 2873816,
+          "running_ns": 2873816
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 7,
+          "ns": 2867147,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 28339,
+          "enabled_ns": 2874525,
+          "running_ns": 2874525
+        },
+        {
+          "phase": "build_merged_datagrams",
+          "pass": 8,
+          "ns": 2979593,
+          "ops": 2000,
+          "branches": 10331649,
+          "misses": 28610,
+          "enabled_ns": 2986454,
+          "running_ns": 2986454
+        },
+        {
+          "phase": "process_ack",
+          "pass": 0,
+          "ns": 4466160097,
+          "ops": 200000,
+          "branches": 489618983,
+          "misses": 13271343,
+          "enabled_ns": 4465775393,
+          "running_ns": 4465775393
+        },
+        {
+          "phase": "process_ack",
+          "pass": 1,
+          "ns": 4468107580,
+          "ops": 200000,
+          "branches": 489618982,
+          "misses": 13271180,
+          "enabled_ns": 4467363610,
+          "running_ns": 4467363610
+        },
+        {
+          "phase": "process_ack",
+          "pass": 2,
+          "ns": 4393942755,
+          "ops": 200000,
+          "branches": 489619007,
+          "misses": 13277022,
+          "enabled_ns": 4393385050,
+          "running_ns": 4393385050
+        },
+        {
+          "phase": "process_ack",
+          "pass": 3,
+          "ns": 4419125433,
+          "ops": 200000,
+          "branches": 489618955,
+          "misses": 13273709,
+          "enabled_ns": 4418665191,
+          "running_ns": 4418665191
+        },
+        {
+          "phase": "process_ack",
+          "pass": 4,
+          "ns": 4502514857,
+          "ops": 200000,
+          "branches": 489618999,
+          "misses": 13271965,
+          "enabled_ns": 4502148267,
+          "running_ns": 4502148267
+        },
+        {
+          "phase": "process_ack",
+          "pass": 5,
+          "ns": 4546858919,
+          "ops": 200000,
+          "branches": 489618969,
+          "misses": 13271582,
+          "enabled_ns": 4546530864,
+          "running_ns": 4546530864
+        },
+        {
+          "phase": "process_ack",
+          "pass": 6,
+          "ns": 4553398086,
+          "ops": 200000,
+          "branches": 489618949,
+          "misses": 13229217,
+          "enabled_ns": 4553070432,
+          "running_ns": 4553070432
+        },
+        {
+          "phase": "process_ack",
+          "pass": 7,
+          "ns": 4561575322,
+          "ops": 200000,
+          "branches": 489618987,
+          "misses": 13073355,
+          "enabled_ns": 4561251737,
+          "running_ns": 4561251737
+        },
+        {
+          "phase": "process_ack",
+          "pass": 8,
+          "ns": 4571415841,
+          "ops": 200000,
+          "branches": 489619014,
+          "misses": 13073527,
+          "enabled_ns": 4570981732,
+          "running_ns": 4570981732
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 0,
+          "ns": 54256280,
+          "ops": 200000,
+          "branches": 120918111,
+          "misses": 200189,
+          "enabled_ns": 54269701,
+          "running_ns": 54269701
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 1,
+          "ns": 54405531,
+          "ops": 200000,
+          "branches": 120918110,
+          "misses": 200188,
+          "enabled_ns": 54413213,
+          "running_ns": 54413213
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 2,
+          "ns": 54560929,
+          "ops": 200000,
+          "branches": 120918111,
+          "misses": 200182,
+          "enabled_ns": 54558832,
+          "running_ns": 54558832
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 3,
+          "ns": 54850005,
+          "ops": 200000,
+          "branches": 120918111,
+          "misses": 200190,
+          "enabled_ns": 54851762,
+          "running_ns": 54851762
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 4,
+          "ns": 54690556,
+          "ops": 200000,
+          "branches": 120918110,
+          "misses": 200186,
+          "enabled_ns": 54683377,
+          "running_ns": 54683377
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 5,
+          "ns": 54903295,
+          "ops": 200000,
+          "branches": 120918125,
+          "misses": 200191,
+          "enabled_ns": 54904135,
+          "running_ns": 54904135
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 6,
+          "ns": 54835757,
+          "ops": 200000,
+          "branches": 120918111,
+          "misses": 200189,
+          "enabled_ns": 54843637,
+          "running_ns": 54843637
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 7,
+          "ns": 54685597,
+          "ops": 200000,
+          "branches": 120918111,
+          "misses": 200182,
+          "enabled_ns": 54675057,
+          "running_ns": 54675057
+        },
+        {
+          "phase": "process_ack_noop",
+          "pass": 8,
+          "ns": 54586003,
+          "ops": 200000,
+          "branches": 120918110,
+          "misses": 200173,
+          "enabled_ns": 54593097,
+          "running_ns": 54593097
+        }
+      ],
+      "workload_outcomes": [
+        "    workload outcomes (including warmup): valid=19800870 invalid=199130",
+        "    workload outcomes (including warmup): payload_checksum=341526400 rejected=100930",
+        "    built bytes total: 515500000",
+        "    datagrams merged total: 72850",
+        "    workload outcomes (including warmup): released_total=31680000 malformed=20000",
+        "    workload outcomes (including warmup): malformed=20000"
+      ]
+    }
+  ],
+  "environment": {
+    "cpu_model": "AMD Ryzen 9 5900HX with Radeon Graphics",
+    "laptop": "Lenovo Legion 7 16ACHg6 (82N6)",
+    "os": "Linux-7.0.0-31-generic-x86_64-with-glibc2.39",
+    "os_release": "PRETTY_NAME=\"Ubuntu 24.04.5 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\nVERSION=\"24.04.5 LTS (Noble Numbat)\"\nVERSION_CODENAME=noble\nID=ubuntu\nID_LIKE=debian\nHOME_URL=\"https://www.ubuntu.com/\"\nSUPPORT_URL=\"https://help.ubuntu.com/\"\nBUG_REPORT_URL=\"https://bugs.launchpad.net/ubuntu/\"\nPRIVACY_POLICY_URL=\"https://www.ubuntu.com/legal/terms-and-policies/privacy-policy\"\nUBUNTU_CODENAME=noble\nLOGO=ubuntu-logo",
+    "ac_online": "1",
+    "power_profile": "performance",
+    "cpu2_governor": "performance",
+    "cpu2_energy_preference": "performance",
+    "cpu2_thread_siblings": "2-3",
+    "perf_event_paranoid": "-1",
+    "python": "3.12.3",
+    "native_compiler": "cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "pre_series_load_average": "0.55 0.91 0.69 4/1097 1338407",
+    "conditions": "AC power, existing performance power profile; low observed system load; ordinary tests finished before benchmark. Other user processes were not stopped.",
+    "command": "RUSTUP_TOOLCHAIN=1.99.0 python3 scripts/perf/review-branches.py --output captures/laptop-decoder-revert --baseline 3606a9b --candidate 83a96e9 --blocks 2 --cpu 2 --pmc",
+    "runner_sha256": "5af729c3056fdff86a884ee1b450c207db00d0c35bc9231e3f45c48fc498060a"
+  },
+  "assembly_probes": {
+    "baseline": "\t.att_syntax\n\t.file\t\"property_probe.7e828dc9298ce5d5-cgu.0\"\n\t.section\t.text.decode,\"ax\",@progbits\n\t.globl\tdecode\n\t.prefalign\t4, .Lfunc_end0, nop\n\t.type\tdecode,@function\ndecode:\n\t.cfi_startproc\n\tandl\t$31, %edi\n\tleaq\t.Lanon.5b93625023a1c2180221257849744b59.0(%rip), %rax\n\tmovzbl\t(%rdi,%rax), %eax\n\tretq\n.Lfunc_end0:\n\t.size\tdecode, .Lfunc_end0-decode\n\t.cfi_endproc\n\n\t.type\t.Lanon.5b93625023a1c2180221257849744b59.0,@object\n\t.section\t.rodata.cst32,\"aM\",@progbits,32\n.Lanon.5b93625023a1c2180221257849744b59.0:\n\t.ascii\t\"\\000\\001\\002\\003\\004\\005\\006\\007\\b\\t\\n\\013\\f\\r\\016\\017\\020\\021\\022\\377\\377\\377\\377\\377\\377\\377\\377\\377\\377\\377\\377\\377\"\n\t.size\t.Lanon.5b93625023a1c2180221257849744b59.0, 32\n\n\t.ident\t\"rustc version 1.99.0 (b940084d7 2026-09-28)\"\n\t.section\t\".note.GNU-stack\",\"\",@progbits\n",
+    "candidate": "\t.att_syntax\n\t.file\t\"property_probe.7e828dc9298ce5d5-cgu.0\"\n\t.section\t.text.decode,\"ax\",@progbits\n\t.globl\tdecode\n\t.prefalign\t4, .Lfunc_end0, nop\n\t.type\tdecode,@function\ndecode:\n\t.cfi_startproc\n\tmovl\t%edi, %eax\n\tandb\t$31, %al\n\tandl\t$31, %edi\n\tcmpb\t$19, %al\n\tmovl\t$255, %eax\n\tcmovbl\t%edi, %eax\n\tretq\n.Lfunc_end0:\n\t.size\tdecode, .Lfunc_end0-decode\n\t.cfi_endproc\n\n\t.ident\t\"rustc version 1.99.0 (b940084d7 2026-09-28)\"\n\t.section\t\".note.GNU-stack\",\"\",@progbits\n"
+  },
+  "git_transport_source_sha256": {
+    "baseline": "4420df5d2ea626649f5fee32438e125079f6435645bd29608a9d1aa3f0ede951",
+    "candidate": "a2b44de7576141b76c9cab46a91ac676502c37f10a9a6044a5c58e14db21dd8d"
+  },
+  "compiled_transport_source_sha256": {
+    "baseline": "4420df5d2ea626649f5fee32438e125079f6435645bd29608a9d1aa3f0ede951",
+    "candidate": "a2b44de7576141b76c9cab46a91ac676502c37f10a9a6044a5c58e14db21dd8d"
+  },
+  "run_log_sha256": {
+    "run-01-baseline.log": "5caee684cc26394831be16abcf32a9ebca55ada26b5d974ed731c6af4e57fb55",
+    "run-02-candidate.log": "7948fdc330b489657c735952f9eea08c630c79c577a0e4028ce1780ff79abc62",
+    "run-03-candidate.log": "77b4ac084d828809cb8b503fffbb0699c604437678edab8a4668f2e8cbce3e83",
+    "run-04-baseline.log": "4d035bf6cf3ab0ff7b318a24cd08ee0e04845aed0a04d3e8fef8860c0ae59b0a",
+    "run-05-candidate.log": "71adcac5708e9c74a3280cf547574746dc53cd8616b299ac7f05e480a6325fc7",
+    "run-06-baseline.log": "b884d57eeba8cd6df0c1948533cbc6675a86c368fe93bf36e3db403b77f275cd",
+    "run-07-baseline.log": "0ccb82ecdba8a77eb4f5dac8d6f1c0d55b054cb95e6d8e530b2b2903a00b11b5",
+    "run-08-candidate.log": "4e45a0801ec3fd95f261041dfba32e3754589d8113a3855539b000bacd538c95"
+  },
+  "validation": {
+    "independent_processes_per_variant": 4,
+    "samples": 432,
+    "minimum_scheduling_coverage": 1.0,
+    "all_workload_outcomes_match": true,
+    "same_benchmark_hashes_as_original": true,
+    "table_binary_matches_original_candidate": true,
+    "ac_online_after": "1",
+    "power_profile_after": "performance"
+  },
+  "limitations": [
+    "Synthetic fixed-seed workloads and malformed rates; no captured production distribution.",
+    "Per-thread user-mode counters exclude kernel and hypervisor; fixture construction and warmup excluded; timed allocation/refill and small clock/control overhead included.",
+    "No application latency/throughput, socket backpressure, event enqueue, receive dispatch, shedding or ID-allocation measurements.",
+    "Outbound phase omits ReliableUnordered; merge operation is a 32-packet batch; do not aggregate unlike phase rates.",
+    "One laptop session; no significance test; power/clock/thermal state not continuously sampled; other user processes were not stopped.",
+    "Assembly probes isolate decoder, not every production call site; cold-helper effects not individually isolated.",
+    "Only two balanced blocks (four independent processes per variant); smaller than original series."
+  ],
+  "decision": "Reject the match-restoration candidate: no local decoder timing improvement and parse timing worsened in both blocks. Retain original table/cold-extraction production code; correct unsupported rationale and comments.",
+  "benchmark_revision": "6b8e7696aba8b6fa14da4971c8dbdebd996fabd1",
+  "final_harness_note": "All measurements used the frozen benchmark files from this revision. A later edit only corrects the outbound delivery-method comment."
+}
