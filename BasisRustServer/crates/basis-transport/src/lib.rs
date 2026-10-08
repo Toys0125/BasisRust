@@ -143,34 +143,29 @@ pub enum PacketProperty {
 }
 
 impl PacketProperty {
-    /// Lookup table for the 5-bit property field, so per-datagram dispatch is one masked load
-    /// instead of a jump-table indirect branch. Values above `CompactMerged` stay `None`.
-    const FROM_BYTE_TABLE: [Option<Self>; 32] = {
-        let mut table = [None; 32];
-        table[Self::Unreliable as u8 as usize] = Some(Self::Unreliable);
-        table[Self::Channeled as u8 as usize] = Some(Self::Channeled);
-        table[Self::Ack as u8 as usize] = Some(Self::Ack);
-        table[Self::Ping as u8 as usize] = Some(Self::Ping);
-        table[Self::Pong as u8 as usize] = Some(Self::Pong);
-        table[Self::ConnectRequest as u8 as usize] = Some(Self::ConnectRequest);
-        table[Self::ConnectAccept as u8 as usize] = Some(Self::ConnectAccept);
-        table[Self::Disconnect as u8 as usize] = Some(Self::Disconnect);
-        table[Self::UnconnectedMessage as u8 as usize] = Some(Self::UnconnectedMessage);
-        table[Self::MtuCheck as u8 as usize] = Some(Self::MtuCheck);
-        table[Self::MtuOk as u8 as usize] = Some(Self::MtuOk);
-        table[Self::Broadcast as u8 as usize] = Some(Self::Broadcast);
-        table[Self::Merged as u8 as usize] = Some(Self::Merged);
-        table[Self::ShutdownOk as u8 as usize] = Some(Self::ShutdownOk);
-        table[Self::PeerNotFound as u8 as usize] = Some(Self::PeerNotFound);
-        table[Self::InvalidProtocol as u8 as usize] = Some(Self::InvalidProtocol);
-        table[Self::NatMessage as u8 as usize] = Some(Self::NatMessage);
-        table[Self::Empty as u8 as usize] = Some(Self::Empty);
-        table[Self::CompactMerged as u8 as usize] = Some(Self::CompactMerged);
-        table
-    };
-
     pub fn from_byte(value: u8) -> Option<Self> {
-        Self::FROM_BYTE_TABLE[(value & 0x1f) as usize]
+        Some(match value & 0x1f {
+            0 => Self::Unreliable,
+            1 => Self::Channeled,
+            2 => Self::Ack,
+            3 => Self::Ping,
+            4 => Self::Pong,
+            5 => Self::ConnectRequest,
+            6 => Self::ConnectAccept,
+            7 => Self::Disconnect,
+            8 => Self::UnconnectedMessage,
+            9 => Self::MtuCheck,
+            10 => Self::MtuOk,
+            11 => Self::Broadcast,
+            12 => Self::Merged,
+            13 => Self::ShutdownOk,
+            14 => Self::PeerNotFound,
+            15 => Self::InvalidProtocol,
+            16 => Self::NatMessage,
+            17 => Self::Empty,
+            18 => Self::CompactMerged,
+            _ => return None,
+        })
     }
 }
 
@@ -993,10 +988,10 @@ impl TransportHandle {
         self.allocate_fresh_peer_id(&retired)
     }
 
-    /// Fresh ID allocation only runs once the recycle queue is exhausted — connection churn,
-    /// not steady state — so the scan and exhaustion check stay out of the accept path. The
-    /// caller's reuse and retire locks stay held for the whole scan, preserving the
-    /// reuse/retire/allocate order.
+    /// Fresh ID allocation runs when the recycle queue is exhausted, including initial
+    /// connections. Mark the scan and exhaustion check cold; this annotation alone does not
+    /// establish the optimized caller's layout. The caller's reuse and retire locks stay held
+    /// for the whole scan, preserving the reuse/retire/allocate order.
     #[cold]
     fn allocate_fresh_peer_id(&self, retired: &HashSet<PeerId>) -> Result<PeerId> {
         let mut allocated = self.allocated_peer_ids.lock();
