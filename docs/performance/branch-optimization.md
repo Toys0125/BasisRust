@@ -14,6 +14,12 @@ match-restoration candidate was rejected after it failed to improve local
 decoder timing and worsened parse timing. The original production code is
 retained with corrected comments; no general application speedup is established.
 
+The subsequent [250-client Rust avatar A/B](branch-client250-20261008.md) ran
+eight fresh-process laptop trials with matched input and all delivery/error gates
+passing. Candidate median p95 gaps rose 0.39%, built work fell 0.50%, and server
+CPU was essentially unchanged. Paired directions varied; this runtime workload
+does not demonstrate a speedup.
+
 Branch: `performance/branch-optimization`, cut from `fix/dedicated-voice-processing` at
 `1e45b3b`. Benchmark harness and checks are in
 `BasisRustServer/crates/basis-transport/src/bench_branches.rs` and

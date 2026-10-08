@@ -128,18 +128,23 @@ def summarize(path, experiment, entry):
     for group, key in [('appMessages', 'protocolErrors'), ('rawUdp', 'wouldBlock'), ('reliable', 'retransmits')]:
         checks['zero_' + key] = all(s['health']['extended'][group][key] == 0 for s in samples)
     checks['zero_transport_drops'] = all(s['health']['transport']['nonReliableDroppedDatagrams'] == 0 for s in samples)
-    # Settings comparisons REQUIRE one frozen server and different configs.
+    # Validate fixed controls separately from the optional settings dimension.
     commands = json.loads((path / 'commands.json').read_text())
     dynamic = {'BASIS_STATUS_INTERVAL_SECS', 'BASIS_AVATAR_DIAGNOSTIC_OBSERVER_ID', 'BASIS_AVATAR_DIAGNOSTIC_START_FILE',
                'BASIS_AVATAR_DIAGNOSTIC_CSV', 'BASIS_AVATAR_DIAGNOSTIC_WINDOW_SECS'}
-    checks['setting_provenance'] = (
+    controls_match = (
         {k: v for k, v in commands['server_environment'].items() if k not in dynamic} == entry['server_settings']
-        and commands['client_environment'] == entry['client_settings']
-        and entry['server_settings'].get('BASIS_AVATAR_FLUSH_LANES') == str(entry['lanes']))
+        and commands['client_environment'] == entry['client_settings'])
+    if experiment.get('comparison_kind', 'settings') == 'revisions':
+        checks['control_provenance'] = controls_match
+        identity = {'variant': entry['variant']}
+    else:
+        checks['setting_provenance'] = controls_match and entry['server_settings'].get('BASIS_AVATAR_FLUSH_LANES') == str(entry['lanes'])
+        identity = {'lanes': entry['lanes']}
     checks['client_config_provenance'] = sha256(pathlib.Path(commands['client'][2])) == experiment['frozen']['client_config']['sha256']
     for role in ('server', 'client'):
         checks['frozen_' + role] = sha256(pathlib.Path(commands[role][0])) == experiment['frozen'][role]['sha256']
-    return {'name': entry['name'], 'lanes': entry['lanes'], 'round': entry['round'], 'valid': all(checks.values()),
+    return {'name': entry['name'], **identity, 'round': entry['round'], 'valid': all(checks.values()),
             'checks': checks, 'metrics': metrics, 'observer': obs, 'minimum_sender_socket_items': minimum,
             'started_unix_seconds': meta['started_unix_seconds'], 'finished_unix_seconds': meta['finished_unix_seconds'],
             'sender_errors': sum(int(r['send_errors']) for r in senders), 'exits': {k: meta[k] for k in ('client_exit_code', 'server_exit_code')}}
