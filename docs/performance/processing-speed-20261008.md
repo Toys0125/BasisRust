@@ -2,9 +2,9 @@
 
 ## Results
 
-The latest admission fix shows no material realtime regression in these matched runs. Relative to its parent, the combined one-peer control probe rate was 2.2% lower, with a 0.9 microsecond increase in median per-trial p95 completion time. The 64-peer control medians were effectively unchanged. These are observations on one host, not statistical significance or server capacity claims.
+The `94b42f9` admission fix showed no material realtime regression in these matched runs. Relative to its parent, the combined one-peer control probe rate was 2.2% lower, with a 0.9 microsecond increase in median per-trial p95 completion time. The 64-peer control medians were effectively unchanged. These are observations on one host, not statistical significance or server capacity claims.
 
-The tested queue repartition did not improve the medians meaningfully and was **not adopted**. Runtime code remains at `94b42f9`.
+The tested queue repartition did not improve the medians meaningfully and was **not adopted**. The runtime for those measurements was `94b42f9`; the newer ordered-admission follow-up is measured below.
 
 ## Revisions and setup
 
@@ -100,3 +100,23 @@ Repeat with `--peers 64 --ops 512 --batch 1` and `--batch 64`. Alternate revisio
 The realtime harness is `scripts/perf/run-windows-avatar-workload.py` despite its name. Use a common frozen current client, fixture and harness; 1,000 clients for avatars, 250 clients/25 speakers for voice, 20-second warmup, 60-second windows, four client workers, 16 server Tokio/Rayon workers and no server diagnostic CSV. Voice additionally requires `--no-client-shared-receive`, `--client-voice-all-clients`, `--voice-speaker-percent 10`, `--no-voice-reencode`, and the common prepared corpus. Generated captures and binaries remain ignored under `captures/pr31-processing-speed-20261008`.
 
 Preliminary control runs before correcting ACK size, request retries and sender window bounds were discarded. They contribute no published measurements. The committed [compact JSON](benchmark-summary.json) retains individual final observations, validation definitions, revision/build hashes and the rejected experiment. These limited samples do not prove the absence of smaller regressions, performance with larger control payloads, production packet loss behavior, or capacity on separate client/server machines.
+
+## Ordered admission follow-up
+
+Runtime `a2da362aa1047464b3b789b29928b8f60e112ea9` was compared with the previous runtime `94b42f97c28d203cb7983f5399bc3df27b608639`, using the identical committed UDP control probe and fixture. The same host remained on the performance CPU governor. Each case used previous / new / new / previous twice: **four samples per revision**, 32,768 operations per trial, four Tokio workers, 16 Rayon threads, system allocator, and GPU disabled. Ordinary handler capacity was unchanged; the new runtime reserves two additional slots for identity handlers.
+
+| Peers / outstanding requests per peer | Previous requests/s | New requests/s | Change | Previous / new p95 batch completion |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / 1 | 43,588 | 38,520 | −11.6% | 29.44 / 31.95 µs |
+| 64 / 1 | 128,150 | 123,736 | −3.4% | 0.573 / 0.605 ms |
+| 64 / 64 | 136,714 | 134,099 | −1.9% | 31.44 / 31.91 ms |
+
+All **24 trials** passed the exact application-count and final-subscription checks, with empty client ACK windows, zero protocol/ACK errors, and zero client retransmissions. No gain was obtained by dropping work. Median whole-process CPU seconds (including driver and setup/shutdown) rose from 2.260 to 2.584, 1.515 to 1.653, and 1.403 to 1.503 respectively. These are not separate server CPU measurements.
+
+The one-peer probe shows a consistent processing-cost increase: preliminary implementations also measured approximately 11–13% lower throughput. Avoiding empty scheduling permit probes, cloning one shared queue handle, and removing duplicate application quota bookkeeping did not eliminate it. The 64-peer differences are smaller observations on a shared host, without statistical significance established. Active cooperative polling adds CPU and map contention on the same runtime, so this probe cannot attribute every difference solely to server code. It does establish that the new control path should not be described as regression-free.
+
+The runtime changes reserve an independent 128-event identity budget and two identity workers. Ordinary ordered quotas (4,096 global, 128 per lane, 256 per connection) cover ingress, queued, and running handlers. In-order admission reserves its permit before sequence commit/ACK; lack of capacity leaves it for retry rather than disconnecting the client. Out-of-order packets already ACKed under the separate bounded reorder budget remain retained until handler admission succeeds. The application FIFO retains accepted events and uses the transport permit as its quota owner.
+
+Regression tests verify reserved identity admission at a full ordinary transport budget, a real signed identity response with all ordinary workers blocked, and a real 400-message UDP burst whose delayed handler eventually receives every message in FIFO order after unchanged-packet retries, with its session still connected. Server workspace validation passed **326 tests, two ignored**, targeted transport/core Clippy denied warnings, and formatting passed. CodeRabbit's first review emitted one minor queue-rejection panic concern, addressed by removing the second quota/rejection path. Its follow-up emitted zero findings but completed with an unverified-findings warning; this is not a clean-review guarantee. Luna audits found no additional concrete issue.
+
+The JSON summary retains all 24 individual measurements, binary/source/fixture hashes, revisions, CPU observations, and validation results. Raw captures remain ignored. **No new voice/avatar workload or 1,000-user capacity test was run at this runtime.** Earlier realtime results above apply to `94b42f9`, not this follow-up.

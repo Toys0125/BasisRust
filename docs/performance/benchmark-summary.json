@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "purpose": "PR #31 benchmark summary; raw captures are local.",
-  "reviewed_revision": "94b42f97c28d203cb7983f5399bc3df27b608639",
+  "reviewed_revision": "a2da362aa1047464b3b789b29928b8f60e112ea9",
   "reliable_receive": {
     "report": "reliable-receive-review-20261008.md",
     "baseline_revision": "6009c2bc556cd483e02e07d4b07030147645b548",
@@ -392,5 +392,161 @@
         ["voice10-250-06-main","main",true,true,5.609807821,2.004093507,73.70703125,66.38671875,1250.0,1.0,0.99999818,21,32.9,11600.633333333,0,0,0]
       ]
     }
+  },
+  "ordered_admission_followup": {
+    "report": "docs/performance/processing-speed-20261008.md#ordered-admission-follow-up",
+    "baseline_runtime_revision": "94b42f97c28d203cb7983f5399bc3df27b608639",
+    "candidate_runtime_revision": "a2da362aa1047464b3b789b29928b8f60e112ea9",
+    "date": "2026-10-08",
+    "host": {
+      "cpu": "AMD Ryzen 9 5900HX with Radeon Graphics",
+      "ram_bytes": 33492484096,
+      "gpu": "NVIDIA GeForce RTX 3080 Laptop GPU",
+      "logical_processors": 16,
+      "governors": ["performance"]
+    },
+    "configuration": {
+      "profile": "release",
+      "rustc": "1.95.0",
+      "tokio_workers": 4,
+      "rayon_threads": 16,
+      "ordinary_handler_workers": 64,
+      "candidate_reserved_identity_workers": 2,
+      "operations_per_trial": 32768,
+      "samples_per_revision_per_case": 4,
+      "order_per_case": ["previous", "admission", "admission", "previous", "previous", "admission", "admission", "previous"],
+      "fixture": "docs/performance/fixtures/avatar-cpu-only-server.xml",
+      "fixture_sha256": "21f6aaa39b91a21358077c0023ce28b555439c8731d8a96050d1272f7ddee6c9",
+      "allocator": "system",
+      "identity_enabled_in_speed_probe": false,
+      "cpu_scope": "server and UDP driver share this process; total CPU includes setup and shutdown"
+    },
+    "binary_sha256": {
+      "previous": "6e6929c0eea6cb0980693ba0775177136d3b681d8e462d142e9c08c45c9f27a2",
+      "admission": "450c2b80311d85b181a8f19088613511375532a96d66ba1698ac559ddb76d9c2"
+    },
+    "candidate_source_sha256": {
+      "BasisRustServer/crates/basis-transport/src/lib.rs": "497da2e5f2749b6141e773bdb7c151cb1fee56db60c78d4ff4b5bb47ca2836e4",
+      "BasisRustServer/crates/basis-server-core/src/lib.rs": "3127ce9b0cc7dbaedf0a9ce699437ef3183d04f5bd628f5a10193154fffc4f99",
+      "BasisRustServer/crates/basis-server-core/examples/registry-processing-benchmark.rs": "10c7705abec650d4362bc893e0e6415b174e7838bb3ce5344415489fd6670a9b"
+    },
+    "cases": [
+      {
+        "peers": 1,
+        "batch_size_per_peer": 1,
+        "previous": {
+          "samples": 4,
+          "median_operations_per_second": 43587.96679581214,
+          "median_batch_p50_ms": 0.0226985,
+          "median_batch_p95_ms": 0.029438,
+          "median_process_total_cpu_seconds": 2.2596405000000006,
+          "retransmits_total": 0
+        },
+        "admission": {
+          "samples": 4,
+          "median_operations_per_second": 38519.855051067294,
+          "median_batch_p50_ms": 0.025143,
+          "median_batch_p95_ms": 0.031952499999999995,
+          "median_process_total_cpu_seconds": 2.5844829999999996,
+          "retransmits_total": 0
+        },
+        "throughput_change_percent": -11.627318540656928
+      },
+      {
+        "peers": 64,
+        "batch_size_per_peer": 1,
+        "previous": {
+          "samples": 4,
+          "median_operations_per_second": 128150.255493962,
+          "median_batch_p50_ms": 0.4828845,
+          "median_batch_p95_ms": 0.5733295,
+          "median_process_total_cpu_seconds": 1.5145959999999992,
+          "retransmits_total": 0
+        },
+        "admission": {
+          "samples": 4,
+          "median_operations_per_second": 123735.7524193571,
+          "median_batch_p50_ms": 0.4959445,
+          "median_batch_p95_ms": 0.6051765,
+          "median_process_total_cpu_seconds": 1.6525625000000002,
+          "retransmits_total": 0
+        },
+        "throughput_change_percent": -3.4447867915588293
+      },
+      {
+        "peers": 64,
+        "batch_size_per_peer": 64,
+        "previous": {
+          "samples": 4,
+          "median_operations_per_second": 136713.62764658502,
+          "median_batch_p50_ms": 29.528087999999997,
+          "median_batch_p95_ms": 31.444504000000002,
+          "median_process_total_cpu_seconds": 1.4034064999999956,
+          "retransmits_total": 0
+        },
+        "admission": {
+          "samples": 4,
+          "median_operations_per_second": 134099.3892105568,
+          "median_batch_p50_ms": 30.365766999999998,
+          "median_batch_p95_ms": 31.9075185,
+          "median_process_total_cpu_seconds": 1.5034245000000013,
+          "retransmits_total": 0
+        },
+        "throughput_change_percent": -1.912200327816782
+      }
+    ],
+    "samples": [
+      ["previous", 0, true, 1, 1, 32768, 0.752114172, 43567.85341893545, 0.022908, 0.029124, 32768, 0, 0, 0, 0, 2.260412, 1.1118546379730105],
+      ["admission", 1, true, 1, 1, 32768, 0.843024646, 38869.56348842024, 0.025003, 0.031498000000000005, 32768, 0, 0, 0, 0, 2.5877070000000004, 1.1830176329240203],
+      ["admission", 2, true, 1, 1, 32768, 0.854900851, 38329.59104166338, 0.025283, 0.031986999999999995, 32768, 0, 0, 0, 0, 2.5812589999999993, 1.1604046979919076],
+      ["previous", 3, true, 1, 1, 32768, 0.750299418, 43673.23126458829, 0.022629, 0.029403, 32768, 0, 0, 0, 0, 2.2588690000000007, 1.1112067990470678],
+      ["previous", 4, true, 1, 1, 32768, 0.751420376, 43608.080172688846, 0.022768, 0.029543000000000003, 32768, 0, 0, 0, 0, 2.245080999999999, 1.113158104941249],
+      ["admission", 5, true, 1, 1, 32768, 0.854664306, 38340.199502844334, 0.025283, 0.031918, 32768, 0, 0, 0, 0, 2.6381680000000003, 1.2135213520377874],
+      ["admission", 6, true, 1, 1, 32768, 0.846729054, 38699.510599290246, 0.024933, 0.031986999999999995, 32768, 0, 0, 0, 0, 2.550048999999998, 1.1604604478925467],
+      ["previous", 7, true, 1, 1, 32768, 0.75544179, 43375.942969742246, 0.022559, 0.029473, 32768, 0, 0, 0, 0, 2.2892820000000036, 1.113611807115376],
+      ["previous", 0, true, 64, 1, 32768, 0.259222114, 126408.96833361987, 0.488611, 0.605666, 32768, 0, 0, 0, 0, 1.536998999999998, 0.7149112890474498],
+      ["admission", 1, true, 64, 1, 32768, 0.26928097, 121687.0245231217, 0.503208, 0.62571, 32768, 0, 0, 0, 0, 1.6627310000000008, 0.7131945861037821],
+      ["admission", 2, true, 64, 1, 32768, 0.270029602, 121349.65854595453, 0.500344, 0.618167, 32768, 0, 0, 0, 0, 1.6683960000000013, 0.7135292689781636],
+      ["previous", 3, true, 64, 1, 32768, 0.258561066, 126732.15077168656, 0.482815, 0.6072719999999999, 32768, 0, 0, 0, 0, 1.5072289999999988, 0.6766817208845168],
+      ["previous", 4, true, 64, 1, 32768, 0.252901248, 129568.36021623743, 0.482954, 0.5409930000000001, 32768, 0, 0, 0, 0, 1.5219629999999995, 0.674302431056276],
+      ["admission", 5, true, 64, 1, 32768, 0.260509086, 125784.48031559252, 0.491545, 0.592186, 32768, 0, 0, 0, 0, 1.6423939999999995, 0.6742797349579632],
+      ["admission", 6, true, 64, 1, 32768, 0.259024814, 126505.25443481257, 0.49133499999999997, 0.5801040000000001, 32768, 0, 0, 0, 0, 1.6402630000000045, 0.6742082878481597],
+      ["previous", 7, true, 64, 1, 32768, 0.251263047, 130413.12835786791, 0.481628, 0.540504, 32768, 0, 0, 0, 0, 1.5047579999999954, 0.6774362241849303],
+      ["previous", 0, true, 64, 64, 32768, 0.248092731, 132079.64565475317, 30.359481000000002, 34.907491, 32768, 0, 0, 0, 0, 1.4366120000000038, 0.6748517400119454],
+      ["admission", 1, true, 64, 64, 32768, 0.24864015, 131788.85228310875, 30.877845, 32.879084000000006, 32768, 0, 0, 0, 0, 1.503108999999995, 0.6744472191203386],
+      ["admission", 2, true, 64, 64, 32768, 0.245566495, 133438.3992409062, 30.471786, 31.915898999999996, 32768, 0, 0, 0, 0, 1.5037400000000076, 0.7413518370594829],
+      ["previous", 3, true, 64, 64, 32768, 0.237941896, 137714.29307262474, 29.527669, 30.465290999999997, 32768, 0, 0, 0, 0, 1.3999839999999963, 0.8532684091478586],
+      ["previous", 4, true, 64, 64, 32768, 0.240530852, 136232.0040341436, 29.528506999999998, 31.883423, 32768, 0, 0, 0, 0, 1.4068289999999948, 0.8029429151210934],
+      ["admission", 5, true, 64, 64, 32768, 0.243157523, 134760.3791802074, 30.259748, 31.899138, 32768, 0, 0, 0, 0, 1.5060650000000066, 0.6739117500837892],
+      ["admission", 6, true, 64, 64, 32768, 0.240570872, 136209.3412539154, 29.603308, 31.316311, 32768, 0, 0, 0, 0, 1.4606739999999974, 0.6763591379858553],
+      ["previous", 7, true, 64, 64, 32768, 0.238842086, 137195.25125902644, 29.504761000000002, 31.005585, 32768, 0, 0, 0, 0, 1.396735999999997, 0.6757035371847451]
+    ],
+    "validation": {
+      "valid_trials": 24,
+      "all_exact_application_counts": true,
+      "all_final_subscription_checks_passed": true,
+      "client_retransmits_total": 0,
+      "all_zero_protocol_and_ack_errors": true,
+      "all_client_windows_drained": true,
+      "server_workspace_tests_passed": 326,
+      "server_workspace_tests_ignored": 2,
+      "targeted_clippy_warnings_denied": "passed",
+      "formatting": "passed",
+      "coderabbit_first_review": "completed: one minor queue rejection panic concern; duplicate queue quota removed",
+      "coderabbit_followup": "completed_with_warnings: zero emitted findings, unverified findings warning; not a clean-review guarantee"
+    },
+    "limitations": ["Four samples per revision/configuration on one shared host; normal desktop activity not isolated.", "Active cooperative polling shares four Tokio workers with server, adding CPU/map contention.", "Small differences cannot be attributed solely to server processing.", "Consistent one-peer probe slowdown remains; no claim of regression-free control processing.", "No new realtime voice/avatar or 1000-user capacity run at this runtime."],
+    "changes": ["Independent 128-slot identity admission budget and two reserved identity workers.", "Regular 4096, per-lane128, per-peer256 quotas reserved before ordered application delivery ACK, held through handler completion.", "ACKed out-of-order messages remain retained under separate existing reorder byte/packet budget until application admission succeeds.", "Single quota owner in transport; core retains accepted events without a second rejection/panic path."],
+    "preliminary_iterations": [
+      {
+        "name": "initial",
+        "one_peer_change_percent": -12.691697188651485
+      },
+      {
+        "name": "intermediate",
+        "one_peer_change_percent": -11.044267527242457
+      }
+    ],
+    "sample_columns": ["revision_label", "sample", "valid", "peers", "batch_size_per_peer", "processed_operations", "elapsed_seconds", "operations_per_second", "batch_completion_p50_ms", "batch_completion_p95_ms", "client_transmissions", "client_retransmits", "client_pending_at_end", "client_ack_errors", "protocol_errors_delta", "process_total_cpu_seconds", "process_total_wall_seconds"]
   }
 }
