@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "purpose": "PR #31 benchmark summary; raw captures are local.",
-  "reviewed_revision": "51c42ab4f31a7fc3f9a8eeb0a5e636e711f27706",
+  "reviewed_revision": "ae10e95d09d0707318f62ff4ca799a2a821dcfad",
   "reliable_receive": {
     "report": "reliable-receive-review-20261008.md",
     "baseline_revision": "6009c2bc556cd483e02e07d4b07030147645b548",
@@ -836,5 +836,199 @@
     "changes": ["Critical admission now limits a single connection/channel to two outstanding messages, independent of the 128 global budget.", "Session-owned bounded atomic lane/peer counters and separate atomic global class totals replace shared mutex and hash maps.", "Failed partial admission rolls back all acquired counters before returning no-ACK; permits retain their original session until completion.", "Direct dispatcher receiver selection replaces nested select; ingress schedules only the class whose queue changed."],
     "memory_cost": "528 bytes of fixed counters per PeerState on this 64-bit host, even when ordered admission is disabled; global class counters may still contend.",
     "limitations": ["Four control samples per revision/configuration on one shared host; differences are observations without statistical significance established.", "Active cooperative observer polling shares four Tokio workers with server and driver; full probe does not isolate server CPU.", "Single-peer candidate remains 9.7% below pre-admission 94b runtime in this cohort.", "Two pre-admission burst trials retried (six retransmissions total), affecting its p95/median; cause not identified.", "Uncontended microbenchmark excludes CAS contention, rejected admissions, ACKs, queue handoff and handler processing.", "No latest voice/avatar workload or 1000-user capacity test."]
+  },
+  "handler_state_optimization": {
+    "report": "docs/performance/processing-speed-20261008.md#shared-handler-state-follow-up",
+    "revisions": {
+      "pre_admission": "94b42f97c28d203cb7983f5399bc3df27b608639",
+      "previous_runtime": "51c42ab4f31a7fc3f9a8eeb0a5e636e711f27706",
+      "previous_head": "15704c659fe830bef36e33f1122498fba395179f",
+      "candidate": "ae10e95d09d0707318f62ff4ca799a2a821dcfad"
+    },
+    "host": {
+      "cpu": "AMD Ryzen 9 5900HX with Radeon Graphics",
+      "ram_bytes": 33492484096,
+      "gpu": "NVIDIA GeForce RTX 3080 Laptop GPU",
+      "logical_processors": 16,
+      "governors": ["performance"]
+    },
+    "configuration": {
+      "profile": "release",
+      "rustc": "1.95.0",
+      "tokio_workers": 4,
+      "rayon_threads": 16,
+      "ordinary_handler_workers": 64,
+      "identity_handler_workers": 2,
+      "regular_total": 4096,
+      "regular_per_peer": 256,
+      "regular_per_lane": 128,
+      "critical_total": 128,
+      "critical_per_peer": 2,
+      "critical_per_lane": 2,
+      "operations_per_trial": 32768,
+      "samples_per_revision_per_case": 4,
+      "order_per_case": ["pre_admission", "previous", "candidate", "candidate", "previous", "pre_admission", "pre_admission", "previous", "candidate", "candidate", "previous", "pre_admission"],
+      "fixture": "docs/performance/fixtures/avatar-cpu-only-server.xml",
+      "fixture_sha256": "21f6aaa39b91a21358077c0023ce28b555439c8731d8a96050d1272f7ddee6c9",
+      "allocator": "system",
+      "identity_enabled_in_speed_probe": false,
+      "cpu_scope": "whole process, including server, UDP driver, observation, setup and shutdown"
+    },
+    "binary_sha256": {
+      "pre_admission": "6e6929c0eea6cb0980693ba0775177136d3b681d8e462d142e9c08c45c9f27a2",
+      "previous": "371cedcb0e233ec62532cf27793e5262e35e27c18c85deabd4ad393d2ebfe23a",
+      "candidate": "8bb468d280623df0f4a2f63bda8011145d76fb5045a3c2ca8feaaea53d9869ae"
+    },
+    "candidate_source_sha256": {
+      "BasisRustServer/crates/basis-server-core/src/lib.rs": "7d935c10a611ef711c0945bf5eb7990dfc05b20911db56106aa8088523e5f999",
+      "BasisRustServer/crates/basis-server-core/examples/registry-processing-benchmark.rs": "10c7705abec650d4362bc893e0e6415b174e7838bb3ce5344415489fd6670a9b"
+    },
+    "cases": [
+      {
+        "peers": 1,
+        "batch_size_per_peer": 1,
+        "pre_admission": {
+          "samples": 4,
+          "median_operations_per_second": 40945.76593428437,
+          "median_batch_p50_ms": 0.023502000000000002,
+          "median_batch_p95_ms": 0.030521,
+          "median_process_total_cpu_seconds": 2.453137999999999,
+          "client_retransmits_total": 0
+        },
+        "previous": {
+          "samples": 4,
+          "median_operations_per_second": 36804.74067283783,
+          "median_batch_p50_ms": 0.026121,
+          "median_batch_p95_ms": 0.033629000000000006,
+          "median_process_total_cpu_seconds": 2.7300650000000015,
+          "client_retransmits_total": 0
+        },
+        "candidate": {
+          "samples": 4,
+          "median_operations_per_second": 42553.81673872044,
+          "median_batch_p50_ms": 0.022873,
+          "median_batch_p95_ms": 0.029718,
+          "median_process_total_cpu_seconds": 2.3017084999999984,
+          "client_retransmits_total": 0
+        },
+        "throughput_change_vs_previous_percent": 15.62047703850682,
+        "throughput_change_vs_pre_admission_percent": 3.927270055265053
+      },
+      {
+        "peers": 64,
+        "batch_size_per_peer": 1,
+        "pre_admission": {
+          "samples": 4,
+          "median_operations_per_second": 122157.74139551024,
+          "median_batch_p50_ms": 0.5036984999999999,
+          "median_batch_p95_ms": 0.622325,
+          "median_process_total_cpu_seconds": 1.5903845000000025,
+          "client_retransmits_total": 0
+        },
+        "previous": {
+          "samples": 4,
+          "median_operations_per_second": 120267.07481357825,
+          "median_batch_p50_ms": 0.509112,
+          "median_batch_p95_ms": 0.6368175,
+          "median_process_total_cpu_seconds": 1.6949529999999982,
+          "client_retransmits_total": 0
+        },
+        "candidate": {
+          "samples": 4,
+          "median_operations_per_second": 124277.93089527631,
+          "median_batch_p50_ms": 0.498321,
+          "median_batch_p95_ms": 0.5944929999999999,
+          "median_process_total_cpu_seconds": 1.5038405000000026,
+          "client_retransmits_total": 0
+        },
+        "throughput_change_vs_previous_percent": 3.3349577080137305,
+        "throughput_change_vs_pre_admission_percent": 1.7356161595207809
+      },
+      {
+        "peers": 64,
+        "batch_size_per_peer": 64,
+        "pre_admission": {
+          "samples": 4,
+          "median_operations_per_second": 128072.33458334961,
+          "median_batch_p50_ms": 31.5154385,
+          "median_batch_p95_ms": 33.9874525,
+          "median_process_total_cpu_seconds": 1.4993750000000041,
+          "client_retransmits_total": 0
+        },
+        "previous": {
+          "samples": 4,
+          "median_operations_per_second": 128369.38587486984,
+          "median_batch_p50_ms": 31.4318375,
+          "median_batch_p95_ms": 33.5625005,
+          "median_process_total_cpu_seconds": 1.5304840000000013,
+          "client_retransmits_total": 0
+        },
+        "candidate": {
+          "samples": 4,
+          "median_operations_per_second": 130049.28934237281,
+          "median_batch_p50_ms": 31.304026999999998,
+          "median_batch_p95_ms": 32.268542,
+          "median_process_total_cpu_seconds": 1.4159480000000002,
+          "client_retransmits_total": 0
+        },
+        "throughput_change_vs_previous_percent": 1.3086480519120647,
+        "throughput_change_vs_pre_admission_percent": 1.543623582294118
+      }
+    ],
+    "sample_columns": ["revision_label", "sample", "valid", "peers", "batch_size_per_peer", "processed_operations", "elapsed_seconds", "operations_per_second", "batch_completion_p50_ms", "batch_completion_p95_ms", "client_transmissions", "client_retransmits", "client_pending_at_end", "client_ack_errors", "protocol_errors_delta", "process_total_cpu_seconds", "process_total_wall_seconds"],
+    "samples": [
+      ["pre_admission", 0, true, 1, 1, 32768, 0.790345979, 41460.32354268484, 0.023397, 0.029543000000000003, 32768, 0, 0, 0, 0, 2.366512, 1.0803834500256926],
+      ["previous", 1, true, 1, 1, 32768, 0.880160199, 37229.586201727354, 0.025911999999999998, 0.032966, 32768, 0, 0, 0, 0, 2.7253299999999996, 1.2332491520792246],
+      ["candidate", 2, true, 1, 1, 32768, 0.764103346, 42884.25141904823, 0.022768999999999998, 0.029193999999999998, 32768, 0, 0, 0, 0, 2.29458, 1.1115322508849204],
+      ["candidate", 3, true, 1, 1, 32768, 0.77211727, 42439.14917224945, 0.022908, 0.029893, 32768, 0, 0, 0, 0, 2.2758129999999994, 1.0816871121060103],
+      ["previous", 4, true, 1, 1, 32768, 0.897782603, 36498.813733417825, 0.02633, 0.034292, 32768, 0, 0, 0, 0, 2.704195000000002, 1.2109565588179976],
+      ["pre_admission", 5, true, 1, 1, 32768, 0.802321114, 40841.502770173895, 0.023537, 0.030591, 32768, 0, 0, 0, 0, 2.453994999999999, 1.1612354258541018],
+      ["pre_admission", 6, true, 1, 1, 32768, 0.801264685, 40895.35032983514, 0.023676000000000003, 0.031009000000000002, 32768, 0, 0, 0, 0, 2.455841999999997, 1.161339769139886],
+      ["previous", 7, true, 1, 1, 32768, 0.882980612, 37110.667612257836, 0.025841, 0.032966, 32768, 0, 0, 0, 0, 2.7348000000000035, 1.234229648951441],
+      ["candidate", 8, true, 1, 1, 32768, 0.771159664, 42491.84900313977, 0.022838, 0.030451, 32768, 0, 0, 0, 0, 2.327400000000001, 1.1318959381897002],
+      ["candidate", 9, true, 1, 1, 32768, 0.768916973, 42615.78447430111, 0.022908, 0.029543000000000003, 32768, 0, 0, 0, 0, 2.308836999999997, 1.1118032950907946],
+      ["previous", 10, true, 1, 1, 32768, 0.906669891, 36141.04794398649, 0.026679, 0.034571, 32768, 0, 0, 0, 0, 2.7917580000000015, 1.2634055570233613],
+      ["pre_admission", 11, true, 1, 1, 32768, 0.799293953, 40996.1815387336, 0.023467000000000002, 0.030451, 32768, 0, 0, 0, 0, 2.4522809999999993, 1.160609562881291],
+      ["pre_admission", 0, true, 64, 1, 32768, 0.271179837, 120834.94245923602, 0.5025109999999999, 0.63563, 32768, 0, 0, 0, 0, 1.593167000000001, 0.7282199580222368],
+      ["previous", 1, true, 64, 1, 32768, 0.27228585, 120344.11630277519, 0.508868, 0.636748, 32768, 0, 0, 0, 0, 1.6997619999999998, 0.7260362138040364],
+      ["candidate", 2, true, 64, 1, 32768, 0.261596078, 125261.81680751345, 0.498251, 0.5866709999999999, 32768, 0, 0, 0, 0, 1.4954869999999971, 0.7133712449576706],
+      ["candidate", 3, true, 64, 1, 32768, 0.265771149, 123294.04498303916, 0.498112, 0.6023149999999999, 32768, 0, 0, 0, 0, 1.5011860000000041, 0.712693011155352],
+      ["previous", 4, true, 64, 1, 32768, 0.263625121, 124297.7144048423, 0.5032800000000001, 0.573192, 32768, 0, 0, 0, 0, 1.6813359999999946, 0.7124958471395075],
+      ["pre_admission", 5, true, 64, 1, 32768, 0.263334648, 124434.82180894024, 0.499928, 0.567464, 32768, 0, 0, 0, 0, 1.5804470000000066, 0.712899531936273],
+      ["pre_admission", 6, true, 64, 1, 32768, 0.267028231, 122713.61674863509, 0.504886, 0.619846, 32768, 0, 0, 0, 0, 1.607122000000004, 0.7136470470577478],
+      ["previous", 7, true, 64, 1, 32768, 0.272634919, 120190.03332438132, 0.509356, 0.639332, 32768, 0, 0, 0, 0, 1.7347289999999944, 0.7132513229735196],
+      ["candidate", 8, true, 64, 1, 32768, 0.260541675, 125768.74697685122, 0.49839100000000003, 0.5601309999999999, 32768, 0, 0, 0, 0, 1.506495000000001, 0.7125220349989831],
+      ["candidate", 9, true, 64, 1, 32768, 0.275731004, 118840.46235148805, 0.512848, 0.643382, 32768, 0, 0, 0, 0, 1.5602540000000005, 0.7263269599061459],
+      ["previous", 10, true, 64, 1, 32768, 0.274088534, 119552.61142007494, 0.513826, 0.6368870000000001, 32768, 0, 0, 0, 0, 1.6901439999999965, 0.7265772719401866],
+      ["pre_admission", 11, true, 64, 1, 32768, 0.269469549, 121601.86604238537, 0.508239, 0.6248039999999999, 32768, 0, 0, 0, 0, 1.587602000000004, 0.713003730867058],
+      ["pre_admission", 0, true, 64, 64, 32768, 0.257796682, 127107.9198761759, 31.535028999999998, 34.188527, 32768, 0, 0, 0, 0, 1.491264000000001, 0.7138697688933462],
+      ["previous", 1, true, 64, 64, 32768, 0.252934857, 129551.14367649215, 31.463580999999998, 33.176939000000004, 32768, 0, 0, 0, 0, 1.5253409999999974, 0.6755720300134271],
+      ["candidate", 2, true, 64, 64, 32768, 0.248575332, 131823.21727724775, 30.972942, 32.020079, 32768, 0, 0, 0, 0, 1.4089170000000024, 0.6752542499452829],
+      ["candidate", 3, true, 64, 64, 32768, 0.25310506, 129464.02572907867, 31.457224999999998, 32.391359, 32768, 0, 0, 0, 0, 1.5153669999999977, 0.7635125331580639],
+      ["previous", 4, true, 64, 64, 32768, 0.255626768, 128186.88847171122, 31.150969, 36.920108, 32768, 0, 0, 0, 0, 1.5715059999999994, 0.7129476449918002],
+      ["pre_admission", 5, true, 64, 64, 32768, 0.253350205, 129338.75463017683, 30.93858, 33.786378, 32768, 0, 0, 0, 0, 1.532630999999995, 0.6765726509038359],
+      ["pre_admission", 6, true, 64, 64, 32768, 0.253943161, 129036.74929052334, 31.495848, 33.008480999999996, 32768, 0, 0, 0, 0, 1.5074860000000072, 0.6749068552162498],
+      ["previous", 7, true, 64, 64, 32768, 0.254900972, 128551.88327802846, 31.400094000000003, 33.358667000000004, 32768, 0, 0, 0, 0, 1.5254889999999932, 0.6756578618660569],
+      ["candidate", 8, true, 64, 64, 32768, 0.250837158, 130634.55295566695, 31.150829, 32.145725, 32768, 0, 0, 0, 0, 1.3864400000000003, 0.6744030839763582],
+      ["candidate", 9, true, 64, 64, 32768, 0.255322955, 128339.42016690194, 31.61821, 33.863414, 32768, 0, 0, 0, 0, 1.422978999999998, 0.675733151147142],
+      ["previous", 10, true, 64, 64, 32768, 0.256527865, 127736.61060173715, 31.640071, 33.766334, 32768, 0, 0, 0, 0, 1.5354790000000094, 0.675336378859356],
+      ["pre_admission", 11, true, 64, 64, 32768, 0.265047025, 123630.89153707724, 32.359370999999996, 35.312351, 32768, 0, 0, 0, 0, 1.47969599999999, 0.7135455561801791]
+    ],
+    "validation": {
+      "valid_trials": 36,
+      "all_exact_application_counts": true,
+      "all_final_subscription_checks_passed": true,
+      "all_client_windows_drained": true,
+      "all_zero_protocol_and_ack_errors": true,
+      "client_retransmits_total": 0,
+      "server_core_tests_passed": 106,
+      "critical_fairness_regression": "passed",
+      "core_all_targets_clippy_warnings_denied": "passed",
+      "formatting_and_diff_checks": "passed",
+      "coderabbit": "review_completed, 1 file reviewed, zero findings",
+      "luna_audit": "shared state semantics, lifecycle, ordering, session and admission unchanged"
+    },
+    "changes": ["Wrap ServerState once in Arc inside the event loop; each handler receives a clone of that single Arc rather than cloning all state fields.", "Remove the redundant second state clone before ordinary callback invocation.", "Critical quotas, pre-ACK reservation, queue budgets, session leases and FIFO dispatch are unchanged."],
+    "limitations": ["Four samples per revision/configuration on one shared host; descriptive medians without statistical significance established.", "Active cooperative observer polling shares four Tokio workers with the server and driver; not isolated server processing or CPU.", "Identity is disabled in speed trials; existing signed-identity and admission tests cover correctness separately.", "No voice/avatar or 1000-user capacity workload rerun.", "No regression versus 94b42f9 observed in this cohort; this does not establish absence of regressions in other workloads."]
   }
 }

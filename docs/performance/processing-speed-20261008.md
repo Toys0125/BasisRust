@@ -156,3 +156,23 @@ Median whole-process CPU seconds, including setup/shutdown and the driver, chang
 Validation passed **330 server tests, three ignored**, targeted transport/core Clippy with warnings denied, formatting, and diff checks. Tests cover critical connection fairness, invalid limits, concurrent global/peer/lane reservations, rollback, stale-session release, auth progress, FIFO bursts and cleanup. Luna audits found no new concrete issue in these changes. CodeRabbit emitted zero findings but completed with unverified warnings, so that run is not a clean-review guarantee.
 
 The compact JSON retains all 36 final UDP trials, all 40 isolated microbenchmark observations, configuration/revision/source/binary hashes, profiling notes and limitations. Raw results and the 25 MB profiling capture remain ignored. No voice/avatar or 1,000-user capacity workload was rerun at this runtime.
+
+## Shared handler state follow-up
+
+Runtime `ae10e95d09d0707318f62ff4ca799a2a821dcfad` addresses the remaining control-processing cost without changing admission behavior. `ServerState` contains shared state wrappers; cloning it for each handler increments many resource reference counts. The dispatcher now wraps it once in an `Arc` and shares that single reference with each handler. A redundant second state clone on the ordinary path is also removed. Critical per-connection limits remain two, pre-ACK reservation and all queue limits remain unchanged, and session leases and FIFO handler execution are preserved.
+
+The matched experiment compared frozen `51c42ab` and `94b42f9` binaries with the new runtime. It used the same probe, fixture, host, allocator, four Tokio workers, 16 Rayon threads, 64 ordinary handler slots, two identity slots, and 32,768 operations per trial. Each case used reference / previous / new / new / previous / reference twice: **four samples per revision/case**. Identity authentication is disabled in speed trials; correctness is covered separately by the existing identity and admission regressions.
+
+| Peers / requests in flight per peer | Previous (`51c42ab`) requests/s | New requests/s | Change | Previous / new p95 batch completion |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / 1 | 36,805 | 42,554 | +15.6% | 33.63 / 29.72 µs |
+| 64 / 1 | 120,267 | 124,278 | +3.3% | 0.637 / 0.594 ms |
+| 64 / 64 | 128,369 | 130,049 | +1.3% | 33.56 / 32.27 ms |
+
+All **36 trials** passed exact processing totals, final-subscription checks, empty ACK windows, and zero protocol/ACK errors, with **zero client retransmissions across all revisions**. The gains were not obtained by dropping work. Median whole-process CPU seconds, including driver and setup/shutdown, fell from 2.730 to 2.302, 1.695 to 1.504, and 1.530 to 1.416 respectively.
+
+The corresponding `94b42f9` medians were 40,946, 122,158 and 128,072 requests/s. New throughput was **3.9%, 1.7% and 1.5% higher**, respectively, and its p95 batch completion was lower in all three cases. Thus the previously observed control regression was **not reproduced in this matched cohort**. Four samples on a shared host do not establish statistical significance or prove that every workload is free of regressions. The active observer and UDP driver still share runtime workers with the server, so throughput and CPU are not isolated server measurements.
+
+Validation passed **106 server-core tests**, the focused transport critical-fairness regression, core all-target Clippy with warnings denied, workspace formatting, and diff checks. Luna verified that the shared wrappers preserve state identity and that the change leaves lifecycle, ordering, session and permit handling intact. CodeRabbit reviewed the changed server file and completed successfully with zero findings. The full workspace was not rerun for this small core-only follow-up; the preceding runtime's 330-test result remains historical.
+
+The [compact JSON](benchmark-summary.json) retains all 36 new samples, revisions, configuration, binary/source hashes, validation checks and limitations. Raw captures remain ignored. **No voice/avatar or 1,000-user capacity workload was rerun at this revision.**
