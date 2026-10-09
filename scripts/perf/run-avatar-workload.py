@@ -138,7 +138,7 @@ def main():
         (output / "commands.txt").write_text(" ".join(server_cmd) + "\n")
         server = subprocess.Popen(server_cmd, cwd=ROOT, env=server_env, stdout=server_log, stderr=subprocess.STDOUT)
 
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + args.ready_timeout
         while time.monotonic() < deadline:
             if server.poll() is not None:
                 raise RuntimeError(f"server exited early with status {server.returncode}")
