@@ -1,5 +1,6 @@
 mod admin_runtime;
 mod avatar_sync;
+mod event_diagnostics;
 #[cfg(feature = "gpu")]
 mod gpu_distance;
 #[cfg(not(feature = "gpu"))]
@@ -11,6 +12,7 @@ mod gpu_distance_types;
 mod gpu_policy;
 pub mod memory_reclaim;
 mod p2p;
+mod realtime;
 
 pub use avatar_sync::BsrProfilerSnapshot;
 
@@ -46,12 +48,15 @@ use basis_server_resources::{
     ContentShareState, NetIdState, OwnershipState, PipState, ResourceState,
 };
 use basis_server_storage::PersistentDatabase;
-use basis_transport::{DeliveryMethod, DisconnectReason, PeerId, ServerEvent, TransportHandle};
+use basis_transport::{
+    DeliveryMethod, DisconnectReason, OrderedAdmissionConfig, OrderedEvent, PeerId, PeerSession,
+    ServerEvent, TransportHandle,
+};
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, OpenOptions},
     io::Write,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -73,9 +78,13 @@ pub struct ConnectedPeer {
     pub id: PeerId,
     pub metadata: ClientMetaDataMessage,
     pub ready: ReadyMessage,
+    // Present for live connections. Unit fixtures that exercise app state without a
+    // transport session may leave this absent.
+    pub session: Option<PeerSession>,
 }
 
 struct PendingIdentity {
+    session: PeerSession,
     ready: ReadyMessage,
     challenge: Vec<u8>,
     expires_at: Instant,
@@ -328,6 +337,14 @@ pub struct StatisticsSnapshot {
     pub inbound_packets: u64,
     pub outbound_packets: u64,
     pub protocol_errors: u64,
+    /// Avatar input packets intercepted by the realtime handler.
+    pub avatar_received: u64,
+    /// Received avatar packets superseded by per-peer coalescing.
+    pub avatar_coalesced: u64,
+    /// Avatar packets discarded for authentication, session, registration, or protocol reasons.
+    pub avatar_rejected: u64,
+    /// Avatar packets accepted by avatar input processing.
+    pub avatar_processed: u64,
 }
 
 #[derive(Debug)]
@@ -371,6 +388,10 @@ pub struct Statistics {
     inbound_packets: Arc<GatedCounter>,
     outbound_packets: Arc<GatedCounter>,
     protocol_errors: Arc<GatedCounter>,
+    avatar_received: Arc<GatedCounter>,
+    avatar_coalesced: Arc<GatedCounter>,
+    avatar_rejected: Arc<GatedCounter>,
+    avatar_processed: Arc<GatedCounter>,
 }
 
 impl Statistics {
@@ -381,6 +402,10 @@ impl Statistics {
             inbound_packets: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
             outbound_packets: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
             protocol_errors: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
+            avatar_received: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
+            avatar_coalesced: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
+            avatar_rejected: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
+            avatar_processed: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
         }
     }
 
@@ -394,6 +419,10 @@ impl Statistics {
             self.inbound_packets.store(0, Ordering::Relaxed);
             self.outbound_packets.store(0, Ordering::Relaxed);
             self.protocol_errors.store(0, Ordering::Relaxed);
+            self.avatar_received.store(0, Ordering::Relaxed);
+            self.avatar_coalesced.store(0, Ordering::Relaxed);
+            self.avatar_rejected.store(0, Ordering::Relaxed);
+            self.avatar_processed.store(0, Ordering::Relaxed);
         }
         self.enabled.store(enabled, Ordering::Relaxed);
     }
@@ -403,6 +432,10 @@ impl Statistics {
             inbound_packets: self.inbound_packets.load(Ordering::Relaxed),
             outbound_packets: self.outbound_packets.load(Ordering::Relaxed),
             protocol_errors: self.protocol_errors.load(Ordering::Relaxed),
+            avatar_received: self.avatar_received.load(Ordering::Relaxed),
+            avatar_coalesced: self.avatar_coalesced.load(Ordering::Relaxed),
+            avatar_rejected: self.avatar_rejected.load(Ordering::Relaxed),
+            avatar_processed: self.avatar_processed.load(Ordering::Relaxed),
         }
     }
 }
@@ -441,6 +474,9 @@ pub struct ServerState {
     shutdown: Arc<AtomicBool>,
     tick_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     workers: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    disconnect_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    identity_timer_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    realtime_threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 }
 
 impl ServerState {
@@ -514,6 +550,18 @@ impl ServerState {
             config.health_include_extended_metrics,
         )
         .await?;
+        let lifecycle_events =
+            transport.enable_lifecycle_event_queues(MAX_LIFECYCLE_EVENTS, MAX_LIFECYCLE_EVENTS)?;
+        let (ordered_events, critical_events) =
+            transport.enable_ordered_admission(OrderedAdmissionConfig {
+                regular_capacity: MAX_PENDING_ORDERED_EVENTS,
+                critical_capacity: MAX_CRITICAL_ORDERED_EVENTS,
+                per_lane: MAX_PENDING_ORDERED_PER_LANE,
+                per_peer: MAX_PENDING_ORDERED_PER_PEER,
+                critical_per_lane: 2,
+                critical_per_peer: 2,
+                critical_channel: channels::AUTH_IDENTITY,
+            })?;
         transport.set_compact_merge_send(config.compact_merged);
         info!("server listening on {}", transport.local_addr()?);
 
@@ -588,6 +636,9 @@ impl ServerState {
             shutdown: Arc::new(AtomicBool::new(false)),
             tick_thread: Arc::new(Mutex::new(None)),
             workers: Arc::new(Mutex::new(Vec::new())),
+            disconnect_tasks: Arc::new(Mutex::new(Vec::new())),
+            identity_timer_tasks: Arc::new(Mutex::new(Vec::new())),
+            realtime_threads: Arc::new(Mutex::new(Vec::new())),
         };
         let tick_thread = state
             .avatar_sync
@@ -597,11 +648,25 @@ impl ServerState {
             })
             .context("starting avatar tick thread")?;
         *state.tick_thread.lock() = Some(tick_thread);
+        match realtime::start(&state) {
+            Ok(threads) => *state.realtime_threads.lock() = threads,
+            Err(error) => {
+                state.shutdown().await?;
+                return Err(error.context("starting realtime threads"));
+            }
+        }
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         state.workers.lock().extend([
             spawn_leave_broadcast_loop(state.clone()),
             admin_runtime::spawn_permission_updates(state.clone()),
-            tokio::spawn(event_loop(state.clone(), events, shutdown_rx)),
+            tokio::spawn(event_loop(
+                state.clone(),
+                events,
+                ordered_events,
+                critical_events,
+                lifecycle_events,
+                shutdown_rx,
+            )),
         ]);
         Ok((state, shutdown_tx))
     }
@@ -765,7 +830,7 @@ impl ServerState {
         let app = self.statistics.snapshot();
         if !verbose {
             return format!(
-                "Server is running and healthy. Players: {} PendingReliable: {} QueuedReliable: {} AppIn: {} AppOut: {} RawIn: {} RawOut: {} AvatarIn: {} AvatarOut: {} ProtocolErrors: {}",
+                "Server is running and healthy. Players: {} PendingReliable: {} QueuedReliable: {} AppIn: {} AppOut: {} RawIn: {} RawOut: {} AvatarIn: {} AvatarOut: {} ProtocolErrors: {} AvatarReceived: {} AvatarCoalesced: {} AvatarRejected: {} AvatarProcessed: {}",
                 players,
                 self.transport.pending_reliable_count(),
                 self.transport.queued_reliable_count(),
@@ -776,10 +841,14 @@ impl ServerState {
                 avatar.inbound_updates,
                 avatar.outbound_messages,
                 app.protocol_errors,
+                app.avatar_received,
+                app.avatar_coalesced,
+                app.avatar_rejected,
+                app.avatar_processed,
             );
         }
         format!(
-            "Server is running and healthy\nPlayers: {}\nReliable: pending={} queued={} window_fills={} retransmits={} dispatch_passes={} peers_visited={} acks_in={} acks_released={} acks_unknown_chan={} window_stalls={}\nApp messages: inbound={} outbound={} protocol_errors={}\nRaw UDP: packets_in={} packets_out={} bytes_in={} bytes_out={} would_block={}\nAvatar sync: inbound_updates={} outbound_messages={} outbound_logical_avatar_sends={} outbound_batches={} active_states={} pending_updates={} receiver_slices={}\nAvatar timing: ticks={} avg_tick_us={} smooth_tick_us={} avg_build_us={} avg_flush_us={} max_tick_us={} receiver_cycle_ms={} cycle_budget_ms={} tick_budget_ms={}",
+            "Server is running and healthy\nPlayers: {}\nReliable: pending={} queued={} window_fills={} retransmits={} dispatch_passes={} peers_visited={} acks_in={} acks_released={} acks_unknown_chan={} window_stalls={}\nApp messages: inbound={} outbound={} protocol_errors={}\nAvatar input: received={} coalesced={} rejected={} processed={}\nRaw UDP: packets_in={} packets_out={} bytes_in={} bytes_out={} would_block={}\nAvatar sync: inbound_updates={} outbound_messages={} outbound_logical_avatar_sends={} outbound_batches={} active_states={} pending_updates={} receiver_slices={}\nAvatar timing: ticks={} avg_tick_us={} smooth_tick_us={} avg_build_us={} avg_flush_us={} max_tick_us={} receiver_cycle_ms={} cycle_budget_ms={} tick_budget_ms={}",
             players,
             self.transport.pending_reliable_count(),
             self.transport.queued_reliable_count(),
@@ -794,6 +863,10 @@ impl ServerState {
             app.inbound_packets,
             app.outbound_packets,
             app.protocol_errors,
+            app.avatar_received,
+            app.avatar_coalesced,
+            app.avatar_rejected,
+            app.avatar_processed,
             transport.raw_packets_received,
             transport.raw_packets_sent,
             transport.raw_bytes_received,
@@ -809,8 +882,14 @@ impl ServerState {
             avatar.tick_count,
             avatar.avg_tick_micros,
             avatar.smoothed_tick_micros,
-            avatar.build_micros.checked_div(avatar.tick_count).unwrap_or(0),
-            avatar.flush_micros.checked_div(avatar.tick_count).unwrap_or(0),
+            avatar
+                .build_micros
+                .checked_div(avatar.tick_count)
+                .unwrap_or(0),
+            avatar
+                .flush_micros
+                .checked_div(avatar.tick_count)
+                .unwrap_or(0),
             avatar.max_tick_micros,
             avatar.receiver_cycle_micros / 1000,
             avatar.receiver_cycle_budget_micros / 1000,
@@ -838,18 +917,78 @@ impl ServerState {
                 worker_result = Err(anyhow::anyhow!("server worker failed to join: {err}"));
             }
         }
-        // Accepted event handlers have now finished; persist their final changes.
+        // Workers can no longer create identity timers. Dropping pending entries
+        // cancels timers that have not started disconnecting; join every timer so
+        // any cleanup it already claimed is visible before draining cleanup tasks.
+        self.pending_identity.clear();
+        let identity_timer_tasks = std::mem::take(&mut *self.identity_timer_tasks.lock());
+        for task in identity_timer_tasks {
+            if let Err(err) = task.await {
+                warn!("identity timer failed to join: {err}");
+                worker_result = Err(anyhow::anyhow!("identity timer failed to join: {err}"));
+            }
+        }
+        // Retire every transport session, including accepted peers still waiting
+        // for identity verification. No admission worker remains to add sessions.
+        let sessions = self
+            .transport
+            .peer_snapshots()
+            .into_iter()
+            .filter_map(|peer| self.transport.peer_session(peer.id))
+            .collect::<Vec<_>>();
+        for session in sessions {
+            let retired = match self
+                .transport
+                .disconnect_session(&session, "Server shutting down")
+                .await
+            {
+                Ok(retired) => retired,
+                Err(err) => {
+                    // A disconnect error must not skip the remaining teardown or final save.
+                    // Only Ok(true) grants ownership of the session cleanup.
+                    error!("failed to retire session during shutdown: {err:#}");
+                    if worker_result.is_ok() {
+                        worker_result = Err(anyhow::anyhow!(
+                            "disconnecting session during shutdown: {err:#}"
+                        ));
+                    }
+                    false
+                }
+            };
+            if retired {
+                session.wait_for_read_leases().await;
+                handle_disconnect(self, &session, DisconnectReason::Remote).await;
+            }
+        }
+        let disconnect_tasks = std::mem::take(&mut *self.disconnect_tasks.lock());
+        for task in disconnect_tasks {
+            if let Err(err) = task.await {
+                warn!("disconnect cleanup task failed to join: {err}");
+                worker_result = Err(anyhow::anyhow!(
+                    "disconnect cleanup task failed to join: {err}"
+                ));
+            }
+        }
+        // Accepted event handlers and all disconnect cleanup have now finished.
         let final_save = self.flush_shutdown_state();
         if let Err(err) = &final_save {
             error!("final shutdown persistence failed: {err:#}");
         }
-        for peer in self.authenticated_peers.iter() {
-            let _ = self
-                .transport
-                .disconnect(*peer.key(), "Server shutting down")
-                .await;
-        }
         let tick_thread = self.tick_thread.lock().take();
+        let realtime_threads = std::mem::take(&mut *self.realtime_threads.lock());
+        let realtime_result = tokio::task::spawn_blocking(move || {
+            let mut failed = false;
+            for thread in realtime_threads {
+                failed |= thread.join().is_err();
+            }
+            if failed {
+                Err(anyhow::anyhow!("realtime thread panicked"))
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .context("joining realtime threads")?;
         let tick_result = if let Some(thread) = tick_thread {
             tokio::task::spawn_blocking(move || thread.join())
                 .await
@@ -865,6 +1004,7 @@ impl ServerState {
         self.avatar_sync.stop_compute_offload().await;
         worker_result?;
         tick_result?;
+        realtime_result?;
         final_save?;
         initial_save?;
         Ok(())
@@ -1045,58 +1185,698 @@ async fn flush_join_batches(state: &ServerState) -> Result<()> {
 
 async fn event_loop(
     state: ServerState,
-    mut events: mpsc::Receiver<ServerEvent>,
-    mut shutdown: oneshot::Receiver<()>,
+    events: mpsc::Receiver<ServerEvent>,
+    ordered_events: mpsc::Receiver<OrderedEvent>,
+    critical_events: mpsc::Receiver<OrderedEvent>,
+    lifecycle_events: basis_transport::LifecycleEventReceivers,
+    shutdown: oneshot::Receiver<()>,
 ) {
+    event_loop_with_handler(
+        state,
+        events,
+        ordered_events,
+        critical_events,
+        lifecycle_events,
+        shutdown,
+        |state, event| async move { handle_event(&state, event).await },
+    )
+    .await;
+}
+
+async fn event_loop_with_handler<F, Fut>(
+    state: ServerState,
+    mut events: mpsc::Receiver<ServerEvent>,
+    mut ordered_events: mpsc::Receiver<OrderedEvent>,
+    mut critical_events: mpsc::Receiver<OrderedEvent>,
+    lifecycle_events: basis_transport::LifecycleEventReceivers,
+    mut shutdown: oneshot::Receiver<()>,
+    handle: F,
+) where
+    F: Fn(Arc<ServerState>, ServerEvent) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    // Handlers share this single state allocation instead of cloning every field
+    // of ServerState for each spawned event.
+    let state = Arc::new(state);
     let worker_limit = std::thread::available_parallelism()
         .map(|count| (count.get() * 4).clamp(8, 256))
         .unwrap_or(32);
     let workers = Arc::new(Semaphore::new(worker_limit));
-    let mut handlers = tokio::task::JoinSet::new();
+    // Authentication cannot wait for ordinary handlers to release all worker slots.
+    let critical_workers = Arc::new(Semaphore::new(2));
+    let diagnostics = event_diagnostics::EventDiagnostics::start_from_env(&state, worker_limit + 6);
+    let (lifecycle_stop, lifecycle_shutdown) = oneshot::channel();
+    let lifecycle = tokio::spawn(lifecycle_loop(
+        state.clone(),
+        lifecycle_events,
+        lifecycle_shutdown,
+        diagnostics.clone(),
+        handle.clone(),
+    ));
+    let mut handlers = tokio::task::JoinSet::<()>::new();
+    let mut ordered_task_keys = HashMap::<tokio::task::Id, OrderedLaneKey>::new();
+    let mut ordered_sessions = HashMap::<(PeerId, u8), (PeerSession, u64)>::new();
+    let mut next_session_generation = 1u64;
+    let mut ordered_queue = OrderedHandlerQueue::default();
+    let mut critical_queue = OrderedHandlerQueue::default();
+    let mut ingress_open = [true, true, true];
     let mut join_flush = tokio::time::interval(JOIN_BATCH_FLUSH_INTERVAL);
     join_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     join_flush.tick().await;
     while !state.shutdown.load(Ordering::Relaxed) {
-        tokio::select! {
-            _ = handlers.join_next(), if !handlers.is_empty() => {}
+        if !ingress_open.iter().any(|open| *open) {
+            break;
+        }
+        let ordered_has_capacity = ordered_queue.pending() < MAX_PENDING_ORDERED_EVENTS;
+        let envelope = tokio::select! {
+            completed = handlers.join_next_with_id(), if !handlers.is_empty() => {
+                if let Some(completed) = completed {
+                    let id = match completed {
+                        Ok((id, ())) => id,
+                        Err(err) => { warn!("event handler failed to join: {err}"); err.id() },
+                    };
+                    if let Some(key) = ordered_task_keys.remove(&id) {
+                        let queue = if key.1 == channels::AUTH_IDENTITY {
+                            &mut critical_queue
+                        } else {
+                            &mut ordered_queue
+                        };
+                        queue.complete(key);
+                        if !queue.contains(key)
+                            && ordered_sessions
+                                .get(&(key.0, key.1))
+                                .is_some_and(|(_, generation)| *generation == key.2)
+                        {
+                            ordered_sessions.remove(&(key.0, key.1));
+                        }
+                    }
+                }
+                spawn_ready_ordered(
+                    &mut ordered_queue,
+                    &mut handlers,
+                    &mut ordered_task_keys,
+                    workers.clone(),
+                    &state,
+                    diagnostics.as_ref(),
+                    handle.clone(),
+                );
+                spawn_ready_ordered(
+                    &mut critical_queue,
+                    &mut handlers,
+                    &mut ordered_task_keys,
+                    critical_workers.clone(),
+                    &state,
+                    diagnostics.as_ref(),
+                    handle.clone(),
+                );
+                continue;
+            }
             _ = join_flush.tick() => {
+                prune_ordered_sessions(
+                    &state.transport,
+                    &mut ordered_queue,
+                    &mut critical_queue,
+                    &mut ordered_sessions,
+                );
                 if let Err(err) = flush_join_batches(&state).await {
                     error!("join batch serialization failed: {err:#}");
                 }
+                continue;
             }
             _ = &mut shutdown => {
                 break;
             }
-            maybe_event = events.recv() => {
-                let Some(event) = maybe_event else { break; };
-                if is_high_frequency_inline_event(&event) {
-                    if let Err(err) = handle_event(&state, event).await {
-                        error!("server event failed: {err:#}");
+            event = events.recv(), if ingress_open[0] && workers.available_permits() > 0 => {
+                match event {
+                    Some(event) => event.into(),
+                    None => {
+                        ingress_open[0] = false;
+                        continue;
                     }
-                    continue;
                 }
-                // Acquire before spawning, so a flood cannot create unbounded waiting tasks.
-                let permit = tokio::select! {
-                    _ = &mut shutdown => break,
-                    permit = workers.clone().acquire_owned() => permit,
-                };
-                let Ok(permit) = permit else { break; };
-                let state = state.clone();
-                handlers.spawn(async move {
-                    let _permit = permit;
-                    if let Err(err) = handle_event(&state, event).await {
-                        error!("server event failed: {err:#}");
-                    }
-                });
             }
+            event = ordered_events.recv(), if ingress_open[1] && ordered_has_capacity => {
+                match event {
+                    Some(event) => event,
+                    None => {
+                        ingress_open[1] = false;
+                        continue;
+                    }
+                }
+            }
+            event = critical_events.recv(), if ingress_open[2] && critical_queue.pending() < MAX_CRITICAL_ORDERED_EVENTS => {
+                match event {
+                    Some(event) => event,
+                    None => {
+                        ingress_open[2] = false;
+                        continue;
+                    }
+                }
+            }
+
+        };
+        if let Some(diagnostics) = &diagnostics {
+            diagnostics.record_queue_depth(events.len());
         }
+        let event = &envelope.event;
+        if let ServerEvent::PeerDisconnected { session, .. } = event {
+            discard_ordered_session(&mut ordered_queue, &mut ordered_sessions, session);
+            discard_ordered_session(&mut critical_queue, &mut ordered_sessions, session);
+        }
+        if is_high_frequency_inline_event(event)
+            && !matches!(
+                event,
+                ServerEvent::Message {
+                    delivery: DeliveryMethod::ReliableOrdered,
+                    ..
+                }
+            )
+        {
+            if let Err(err) = handle(state.clone(), envelope.event).await {
+                error!("server event failed: {err:#}");
+            }
+            continue;
+        }
+        if let ServerEvent::Message {
+            peer,
+            session,
+            channel,
+            delivery: DeliveryMethod::ReliableOrdered,
+            ..
+        } = event
+        {
+            if !state.transport.is_current_session(session) {
+                discard_ordered_session(&mut ordered_queue, &mut ordered_sessions, session);
+                discard_ordered_session(&mut critical_queue, &mut ordered_sessions, session);
+                continue;
+            }
+            let base = (*peer, *channel);
+            let generation = ordered_lane_generation(
+                base,
+                session,
+                &mut next_session_generation,
+                &mut ordered_sessions,
+                &mut ordered_queue,
+                &mut critical_queue,
+            );
+            let key = (base.0, base.1, generation);
+            if *channel == channels::AUTH_IDENTITY {
+                // Admission is reserved before ACK and retained through handler
+                // completion. Temporary overload leaves packets for retry.
+                critical_queue.enqueue(key, envelope);
+                spawn_ready_ordered(
+                    &mut critical_queue,
+                    &mut handlers,
+                    &mut ordered_task_keys,
+                    critical_workers.clone(),
+                    &state,
+                    diagnostics.as_ref(),
+                    handle.clone(),
+                );
+            } else {
+                // Admission is reserved before ACK and retained through handler
+                // completion. Temporary overload leaves packets for retry.
+                ordered_queue.enqueue(key, envelope);
+                spawn_ready_ordered(
+                    &mut ordered_queue,
+                    &mut handlers,
+                    &mut ordered_task_keys,
+                    workers.clone(),
+                    &state,
+                    diagnostics.as_ref(),
+                    handle.clone(),
+                );
+            }
+            continue;
+        }
+        // Ordinary ingress is selected only when its worker class has capacity.
+        let permit = workers
+            .clone()
+            .try_acquire_owned()
+            .expect("ordinary ingress selected with worker capacity");
+        spawn_event_handler(
+            &mut handlers,
+            &state,
+            diagnostics.as_ref(),
+            handle.clone(),
+            envelope,
+            permit,
+        );
     }
     // Stop admission, then finish accepted handlers before final persistence.
     events.close();
-    while let Some(result) = handlers.join_next().await {
-        if let Err(err) = result {
-            warn!("event handler failed to join: {err}");
+    ordered_events.close();
+    critical_events.close();
+    let _ = lifecycle_stop.send(());
+    while !handlers.is_empty() || ordered_queue.pending() > 0 || critical_queue.pending() > 0 {
+        prune_ordered_sessions(
+            &state.transport,
+            &mut ordered_queue,
+            &mut critical_queue,
+            &mut ordered_sessions,
+        );
+        spawn_ready_ordered(
+            &mut ordered_queue,
+            &mut handlers,
+            &mut ordered_task_keys,
+            workers.clone(),
+            &state,
+            diagnostics.as_ref(),
+            handle.clone(),
+        );
+        spawn_ready_ordered(
+            &mut critical_queue,
+            &mut handlers,
+            &mut ordered_task_keys,
+            critical_workers.clone(),
+            &state,
+            diagnostics.as_ref(),
+            handle.clone(),
+        );
+        if let Some(result) = handlers.join_next_with_id().await {
+            match result {
+                Ok((id, ())) => {
+                    if let Some(key) = ordered_task_keys.remove(&id) {
+                        if key.1 == channels::AUTH_IDENTITY {
+                            critical_queue.complete(key);
+                        } else {
+                            ordered_queue.complete(key);
+                        }
+                    }
+                }
+                Err(err) => {
+                    if let Some(key) = ordered_task_keys.remove(&err.id()) {
+                        if key.1 == channels::AUTH_IDENTITY {
+                            critical_queue.complete(key);
+                        } else {
+                            ordered_queue.complete(key);
+                        }
+                    }
+                    warn!("event handler failed to join: {err}");
+                }
+            }
         }
+    }
+    if let Err(err) = lifecycle.await {
+        warn!("lifecycle dispatcher failed to join: {err}");
+    }
+}
+
+async fn lifecycle_loop<F, Fut>(
+    state: Arc<ServerState>,
+    mut events: basis_transport::LifecycleEventReceivers,
+    mut shutdown: oneshot::Receiver<()>,
+    diagnostics: Option<Arc<event_diagnostics::EventDiagnostics>>,
+    handle: F,
+) where
+    F: Fn(Arc<ServerState>, ServerEvent) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    // Lease waits occupy only the disconnect class. Both live tasks and queued
+    // events are bounded; no task is spawned merely to wait for a worker permit.
+    let connections = Arc::new(Semaphore::new(LIFECYCLE_WORKERS_PER_CLASS));
+    let disconnects = Arc::new(Semaphore::new(LIFECYCLE_WORKERS_PER_CLASS));
+    let mut handlers = tokio::task::JoinSet::new();
+    let mut open = [true, true];
+    while !state.shutdown.load(Ordering::Relaxed) && open.iter().any(|open| *open) {
+        let (event, workers) = tokio::select! {
+            _ = &mut shutdown => break,
+            completed = handlers.join_next(), if !handlers.is_empty() => {
+                if let Some(Err(err)) = completed {
+                    warn!("lifecycle handler failed to join: {err}");
+                }
+                continue;
+            }
+            event = events.connections.recv(),
+                if open[0] && connections.available_permits() > 0
+                    && handlers.len() < LIFECYCLE_WORKERS_PER_CLASS * 2 => {
+                match event {
+                    Some(event) => (event, &connections),
+                    None => { open[0] = false; continue; }
+                }
+            }
+            event = events.disconnects.recv(),
+                if open[1] && disconnects.available_permits() > 0
+                    && handlers.len() < LIFECYCLE_WORKERS_PER_CLASS * 2 => {
+                match event {
+                    Some(event) => (event, &disconnects),
+                    None => { open[1] = false; continue; }
+                }
+            }
+        };
+        let permit = workers
+            .clone()
+            .try_acquire_owned()
+            .expect("lifecycle capacity selected");
+        spawn_event_handler(
+            &mut handlers,
+            &state,
+            diagnostics.as_ref(),
+            handle.clone(),
+            event.into(),
+            permit,
+        );
+    }
+    events.connections.close();
+    events.disconnects.close();
+    let mut drained = false;
+    while !handlers.is_empty() || !drained {
+        while !drained && handlers.len() < LIFECYCLE_WORKERS_PER_CLASS * 2 {
+            let Ok(permit) = disconnects.clone().try_acquire_owned() else {
+                break;
+            };
+            let Some(event) = events.disconnects.recv().await else {
+                drained = true;
+                break;
+            };
+            // Retirement already committed; finish cleanup before persistence.
+            // Closed connection ingress admits no queued new requests.
+            if matches!(event, ServerEvent::PeerDisconnected { .. }) {
+                spawn_event_handler(
+                    &mut handlers,
+                    &state,
+                    diagnostics.as_ref(),
+                    handle.clone(),
+                    event.into(),
+                    permit,
+                );
+            }
+        }
+        if let Some(Err(err)) = handlers.join_next().await {
+            warn!("lifecycle handler failed to join: {err}");
+        }
+    }
+}
+
+fn spawn_event_handler<F, Fut>(
+    handlers: &mut tokio::task::JoinSet<()>,
+    state: &Arc<ServerState>,
+    diagnostics: Option<&Arc<event_diagnostics::EventDiagnostics>>,
+    handle: F,
+    envelope: OrderedEvent,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) where
+    F: Fn(Arc<ServerState>, ServerEvent) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    let OrderedEvent { event, admission } = envelope;
+    let mut diagnostic_guard = diagnostics.map(|d| d.spawned(&event));
+    let state = state.clone();
+    let task = async move {
+        let _permit = permit;
+        let _admission = admission;
+        if let Some(guard) = &mut diagnostic_guard {
+            guard.started();
+        }
+        if let Err(err) = handle(state, event).await {
+            error!("server event failed: {err:#}");
+        }
+    };
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.record_task_size(std::mem::size_of_val(&task));
+    }
+    handlers.spawn(task);
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn receive_control_event(
+    events: &mut mpsc::Receiver<ServerEvent>,
+    ordered_events: &mut mpsc::Receiver<OrderedEvent>,
+    critical_events: &mut mpsc::Receiver<OrderedEvent>,
+    open: &mut [bool; 3],
+    ordered_has_capacity: bool,
+    critical_has_capacity: bool,
+    regular_has_capacity: bool,
+) -> Option<OrderedEvent> {
+    loop {
+        if !open.iter().any(|open| *open) {
+            return None;
+        }
+        tokio::select! {
+            event = events.recv(), if open[0] && regular_has_capacity => match event {
+                Some(event) => return Some(event.into()),
+                None => open[0] = false,
+            },
+            event = ordered_events.recv(), if open[1] && ordered_has_capacity => match event {
+                Some(event) => return Some(event),
+                None => open[1] = false,
+            },
+            event = critical_events.recv(), if open[2] && critical_has_capacity => match event {
+                Some(event) => return Some(event),
+                None => open[2] = false,
+            },
+            // Handler completion cancels this wait when admission is paused.
+            else => std::future::pending::<()>().await,
+        }
+    }
+}
+
+const MAX_PENDING_ORDERED_EVENTS: usize = 4096;
+const MAX_CRITICAL_ORDERED_EVENTS: usize = 128;
+const MAX_LIFECYCLE_EVENTS: usize = 256;
+const LIFECYCLE_WORKERS_PER_CLASS: usize = 2;
+const MAX_PENDING_ORDERED_PER_LANE: usize = 128;
+const MAX_PENDING_ORDERED_PER_PEER: usize = 256;
+type OrderedLaneKey = (PeerId, u8, u64);
+
+struct OrderedHandlerQueue<E = OrderedEvent> {
+    lanes: HashMap<OrderedLaneKey, OrderedLane<E>>,
+    ready: VecDeque<OrderedLaneKey>,
+    pending: usize,
+}
+
+struct OrderedLane<E> {
+    events: VecDeque<E>,
+    running: bool,
+}
+
+impl<E> Default for OrderedHandlerQueue<E> {
+    fn default() -> Self {
+        Self {
+            lanes: HashMap::new(),
+            ready: VecDeque::new(),
+            pending: 0,
+        }
+    }
+}
+
+impl<E> Default for OrderedLane<E> {
+    fn default() -> Self {
+        Self {
+            events: VecDeque::new(),
+            running: false,
+        }
+    }
+}
+
+impl<E> OrderedHandlerQueue<E> {
+    // Every production envelope already owns its transport admission budget. Keep
+    // accepted data until processing or session retirement; never drop an ACKed event
+    // because a second layer disagrees about the session/lane key.
+    fn enqueue(&mut self, key: OrderedLaneKey, event: E) {
+        let lane = self.lanes.entry(key).or_default();
+        if !lane.running && lane.events.is_empty() {
+            self.ready.push_back(key);
+        }
+        lane.events.push_back(event);
+        self.pending += 1;
+    }
+
+    fn start_next(&mut self) -> Option<(OrderedLaneKey, E)> {
+        while let Some(key) = self.ready.pop_front() {
+            let Some(lane) = self.lanes.get_mut(&key) else {
+                continue;
+            };
+            if lane.running {
+                continue;
+            }
+            let Some(event) = lane.events.pop_front() else {
+                self.lanes.remove(&key);
+                continue;
+            };
+            lane.running = true;
+            self.pending -= 1;
+            return Some((key, event));
+        }
+        None
+    }
+
+    fn complete(&mut self, key: OrderedLaneKey) {
+        let Some(lane) = self.lanes.get_mut(&key) else {
+            return;
+        };
+        lane.running = false;
+        if lane.events.is_empty() {
+            self.lanes.remove(&key);
+        } else {
+            self.ready.push_back(key);
+        }
+    }
+
+    fn discard_matching(&mut self, mut matches: impl FnMut(&E) -> bool) {
+        let keys: Vec<_> = self.lanes.keys().copied().collect();
+        for key in keys {
+            let lane = self.lanes.get_mut(&key).unwrap();
+            let before = lane.events.len();
+            lane.events.retain(|event| !matches(event));
+            let removed = before - lane.events.len();
+            let empty = lane.events.is_empty() && !lane.running;
+            self.pending -= removed;
+            if empty {
+                self.lanes.remove(&key);
+            }
+        }
+        self.compact_ready();
+    }
+
+    fn discard_lane(&mut self, key: OrderedLaneKey) -> bool {
+        let Some(lane) = self.lanes.get_mut(&key) else {
+            return false;
+        };
+        let changed = !lane.events.is_empty() || !lane.running;
+        self.pending -= lane.events.len();
+        lane.events.clear();
+        if !lane.running {
+            self.lanes.remove(&key);
+        }
+        changed
+    }
+
+    fn compact_ready(&mut self) {
+        self.ready.retain(|key| self.lanes.contains_key(key));
+    }
+
+    fn pending(&self) -> usize {
+        self.pending
+    }
+
+    fn contains(&self, key: OrderedLaneKey) -> bool {
+        self.lanes.contains_key(&key)
+    }
+}
+
+fn ordered_lane_generation(
+    base: (PeerId, u8),
+    session: &PeerSession,
+    next_generation: &mut u64,
+    sessions: &mut HashMap<(PeerId, u8), (PeerSession, u64)>,
+    ordered: &mut OrderedHandlerQueue,
+    critical: &mut OrderedHandlerQueue,
+) -> u64 {
+    if let Some((old_session, generation)) = sessions.get(&base) {
+        if old_session.same_connection(session) {
+            return *generation;
+        }
+        // Retire the old pending lane before its last registry entry is replaced.
+        // A running head retains its key until completion and cannot erase the
+        // new generation when its JoinSet result is collected.
+        let old_key = (base.0, base.1, *generation);
+        if ordered.discard_lane(old_key) {
+            ordered.compact_ready();
+        }
+        if critical.discard_lane(old_key) {
+            critical.compact_ready();
+        }
+    }
+    let generation = *next_generation;
+    *next_generation = next_generation.wrapping_add(1).max(1);
+    sessions.insert(base, (session.clone(), generation));
+    generation
+}
+
+fn prune_ordered_sessions(
+    transport: &TransportHandle,
+    ordered: &mut OrderedHandlerQueue,
+    critical: &mut OrderedHandlerQueue,
+    sessions: &mut HashMap<(PeerId, u8), (PeerSession, u64)>,
+) {
+    let mut changed = false;
+    sessions.retain(|base, (session, generation)| {
+        let key = (base.0, base.1, *generation);
+        if !transport.is_current_session(session) {
+            changed |= ordered.discard_lane(key);
+            changed |= critical.discard_lane(key);
+        }
+        ordered.contains(key) || critical.contains(key)
+    });
+    if changed {
+        // Compact once per pass, so repeated retirement cannot accumulate stale
+        // ready keys while ordinary workers are blocked.
+        ordered.compact_ready();
+        critical.compact_ready();
+    }
+}
+
+fn discard_ordered_session(
+    queue: &mut OrderedHandlerQueue,
+    sessions: &mut HashMap<(PeerId, u8), (PeerSession, u64)>,
+    session: &PeerSession,
+) {
+    queue.discard_matching(|event| {
+        matches!(&event.event,
+            ServerEvent::Message { session: queued, .. } if queued.same_connection(session)
+        )
+    });
+    sessions.retain(|_, (queued, _)| !queued.same_connection(session));
+}
+
+fn spawn_ready_ordered<F, Fut>(
+    queue: &mut OrderedHandlerQueue<OrderedEvent>,
+    handlers: &mut tokio::task::JoinSet<()>,
+    task_keys: &mut HashMap<tokio::task::Id, OrderedLaneKey>,
+    workers: Arc<Semaphore>,
+    state: &Arc<ServerState>,
+    diagnostics: Option<&Arc<event_diagnostics::EventDiagnostics>>,
+    handle: F,
+) where
+    F: Fn(Arc<ServerState>, ServerEvent) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    spawn_ready_ordered_with(queue, handlers, task_keys, workers, |envelope, permit| {
+        let OrderedEvent { event, admission } = envelope;
+        let state = state.clone();
+        let handle = handle.clone();
+        let mut diagnostic_guard = diagnostics.map(|d| d.spawned(&event));
+        let task = async move {
+            let _permit = permit;
+            let _admission = admission;
+            if let Some(guard) = &mut diagnostic_guard {
+                guard.started();
+            }
+            if let Err(err) = handle(state, event).await {
+                error!("server event failed: {err:#}");
+            }
+        };
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.record_task_size(std::mem::size_of_val(&task));
+        }
+        task
+    });
+}
+
+// Waiting lane followers stay as event data; only runnable heads become tasks.
+fn spawn_ready_ordered_with<E, F, Fut>(
+    queue: &mut OrderedHandlerQueue<E>,
+    handlers: &mut tokio::task::JoinSet<()>,
+    task_keys: &mut HashMap<tokio::task::Id, OrderedLaneKey>,
+    workers: Arc<Semaphore>,
+    mut handle: F,
+) where
+    E: Send + 'static,
+    F: FnMut(E, OwnedSemaphorePermit) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    while queue.pending() > 0 {
+        let Ok(permit) = workers.clone().try_acquire_owned() else {
+            break;
+        };
+        let Some((key, event)) = queue.start_next() else {
+            drop(permit);
+            break;
+        };
+        let id = handlers.spawn(handle(event, permit)).id();
+        task_keys.insert(id, key);
     }
 }
 
@@ -1132,16 +1912,46 @@ async fn handle_event(state: &ServerState, event: ServerEvent) -> Result<()> {
             let payload = request.payload.clone();
             handle_connection_request(state, remote_addr, payload, request).await
         }
-        ServerEvent::PeerDisconnected { peer, reason } => {
-            handle_disconnect(state, peer, reason).await;
+        ServerEvent::PeerDisconnected {
+            peer,
+            session,
+            reason,
+        } => {
+            if peer != session.peer_id() || !state.transport.close_session_admission(&session) {
+                return Ok(());
+            }
+            session.wait_for_read_leases().await;
+            handle_disconnect(state, &session, reason).await;
             Ok(())
         }
         ServerEvent::Message {
             peer,
+            session,
             channel,
             delivery,
             payload,
-        } => handle_message(state, peer, channel, delivery, payload).await,
+        } => {
+            if peer != session.peer_id() {
+                return Ok(());
+            }
+            let Some(_lease) = session.try_read_lease() else {
+                return Ok(());
+            };
+            if !state.transport.is_current_session(&session) {
+                return Ok(());
+            }
+            handle_message(
+                state,
+                peer,
+                Some(&session),
+                channel,
+                delivery,
+                payload,
+                true,
+                false,
+            )
+            .await
+        }
         ServerEvent::UnconnectedRequest {
             remote_addr, nonce, ..
         } => {
@@ -1364,8 +2174,13 @@ async fn handle_connection_request(
         .await?;
         return Ok(());
     };
-    let peer_id = match state.transport.accept(&request).await {
-        Ok(peer) => peer,
+    // Validation can await storage and policy work. A newer ConnectRequest for
+    // this address may have superseded this queued event in the meantime.
+    if !state.transport.is_pending_request(&request) {
+        return Ok(());
+    }
+    let session = match state.transport.accept_session(&request).await {
+        Ok(session) => session,
         Err(basis_transport::TransportError::PeerIdExhausted) => {
             reject_structured(
                 state,
@@ -1381,6 +2196,13 @@ async fn handle_connection_request(
         Err(basis_transport::TransportError::StaleAdmission) => return Ok(()),
         Err(error) => return Err(error.into()),
     };
+    let peer_id = session.peer_id();
+    let Some(_session_lease) = session.try_read_lease() else {
+        return Ok(());
+    };
+    if !state.transport.is_current_session(&session) {
+        return Ok(());
+    }
     if config.use_auth_identity {
         let challenge_ttl = identity_challenge_ttl(
             state.player_count(),
@@ -1393,6 +2215,7 @@ async fn handle_connection_request(
         state.pending_identity.insert(
             peer_id,
             PendingIdentity {
+                session: session.clone(),
                 ready,
                 challenge: challenge.clone(),
                 expires_at,
@@ -1403,22 +2226,34 @@ async fn handle_connection_request(
         let timeout_challenge = challenge.clone();
         let pending_identity = state.pending_identity.clone();
         let timeout_state = state.clone();
-        tokio::spawn(async move {
+        let timeout_session = session.clone();
+        let timer_task = tokio::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(challenge_ttl) => {
                     if pending_identity
                         .remove_if(&peer_id, |_, pending| {
-                            pending.challenge == timeout_challenge
+                            pending.session.same_connection(&timeout_session)
+                                && pending.challenge == timeout_challenge
                                 && pending.expires_at <= Instant::now()
                         })
                         .is_some()
                     {
-                        disconnect_admission(&timeout_state, peer_id, "Authentication timeout").await;
+                        disconnect_admission(
+                            &timeout_state,
+                            &timeout_session,
+                            "Authentication timeout",
+                        )
+                        .await;
                     }
                 }
                 _ = &mut timeout_cancelled => {}
             }
         });
+        {
+            let mut timer_tasks = state.identity_timer_tasks.lock();
+            timer_tasks.retain(|task| !task.is_finished());
+            timer_tasks.push(timer_task);
+        }
         let mut writer = NetWriter::new();
         BytesMessage {
             data: challenge.clone(),
@@ -1426,15 +2261,15 @@ async fn handle_connection_request(
         .serialize(&mut writer)?;
         state
             .transport
-            .send(
-                peer_id,
+            .send_session(
+                &session,
                 channels::AUTH_IDENTITY,
                 DeliveryMethod::ReliableOrdered,
                 writer.as_slice(),
             )
             .await?;
     } else {
-        finalize_accept(state, peer_id, ready, false).await?;
+        finalize_accept(state, &session, ready, false).await?;
     }
     Ok(())
 }
@@ -1449,17 +2284,46 @@ fn password_matches(server_password: &str, auth_bytes: &[u8]) -> bool {
     bool::from(auth_bytes.ct_eq(server_password.as_bytes()))
 }
 
-async fn disconnect_admission(state: &ServerState, peer: PeerId, reason: &str) {
-    let _ = state.transport.disconnect(peer, reason).await;
-    handle_disconnect(state, peer, DisconnectReason::Remote).await;
+async fn disconnect_admission(state: &ServerState, session: &PeerSession, reason: &str) {
+    if let Err(error) = request_disconnect(state, session, reason).await {
+        warn!(
+            peer = session.peer_id(),
+            "failed to request peer disconnect: {error:#}"
+        );
+    }
+}
+
+/// Remove the exact connection and defer keyed cleanup until its message leases drain.
+/// This function may be called by a message handler that holds the session's own lease,
+/// so it must never await `wait_for_read_leases` itself.
+pub(crate) async fn request_disconnect(
+    state: &ServerState,
+    session: &PeerSession,
+    reason: &str,
+) -> Result<()> {
+    if !state.transport.disconnect_session(session, reason).await? {
+        return Ok(());
+    }
+    let disconnect_tasks = state.disconnect_tasks.clone();
+    let cleanup_state = state.clone();
+    let session = session.clone();
+    let task = tokio::spawn(async move {
+        session.wait_for_read_leases().await;
+        handle_disconnect(&cleanup_state, &session, DisconnectReason::Remote).await;
+    });
+    let mut tasks = disconnect_tasks.lock();
+    tasks.retain(|task| !task.is_finished());
+    tasks.push(task);
+    Ok(())
 }
 
 async fn finalize_accept(
     state: &ServerState,
-    peer_id: PeerId,
+    session: &PeerSession,
     ready: ReadyMessage,
     identity_verified: bool,
 ) -> Result<()> {
+    let peer_id = session.peer_id();
     let uuid = ready.player_meta_data_message.player_uuid.clone();
     let config = state.config.read().clone();
     if config.basis_user_restriction_mode == BasisUserRestrictionMode::RejoinOnly
@@ -1467,14 +2331,14 @@ async fn finalize_accept(
     {
         disconnect_admission(
             state,
-            peer_id,
+            session,
             "Rejoin-only mode requires authenticated identity.",
         )
         .await;
         return Ok(());
     }
     if let Some(reason) = admission_rejection(state, &ready) {
-        disconnect_admission(state, peer_id, reason).await;
+        disconnect_admission(state, session, reason).await;
         return Ok(());
     }
     let metadata = ready.player_meta_data_message.clone();
@@ -1482,6 +2346,7 @@ async fn finalize_accept(
         id: peer_id,
         metadata: metadata.clone(),
         ready: ready.clone(),
+        session: Some(session.clone()),
     };
     let existing_players = {
         let _commit = state.admission_commit.lock();
@@ -1500,7 +2365,7 @@ async fn finalize_accept(
     let Some(existing_players) = existing_players else {
         disconnect_admission(
             state,
-            peer_id,
+            session,
             "This server is full. Please try again later.",
         )
         .await;
@@ -1747,7 +2612,8 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
     }
 }
 
-async fn handle_disconnect(state: &ServerState, peer: PeerId, reason: DisconnectReason) {
+async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: DisconnectReason) {
+    let peer = session.peer_id();
     // Close avatar admission before any asynchronous disconnect cleanup.
     state.avatar_sync.remove_player(peer);
     state.admin_runtime.remove_peer(peer);
@@ -1901,9 +2767,9 @@ async fn handle_uplink_avatar_delta(
     state: &ServerState,
     peer: PeerId,
     payload: &[u8],
-) -> Result<()> {
+) -> Result<bool> {
     if payload.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let header = payload[0];
     if header & channels::DELTA_HEADER_CONTROL_BIT != 0 {
@@ -1911,10 +2777,10 @@ async fn handle_uplink_avatar_delta(
             let sender_id = u16::from_le_bytes([payload[1], payload[2]]);
             state.avatar_sync.request_keyframe(sender_id, peer);
         }
-        return Ok(());
+        return Ok(false);
     }
     if header & channels::DELTA_HEADER_QUALITY_MASK != BitQuality::High as u8 {
-        return Ok(());
+        return Ok(false);
     }
     if payload.len() < 3 {
         anyhow::bail!("uplink avatar delta missing sequence header");
@@ -1946,7 +2812,7 @@ async fn handle_uplink_avatar_delta(
         if should_nack {
             send_uplink_keyframe_request(state, peer).await?;
         }
-        return Ok(());
+        return Ok(false);
     };
 
     let (full_payload, delta_body_len) = apply_delta(&baseline, &payload[3..], BitQuality::High)?;
@@ -1974,34 +2840,61 @@ async fn handle_uplink_avatar_delta(
     state
         .avatar_sync
         .upsert_from_channel_payload(peer, channel, &full_frame)?;
-    Ok(())
+    Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_message(
     state: &ServerState,
     peer: PeerId,
+    session: Option<&PeerSession>,
     channel: u8,
     delivery: DeliveryMethod,
     payload: Bytes,
+    count_inbound: bool,
+    count_avatar: bool,
 ) -> Result<()> {
-    state
-        .statistics
-        .inbound_packets
-        .fetch_add(1, Ordering::Relaxed);
+    if count_inbound {
+        state
+            .statistics
+            .inbound_packets
+            .fetch_add(1, Ordering::Relaxed);
+    }
     if channel != channels::AUTH_IDENTITY && !state.authenticated_peers.contains_key(&peer) {
+        if count_avatar {
+            state
+                .statistics
+                .avatar_rejected
+                .fetch_add(1, Ordering::Relaxed);
+        }
         return Ok(());
     }
     if (channels::PLAYER_AVATAR_QUALITY_CHANNELS.contains(&channel)
         || channel == channels::DELTA_AVATAR)
         && !state.avatar_sync.is_player_registered(peer)
     {
+        if count_avatar {
+            state
+                .statistics
+                .avatar_rejected
+                .fetch_add(1, Ordering::Relaxed);
+        }
         return Ok(());
     }
     match channel {
         channels::AUTH_IDENTITY => {
-            if let Some((_, pending)) = state.pending_identity.remove(&peer) {
+            let Some(session) = session else {
+                return Ok(());
+            };
+            if let Some((_, pending)) = state
+                .pending_identity
+                .remove_if(&peer, |_, pending| pending.session.same_connection(session))
+            {
                 if pending.expires_at <= Instant::now() {
-                    disconnect_admission(state, peer, "Authentication timeout").await;
+                    disconnect_admission(state, session, "Authentication timeout").await;
+                    return Ok(());
+                }
+                if !pending.session.same_connection(session) {
                     return Ok(());
                 }
                 let identity_check = (|| -> Result<()> {
@@ -2019,13 +2912,13 @@ async fn handle_message(
                 if let Err(error) = identity_check {
                     disconnect_admission(
                         state,
-                        peer,
+                        session,
                         &format!("Identity verification failed: {error}"),
                     )
                     .await;
                     return Ok(());
                 }
-                finalize_accept(state, peer, pending.ready, true).await?;
+                finalize_accept(state, session, pending.ready, true).await?;
             }
         }
         channels::PLAYER_AVATAR_HIGH | channels::PLAYER_AVATAR_HIGH_ADDITIONAL => {
@@ -2042,17 +2935,40 @@ async fn handle_message(
             } else {
                 payload.as_ref()
             };
+            if ingest_payload.is_empty() {
+                if count_avatar {
+                    state
+                        .statistics
+                        .avatar_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(());
+            }
             match state.avatar_sync.upsert_from_channel_payload(
                 peer,
                 ingest_channel,
                 ingest_payload,
             ) {
-                Ok(()) => capture_uplink_delta_baseline(state, peer, ingest_payload),
+                Ok(()) => {
+                    capture_uplink_delta_baseline(state, peer, ingest_payload);
+                    if count_avatar {
+                        state
+                            .statistics
+                            .avatar_processed
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 Err(err) => {
                     state
                         .statistics
                         .protocol_errors
                         .fetch_add(1, Ordering::Relaxed);
+                    if count_avatar {
+                        state
+                            .statistics
+                            .avatar_rejected
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     warn!("invalid avatar update from peer {peer}: {err}");
                 }
             }
@@ -2090,6 +3006,15 @@ async fn handle_message(
             } else {
                 payload.as_ref()
             };
+            if ingest_payload.is_empty() {
+                if count_avatar {
+                    state
+                        .statistics
+                        .avatar_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(());
+            }
             match state.avatar_sync.upsert_from_channel_payload(
                 peer,
                 ingest_channel,
@@ -2103,25 +3028,59 @@ async fn handle_message(
                     ) {
                         capture_uplink_delta_baseline(state, peer, ingest_payload);
                     }
+                    if count_avatar {
+                        state
+                            .statistics
+                            .avatar_processed
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Err(err) => {
                     state
                         .statistics
                         .protocol_errors
                         .fetch_add(1, Ordering::Relaxed);
+                    if count_avatar {
+                        state
+                            .statistics
+                            .avatar_rejected
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     warn!("invalid avatar update from peer {peer}: {err}");
                 }
             }
         }
-        channels::DELTA_AVATAR => {
-            if let Err(err) = handle_uplink_avatar_delta(state, peer, &payload).await {
+        channels::DELTA_AVATAR => match handle_uplink_avatar_delta(state, peer, &payload).await {
+            Ok(true) => {
+                if count_avatar {
+                    state
+                        .statistics
+                        .avatar_processed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Ok(false) => {
+                if count_avatar {
+                    state
+                        .statistics
+                        .avatar_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Err(err) => {
                 state
                     .statistics
                     .protocol_errors
                     .fetch_add(1, Ordering::Relaxed);
+                if count_avatar {
+                    state
+                        .statistics
+                        .avatar_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 warn!("invalid avatar delta from peer {peer}: {err}");
             }
-        }
+        },
         channels::CHAT => {
             if admin_runtime::is_text_muted(state, peer) {
                 return Ok(());
@@ -4749,20 +5708,36 @@ fn peer_by_uuid(state: &ServerState, uuid: &str) -> Option<PeerId> {
         .find_map(|peer| (peer.metadata.player_uuid == uuid).then_some(*peer.key()))
 }
 
+fn peer_session_by_uuid(state: &ServerState, uuid: &str) -> Option<(PeerId, PeerSession)> {
+    state.authenticated_peers.iter().find_map(|peer| {
+        if peer.metadata.player_uuid == uuid {
+            peer.session.clone().map(|session| (*peer.key(), session))
+        } else {
+            None
+        }
+    })
+}
+
 async fn disconnect_headless_peers(state: &ServerState) {
     let peers = state
         .authenticated_peers
         .iter()
         .filter_map(|peer| {
             let platform = &peer.metadata.player_platform;
-            is_headless_platform(platform).then_some(*peer.key())
+            (is_headless_platform(platform))
+                .then(|| peer.session.clone())
+                .flatten()
         })
         .collect::<Vec<_>>();
-    for peer in peers {
-        let _ = state
-            .transport
-            .disconnect(peer, "Headless client disallowed by server.")
-            .await;
+    for session in peers {
+        if let Err(error) =
+            request_disconnect(state, &session, "Headless client disallowed by server.").await
+        {
+            warn!(
+                peer = session.peer_id(),
+                "failed to disconnect headless peer: {error:#}"
+            );
+        }
     }
 }
 
@@ -4945,6 +5920,356 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn reliable_ordered_handlers_wait_for_the_previous_handler() {
+        let mut queue = OrderedHandlerQueue::<u8>::default();
+        let lane = (17, 3, 1);
+        for event in [1, 2, 3] {
+            queue.enqueue(lane, event);
+        }
+        queue.enqueue((17, 4, 1), 4); // Independent channel.
+        queue.enqueue((18, 3, 1), 5); // Independent peer.
+        queue.enqueue((17, 3, 2), 6); // Replacement incarnation.
+        let workers = Arc::new(Semaphore::new(2));
+        let mut handlers = tokio::task::JoinSet::new();
+        let mut keys = HashMap::new();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let handle = |event, permit| {
+            let release = release.clone();
+            let started = started.clone();
+            async move {
+                let _permit = permit;
+                started.send(event).unwrap();
+                if event == 1 {
+                    release.notified().await;
+                }
+            }
+        };
+        spawn_ready_ordered_with(
+            &mut queue,
+            &mut handlers,
+            &mut keys,
+            workers.clone(),
+            handle,
+        );
+        // Only the blocked head and an independent lane can occupy the two slots.
+        assert_eq!(handlers.len(), 2);
+        for expected in [4, 5, 6] {
+            let (id, ()) =
+                tokio::time::timeout(Duration::from_secs(2), handlers.join_next_with_id())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            let finished_lane = keys.remove(&id).unwrap();
+            assert_ne!(finished_lane, lane);
+            queue.complete(finished_lane);
+            spawn_ready_ordered_with(
+                &mut queue,
+                &mut handlers,
+                &mut keys,
+                workers.clone(),
+                handle,
+            );
+            assert!(queue.contains(lane));
+            // Consume the starts deterministically, without assuming executor poll order.
+            if expected == 4 {
+                let mut initial = [starts.recv().await.unwrap(), starts.recv().await.unwrap()];
+                initial.sort_unstable();
+                assert_eq!(initial, [1, 4]);
+            } else {
+                assert_eq!(starts.recv().await.unwrap(), expected);
+            }
+        }
+        assert_eq!(workers.available_permits(), 1);
+        assert_eq!(queue.pending(), 2);
+        assert!(starts.try_recv().is_err()); // Neither follower started while head blocked.
+        release.notify_one();
+        // Drain accepted lane data using the same scheduling primitive as shutdown.
+        while !handlers.is_empty() || queue.pending() > 0 {
+            let (id, ()) =
+                tokio::time::timeout(Duration::from_secs(2), handlers.join_next_with_id())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            queue.complete(keys.remove(&id).unwrap());
+            spawn_ready_ordered_with(
+                &mut queue,
+                &mut handlers,
+                &mut keys,
+                workers.clone(),
+                handle,
+            );
+        }
+        assert_eq!(starts.recv().await.unwrap(), 2);
+        assert_eq!(starts.recv().await.unwrap(), 3);
+        assert!(queue.lanes.is_empty());
+        assert!(keys.is_empty());
+        assert_eq!(workers.available_permits(), 2);
+    }
+
+    #[test]
+    fn retiring_ordered_lane_preserves_running_head_and_new_generation() {
+        let mut queue = OrderedHandlerQueue::<u8>::default();
+        let old = (17, 3, 1);
+        let new = (17, 3, 2);
+        queue.enqueue(old, 1);
+        queue.enqueue(old, 2);
+        queue.enqueue(new, 3);
+        assert_eq!(queue.start_next(), Some((old, 1)));
+        assert!(queue.discard_lane(old));
+        assert_eq!(queue.pending(), 1);
+        assert!(queue.contains(old));
+        assert!(!queue.discard_lane(old));
+        queue.complete(old);
+        assert!(!queue.contains(old));
+        assert_eq!(queue.start_next(), Some((new, 3)));
+        queue.complete(new);
+        assert!(queue.lanes.is_empty());
+    }
+
+    #[test]
+    fn retired_ordered_ready_keys_are_compacted_once_per_pass() {
+        let mut queue = OrderedHandlerQueue::<u8>::default();
+        for generation in 1..=4096 {
+            let key = (17, 3, generation);
+            queue.enqueue(key, 1);
+            assert!(queue.discard_lane(key));
+        }
+        let live = (18, 3, 4097);
+        queue.enqueue(live, 2);
+        queue.compact_ready();
+        assert_eq!(queue.pending(), 1);
+        assert_eq!(queue.ready.len(), 1);
+        assert_eq!(queue.start_next(), Some((live, 2)));
+    }
+
+    #[tokio::test]
+    async fn reliable_ordered_handler_panic_releases_its_lane() {
+        let mut queue = OrderedHandlerQueue::<u8>::default();
+        let lane = (17, 3, 1);
+        queue.enqueue(lane, 1);
+        queue.enqueue(lane, 2);
+        let workers = Arc::new(Semaphore::new(1));
+        let mut handlers = tokio::task::JoinSet::new();
+        let mut keys = HashMap::new();
+        let handle = |event, permit| async move {
+            let _permit = permit;
+            assert_ne!(event, 1, "deliberately failing first handler");
+        };
+        spawn_ready_ordered_with(
+            &mut queue,
+            &mut handlers,
+            &mut keys,
+            workers.clone(),
+            handle,
+        );
+        let error = tokio::time::timeout(Duration::from_secs(2), handlers.join_next_with_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.is_panic());
+        queue.complete(keys.remove(&error.id()).unwrap());
+        spawn_ready_ordered_with(
+            &mut queue,
+            &mut handlers,
+            &mut keys,
+            workers.clone(),
+            handle,
+        );
+        let (id, ()) = tokio::time::timeout(Duration::from_secs(2), handlers.join_next_with_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        queue.complete(keys.remove(&id).unwrap());
+        assert!(queue.lanes.is_empty());
+        assert_eq!(workers.available_permits(), 1);
+    }
+
+    #[test]
+    fn pruning_ordered_followers_preserves_running_head_and_other_lanes() {
+        let mut queue = OrderedHandlerQueue::<u8>::default();
+        let old_lane = (17, 3, 1);
+        let replacement_lane = (17, 3, 2);
+        queue.enqueue(old_lane, 1);
+        assert_eq!(queue.start_next(), Some((old_lane, 1)));
+        queue.enqueue(old_lane, 2);
+        queue.enqueue(replacement_lane, 3);
+        queue.discard_matching(|event| *event == 2);
+        assert_eq!(queue.pending(), 1);
+        assert!(queue.contains(old_lane));
+        queue.complete(old_lane);
+        assert!(!queue.contains(old_lane));
+        assert_eq!(queue.start_next(), Some((replacement_lane, 3)));
+        queue.complete(replacement_lane);
+        assert!(queue.lanes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn global_ordered_backpressure_keeps_regular_event_admission_open() {
+        let mut queue = OrderedHandlerQueue::<u8>::default();
+        for peer in 0..(MAX_PENDING_ORDERED_EVENTS / MAX_PENDING_ORDERED_PER_LANE) {
+            for _ in 0..MAX_PENDING_ORDERED_PER_LANE {
+                queue.enqueue((peer as PeerId, 3, 1), 1);
+            }
+        }
+        let (control_tx, mut control) = mpsc::channel(1);
+        let (ordered_tx, mut ordered) = mpsc::channel(1);
+        let (_critical_tx, mut critical) = mpsc::channel(1);
+        ordered_tx
+            .send(ServerEvent::NetworkError("ordered waiting".into()).into())
+            .await
+            .unwrap();
+        control_tx
+            .send(ServerEvent::NetworkError("lifecycle admitted".into()))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            receive_control_event(
+                &mut control,
+                &mut ordered,
+                &mut critical,
+                &mut [true, true, true],
+                queue.pending() < MAX_PENDING_ORDERED_EVENTS,
+                true,
+                true,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(event.event, ServerEvent::NetworkError(value) if value == "lifecycle admitted")
+        );
+        assert_eq!(ordered.len(), 1); // Already admitted ordered data is retained, not dropped.
+        queue.start_next().unwrap();
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            receive_control_event(
+                &mut control,
+                &mut ordered,
+                &mut critical,
+                &mut [true, true, true],
+                queue.pending() < MAX_PENDING_ORDERED_EVENTS,
+                true,
+                true,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(event.event, ServerEvent::NetworkError(value) if value == "ordered waiting")
+        );
+    }
+
+    #[tokio::test]
+    async fn critical_ordered_ingress_survives_full_ordinary_queues_and_workers() {
+        let (control_tx, mut control) = mpsc::channel(1);
+        let (ordered_tx, mut ordered) = mpsc::channel(1);
+        let (critical_tx, mut critical) = mpsc::channel(1);
+        control_tx
+            .send(ServerEvent::NetworkError("ordinary control".into()))
+            .await
+            .unwrap();
+        ordered_tx
+            .send(ServerEvent::NetworkError("ordinary ordered".into()).into())
+            .await
+            .unwrap();
+        critical_tx
+            .send(ServerEvent::NetworkError("identity".into()).into())
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            receive_control_event(
+                &mut control,
+                &mut ordered,
+                &mut critical,
+                &mut [true, true, true],
+                false,
+                true,
+                false,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(event.event, ServerEvent::NetworkError(value) if value == "identity"));
+        assert_eq!(control.len(), 1);
+        assert_eq!(ordered.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn closing_one_ingress_preserves_the_other_buffered_events() {
+        let (control_tx, mut control) = mpsc::channel(1);
+        let (ordered_tx, mut ordered) = mpsc::channel(1);
+        let (critical_tx, mut critical) = mpsc::channel(1);
+        let mut open = [true, true, true];
+        drop(critical_tx);
+        ordered_tx
+            .send(ServerEvent::NetworkError("retained ordered".into()).into())
+            .await
+            .unwrap();
+        drop(control_tx);
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            receive_control_event(
+                &mut control,
+                &mut ordered,
+                &mut critical,
+                &mut open,
+                false,
+                true,
+                true,
+            )
+        )
+        .await
+        .is_err());
+        assert!(!open[0]);
+        assert_eq!(ordered.len(), 1);
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            receive_control_event(
+                &mut control,
+                &mut ordered,
+                &mut critical,
+                &mut open,
+                true,
+                true,
+                true,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(event.event, ServerEvent::NetworkError(value) if value == "retained ordered")
+        );
+        drop(ordered_tx);
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            receive_control_event(
+                &mut control,
+                &mut ordered,
+                &mut critical,
+                &mut open,
+                true,
+                true,
+                true,
+            )
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(open, [false, false, false]);
+    }
+
+    #[tokio::test]
     async fn shutdown_saves_before_worker_wait_and_again_after_final_updates() {
         let path =
             std::env::temp_dir().join(format!("basis-core-shutdown-{}.json", uuid::Uuid::new_v4()));
@@ -5033,23 +6358,41 @@ mod tests {
         statistics.inbound_packets.fetch_add(1, Ordering::Relaxed);
         statistics.outbound_packets.fetch_add(1, Ordering::Relaxed);
         statistics.protocol_errors.fetch_add(1, Ordering::Relaxed);
+        statistics.avatar_received.fetch_add(1, Ordering::Relaxed);
+        statistics.avatar_coalesced.fetch_add(1, Ordering::Relaxed);
+        statistics.avatar_rejected.fetch_add(1, Ordering::Relaxed);
+        statistics.avatar_processed.fetch_add(1, Ordering::Relaxed);
         assert_eq!(statistics.snapshot().inbound_packets, 0);
         assert_eq!(statistics.snapshot().outbound_packets, 0);
         assert_eq!(statistics.snapshot().protocol_errors, 0);
+        assert_eq!(statistics.snapshot().avatar_received, 0);
 
         statistics.set_enabled(true);
         statistics.inbound_packets.fetch_add(2, Ordering::Relaxed);
         statistics.outbound_packets.fetch_add(3, Ordering::Relaxed);
         statistics.protocol_errors.fetch_add(4, Ordering::Relaxed);
+        statistics.avatar_received.fetch_add(5, Ordering::Relaxed);
+        statistics.avatar_coalesced.fetch_add(2, Ordering::Relaxed);
+        statistics.avatar_rejected.fetch_add(1, Ordering::Relaxed);
+        statistics.avatar_processed.fetch_add(2, Ordering::Relaxed);
         let snapshot = statistics.snapshot();
         assert_eq!(snapshot.inbound_packets, 2);
         assert_eq!(snapshot.outbound_packets, 3);
         assert_eq!(snapshot.protocol_errors, 4);
+        assert_eq!(snapshot.avatar_received, 5);
+        assert_eq!(snapshot.avatar_coalesced, 2);
+        assert_eq!(snapshot.avatar_rejected, 1);
+        assert_eq!(snapshot.avatar_processed, 2);
 
         statistics.set_enabled(false);
         statistics.inbound_packets.fetch_add(10, Ordering::Relaxed);
         statistics.set_enabled(true);
-        assert_eq!(statistics.snapshot().inbound_packets, 0);
+        let reset = statistics.snapshot();
+        assert_eq!(reset.inbound_packets, 0);
+        assert_eq!(reset.avatar_received, 0);
+        assert_eq!(reset.avatar_coalesced, 0);
+        assert_eq!(reset.avatar_rejected, 0);
+        assert_eq!(reset.avatar_processed, 0);
     }
 
     fn test_ready_message() -> ReadyMessage {
@@ -5077,6 +6420,7 @@ mod tests {
             id: peer_id,
             metadata: test_ready_message().player_meta_data_message,
             ready: test_ready_message(),
+            session: None,
         }
     }
 

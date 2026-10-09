@@ -62,7 +62,7 @@ to obtain lower CPU.
 All 81 core release tests, including exact cached bytes, patch identity,
 overshoot/fallback, incarnation reuse and receiver flush bounds, passed. Rust
 formatting and whitespace checks passed. The candidate was built with
-`rtk proxy cargo build --locked --release --jobs 2 -p basis-server-console` and
+`cargo build --locked --release --jobs 2 -p basis-server-console` and
 frozen as SHA-256
 `a7334854bef5f60800a3abbae7cff55083e50c82ac709f3cc77bb0f7ce63b669`.
 
@@ -271,17 +271,17 @@ job closure, forced proxy exit, and a failed launch before resume. The cleanup
 tests verify worker/grandchild exit and socket release while an independently
 owned process stays alive. A real two-client crossover also passed all delivery
 gates. Run these checks with
-`rtk proxy python -B scripts/perf/test_windows_avatar_tools.py`.
+`python -B scripts/perf/test_windows_avatar_tools.py`.
 Review-fix smoke artifacts are retained separately under
 `captures/pr27-review-fixes-20261004/` and generated `captures/avatar-tools-tests-*`
 directories. The Rust avatar source, frozen performance binaries and all 48
 reported performance measurements are preserved.
 
 Build each server revision in its separate Server workspace with
-`rtk proxy cargo build --locked --release --jobs 2 -p basis-server-console`.
+`cargo build --locked --release --jobs 2 -p basis-server-console`.
 The candidate build starts from `5915bca` plus the recorded avatar source patch.
 Client builds use their separate Client workspace and
-`rtk proxy cargo build --locked --release --jobs 2`; freeze one client and reuse
+`cargo build --locked --release --jobs 2`; freeze one client and reuse
 it for every variant. These experiments reused the review's frozen merged
 client without rebuilding it between series. Default features, Rust 1.99.0
 MSVC and the CPU-only server fixture were used. Build environment/manifests
@@ -291,8 +291,8 @@ From the repository root, substitute frozen binary paths and use a new capture
 directory. This reproduces the confirmation's two opposite-order blocks:
 
 ```powershell
-rtk proxy python -B scripts/perf/run-windows-avatar-crossover.py --output captures/new-confirm-750 --client captures/binaries/client.exe --clients 750 --port 64142 --health-port 64353 --variants before-1=captures/binaries/before-server.exe six-1=captures/binaries/six-cache-server.exe six-2=captures/binaries/six-cache-server.exe before-2=captures/binaries/before-server.exe six-3=captures/binaries/six-cache-server.exe before-3=captures/binaries/before-server.exe before-4=captures/binaries/before-server.exe six-4=captures/binaries/six-cache-server.exe
-rtk proxy python -B scripts/perf/compare-windows-avatar-crossover.py captures/new-confirm-750 --candidate six --summary-only
+python -B scripts/perf/run-windows-avatar-crossover.py --output captures/new-confirm-750 --client captures/binaries/client.exe --clients 750 --port 64142 --health-port 64353 --variants before-1=captures/binaries/before-server.exe six-1=captures/binaries/six-cache-server.exe six-2=captures/binaries/six-cache-server.exe before-2=captures/binaries/before-server.exe six-3=captures/binaries/six-cache-server.exe before-3=captures/binaries/before-server.exe before-4=captures/binaries/before-server.exe six-4=captures/binaries/six-cache-server.exe
+python -B scripts/perf/compare-windows-avatar-crossover.py captures/new-confirm-750 --candidate six --summary-only
 ```
 
 For the heavier series, use a new directory, `--clients 1000 --diagnostics`.

@@ -185,7 +185,7 @@ def run_workload(args, output, server_env, client_env):
     owner = ProcessTree()
     server = client = None
     meta = {'started_unix_seconds': time.time(), 'error': None, 'completed': False,
-            'workload': {k: getattr(args, k) for k in ('clients', 'warmup_seconds', 'window_seconds', 'rayon_threads', 'tokio_workers', 'client_workers', 'port', 'health_port', 'server_cpus', 'client_cpus', 'startup_timeout', 'ready_timeout')}}
+            'workload': {k: getattr(args, k) for k in ('clients', 'network_capacity_mbps', 'warmup_seconds', 'window_seconds', 'rayon_threads', 'tokio_workers', 'client_workers', 'port', 'health_port', 'server_cpus', 'client_cpus', 'startup_timeout', 'ready_timeout')}}
     try:
         # Re-probe before EVERY fresh run; never accept a prior server's health.
         select_port(socket.SOCK_DGRAM, args.port)

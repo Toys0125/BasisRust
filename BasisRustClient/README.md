@@ -90,6 +90,26 @@ configuration fields. The server uses a separate schema/path and defaults.
 Voice settings include `VoiceEnabled`, `VoiceAudioFolder`, `VoiceSpeakerPercent`,
 `VoiceHearingDistance`, and `VoiceFrameDurationMs`.
 
+For a measured Windows voice/avatar load test, build the release server and
+client, then run `python scripts/perf/run-windows-voice-workload.py
+--audio-folder <Ogg-Opus-folder> --output <new-capture-directory>` from the
+repository root. The default suite uses 1,000 local clients: a voice preflight,
+an avatar-only baseline, 10% simultaneous speakers, then 100% speakers. It
+prepares every source clip as 48 kHz mono/20 ms Opus, freezes the binaries,
+records process/health counters, and verifies sampled received packets against
+the encoded corpus and with an FFmpeg decode.
+
+The lower-level Windows runner also accepts `--voice-audio-folder`,
+`--voice-speaker-percent`, and `--no-voice-reencode`. It sets
+`BASIS_VOICE_DIAGNOSTIC_CSV` to enable per-client voice counters and an observer
+window synchronized with the avatar capture marker. Other clients allocate no
+voice diagnostic counters. These measurements exercise headless packet delivery;
+they do not emulate 1,000 audio playback engines or a physical network.
+Voice runs default to a 24 GiB server working-set limit. The runner captures a
+controlled early stop when that limit is reached, and starts measurement early
+if warmup reaches half the limit. Override this with
+`--max-server-working-set-mib` in the lower-level runner; `0` disables the limit.
+
 ## Building
 
 ```powershell

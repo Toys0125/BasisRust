@@ -13,7 +13,9 @@ use crate::receiver::{shared_maintenance_loop, shared_receive_loop};
 use crate::simulation::{movement_workers, CadenceOptions, SpawnLayout};
 use crate::transport::{ConnectOptions, MaintenanceOptions};
 use crate::voice::{voice_workers, VoiceLibrary};
+use crate::voice_diagnostics;
 use anyhow::{anyhow, Context, Result};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -336,6 +338,19 @@ pub async fn run(
     } else {
         None
     };
+    let voice_diagnostic_task = match (
+        std::env::var_os("BASIS_VOICE_DIAGNOSTIC_CSV"),
+        config.observe_avatar_start_file.clone(),
+    ) {
+        (Some(output), Some(marker)) => Some(tokio::spawn(voice_diagnostics::capture_window(
+            managed_clients.clone(),
+            marker,
+            PathBuf::from(output),
+            config.observe_avatar_window,
+            shutdown.clone(),
+        ))),
+        _ => None,
+    };
     let mut voice_running = false;
     if let Some(voice_library) = voice_library.take() {
         if !shutdown.load(Ordering::Relaxed) {
@@ -462,6 +477,13 @@ pub async fn run(
         }
     }
     shutdown.store(true, Ordering::SeqCst);
+    if let Some(task) = voice_diagnostic_task {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!("voice diagnostic window failed: {error:#}"),
+            Err(error) => warn!("voice diagnostic task failed: {error}"),
+        }
+    }
     if let Some(task) = avatar_diagnostic_task {
         match task.await {
             Ok(Ok(())) => {}

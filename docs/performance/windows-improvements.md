@@ -102,7 +102,7 @@ Build with `--locked --release`, keep executable/config copies fixed, clear
 Rayon and avatar budget/slice overrides, and use fresh output directories:
 
 ```powershell
-rtk proxy python scripts/perf/run-windows-avatar-workload.py --server BasisRustServer/target/release/basis-server-console.exe --client BasisRustClient/target/release/basis-rust-client.exe --server-config docs/performance/fixtures/avatar-cpu-only-server.xml --output captures/windows-repeat --clients 750 --server-ip 127.0.0.1 --workers 4 --warmup-seconds 45 --window-seconds 60 --no-server-avatar-diagnostics
+python scripts/perf/run-windows-avatar-workload.py --server BasisRustServer/target/release/basis-server-console.exe --client BasisRustClient/target/release/basis-rust-client.exe --server-config docs/performance/fixtures/avatar-cpu-only-server.xml --output captures/windows-repeat --clients 750 --server-ip 127.0.0.1 --workers 4 --warmup-seconds 45 --window-seconds 60 --no-server-avatar-diagnostics
 ```
 
 For C#, add `--server-kind csharp` and supply a published protocol-v55 apphost.

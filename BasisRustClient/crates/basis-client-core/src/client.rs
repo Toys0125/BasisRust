@@ -1,6 +1,20 @@
 use crate::observer_session::ObserverSession;
 use crate::packet_diagnostics::{DropReason, PacketDiagnostics};
 pub(crate) const OBSERVER_CANDIDATE_COUNT: usize = 3;
+
+/// Whether non-observer load-sink sockets get the bulk-unreliable receive filter.
+///
+/// The filter drops top-level `Unreliable` and `CompactMerged` datagrams in the kernel, which
+/// makes voice reception depend on how the server frames it. The Rust server frames voice as
+/// `Merged` and slips through; LiteNetLib frames it as `CompactMerged` and does not. Disable
+/// this when measuring all-client voice fanout against a non-Rust server so every leg measures
+/// the same population.
+fn load_sink_filter_enabled() -> bool {
+    match std::env::var("BASIS_CLIENT_LOAD_SINK_FILTER") {
+        Ok(value) => value != "0" && !value.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
 use crate::avatar::{
     parse_server_avatar_metadata, shared_receive_handoff_ready, PoseState, ServerAvatarMetadata,
 };
@@ -69,6 +83,7 @@ pub(crate) struct BasisClient {
     pub(crate) avatar_observer: Option<Arc<ObserverSession>>,
     pub(crate) packet_diagnostics: PacketDiagnostics,
     pub(crate) avatar_diagnostics: Option<Arc<ClientAvatarDiagnostics>>,
+    pub(crate) voice_diagnostics: Option<crate::voice_diagnostics::VoiceDiagnostics>,
     pub(crate) identity: Identity,
 }
 
@@ -120,6 +135,8 @@ impl BasisClient {
             packet_diagnostics: PacketDiagnostics::default(),
             avatar_diagnostics: ClientAvatarDiagnostics::enabled_from_env()
                 .then(|| Arc::new(ClientAvatarDiagnostics::default())),
+            voice_diagnostics: crate::voice_diagnostics::VoiceDiagnostics::enabled()
+                .then(|| crate::voice_diagnostics::VoiceDiagnostics::new(index)),
             identity,
         });
 
@@ -461,7 +478,7 @@ impl BasisClient {
             {
                 let remote_peer = i32::from_le_bytes(bytes[11..15].try_into().unwrap());
                 *self.remote_peer_id.lock().await = Some(remote_peer);
-                if self.index != 0 && self.avatar_observer.is_none() {
+                if self.index != 0 && self.avatar_observer.is_none() && load_sink_filter_enabled() {
                     if let Err(err) = configure_load_sink_socket(&self.socket) {
                         warn!(
                             "client {} failed to enable load-sink receive filter: {err}",
@@ -526,6 +543,9 @@ impl BasisClient {
             }
             PacketProperty::Unreliable => {
                 if let (Some(channel), Some(payload)) = (bytes.get(1).copied(), bytes.get(2..)) {
+                    if let Some(diagnostics) = &self.voice_diagnostics {
+                        diagnostics.receive(channel, payload);
+                    }
                     self.observe_avatar_channel(channel, payload).await;
                 }
             }
@@ -657,6 +677,9 @@ impl BasisClient {
             PacketProperty::Unreliable
         );
         self.note_received_packet();
+        if let Some(diagnostics) = &self.voice_diagnostics {
+            diagnostics.receive(channel, payload);
+        }
         self.observe_avatar_channel(channel, payload).await;
     }
 
@@ -764,6 +787,13 @@ impl BasisClient {
                 );
                 return Ok(());
             }
+        }
+
+        // Count reliable voice only after its transport sequence has passed the
+        // existing duplicate/window checks. Unreliable receive paths are counted
+        // at their dispatch points because they have no transport deduplication.
+        if let Some(diagnostics) = &self.voice_diagnostics {
+            diagnostics.receive(channel, payload);
         }
 
         match channel {

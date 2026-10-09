@@ -1,0 +1,269 @@
+# PR #31 processing-speed comparison — 2026-10-08
+
+## Results
+
+The `94b42f9` admission fix showed no material realtime regression in these matched runs. Relative to its parent, the combined one-peer control probe rate was 2.2% lower, with a 0.9 microsecond increase in median per-trial p95 completion time. The 64-peer control medians were effectively unchanged. These are observations on one host, not statistical significance or server capacity claims.
+
+The tested queue repartition did not improve the medians meaningfully and was **not adopted**. The runtime for those measurements was `94b42f9`; the newer ordered-admission follow-up is measured below.
+
+## Revisions and setup
+
+| Label | Revision | Description |
+| --- | --- | --- |
+| main | `ccedc4280dbe67cb5701ccdde3520df948502dc7` | Current target branch reference |
+| parent | `da0aafc6862660c526da05f6668060ce2a33bf51` | Ordered application handlers and reusable peer snapshots |
+| current | `94b42f97c28d203cb7983f5399bc3df27b608639` | Independent ordered ingress and bounded per-lane admission |
+| budget variant | Local modification of current | 2,048 ingress + 2,176 waiting slots; same combined 4,224-slot bound |
+
+Host: AMD Ryzen 9 5900HX, 16 logical processors, 33,492,484,096 bytes of OS-reported RAM, NVIDIA GeForce RTX 3080 Laptop GPU. Linux, performance CPU governor, Rust 1.95.0. GPU processing was disabled. Normal desktop activity was not isolated.
+
+Every revision was exported from committed source and built in release mode with a separate Cargo target directory. Existing workspace edits were excluded. All realtime trials used one frozen client binary from committed current source, the same harness and fixtures, and the same audio corpus. Binary, fixture, harness, probe and manifest hashes are recorded in [benchmark-summary.json](benchmark-summary.json).
+
+## Realtime workloads
+
+Each workload used the sequential order main / parent / current / current / parent / main: **two samples per revision**, each with 20 seconds of warmup after authenticated/active readiness and a 60-second measurement. Server Tokio and Rayon workers were both 16; client Tokio workers were four. All clients were colocated, P2P disabled, and server diagnostic CSV/profiling disabled.
+
+### Avatar-only: 1,000 clients
+
+Default Linux shared receive and socket load-sink filtering were retained. Avatar coverage and cadence are measured at one observer. All six samples passed the readiness, sender progress, coverage, freshness, decode, sequence and transport/protocol checks. Every sender produced at least the required 2,900 updates in the window; measured server avatar ingress was approximately 50,000 updates/s.
+
+Medians of the two trial values:
+
+| Revision | Avatar gap p95 | Observer applied items/s | Server CPU cores | Client CPU cores | Server peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| main | 172.81 ms | 6,327 | 4.676 | 0.614 | 193.8 |
+| parent | 159.56 ms | 6,710 | 4.717 | 0.591 | 243.0 |
+| current | 160.78 ms | 6,718 | 4.694 | 0.587 | 234.8 |
+
+Current versus parent: p95 +0.8%, applied throughput +0.1%, server CPU −0.5%. The measured difference is small. Current versus main improved observer cadence at similar CPU cost; it used more memory in this workload.
+
+### Voice plus avatars: 250 clients, 25 speakers
+
+Linux shared receive and the socket load-sink filter were disabled. Every client received voice. The same 40 real source clips were encoded once as mono 48 kHz, 32 kbps Opus with 20 ms frames, using the harness encoder settings. No synthetic or single-clip replacement was used.
+
+All six trials passed capture validation, sampled payload/hash and Opus decode validation, and the voice capacity checks **for this configuration**. Unique receipt counters were available; duplicate, reordered and ambiguous voice counts were zero. Offered voice cadence was approximately 1,250 frames/s, or 100% of nominal.
+
+| Revision | Voice gap p95 histogram floor | Unique fanout received | Avatar gap p95 | Server CPU cores | Client CPU cores | Server peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| main | 20.5 ms | ~100% | 28.99 ms | 5.585 | 2.037 | 71.4 |
+| parent | 21 ms | ~100% | 21.64 ms | 3.453 | 0.952 | 86.9 |
+| current | 21 ms | ~100% | 21.79 ms | 3.466 | 0.963 | 87.6 |
+
+Current versus parent: server CPU +0.4%, avatar gap p95 +0.7%, with the same median voice gap. Current versus main used 37.9% less server CPU while sustaining comparable voice delivery; server RSS was higher at this population. Slight receipt ratios above one in individual samples reflect in-flight frames crossing the measurement boundaries; exact ratios are retained in the JSON. The voice histogram values describe arrival cadence, not send-to-receive latency.
+
+### Ineligible 1,000-client voice attempt
+
+Before selecting the smaller voice population, main was tested with 1,000 clients and 100 speakers. It sustained only **13.6% of nominal voice send cadence**. Avatar freshness and delta application checks failed, and unique voice receipt tracking became unavailable. Server/client CPU consumption was approximately 11.14/3.55 cores. The next trial was interrupted and excluded.
+
+These shared-host runs could not provide comparable offered voice load at that population. They were excluded from the speed comparison. No latest-revision 1,000-speaker capacity conclusion follows from this work.
+
+## Live control processing probe
+
+[registry-processing-benchmark.rs](../../BasisRustServer/crates/basis-server-core/examples/registry-processing-benchmark.rs) creates real UDP peers, authenticates their Ready metadata without password/identity authentication, and sends reliable ordered registry subscriptions through the transport and ordinary application dispatcher. Each successful trial sends 32,768 requests with globally unique subscription IDs.
+
+The identical probe source is overlaid on each revision. It uses four Tokio workers, 16 Rayon threads and the default allocator, rather than the console's mimalloc allocator. Server and UDP driver share this process. Completion includes request submission, UDP reception, dispatch and visibility of committed final state. Six samples per revision/configuration use main / parent / current / variant / variant / current / parent / main, repeated three times.
+
+The driver implements the 128-sequence sender window, correct 21-byte bitmap ACKs and unchanged-packet retries after 100 ms. Before timing, the initial server reliable queues must drain. Every successful trial requires the exact application inbound-count delta, each peer's final singleton subscription ID, zero reported protocol/ACK errors and empty client pending ACK windows. This checks the processing total and final state; it does not observe every intermediate application state. Whole-process CPU observations include startup/shutdown and the driver, and are available in the JSON; they do not isolate server processing CPU. The observer actively polls with cooperative `yield_now` on the same four-worker runtime and contributes CPU and map-read contention. This load is matched across revisions but limits attribution of small differences to server code alone. CodeRabbit reported this as a minor measurement-method concern; its suggested 1 ms polling would mask the approximately 30 microsecond single-request behavior, so active polling was retained and the limitation is explicit.
+
+| Population / requests in flight per peer | main requests/s | parent requests/s | current requests/s | Current versus parent |
+| --- | ---: | ---: | ---: | ---: |
+| 1 peer / 1 | 47,469 | 44,711 | 43,722 | −2.2% |
+| 64 peers / 1 | 128,511 | 127,485 | 128,543 | +0.8% |
+| 64 peers / 64 | Failed final-state check | 135,225 | 135,231 | ~0% |
+
+Median per-trial p95 batch completion: one peer 27.24 / 28.22 / 29.12 microseconds for main / parent / current; 64 peers with one request each 0.583 / 0.578 / 0.567 ms. With 64 requests per peer, parent/current medians were 31.43/31.53 ms.
+
+Current had **one retry in six pipelined samples**. That trial reached 107.61 ms p95 and 101,143 requests/s; its other five samples reached 134,391–135,995 requests/s with zero retries. Parent's six samples had zero retries and 132,574–136,248 requests/s. This outlier is retained. The probe does not distinguish admission rejection from UDP/ACK loss, so it does not establish the cause or production frequency.
+
+Main failed both pipelined attempts: all 4,096 first-batch requests were counted, but multiple peers retained older subscription IDs. Thus its pipelined throughput is not reported as comparable successful work. The full receive/application path is tested; the failure alone does not isolate the layer that reordered messages. Parent and current passed all 18 configured trials each, with exact totals and final states.
+
+### Queue repartition experiment
+
+The local variant preserved 4,224 combined queued slots by changing ingress/waiting capacities from 128/4,096 to 2,048/2,176. Per-lane 128 and per-peer 256 limits were retained. Its median throughput was 42,913 requests/s for one peer, 130,663 for 64 peers with one request each, and 135,595 for the pipelined case. All 18 trials passed with zero client retries.
+
+The improvement was inconsistent across configurations and the burst median was only 0.3% higher than current. The smaller application waiting budget and larger FIFO ingress also change where overload accumulates. The variant was not adopted.
+
+## Reproduction and evidence limits
+
+For each revision, use an isolated export/checkout with its own Cargo target directory. Copy the committed control example into older revisions before building it:
+
+```sh
+cargo build --release --locked --manifest-path BasisRustServer/Cargo.toml \
+  -p basis-server-core --example registry-processing-benchmark
+RAYON_NUM_THREADS=16 BasisRustServer/target/release/examples/registry-processing-benchmark \
+  --config docs/performance/fixtures/avatar-cpu-only-server.xml \
+  --peers 1 --ops 32768 --batch 1
+```
+
+Repeat with `--peers 64 --ops 512 --batch 1` and `--batch 64`. Alternate revision order, require successful count/state/ACK validation, and keep builds separate from measurements.
+
+The realtime harness is `scripts/perf/run-windows-avatar-workload.py` despite its name. Use a common frozen current client, fixture and harness; 1,000 clients for avatars, 250 clients/25 speakers for voice, 20-second warmup, 60-second windows, four client workers, 16 server Tokio/Rayon workers and no server diagnostic CSV. Voice additionally requires `--no-client-shared-receive`, `--client-voice-all-clients`, `--voice-speaker-percent 10`, `--no-voice-reencode`, and the common prepared corpus. Generated captures and binaries remain ignored under `captures/pr31-processing-speed-20261008`.
+
+Preliminary control runs before correcting ACK size, request retries and sender window bounds were discarded. They contribute no published measurements. The committed [compact JSON](benchmark-summary.json) retains individual final observations, validation definitions, revision/build hashes and the rejected experiment. These limited samples do not prove the absence of smaller regressions, performance with larger control payloads, production packet loss behavior, or capacity on separate client/server machines.
+
+## Ordered admission follow-up
+
+Runtime `a2da362aa1047464b3b789b29928b8f60e112ea9` was compared with the previous runtime `94b42f97c28d203cb7983f5399bc3df27b608639`, using the identical committed UDP control probe and fixture. The same host remained on the performance CPU governor. Each case used previous / new / new / previous twice: **four samples per revision**, 32,768 operations per trial, four Tokio workers, 16 Rayon threads, system allocator, and GPU disabled. Ordinary handler capacity was unchanged; the new runtime reserves two additional slots for identity handlers.
+
+| Peers / outstanding requests per peer | Previous requests/s | New requests/s | Change | Previous / new p95 batch completion |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / 1 | 43,588 | 38,520 | −11.6% | 29.44 / 31.95 µs |
+| 64 / 1 | 128,150 | 123,736 | −3.4% | 0.573 / 0.605 ms |
+| 64 / 64 | 136,714 | 134,099 | −1.9% | 31.44 / 31.91 ms |
+
+All **24 trials** passed the exact application-count and final-subscription checks, with empty client ACK windows, zero protocol/ACK errors, and zero client retransmissions. No gain was obtained by dropping work. Median whole-process CPU seconds (including driver and setup/shutdown) rose from 2.260 to 2.584, 1.515 to 1.653, and 1.403 to 1.503 respectively. These are not separate server CPU measurements.
+
+The one-peer probe shows a consistent processing-cost increase: preliminary implementations also measured approximately 11–13% lower throughput. Avoiding empty scheduling permit probes, cloning one shared queue handle, and removing duplicate application quota bookkeeping did not eliminate it. The 64-peer differences are smaller observations on a shared host, without statistical significance established. Active cooperative polling adds CPU and map contention on the same runtime, so this probe cannot attribute every difference solely to server code. It does establish that the new control path should not be described as regression-free.
+
+The runtime changes reserve an independent 128-event identity budget and two identity workers. Ordinary ordered quotas (4,096 global, 128 per lane, 256 per connection) cover ingress, queued, and running handlers. In-order admission reserves its permit before sequence commit/ACK; lack of capacity leaves it for retry rather than disconnecting the client. Out-of-order packets already ACKed under the separate bounded reorder budget remain retained until handler admission succeeds. The application FIFO retains accepted events and uses the transport permit as its quota owner.
+
+Regression tests verify reserved identity admission at a full ordinary transport budget, a real signed identity response with all ordinary workers blocked, and a real 400-message UDP burst whose delayed handler eventually receives every message in FIFO order after unchanged-packet retries, with its session still connected. Server workspace validation passed **326 tests, two ignored**, targeted transport/core Clippy denied warnings, and formatting passed. CodeRabbit's first review emitted one minor queue-rejection panic concern, addressed by removing the second quota/rejection path. Its follow-up emitted zero findings but completed with an unverified-findings warning; this is not a clean-review guarantee. Luna audits found no additional concrete issue.
+
+The JSON summary retains all 24 individual measurements, binary/source/fixture hashes, revisions, CPU observations, and validation results. Raw captures remain ignored. **No new voice/avatar workload or 1,000-user capacity test was run at this runtime.** Earlier realtime results above apply to `94b42f9`, not this follow-up.
+
+## Authentication fairness and admission optimization
+
+Runtime `51c42ab4f31a7fc3f9a8eeb0a5e636e711f27706` limits critical admission to **two outstanding messages per connection/channel**, independently of the 128 global identity slots. The regression test holds two messages from one connection, verifies its next in-order message is not committed/ACKed, and admits another connection's identity response. Ordinary quotas and ordering guarantees are unchanged.
+
+Admission accounting now uses bounded atomic counters owned by each connection incarnation, with separate global totals for ordinary and critical traffic. Failed partial reservations roll back their counters; permits retain their original session and release capacity on completion or cleanup. This removes the shared accounting mutex and repeated hash-map insertion/removal. It adds **528 bytes per peer** on this 64-bit host, including inactive peers. Global atomic counters can still contend.
+
+The dispatcher now selects its three ingress receivers directly, removing the nested receiver-selection future. Ordered ingress schedules the queue it changed; handler completion and shutdown still schedule both classes. Identity keeps its independent queue and two workers.
+
+### Profiling and controlled iterations
+
+A pre-change `perf` user-cycle capture recorded 3,154 samples with DWARF call stacks. Driver/observer and memory-copy activity dominated the shared-process profile; the sample did **not** establish admission mutex contention as the cause of the full throughput loss.
+
+An isolated reserve-and-drop benchmark measured one million successful immediate reservations per sample, on one thread. Twenty samples per case across both revisions used previous/new/new/previous, five samples per process. Median cost fell from **104.88 to 25.06 ns** for one peer rotating through 64 channels and **105.29 to 24.67 ns** for 64 peers in rotation. This excludes contention, queue handoff, ACKs and handlers. The identical measured loop was backported to the previous transport; its older config omitted the two new critical-local fields. No quota was saturated.
+
+The first atomic-only candidate completed all 24 matched UDP trials, but its throughput changed by −0.4%, +1.1%, and −0.5% across the three cases. Thus faster local accounting did not establish a full-pipeline gain. Receiver-selection flattening was measured next.
+
+### Final matched control comparison
+
+The final experiment used **four samples per revision/case**, in the order `94b42f9` / reviewed runtime / new / new / reviewed runtime / `94b42f9`, twice. All builds used the identical committed UDP probe and fixture, 32,768 operations per trial, four Tokio workers, 16 Rayon threads and the system allocator. Ordinary handler capacity remained 64 and reserved identity workers remained two. These speed trials disable identity authentication; the separate correctness tests exercise signed identity and saturation.
+
+| Peers / requests in flight per peer | Reviewed runtime requests/s | New requests/s | Change | Reviewed / new p95 batch completion |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / 1 | 36,885 | 37,654 | +2.1% | 33.63 / 32.30 µs |
+| 64 / 1 | 119,278 | 121,255 | +1.7% | 0.634 / 0.619 ms |
+| 64 / 64 | 127,641 | 127,846 | +0.2% | 34.52 / 34.54 ms |
+
+All **36 trials** passed exact processing totals, final-subscription checks, zero protocol/ACK errors, and empty client ACK windows. Reviewed and new runtimes had zero client retransmissions. Two `94b42f9` burst trials retried, six retransmissions total, affecting its median and tail; their cause is not identified, so its apparent burst disadvantage is not presented as a clean speedup.
+
+The new one-peer median remains **9.7% below `94b42f9`** (41,682 requests/s), and 64-peer steady throughput remains 1.9% below that reference. The improvement is limited; this does not eliminate the previously reported control-processing regression. Four samples on a shared host do not establish statistical significance. Active cooperative polling still shares the server's runtime, so these measurements include driver/observer interactions rather than isolated server processing.
+
+Median whole-process CPU seconds, including setup/shutdown and the driver, changed from 2.682 to 2.622, 1.713 to 1.699, and 1.535 to 1.538 across the three cases. These are not server-only CPU observations.
+
+Validation passed **330 server tests, three ignored**, targeted transport/core Clippy with warnings denied, formatting, and diff checks. Tests cover critical connection fairness, invalid limits, concurrent global/peer/lane reservations, rollback, stale-session release, auth progress, FIFO bursts and cleanup. Luna audits found no new concrete issue in these changes. CodeRabbit emitted zero findings but completed with unverified warnings, so that run is not a clean-review guarantee.
+
+The compact JSON retains all 36 final UDP trials, all 40 isolated microbenchmark observations, configuration/revision/source/binary hashes, profiling notes and limitations. Raw results and the 25 MB profiling capture remain ignored. No voice/avatar or 1,000-user capacity workload was rerun at this runtime.
+
+## Shared handler state follow-up
+
+Runtime `ae10e95d09d0707318f62ff4ca799a2a821dcfad` addresses the remaining control-processing cost without changing admission behavior. `ServerState` contains shared state wrappers; cloning it for each handler increments many resource reference counts. The dispatcher now wraps it once in an `Arc` and shares that single reference with each handler. A redundant second state clone on the ordinary path is also removed. Critical per-connection limits remain two, pre-ACK reservation and all queue limits remain unchanged, and session leases and FIFO handler execution are preserved.
+
+The matched experiment compared frozen `51c42ab` and `94b42f9` binaries with the new runtime. It used the same probe, fixture, host, allocator, four Tokio workers, 16 Rayon threads, 64 ordinary handler slots, two identity slots, and 32,768 operations per trial. Each case used reference / previous / new / new / previous / reference twice: **four samples per revision/case**. Identity authentication is disabled in speed trials; correctness is covered separately by the existing identity and admission regressions.
+
+| Peers / requests in flight per peer | Previous (`51c42ab`) requests/s | New requests/s | Change | Previous / new p95 batch completion |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / 1 | 36,805 | 42,554 | +15.6% | 33.63 / 29.72 µs |
+| 64 / 1 | 120,267 | 124,278 | +3.3% | 0.637 / 0.594 ms |
+| 64 / 64 | 128,369 | 130,049 | +1.3% | 33.56 / 32.27 ms |
+
+All **36 trials** passed exact processing totals, final-subscription checks, empty ACK windows, and zero protocol/ACK errors, with **zero client retransmissions across all revisions**. The gains were not obtained by dropping work. Median whole-process CPU seconds, including driver and setup/shutdown, fell from 2.730 to 2.302, 1.695 to 1.504, and 1.530 to 1.416 respectively.
+
+The corresponding `94b42f9` medians were 40,946, 122,158 and 128,072 requests/s. New throughput was **3.9%, 1.7% and 1.5% higher**, respectively, and its p95 batch completion was lower in all three cases. Thus the previously observed control regression was **not reproduced in this matched cohort**. Four samples on a shared host do not establish statistical significance or prove that every workload is free of regressions. The active observer and UDP driver still share runtime workers with the server, so throughput and CPU are not isolated server measurements.
+
+Validation passed **106 server-core tests**, the focused transport critical-fairness regression, core all-target Clippy with warnings denied, workspace formatting, and diff checks. Luna verified that the shared wrappers preserve state identity and that the change leaves lifecycle, ordering, session and permit handling intact. CodeRabbit reviewed the changed server file and completed successfully with zero findings. The full workspace was not rerun for this small core-only follow-up; the preceding runtime's 330-test result remains historical.
+
+The [compact JSON](benchmark-summary.json) retains all 36 new samples, revisions, configuration, binary/source hashes, validation checks and limitations. Raw captures remain ignored. **No voice/avatar or 1,000-user capacity workload was rerun at this revision.**
+
+## Lifecycle isolation follow-up
+
+Runtime `6380dce67b82eeedabdb7b7ad2ba19218f759742` fixes the confirmed admission dependency between ordinary worker capacity and lifecycle events. The transport now offers an optional, independently bounded lifecycle receiver. The server installs **256 queued slots and two reserved lifecycle workers** for connection requests and disconnect notifications; ordinary messages and identity keep their existing queues and workers. Transport consumers that do not install the new queue retain the previous bind receiver behavior.
+
+Connection replacement still reserves both its disconnect and connection-request events before retiring the existing peer. Remote disconnects reserve capacity before retirement, and timeout cleanup retains its awaited reservation. A full lifecycle queue therefore does not silently drop committed retirement state. Session admission closes before publication, queued ordered work for that incarnation is discarded, and application cleanup still waits for active read leases. During shutdown, the dispatcher closes lifecycle ingress, drains queued disconnect cleanup with the same bounded workers, and skips new connection requests.
+
+The real UDP regression holds every ordinary worker, then completes a new connection and processes another client's disconnect, removing authenticated player and ownership state before ordinary workers are released. A separate shutdown regression holds both lifecycle callbacks, buffers a third real disconnect, waits until the dispatcher closes ingress, then releases the callbacks and verifies all three sessions are cleaned before return. Transport tests cover routing around a full ordinary queue, preserving peer/pending-request state when replacement admission is full, and positive/one-time installation.
+
+**335 server workspace tests passed, three ignored**, including 108 core and 86 transport tests. Targeted transport/core all-target Clippy with warnings denied, formatting and diff checks passed. Luna audited queue/worker bounds, session safety, shutdown drain and the deterministic test barrier. CodeRabbit reviewed the three changed server files and completed with zero findings.
+
+### Matched control measurements
+
+The same probe, fixture, host, allocator, 32,768 operations per trial, four Tokio workers, 16 Rayon threads, 64 ordinary handler slots and two identity workers were retained. The new lifecycle class adds two worker slots. Frozen `ae10e95` and `94b42f9` binaries were compared with the new runtime in reference / previous / new / new / previous / reference order twice: **four samples per revision/case**. No builds or test suites ran during measurements.
+
+| Peers / requests in flight per peer | Previous (`ae10e95`) requests/s | New requests/s | Change | Previous / new p95 batch completion |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / 1 | 42,604 | 42,535 | −0.2% | 29.26 / 28.84 µs |
+| 64 / 1 | 120,987 | 120,425 | −0.5% | 0.631 / 0.635 ms |
+| 64 / 64 | 129,942 | 127,265 | −2.1% | 33.33 / 34.36 ms |
+
+All **36 trials** passed exact operation totals, final-subscription checks, drained client windows and zero protocol/ACK errors, with **zero retransmissions across all revisions**. Whole-process CPU medians changed from 2.330 to 2.341 seconds, 1.529 to 1.571 seconds, and 1.415 to 1.432 seconds, including driver and setup/shutdown. Against the simultaneous `94b42f9` reference, throughput changed by +2.3%, −0.1% and −0.6% respectively.
+
+The burst throughput/p95 observation is less favorable than the previous revision. Four samples on one shared host do not establish statistical significance or isolate its cause, so this change is not described as regression-free. The probe's active observer and UDP driver share runtime workers with the server; identity is disabled in speed trials. These measurements do not cover lifecycle flooding, production loss, voice/avatar throughput or 1,000-user capacity.
+
+Lifecycle capacity remains bounded: if both lifecycle workers are busy, subsequent lifecycle events queue. Disconnect cleanup cannot complete while an existing handler holds a read lease on that same session. The fix provides capacity independent of unrelated ordinary handlers; it does not bypass that safety requirement.
+
+The [compact JSON](benchmark-summary.json) retains all 36 new observations, revision/source/binary hashes, configuration, validation and limitations. Raw captures remain ignored.
+
+## Split lifecycle capacity follow-up
+
+Runtime `2f5d358ef517605873de5535c432cd9f167bc752` resolves both remaining lifecycle admission dependencies. Connection requests and disconnect notifications now have **independent 256-event queues**, with **two connection workers and two disconnect workers**. Filling connection admission cannot consume disconnect capacity. Cleanup waiting for departing sessions' read leases cannot consume connection worker slots.
+
+A separate lifecycle dispatcher selects the two classes fairly, with at most **four tracked handlers**, including completed tasks awaiting collection. It admits work only when that class has a permit; it creates no unbounded collection of tasks waiting for leases or worker slots. The ordinary dispatcher returns to three ingress branches. Session retirement remains atomic with event reservation: replacement must reserve both its connection and disconnect event before mutating state, and reservation failure rolls back. Unconfigured transport consumers retain the original queue behavior.
+
+The ordinary dispatcher prunes retired ordered lanes on its existing **50 ms join-flush tick** and during shutdown. It drops pending envelopes and their admission permits, retains active lanes until their handlers complete, and compacts stale ready keys once per pass without allocating a fresh key snapshot. Pending retired-session permits can therefore remain until the next tick. Session read gates and captured connection identity still prevent stale processing, and peer IDs remain retired until keyed cleanup finishes. Separate queues provide no cross-class completion ordering; the earlier two-worker dispatcher also allowed replacement callbacks to run concurrently.
+
+Shutdown closes both lifecycle queues, skips buffered connection requests, drains committed disconnect cleanup and joins the lifecycle dispatcher after ordinary handlers drain. Each class remains bounded and can queue behind its own busy workers; a full disconnect queue backpressures retirement. Active read leases must still finish before their session's cleanup and ID recycling.
+
+### Correctness checks
+
+- A transport test fills connection admission with **256 distinct requests**, then verifies an existing peer's disconnect is admitted and retired through the independent queue.
+- Replacement tests exhaust either class, verifying no premature retirement or pending-request insertion and that partial reservations release capacity.
+- A real UDP regression holds read leases on **two disconnected sessions** while both cleanup callbacks wait. New clients still authenticate. Releasing one lease completes only its cleanup and permits only that ID to recycle; the other session stays protected until its lease is released.
+- The deterministic shutdown regression still drains a third disconnect buffered behind two held cleanup callbacks. Ordered queue tests preserve a running head and replacement generation and compact repeated stale ready keys.
+
+**339 server workspace tests passed, three ignored**, including 111 core and 87 transport tests. Transport/core all-target Clippy with warnings denied, formatting and diff checks passed. Luna audited admission rollback, bounded worker/task counts, session/ID safety and shutdown. CodeRabbit completed its review of the three changed server files with zero findings.
+
+### Matched control measurements
+
+Frozen `6380dce` and pre-lifecycle `ae10e95` binaries were compared with the new runtime using the same fixture/probe, host, allocator, 32,768 operations per trial, four Tokio workers, 16 Rayon threads, 64 ordinary slots and two identity slots. The new lifecycle class has four slots rather than the previous two. Each case used reference / previous / new / new / previous / reference twice: **four samples per revision/case**. Builds and test suites ran before measurements.
+
+| Peers / requests in flight per peer | Previous (`6380dce`) requests/s | New requests/s | Change | Previous / new p95 batch completion |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / 1 | 42,573 | 42,661 | +0.2% | 29.12 / 29.30 µs |
+| 64 / 1 | 124,919 | 124,510 | −0.3% | 0.581 / 0.588 ms |
+| 64 / 64 | 128,696 | 130,016 | +1.0% | 33.44 / 34.07 ms |
+
+All **36 trials** passed exact processing totals, final-subscription checks, zero protocol/ACK errors and drained client windows, with **zero retransmissions across all revisions**. Previous/new whole-process CPU medians were 2.321/2.320 seconds, 1.515/1.496 seconds and 1.418/1.418 seconds, including driver and setup/shutdown. Versus simultaneous `ae10e95`, throughput changed by +0.4%, −0.4% and +0.8%.
+
+These small throughput differences do not establish statistical significance. P95 completion was slightly higher in all three cases, so this is not presented as a general speedup. Active observer polling and the UDP driver still share runtime workers with the server, and identity is disabled in speed trials. The correctness regressions establish the intended overload isolation; these measurements do not establish throughput during lifecycle floods, production packet loss or **1,000-user voice capacity**.
+
+The [compact JSON](benchmark-summary.json) retains all 36 new samples, configuration/revision/source/binary hashes, validation checks and limitations. Historical evidence is preserved; raw captures remain ignored.
+
+## Ordered generation retirement follow-up
+
+Runtime `92adc0ab94ac92d351c32a56dca6541f92950cb2` (2026-10-09) fixes the session-replacement window in ordered admission accounting. The registry tracks only the latest generation per peer/channel: previously, replacing that entry before periodic pruning could orphan the old queued lane and its admission permits. Before registry replacement, the dispatcher now discards the prior generation from **both ordered queues** and compacts the affected ready lists. A running head remains until keyed completion, which cannot remove the new generation. Other retired channels retain the existing 50 ms pruning behavior.
+
+The same-session hot path now borrows the envelope's session, avoiding an extra `Arc` clone/drop. Queue cleanup occurs only on session replacement. Admission quotas, ACK timing, handler ordering and session leases are unchanged.
+
+### Correctness checks
+
+A deterministic wire regression stages two real UDP `OrderedEvent` admission guards for session A in the production queue while all fixture ordinary permits are held. After A retires and cleanup recycles its numeric ID, session B admits a head using the last global slot. The production generation helper clears A's pending lane before installing B's entry; two more B packets then obtain the released quota. This exercises real transport admission and ID reuse with explicit queue/helper staging, rather than reproducing the full event-loop tick race. Temporarily disabling the cleanup makes the regression fail at its stale-lane assertion; restoring it passes. Existing queue tests cover preservation of a running old head and generation-keyed completion.
+
+**340 server workspace tests passed, three ignored**, including 112 core and 87 transport tests. Transport/core all-target Clippy with warnings denied, workspace formatting and diff checks passed. Luna audited replacement bookkeeping and guard lifetimes; CodeRabbit completed review of both changed server files with zero findings.
+
+### Matched control measurements
+
+The frozen `2f5d358` binary from head `0922c9e` and the new binary used the unchanged fixture/probe, release profile, system allocator, performance CPU governor, four Tokio workers, 16 Rayon threads and 32,768 operations per trial. Previous / new / new / previous ran twice per case: **four samples per revision/case**, after builds and tests completed.
+
+| Peers / requests in flight per peer | Previous requests/s | New requests/s | Change | Previous / new p95 batch completion |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / 1 | 43,606 | 42,956 | -1.5% | 29.228 / 30.241 µs |
+| 64 / 1 | 126,660 | 126,075 | -0.5% | 0.581 / 0.605 ms |
+| 64 / 64 | 132,075 | 133,618 | +1.2% | 32.143 / 31.916 ms |
+
+All **24 trials** passed exact processing totals, final-subscription checks, drained client windows and zero protocol/ACK errors, with **zero retransmissions**. Previous/new whole-process CPU medians were 2.258/2.268 seconds, 1.467/1.480 seconds, 1.364/1.364 seconds. CPU includes the server, driver, observer and setup/shutdown.
+
+Throughput was slightly lower in the first two cases and higher in bursts; p95 was higher in the first two cases. Four shared-host samples do not establish statistical significance, a regression, or a general speedup. Active observer polling and the UDP driver share runtime workers with the server; identity is disabled. These speed trials do not cover session churn or **1,000-user voice capacity**.
+
+The [compact JSON](benchmark-summary.json) retains all 24 observations, configuration, source/revision/binary hashes and validation checks. Earlier evidence is preserved; raw captures remain ignored.

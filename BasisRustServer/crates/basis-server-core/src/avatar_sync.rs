@@ -1459,6 +1459,12 @@ impl AvatarSyncSystem {
         *self.memory_reclaim.write() = Some(epoch);
     }
 
+    pub(crate) fn poll_memory_reclaim(&self) {
+        if let Some(epoch) = self.memory_reclaim.read().as_ref() {
+            epoch.poll_current_thread();
+        }
+    }
+
     pub fn set_offloaded_pairs(&mut self, offloaded_pairs: Arc<DashMap<u64, ()>>) {
         self.offloaded_pairs = offloaded_pairs;
     }
