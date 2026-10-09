@@ -1356,19 +1356,15 @@ async fn event_loop_with_handler<F, Fut>(
                 discard_ordered_session(&mut critical_queue, &mut ordered_sessions, session);
                 continue;
             }
-            let session = session.clone();
             let base = (*peer, *channel);
-            let generation = match ordered_sessions.get(&base) {
-                Some((old_session, generation)) if old_session.same_connection(&session) => {
-                    *generation
-                }
-                _ => {
-                    let generation = next_session_generation;
-                    next_session_generation = next_session_generation.wrapping_add(1).max(1);
-                    ordered_sessions.insert(base, (session.clone(), generation));
-                    generation
-                }
-            };
+            let generation = ordered_lane_generation(
+                base,
+                session,
+                &mut next_session_generation,
+                &mut ordered_sessions,
+                &mut ordered_queue,
+                &mut critical_queue,
+            );
             let key = (base.0, base.1, generation);
             if *channel == channels::AUTH_IDENTITY {
                 // Admission is reserved before ACK and retained through handler
@@ -1744,6 +1740,35 @@ impl<E> OrderedHandlerQueue<E> {
     fn contains(&self, key: OrderedLaneKey) -> bool {
         self.lanes.contains_key(&key)
     }
+}
+
+fn ordered_lane_generation(
+    base: (PeerId, u8),
+    session: &PeerSession,
+    next_generation: &mut u64,
+    sessions: &mut HashMap<(PeerId, u8), (PeerSession, u64)>,
+    ordered: &mut OrderedHandlerQueue,
+    critical: &mut OrderedHandlerQueue,
+) -> u64 {
+    if let Some((old_session, generation)) = sessions.get(&base) {
+        if old_session.same_connection(session) {
+            return *generation;
+        }
+        // Retire the old pending lane before its last registry entry is replaced.
+        // A running head retains its key until completion and cannot erase the
+        // new generation when its JoinSet result is collected.
+        let old_key = (base.0, base.1, *generation);
+        if ordered.discard_lane(old_key) {
+            ordered.compact_ready();
+        }
+        if critical.discard_lane(old_key) {
+            critical.compact_ready();
+        }
+    }
+    let generation = *next_generation;
+    *next_generation = next_generation.wrapping_add(1).max(1);
+    sessions.insert(base, (session.clone(), generation));
+    generation
 }
 
 fn prune_ordered_sessions(

@@ -1574,6 +1574,169 @@ async fn signed_identity_uses_reserved_workers_when_ordinary_workers_are_full() 
 }
 
 #[tokio::test]
+async fn replacement_session_releases_old_ordered_admissions_before_new_lane_progress() {
+    let (mut state, shutdown, _) = super::tests::test_server(false).await;
+    let (transport, legacy_events) =
+        basis_transport::TransportHandle::bind_with_statistics_options(
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+    let (mut ordered_events, _critical_events) = transport
+        .enable_ordered_admission(basis_transport::OrderedAdmissionConfig {
+            regular_capacity: 3,
+            critical_capacity: 1,
+            per_lane: 3,
+            per_peer: 3,
+            critical_per_lane: 1,
+            critical_per_peer: 1,
+            critical_channel: channels::AUTH_IDENTITY,
+        })
+        .unwrap();
+    let mut lifecycle_events = transport.enable_lifecycle_event_queues(16, 16).unwrap();
+    state.transport = transport.clone();
+
+    // Run only connection admission. Ordered envelopes below stay in the explicit
+    // lane queues, modeling the dispatcher with no ordinary worker slots available.
+    let lifecycle_state = state.clone();
+    let (stop_connections, mut stopping_connections) = oneshot::channel();
+    let connection_dispatcher = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut stopping_connections => break,
+                event = lifecycle_events.connections.recv() => match event {
+                    Some(event) => crate::handle_event(&lifecycle_state, event).await.unwrap(),
+                    None => break,
+                }
+            }
+        }
+    });
+
+    // Hold every ordinary permit while accepted OrderedEvents are staged in the
+    // production handler queue without starting a lane head.
+    let worker_limit = std::thread::available_parallelism()
+        .map(|count| (count.get() * 4).clamp(8, 256))
+        .unwrap_or(32);
+    let ordinary_workers = Arc::new(Semaphore::new(worker_limit));
+    let mut held_workers = Vec::with_capacity(worker_limit);
+    for _ in 0..worker_limit {
+        held_workers.push(ordinary_workers.clone().acquire_owned().await.unwrap());
+    }
+    assert_eq!(ordinary_workers.available_permits(), 0);
+
+    let mut old_client = Client::connect(&state, "ordered-admission-old").await;
+    let (peer, old_session) = session_for_uuid(&state, "ordered-admission-old");
+    let base = (peer, channels::REGISTRY_CONTROL);
+    let mut ordered_queue = crate::OrderedHandlerQueue::<basis_transport::OrderedEvent>::default();
+    let mut critical_queue = crate::OrderedHandlerQueue::<basis_transport::OrderedEvent>::default();
+    let mut ordered_sessions = HashMap::new();
+    let mut next_generation = 1;
+    let old_generation = crate::ordered_lane_generation(
+        base,
+        &old_session,
+        &mut next_generation,
+        &mut ordered_sessions,
+        &mut ordered_queue,
+        &mut critical_queue,
+    );
+    let old_key = (peer, channels::REGISTRY_CONTROL, old_generation);
+
+    for sequence in 0..2u8 {
+        old_client
+            .send(channels::REGISTRY_CONTROL, &[sequence], true)
+            .await;
+        let envelope = tokio::time::timeout(Duration::from_secs(3), ordered_events.recv())
+            .await
+            .expect("old ordered message admitted before ACK")
+            .expect("ordered ingress remains open");
+        assert!(envelope.admission.is_some());
+        assert!(matches!(
+            &envelope.event,
+            ServerEvent::Message { peer: event_peer, session, .. }
+                if *event_peer == peer && session.same_connection(&old_session)
+        ));
+        ordered_queue.enqueue(old_key, envelope);
+    }
+    assert_eq!(ordered_queue.pending(), 2);
+
+    assert!(transport
+        .disconnect_session(&old_session, "replace ordered lane")
+        .await
+        .unwrap());
+    old_session.wait_for_read_leases().await;
+    crate::handle_disconnect(&state, &old_session, DisconnectReason::Remote).await;
+    assert!(!state.authenticated_peers.contains_key(&peer));
+
+    let mut new_client = Client::connect(&state, "ordered-admission-new").await;
+    let (new_peer, new_session) = session_for_uuid(&state, "ordered-admission-new");
+    assert_eq!(new_peer, peer, "the old peer ID is now reusable");
+
+    // One spare global admission carries the replacement head. The helper must
+    // discard the retired generation, releasing both old transport permits.
+    new_client
+        .send(channels::REGISTRY_CONTROL, &[0], true)
+        .await;
+    let first_new = tokio::time::timeout(Duration::from_secs(3), ordered_events.recv())
+        .await
+        .expect("replacement lane head gets the remaining global permit")
+        .expect("ordered ingress remains open");
+    assert!(first_new.admission.is_some());
+    let new_generation = crate::ordered_lane_generation(
+        base,
+        &new_session,
+        &mut next_generation,
+        &mut ordered_sessions,
+        &mut ordered_queue,
+        &mut critical_queue,
+    );
+    assert_ne!(new_generation, old_generation);
+    let new_key = (new_peer, channels::REGISTRY_CONTROL, new_generation);
+    assert!(!ordered_queue.contains(old_key));
+    assert_eq!(ordered_queue.pending(), 0);
+    assert!(ordered_sessions
+        .get(&base)
+        .is_some_and(
+            |(session, generation)| session.same_connection(&new_session)
+                && *generation == new_generation
+        ));
+    ordered_queue.enqueue(new_key, first_new);
+
+    // If the old generation still held its two ACKed admissions, these two packets
+    // would remain unacknowledged at the transport's three-event global limit.
+    for sequence in 1..3u8 {
+        new_client
+            .send(channels::REGISTRY_CONTROL, &[sequence], true)
+            .await;
+        let envelope = tokio::time::timeout(Duration::from_secs(3), ordered_events.recv())
+            .await
+            .expect("replacement lane progresses after retired permits release")
+            .expect("ordered ingress remains open");
+        assert!(envelope.admission.is_some());
+        assert!(matches!(
+            &envelope.event,
+            ServerEvent::Message { peer: event_peer, session, .. }
+                if *event_peer == new_peer && session.same_connection(&new_session)
+        ));
+        ordered_queue.enqueue(new_key, envelope);
+    }
+    assert_eq!(ordered_queue.pending(), 3);
+    assert_eq!(critical_queue.pending(), 0);
+
+    drop(held_workers);
+    drop(ordered_queue);
+    let _ = stop_connections.send(());
+    tokio::time::timeout(Duration::from_secs(3), connection_dispatcher)
+        .await
+        .unwrap()
+        .unwrap();
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+    drop((legacy_events, old_client, new_client));
+}
+
+#[tokio::test]
 async fn ordered_udp_burst_backpressures_and_retries_in_fifo_order() {
     let (mut state, shutdown, _) = super::tests::test_server(false).await;
     let (transport, events) = basis_transport::TransportHandle::bind_with_statistics_options(
