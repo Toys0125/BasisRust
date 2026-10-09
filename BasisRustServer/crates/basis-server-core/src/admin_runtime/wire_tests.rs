@@ -121,6 +121,13 @@ impl Client {
         .expect("server did not disconnect rejected identity")
     }
 
+    async fn disconnect(&mut self) {
+        let mut writer = NetWriter::new();
+        writer.put_u8(PacketProperty::Disconnect as u8);
+        writer.put_i64(1); // connect_time from connect_pending_with_contract
+        self.socket.send(writer.as_slice()).await.unwrap();
+    }
+
     async fn send(&mut self, channel: u8, payload: &[u8], reliable: bool) {
         let mut writer = NetWriter::new();
         if reliable {
@@ -886,6 +893,7 @@ async fn saturated_ordered_lane_does_not_block_other_control_or_disconnects() {
     let (events, receiver) = mpsc::channel(8);
     let (ordered, ordered_receiver) = mpsc::channel(crate::MAX_PENDING_ORDERED_EVENTS);
     let (_critical, critical_receiver) = mpsc::channel(crate::MAX_CRITICAL_ORDERED_EVENTS);
+    let (_lifecycle, lifecycle_receiver) = mpsc::channel(1);
     let (stop, stopping) = oneshot::channel();
     let handler_release = release.clone();
     let handler_calls = a_calls.clone();
@@ -896,6 +904,7 @@ async fn saturated_ordered_lane_does_not_block_other_control_or_disconnects() {
         receiver,
         ordered_receiver,
         critical_receiver,
+        lifecycle_receiver,
         stopping,
         move |state, event| {
             let release = handler_release.clone();
@@ -996,6 +1005,301 @@ async fn saturated_ordered_lane_does_not_block_other_control_or_disconnects() {
 }
 
 #[tokio::test]
+async fn saturated_ordinary_handlers_do_not_block_transport_lifecycle_cleanup() {
+    let (mut state, shutdown, _) = super::tests::test_server(false).await;
+    let (transport, transport_events) =
+        basis_transport::TransportHandle::bind_with_statistics_options(
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+    let (ordered_receiver, critical_receiver) = transport
+        .enable_ordered_admission(basis_transport::OrderedAdmissionConfig {
+            regular_capacity: crate::MAX_PENDING_ORDERED_EVENTS,
+            critical_capacity: crate::MAX_CRITICAL_ORDERED_EVENTS,
+            per_lane: crate::MAX_PENDING_ORDERED_PER_LANE,
+            per_peer: crate::MAX_PENDING_ORDERED_PER_PEER,
+            critical_per_lane: 2,
+            critical_per_peer: 2,
+            critical_channel: channels::AUTH_IDENTITY,
+        })
+        .unwrap();
+    let lifecycle_receiver = transport.enable_lifecycle_event_queue(256).unwrap();
+    state.transport = transport.clone();
+
+    let worker_limit = std::thread::available_parallelism()
+        .map(|count| (count.get() * 4).clamp(8, 256))
+        .unwrap_or(32);
+    let (events, event_receiver) = mpsc::channel(worker_limit);
+    let (stop, stopping) = oneshot::channel();
+    let (blocked_tx, mut blocked_rx) = mpsc::unbounded_channel();
+    let (disconnected_tx, mut disconnected_rx) = mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handler_release = release.clone();
+    let dispatcher = tokio::spawn(crate::event_loop_with_handler(
+        state.clone(),
+        event_receiver,
+        ordered_receiver,
+        critical_receiver,
+        lifecycle_receiver,
+        stopping,
+        move |state, event| {
+            let release = handler_release.clone();
+            let blocked = blocked_tx.clone();
+            let disconnected = disconnected_tx.clone();
+            async move {
+                if matches!(&event, ServerEvent::NetworkError(_)) {
+                    blocked.send(()).unwrap();
+                    release.notified().await;
+                    return Ok(());
+                }
+                let was_disconnect = matches!(&event, ServerEvent::PeerDisconnected { .. });
+                crate::handle_event(&state, event).await?;
+                if was_disconnect {
+                    disconnected.send(()).unwrap();
+                }
+                Ok(())
+            }
+        },
+    ));
+
+    // ConnectionRequest carries ReadyMessage on the lifecycle queue, so the real UDP
+    // handshake can finish even after every ordinary handler slot is held below.
+    let mut client = Client::connect(&state, "lifecycle-under-load").await;
+    let (peer, session) = session_for_uuid(&state, "lifecycle-under-load");
+    state
+        .ownership
+        .switch_ownership("lifecycle-cleanup-object", peer);
+    assert!(state
+        .ownership
+        .all()
+        .iter()
+        .any(|item| item.player_id == peer));
+
+    for _ in 0..worker_limit {
+        events
+            .send(ServerEvent::NetworkError("hold ordinary handler".into()))
+            .await
+            .unwrap();
+    }
+    for _ in 0..worker_limit {
+        tokio::time::timeout(Duration::from_secs(3), blocked_rx.recv())
+            .await
+            .expect("ordinary handler started")
+            .expect("ordinary handler signal");
+    }
+
+    let _late_client = Client::connect(&state, "lifecycle-connected-under-load").await;
+    let (late_peer, _) = session_for_uuid(&state, "lifecycle-connected-under-load");
+    assert!(state.authenticated_peers.contains_key(&late_peer));
+
+    client.disconnect().await;
+    tokio::time::timeout(Duration::from_secs(3), disconnected_rx.recv())
+        .await
+        .expect("lifecycle handler must run while ordinary workers are blocked")
+        .expect("disconnect lifecycle progress signal");
+    assert!(!state.transport.is_current_session(&session));
+    assert!(!state.authenticated_peers.contains_key(&peer));
+    assert!(!state
+        .ownership
+        .all()
+        .iter()
+        .any(|ownership| ownership.player_id == peer));
+    assert_eq!(blocked_rx.len(), 0, "ordinary handlers remain held");
+
+    release.notify_waiters();
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), dispatcher)
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for_disconnect_cleanups(&state).await;
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+    drop(transport_events);
+}
+
+#[tokio::test]
+async fn shutdown_drains_queued_transport_disconnects_after_lifecycle_workers_free() {
+    let (mut state, shutdown, _) = super::tests::test_server(false).await;
+    let (transport, events) = basis_transport::TransportHandle::bind_with_statistics_options(
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+        true,
+        true,
+    )
+    .await
+    .unwrap();
+    let (ordered_events, critical_events) = transport
+        .enable_ordered_admission(basis_transport::OrderedAdmissionConfig {
+            regular_capacity: crate::MAX_PENDING_ORDERED_EVENTS,
+            critical_capacity: crate::MAX_CRITICAL_ORDERED_EVENTS,
+            per_lane: crate::MAX_PENDING_ORDERED_PER_LANE,
+            per_peer: crate::MAX_PENDING_ORDERED_PER_PEER,
+            critical_per_lane: 2,
+            critical_per_peer: 2,
+            critical_channel: channels::AUTH_IDENTITY,
+        })
+        .unwrap();
+    let mut transport_lifecycle_events = transport.enable_lifecycle_event_queue(16).unwrap();
+    let (lifecycle_sender, lifecycle_events) = mpsc::channel(16);
+    let lifecycle_close_probe = lifecycle_sender.clone();
+    let (forwarded_disconnect_tx, mut forwarded_disconnect_rx) = mpsc::unbounded_channel();
+    let lifecycle_relay = tokio::spawn(async move {
+        while let Some(event) = transport_lifecycle_events.recv().await {
+            let disconnected_peer = match &event {
+                ServerEvent::PeerDisconnected { peer, .. } => Some(*peer),
+                _ => None,
+            };
+            if lifecycle_sender.send(event).await.is_err() {
+                break;
+            }
+            if let Some(peer) = disconnected_peer {
+                let _ = forwarded_disconnect_tx.send(peer);
+            }
+        }
+    });
+    state.transport = transport.clone();
+
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler_release = release.clone();
+    let held_peers = Arc::new(Mutex::new(HashSet::new()));
+    let handler_held_peers = held_peers.clone();
+    let (blocked_tx, mut blocked_rx) = mpsc::unbounded_channel();
+    let (cleaned_tx, mut cleaned_rx) = mpsc::unbounded_channel();
+    let (stop, stopping) = oneshot::channel();
+    let dispatcher = tokio::spawn(crate::event_loop_with_handler(
+        state.clone(),
+        events,
+        ordered_events,
+        critical_events,
+        lifecycle_events,
+        stopping,
+        move |state, event| {
+            let release = handler_release.clone();
+            let held_peers = handler_held_peers.clone();
+            let blocked = blocked_tx.clone();
+            let cleaned = cleaned_tx.clone();
+            async move {
+                let held_disconnect = match &event {
+                    ServerEvent::PeerDisconnected { peer, .. }
+                        if held_peers.lock().contains(peer) =>
+                    {
+                        Some(*peer)
+                    }
+                    _ => None,
+                };
+                if let Some(peer) = held_disconnect {
+                    blocked.send(peer).unwrap();
+                    release.acquire().await.unwrap().forget();
+                }
+                let peer = match &event {
+                    ServerEvent::PeerDisconnected { peer, .. } => Some(*peer),
+                    _ => None,
+                };
+                crate::handle_event(&state, event).await?;
+                if let Some(peer) = peer {
+                    cleaned.send(peer).unwrap();
+                }
+                Ok(())
+            }
+        },
+    ));
+
+    let mut first = Client::connect(&state, "drain-disconnect-a").await;
+    let mut second = Client::connect(&state, "drain-disconnect-b").await;
+    let mut queued = Client::connect(&state, "drain-disconnect-c").await;
+    let (first_peer, first_session) = session_for_uuid(&state, "drain-disconnect-a");
+    let (second_peer, second_session) = session_for_uuid(&state, "drain-disconnect-b");
+    let (queued_peer, queued_session) = session_for_uuid(&state, "drain-disconnect-c");
+    held_peers.lock().extend([first_peer, second_peer]);
+
+    first.disconnect().await;
+    second.disconnect().await;
+    let mut held = vec![
+        tokio::time::timeout(Duration::from_secs(3), blocked_rx.recv())
+            .await
+            .expect("first lifecycle worker entered its disconnect handler")
+            .unwrap(),
+        tokio::time::timeout(Duration::from_secs(3), blocked_rx.recv())
+            .await
+            .expect("second lifecycle worker entered its disconnect handler")
+            .unwrap(),
+    ];
+    held.sort_unstable();
+    assert_eq!(held, [first_peer, second_peer]);
+
+    queued.disconnect().await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while transport.is_current_session(&queued_session) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("transport must retire the queued disconnect before dispatcher shutdown");
+    let mut forwarded_held = vec![
+        tokio::time::timeout(Duration::from_secs(3), forwarded_disconnect_rx.recv())
+            .await
+            .expect("relay must forward the first held disconnect")
+            .unwrap(),
+        tokio::time::timeout(Duration::from_secs(3), forwarded_disconnect_rx.recv())
+            .await
+            .expect("relay must forward the second held disconnect")
+            .unwrap(),
+    ];
+    forwarded_held.sort_unstable();
+    assert_eq!(forwarded_held, held);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), forwarded_disconnect_rx.recv())
+            .await
+            .expect("relay must forward the third disconnect")
+            .unwrap(),
+        queued_peer,
+        "the third disconnect must be buffered at the dispatcher before shutdown"
+    );
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), lifecycle_close_probe.closed())
+        .await
+        .expect("dispatcher must close lifecycle ingress before workers are released");
+    release.add_permits(2);
+    tokio::time::timeout(Duration::from_secs(3), dispatcher)
+        .await
+        .expect("shutdown must drain queued disconnect callbacks")
+        .unwrap();
+
+    let mut cleaned = vec![
+        tokio::time::timeout(Duration::from_secs(3), cleaned_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        tokio::time::timeout(Duration::from_secs(3), cleaned_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        tokio::time::timeout(Duration::from_secs(3), cleaned_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+    ];
+    cleaned.sort_unstable();
+    assert_eq!(cleaned, [first_peer, second_peer, queued_peer]);
+    assert!(!transport.is_current_session(&first_session));
+    assert!(!transport.is_current_session(&second_session));
+    assert!(!transport.is_current_session(&queued_session));
+    for peer in [first_peer, second_peer, queued_peer] {
+        assert!(!state.authenticated_peers.contains_key(&peer));
+    }
+
+    wait_for_disconnect_cleanups(&state).await;
+    lifecycle_relay.abort();
+    let _ = lifecycle_relay.await;
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
 async fn signed_identity_uses_reserved_workers_when_ordinary_workers_are_full() {
     let (state, shutdown, _) = super::tests::test_server(false).await;
     state.config.write().use_auth_identity = true;
@@ -1016,6 +1320,7 @@ async fn signed_identity_uses_reserved_workers_when_ordinary_workers_are_full() 
     let (events, event_receiver) = mpsc::channel(worker_limit);
     let (_ordered, ordered_receiver) = mpsc::channel(crate::MAX_PENDING_ORDERED_EVENTS);
     let (_critical, critical_receiver) = mpsc::channel(crate::MAX_CRITICAL_ORDERED_EVENTS);
+    let (_lifecycle, lifecycle_receiver) = mpsc::channel(1);
     let (stop, stopping) = oneshot::channel();
     let (started_tx, mut started_rx) = mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Notify::new());
@@ -1025,6 +1330,7 @@ async fn signed_identity_uses_reserved_workers_when_ordinary_workers_are_full() 
         event_receiver,
         ordered_receiver,
         critical_receiver,
+        lifecycle_receiver,
         stopping,
         move |state, event| {
             let release = handler_release.clone();
@@ -1141,11 +1447,13 @@ async fn ordered_udp_burst_backpressures_and_retries_in_fifo_order() {
     let (blocked_tx, mut blocked_rx) = mpsc::unbounded_channel();
     let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
     let (stop, stopping) = oneshot::channel();
+    let (_lifecycle, lifecycle_receiver) = mpsc::channel(1);
     let dispatcher = tokio::spawn(crate::event_loop_with_handler(
         state.clone(),
         events,
         ordered_receiver,
         critical_receiver,
+        lifecycle_receiver,
         stopping,
         move |state, event| {
             let release = handler_release.clone();

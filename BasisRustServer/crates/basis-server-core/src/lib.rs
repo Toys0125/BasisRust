@@ -550,6 +550,7 @@ impl ServerState {
             config.health_include_extended_metrics,
         )
         .await?;
+        let lifecycle_events = transport.enable_lifecycle_event_queue(MAX_LIFECYCLE_EVENTS)?;
         let (ordered_events, critical_events) =
             transport.enable_ordered_admission(OrderedAdmissionConfig {
                 regular_capacity: MAX_PENDING_ORDERED_EVENTS,
@@ -662,6 +663,7 @@ impl ServerState {
                 events,
                 ordered_events,
                 critical_events,
+                lifecycle_events,
                 shutdown_rx,
             )),
         ]);
@@ -1171,6 +1173,7 @@ async fn event_loop(
     events: mpsc::Receiver<ServerEvent>,
     ordered_events: mpsc::Receiver<OrderedEvent>,
     critical_events: mpsc::Receiver<OrderedEvent>,
+    lifecycle_events: mpsc::Receiver<ServerEvent>,
     shutdown: oneshot::Receiver<()>,
 ) {
     event_loop_with_handler(
@@ -1178,6 +1181,7 @@ async fn event_loop(
         events,
         ordered_events,
         critical_events,
+        lifecycle_events,
         shutdown,
         |state, event| async move { handle_event(&state, event).await },
     )
@@ -1189,6 +1193,7 @@ async fn event_loop_with_handler<F, Fut>(
     mut events: mpsc::Receiver<ServerEvent>,
     mut ordered_events: mpsc::Receiver<OrderedEvent>,
     mut critical_events: mpsc::Receiver<OrderedEvent>,
+    mut lifecycle_events: mpsc::Receiver<ServerEvent>,
     mut shutdown: oneshot::Receiver<()>,
     handle: F,
 ) where
@@ -1204,14 +1209,17 @@ async fn event_loop_with_handler<F, Fut>(
     let workers = Arc::new(Semaphore::new(worker_limit));
     // Authentication cannot wait for ordinary handlers to release all worker slots.
     let critical_workers = Arc::new(Semaphore::new(2));
-    let diagnostics = event_diagnostics::EventDiagnostics::start_from_env(&state, worker_limit + 2);
+    // Connection admission and disconnect cleanup have their own bounded ingress
+    // and workers, independent of slow ordinary control handlers.
+    let lifecycle_workers = Arc::new(Semaphore::new(2));
+    let diagnostics = event_diagnostics::EventDiagnostics::start_from_env(&state, worker_limit + 4);
     let mut handlers = tokio::task::JoinSet::<()>::new();
     let mut ordered_task_keys = HashMap::<tokio::task::Id, OrderedLaneKey>::new();
     let mut ordered_sessions = HashMap::<(PeerId, u8), (PeerSession, u64)>::new();
     let mut next_session_generation = 1u64;
     let mut ordered_queue = OrderedHandlerQueue::default();
     let mut critical_queue = OrderedHandlerQueue::default();
-    let mut ingress_open = [true, true, true];
+    let mut ingress_open = [true, true, true, true];
     let mut join_flush = tokio::time::interval(JOIN_BATCH_FLUSH_INTERVAL);
     join_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     join_flush.tick().await;
@@ -1220,6 +1228,7 @@ async fn event_loop_with_handler<F, Fut>(
             break;
         }
         let ordered_has_capacity = ordered_queue.pending() < MAX_PENDING_ORDERED_EVENTS;
+        let mut lifecycle_event = false;
         let envelope = tokio::select! {
             completed = handlers.join_next_with_id(), if !handlers.is_empty() => {
                 if let Some(completed) = completed {
@@ -1303,6 +1312,18 @@ async fn event_loop_with_handler<F, Fut>(
                     }
                 }
             }
+            event = lifecycle_events.recv(), if ingress_open[3] && lifecycle_workers.available_permits() > 0 => {
+                match event {
+                    Some(event) => {
+                        lifecycle_event = true;
+                        event.into()
+                    }
+                    None => {
+                        ingress_open[3] = false;
+                        continue;
+                    }
+                }
+            }
         };
         if let Some(diagnostics) = &diagnostics {
             diagnostics.record_queue_depth(events.len());
@@ -1382,36 +1403,60 @@ async fn event_loop_with_handler<F, Fut>(
             }
             continue;
         }
-        // Regular ingress is selected only when an ordinary worker is free;
-        // waiting for one here would also block the reserved identity ingress.
-        let permit = workers
+        // Each ingress is selected only when its worker class has capacity.
+        // Never wait here and block the other reserved ingress classes.
+        let worker_pool = if lifecycle_event {
+            &lifecycle_workers
+        } else {
+            &workers
+        };
+        let permit = worker_pool
             .clone()
             .try_acquire_owned()
-            .expect("regular ingress selected with worker capacity");
-        let OrderedEvent { event, admission } = envelope;
-        let mut diagnostic_guard = diagnostics.as_ref().map(|d| d.spawned(&event));
-        let state = state.clone();
-        let handle = handle.clone();
-        let task = async move {
-            let _permit = permit;
-            let _admission = admission;
-            if let Some(guard) = &mut diagnostic_guard {
-                guard.started();
-            }
-            if let Err(err) = handle(state, event).await {
-                error!("server event failed: {err:#}");
-            }
-        };
-        if let Some(diagnostics) = &diagnostics {
-            diagnostics.record_task_size(std::mem::size_of_val(&task));
-        }
-        handlers.spawn(task);
+            .expect("ingress selected with worker capacity");
+        spawn_event_handler(
+            &mut handlers,
+            &state,
+            diagnostics.as_ref(),
+            handle.clone(),
+            envelope,
+            permit,
+        );
     }
     // Stop admission, then finish accepted handlers before final persistence.
     events.close();
     ordered_events.close();
     critical_events.close();
-    while !handlers.is_empty() || ordered_queue.pending() > 0 || critical_queue.pending() > 0 {
+    lifecycle_events.close();
+    let mut lifecycle_drained = false;
+    while !handlers.is_empty()
+        || ordered_queue.pending() > 0
+        || critical_queue.pending() > 0
+        || !lifecycle_drained
+    {
+        while !lifecycle_drained {
+            let Ok(permit) = lifecycle_workers.clone().try_acquire_owned() else {
+                break;
+            };
+            let Some(event) = lifecycle_events.recv().await else {
+                lifecycle_drained = true;
+                break;
+            };
+            // Transport retirement already committed these disconnects. Finish
+            // their application cleanup, but admit no new connections on shutdown.
+            if let ServerEvent::PeerDisconnected { session, .. } = &event {
+                discard_ordered_session(&mut ordered_queue, &mut ordered_sessions, session);
+                discard_ordered_session(&mut critical_queue, &mut ordered_sessions, session);
+                spawn_event_handler(
+                    &mut handlers,
+                    &state,
+                    diagnostics.as_ref(),
+                    handle.clone(),
+                    event.into(),
+                    permit,
+                );
+            }
+        }
         spawn_ready_ordered(
             &mut ordered_queue,
             &mut handlers,
@@ -1456,6 +1501,36 @@ async fn event_loop_with_handler<F, Fut>(
     }
 }
 
+fn spawn_event_handler<F, Fut>(
+    handlers: &mut tokio::task::JoinSet<()>,
+    state: &Arc<ServerState>,
+    diagnostics: Option<&Arc<event_diagnostics::EventDiagnostics>>,
+    handle: F,
+    envelope: OrderedEvent,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) where
+    F: Fn(Arc<ServerState>, ServerEvent) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    let OrderedEvent { event, admission } = envelope;
+    let mut diagnostic_guard = diagnostics.map(|d| d.spawned(&event));
+    let state = state.clone();
+    let task = async move {
+        let _permit = permit;
+        let _admission = admission;
+        if let Some(guard) = &mut diagnostic_guard {
+            guard.started();
+        }
+        if let Err(err) = handle(state, event).await {
+            error!("server event failed: {err:#}");
+        }
+    };
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.record_task_size(std::mem::size_of_val(&task));
+    }
+    handlers.spawn(task);
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn receive_control_event(
@@ -1492,6 +1567,7 @@ async fn receive_control_event(
 
 const MAX_PENDING_ORDERED_EVENTS: usize = 4096;
 const MAX_CRITICAL_ORDERED_EVENTS: usize = 128;
+const MAX_LIFECYCLE_EVENTS: usize = 256;
 const MAX_PENDING_ORDERED_PER_LANE: usize = 128;
 const MAX_PENDING_ORDERED_PER_PEER: usize = 256;
 type OrderedLaneKey = (PeerId, u8, u64);
