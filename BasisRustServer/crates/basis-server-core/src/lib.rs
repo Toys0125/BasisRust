@@ -1192,9 +1192,12 @@ async fn event_loop_with_handler<F, Fut>(
     mut shutdown: oneshot::Receiver<()>,
     handle: F,
 ) where
-    F: Fn(ServerState, ServerEvent) -> Fut + Clone + Send + 'static,
+    F: Fn(Arc<ServerState>, ServerEvent) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Result<()>> + Send + 'static,
 {
+    // Handlers share this single state allocation instead of cloning every field
+    // of ServerState for each spawned event.
+    let state = Arc::new(state);
     let worker_limit = std::thread::available_parallelism()
         .map(|count| (count.get() * 4).clamp(8, 256))
         .unwrap_or(32);
@@ -1395,7 +1398,7 @@ async fn event_loop_with_handler<F, Fut>(
             if let Some(guard) = &mut diagnostic_guard {
                 guard.started();
             }
-            if let Err(err) = handle(state.clone(), event).await {
+            if let Err(err) = handle(state, event).await {
                 error!("server event failed: {err:#}");
             }
         };
@@ -1610,11 +1613,11 @@ fn spawn_ready_ordered<F, Fut>(
     handlers: &mut tokio::task::JoinSet<()>,
     task_keys: &mut HashMap<tokio::task::Id, OrderedLaneKey>,
     workers: Arc<Semaphore>,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     diagnostics: Option<&Arc<event_diagnostics::EventDiagnostics>>,
     handle: F,
 ) where
-    F: Fn(ServerState, ServerEvent) -> Fut + Clone + Send + 'static,
+    F: Fn(Arc<ServerState>, ServerEvent) -> Fut + Clone + Send + 'static,
     Fut: std::future::Future<Output = Result<()>> + Send + 'static,
 {
     spawn_ready_ordered_with(queue, handlers, task_keys, workers, |envelope, permit| {
