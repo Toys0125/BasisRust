@@ -107,7 +107,7 @@ def main():
                       'platform': platform.platform(), 'build': build, 'frozen': artifacts,
                       'cleared_environment_keys': cleared, 'tool_sha256': tools, 'runs': [],
                       'invocation': [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
-                      'workload': {k: getattr(args, k) for k in ('clients', 'warmup_seconds', 'window_seconds', 'rayon_threads', 'tokio_workers', 'client_workers', 'port', 'health_port', 'server_cpus', 'client_cpus', 'startup_timeout', 'ready_timeout')}}
+                      'workload': {k: getattr(args, k) for k in ('clients', 'network_capacity_mbps', 'warmup_seconds', 'window_seconds', 'rayon_threads', 'tokio_workers', 'client_workers', 'port', 'health_port', 'server_cpus', 'client_cpus', 'startup_timeout', 'ready_timeout')}}
 
         def save():
             write_json(args.output / 'experiment.json', experiment)

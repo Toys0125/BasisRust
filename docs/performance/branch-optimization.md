@@ -33,6 +33,14 @@ original absolute-zero retransmit gate: counts accumulated before measurement
 and stayed constant during it. A post-measurement shutdown grace now prevents
 late-starting observer windows from being truncated.
 
+The [main-integration regression check](main-regression-client1500-20261009.md)
+compared freshly built ordinary servers before/after pulling main, with one
+updated client and eight matched 1,500-client runs. No clear cadence/throughput
+regression appeared: median p95 was 412 → 407 ms, built work rose 1.59%, and
+client CPU fell 30.32%. Peak server RSS increased 6.00 MiB (+2.56%), with increases
+in every pair. Premeasurement retransmit counts again failed the strict gate
+but stayed constant during measurement; all other 33 gates passed.
+
 Branch: `performance/branch-optimization`, cut from `fix/dedicated-voice-processing` at
 `1e45b3b`. Benchmark harness and checks are in
 `BasisRustServer/crates/basis-transport/src/bench_branches.rs` and

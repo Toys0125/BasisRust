@@ -62,7 +62,7 @@ def main():
         experiment = {'comparison_kind': 'revisions', 'purpose': 'PGO training, excluded from evaluation',
                       'os_name': os.name, 'frozen': artifacts, 'cleared_environment_keys': cleared,
                       'training_tool_sha256': sha256(Path(__file__)), 'runs': [],
-                      'workload': {k: getattr(args, k) for k in ('clients', 'warmup_seconds', 'window_seconds', 'rayon_threads', 'tokio_workers', 'client_workers', 'port', 'health_port', 'server_cpus', 'client_cpus', 'startup_timeout', 'ready_timeout')}}
+                      'workload': {k: getattr(args, k) for k in ('clients', 'network_capacity_mbps', 'warmup_seconds', 'window_seconds', 'rayon_threads', 'tokio_workers', 'client_workers', 'port', 'health_port', 'server_cpus', 'client_cpus', 'startup_timeout', 'ready_timeout')}}
         write_json(args.output / 'experiment.json', experiment)
         for index in range(2):
             entry = {'name': f'{index + 1:02d}-training', 'variant': 'instrumented', 'round': index,

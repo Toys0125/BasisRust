@@ -149,3 +149,15 @@ The desktop remains unchanged at the production level. A failed attempt to
 install Kali `linux-perf` encountered stale-package 404s before installation;
 Rust 1.99.0 was installed in WSL alongside the existing toolchain. Neither is a
 laptop prerequisite beyond having the appropriate Rust compiler.
+
+## Latest integration checkpoint — 2026-10-09
+
+Main at `63748ef` is merged into this branch in `1e4dc73`. The
+[1,500-client regression report](main-regression-client1500-20261009.md) compares
+pre-pull `c1d74bd` with the integrated production source using fresh ordinary
+release builds and one compatible updated Rust client. Cadence/throughput show
+no clear regression, client CPU falls about 30%, and server peak RSS rises about
+6 MiB. Four runs per variant are descriptive; strict cumulative retransmit gates
+remain invalid while every other gate passes and counters stay constant during
+measurement. Evidence and all attempts are retained. PGO was deliberately off
+for this source comparison; older profiles have not been retrained for main.
