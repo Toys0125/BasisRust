@@ -512,11 +512,13 @@ pub async fn run(
             Err(error) => warn!("voice diagnostic task failed: {error}"),
         }
     }
-    if let Some(task) = scene_task {
-        task.await.context("scene workload worker failed")?;
-    }
+    // Preserve diagnostic failures, but always disconnect the population before returning.
+    let mut shutdown_result = match scene_task {
+        Some(task) => task.await.context("scene workload worker failed"),
+        None => Ok(()),
+    };
     if let (Some(path), Some(session)) = (&args.observe_scene_csv, &config.scene_session) {
-        session.write_csv(path)?;
+        shutdown_result = shutdown_result.and(session.write_csv(path));
     }
     if let Some(task) = avatar_diagnostic_task {
         match task.await {
@@ -526,17 +528,21 @@ pub async fn run(
         }
     }
     if let (Some(path), Some(session)) = (&config.observe_avatar_csv, &config.observer_session) {
-        if let Some(state) = session.lock() {
-            let (summary, csv) = state.observer.summary_and_csv(std::time::Instant::now());
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+        let csv_result = (|| -> Result<()> {
+            if let Some(state) = session.lock() {
+                let (summary, csv) = state.observer.summary_and_csv(std::time::Instant::now());
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(path, csv)
+                    .with_context(|| format!("writing avatar observer CSV {}", path.display()))?;
+                info!("{summary}; csv={}", path.display());
+            } else {
+                warn!("avatar observer measurement unavailable; no CSV written");
             }
-            std::fs::write(path, csv)
-                .with_context(|| format!("writing avatar observer CSV {}", path.display()))?;
-            info!("{summary}; csv={}", path.display());
-        } else {
-            warn!("avatar observer measurement unavailable; no CSV written");
-        }
+            Ok(())
+        })();
+        shutdown_result = shutdown_result.and(csv_result);
     }
     info!(
         "shutting down clients in batches of {} ({}ms between batches)",
@@ -544,7 +550,7 @@ pub async fn run(
         quit_batch_delay.as_millis()
     );
     disconnect_clients_in_batches(&managed_clients, quit_batch_size, quit_batch_delay).await;
-    Ok(())
+    shutdown_result
 }
 
 #[cfg(test)]

@@ -35,6 +35,7 @@ throughout the measurement. Each sender emits once per interval; missed ticks
 are skipped instead of caught up in a burst. Reliable sends report backpressure
 when the pending queue reaches 256. Shutdown interrupts the scene timer so long
 send intervals do not delay CSV output or client disconnection.
+Scene worker and observer CSV failures return an error after disconnecting clients.
 This is one scheduled sender worker, so high
 loads can become client-limited; inspect client CPU alongside server CPU.
 

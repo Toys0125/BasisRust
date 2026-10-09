@@ -76,5 +76,7 @@ an extension-aware capture helper, not an upstream Unity parity assertion.
 Prop/scene script relay and AdditionalAvatarData workloads are covered by the
 live suite as well. A long-interval scene regression verifies that `quit` exits
 within two seconds and writes the CSV between 60-second send ticks.
+A CSV failure regression forces scene and avatar observer write errors, verifies
+both clients send disconnects and leave the server, and requires an error exit.
 See [script-data-harness.md](../../docs/performance/script-data-harness.md)
 for benchmark commands, metrics, and limitations.

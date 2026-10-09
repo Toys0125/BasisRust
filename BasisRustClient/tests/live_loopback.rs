@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use basis_protocol::channels;
 use basis_transport::{DeliveryMethod, PacketProperty};
 use support::{Fault, Live, LIMIT, SILENCE};
+use tokio::io::AsyncWriteExt;
 use tokio::time::{timeout, Instant};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -316,6 +317,76 @@ async fn actual_clients_forward_avatar_state_and_exact_opus_payload_to_other_pee
             })
         })
         .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observer_csv_failures_disconnect_clients_before_error_exit() {
+    for (csv_flag, csv_path) in [
+        ("--observe-scene-csv", "scene.csv"),
+        ("--observe-avatar-csv", "avatar.csv"),
+    ] {
+        Live::start_with_args(
+            "default_password",
+            2,
+            false,
+            Fault::None,
+            &["--scene-data-bytes", "64", csv_flag, csv_path],
+        )
+        .await
+        .run(move |live| {
+            Box::pin(async move {
+                let mut senders = HashSet::new();
+                while senders.len() < 2 {
+                    let packet = live
+                        .until(|p| {
+                            !p.from_server
+                                && p.property() == PacketProperty::Unreliable
+                                && p.bytes[1] == channels::SCENE
+                        })
+                        .await;
+                    senders.insert(packet.client);
+                }
+                timeout(LIMIT, async {
+                    while live.server.player_count() != 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("scene clients were not admitted");
+                // A directory at the output path forces a write failure on every platform.
+                std::fs::create_dir(live.dir.path().join(csv_path)).unwrap();
+                live.child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(b"quit\n")
+                    .await
+                    .unwrap();
+                let status = timeout(LIMIT, live.child.wait()).await.unwrap().unwrap();
+                assert!(!status.success(), "CSV error was swallowed: {}", live.log());
+
+                let deadline = Instant::now() + std::time::Duration::from_secs(2);
+                let mut disconnected = HashSet::new();
+                while disconnected.len() < 2 {
+                    let packet = live.next(deadline).await;
+                    if !packet.from_server && packet.property() == PacketProperty::Disconnect {
+                        disconnected.insert(packet.client);
+                    }
+                }
+                assert_eq!(disconnected, senders);
+                tokio::time::timeout_at(deadline, async {
+                    while live.server.player_count() != 0
+                        || live.server.transport.connected_peers_count() != 0
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("clients stayed registered after CSV error");
+            })
+        })
+        .await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
