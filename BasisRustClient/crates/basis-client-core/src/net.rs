@@ -65,13 +65,10 @@ pub(crate) fn bind_udp_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn configure_load_sink_socket(socket: &UdpSocket) -> std::io::Result<()> {
-    // A simulated load client only needs reliable/control traffic after it has connected.
-    // Basis server avatar fanout is sent as top-level Unreliable, Merged, or CompactMerged
-    // datagrams. For non-observer load-sink clients we drop top-level Unreliable and CompactMerged,
-    // but allow Merged through so the shared receiver can ACK reliable channeled packets nested
-    // inside it. Client 0 remains unfiltered and exercises the complete receive protocol. These
-    // sockets are connected UDP sockets; the socket-filter view starts at the UDP header, so
-    // LiteNetLib byte 0 is at offset 8.
+    // Drop only standalone unreliable fanout for non-observer load sinks.
+    // Both merged formats can also carry raw reliable messages and ACKs, so
+    // userspace must retain their control entries before discarding bulk data.
+    // The connected UDP socket's filter view includes its 8-byte UDP header.
     const BPF_LD_B_ABS: u16 = 0x30;
     const BPF_ALU_AND_K: u16 = 0x54;
     const BPF_JMP_JEQ_K: u16 = 0x15;
@@ -93,21 +90,9 @@ pub(crate) fn configure_load_sink_socket(socket: &UdpSocket) -> std::io::Result<
         },
         libc::sock_filter {
             code: BPF_JMP_JEQ_K,
-            jt: 3,
+            jt: 1,
             jf: 0,
             k: PacketProperty::Unreliable as u32,
-        },
-        libc::sock_filter {
-            code: BPF_JMP_JEQ_K,
-            jt: 1,
-            jf: 0,
-            k: PacketProperty::Merged as u32,
-        },
-        libc::sock_filter {
-            code: BPF_JMP_JEQ_K,
-            jt: 1,
-            jf: 0,
-            k: PacketProperty::CompactMerged as u32,
         },
         libc::sock_filter {
             code: BPF_RET_K,

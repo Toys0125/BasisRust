@@ -26,6 +26,14 @@ pub struct ClientOptions {
     pub reconnect_min_secs: u64,
     pub reconnect_max_secs: u64,
     pub no_movement: bool,
+    /// Bytes in a synthetic AdditionalAvatarData item (0 disables it).
+    pub additional_avatar_bytes: u8,
+    /// Synthetic prop/scene script payload size (0 disables the workload).
+    pub scene_data_bytes: usize,
+    pub scene_data_interval_ms: u64,
+    pub scene_data_reliable: bool,
+    pub observe_scene_csv: Option<PathBuf>,
+    pub scene_start_file: Option<PathBuf>,
     /// Use synchronized worker batches instead of the default per-client randomized cadence.
     pub sync_batching: bool,
     /// Simulate Unity's frame-quantized avatar tick, keyframes, deltas, and idle policy.
@@ -86,6 +94,12 @@ impl Default for ClientOptions {
             reconnect_min_secs: 60,
             reconnect_max_secs: 1200,
             no_movement: false,
+            additional_avatar_bytes: 0,
+            scene_data_bytes: 0,
+            scene_data_interval_ms: 50,
+            scene_data_reliable: false,
+            observe_scene_csv: None,
+            scene_start_file: None,
             sync_batching: false,
             unity_avatar_policy: false,
             unity_frame_rate: 60,
@@ -147,6 +161,10 @@ pub struct Config {
     pub observe_avatar_window: Duration,
     #[serde(skip)]
     pub(crate) observer_session: Option<Arc<ObserverSession>>,
+    #[serde(skip)]
+    pub additional_avatar_bytes: u8,
+    #[serde(skip)]
+    pub(crate) scene_session: Option<Arc<crate::scene::SceneSession>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -191,6 +209,8 @@ impl Default for Config {
             observe_avatar_start_file: None,
             observe_avatar_window: Duration::from_secs(60),
             observer_session: None,
+            additional_avatar_bytes: 0,
+            scene_session: None,
         }
     }
 }
@@ -288,6 +308,8 @@ impl Config {
             observe_avatar_start_file: defaults.observe_avatar_start_file,
             observe_avatar_window: defaults.observe_avatar_window,
             observer_session: None,
+            additional_avatar_bytes: 0,
+            scene_session: None,
         }
     }
 

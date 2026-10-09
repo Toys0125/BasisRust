@@ -89,8 +89,23 @@ pub async fn run(
     };
     let _ = signal_ready_rx.await;
     info!("tokio runtime workers={worker_threads}");
+    anyhow::ensure!(
+        args.scene_data_bytes == 0 || (24..=1024).contains(&args.scene_data_bytes),
+        "scene data bytes must be 0 or 24..=1024"
+    );
+    anyhow::ensure!(
+        args.scene_data_interval_ms > 0,
+        "scene interval must be positive"
+    );
     let config_path = args.config.clone();
     let mut config = Config::load_or_create(&config_path, args.strict_config)?;
+    config.additional_avatar_bytes = args.additional_avatar_bytes;
+    config.scene_session = (args.scene_data_bytes > 0).then(|| {
+        Arc::new(crate::scene::SceneSession::new(
+            args.scene_data_bytes,
+            args.scene_start_file.clone(),
+        ))
+    });
     if let Some(ip) = args.ip {
         config.ip = ip;
     }
@@ -143,6 +158,7 @@ pub async fn run(
     let voice_reencode = !args.no_voice_reencode;
     let cadence = CadenceOptions {
         sync_batching: args.sync_batching,
+        additional_avatar_bytes: config.additional_avatar_bytes,
         unity_avatar_policy: args.unity_avatar_policy,
         unity_frame_rate: args.unity_frame_rate,
         unity_pose_amplitude_radians: args.unity_pose_amplitude_degrees.to_radians(),
@@ -315,6 +331,17 @@ pub async fn run(
     if !args.no_movement && !shutdown.load(Ordering::Relaxed) {
         movement_workers(managed_clients.clone(), shutdown.clone(), cadence).await;
     }
+    let scene_stop = Arc::new(Notify::new());
+    let scene_task = config.scene_session.as_ref().map(|session| {
+        tokio::spawn(crate::scene::run(
+            managed_clients.clone(),
+            shutdown.clone(),
+            scene_stop.clone(),
+            session.clone(),
+            Duration::from_millis(args.scene_data_interval_ms),
+            args.scene_data_reliable,
+        ))
+    });
     let avatar_diagnostic_task = if ClientAvatarDiagnostics::enabled_from_env() {
         match (
             config.observe_avatar_start_file.clone(),
@@ -477,12 +504,21 @@ pub async fn run(
         }
     }
     shutdown.store(true, Ordering::SeqCst);
+    scene_stop.notify_one();
     if let Some(task) = voice_diagnostic_task {
         match task.await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => warn!("voice diagnostic window failed: {error:#}"),
             Err(error) => warn!("voice diagnostic task failed: {error}"),
         }
+    }
+    // Preserve diagnostic failures, but always disconnect the population before returning.
+    let mut shutdown_result = match scene_task {
+        Some(task) => task.await.context("scene workload worker failed"),
+        None => Ok(()),
+    };
+    if let (Some(path), Some(session)) = (&args.observe_scene_csv, &config.scene_session) {
+        shutdown_result = shutdown_result.and(session.write_csv(path));
     }
     if let Some(task) = avatar_diagnostic_task {
         match task.await {
@@ -492,17 +528,21 @@ pub async fn run(
         }
     }
     if let (Some(path), Some(session)) = (&config.observe_avatar_csv, &config.observer_session) {
-        if let Some(state) = session.lock() {
-            let (summary, csv) = state.observer.summary_and_csv(std::time::Instant::now());
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+        let csv_result = (|| -> Result<()> {
+            if let Some(state) = session.lock() {
+                let (summary, csv) = state.observer.summary_and_csv(std::time::Instant::now());
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(path, csv)
+                    .with_context(|| format!("writing avatar observer CSV {}", path.display()))?;
+                info!("{summary}; csv={}", path.display());
+            } else {
+                warn!("avatar observer measurement unavailable; no CSV written");
             }
-            std::fs::write(path, csv)
-                .with_context(|| format!("writing avatar observer CSV {}", path.display()))?;
-            info!("{summary}; csv={}", path.display());
-        } else {
-            warn!("avatar observer measurement unavailable; no CSV written");
-        }
+            Ok(())
+        })();
+        shutdown_result = shutdown_result.and(csv_result);
     }
     info!(
         "shutting down clients in batches of {} ({}ms between batches)",
@@ -510,7 +550,7 @@ pub async fn run(
         quit_batch_delay.as_millis()
     );
     disconnect_clients_in_batches(&managed_clients, quit_batch_size, quit_batch_delay).await;
-    Ok(())
+    shutdown_result
 }
 
 #[cfg(test)]

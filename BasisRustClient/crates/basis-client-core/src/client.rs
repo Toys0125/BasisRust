@@ -81,6 +81,7 @@ pub(crate) struct BasisClient {
     pub(crate) force_avatar_keyframe: AtomicBool,
     pub(crate) pose: Mutex<PoseState>,
     pub(crate) avatar_observer: Option<Arc<ObserverSession>>,
+    pub(crate) scene_session: Option<Arc<crate::scene::SceneSession>>,
     pub(crate) packet_diagnostics: PacketDiagnostics,
     pub(crate) avatar_diagnostics: Option<Arc<ClientAvatarDiagnostics>>,
     pub(crate) voice_diagnostics: Option<crate::voice_diagnostics::VoiceDiagnostics>,
@@ -132,6 +133,7 @@ impl BasisClient {
             avatar_observer: (index < OBSERVER_CANDIDATE_COUNT)
                 .then(|| config.observer_session.clone())
                 .flatten(),
+            scene_session: (index == 0).then(|| config.scene_session.clone()).flatten(),
             packet_diagnostics: PacketDiagnostics::default(),
             avatar_diagnostics: ClientAvatarDiagnostics::enabled_from_env()
                 .then(|| Arc::new(ClientAvatarDiagnostics::default())),
@@ -684,6 +686,11 @@ impl BasisClient {
     }
 
     pub(crate) async fn observe_avatar_channel(&self, channel: u8, payload: &[u8]) {
+        if channel == channels::SCENE {
+            if let Some(session) = &self.scene_session {
+                session.observe(payload);
+            }
+        }
         let Some(session) = &self.avatar_observer else {
             return;
         };
@@ -796,6 +803,11 @@ impl BasisClient {
             diagnostics.receive(channel, payload);
         }
 
+        if channel == channels::SCENE {
+            if let Some(session) = &self.scene_session {
+                session.observe(payload);
+            }
+        }
         match channel {
             channels::AUTH_IDENTITY => {
                 if let Some(challenge) = read_bytes_message(payload) {
