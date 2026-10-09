@@ -74,5 +74,7 @@ scenarios. Merged captures are unpacked independently; CompactMerged handling is
 an extension-aware capture helper, not an upstream Unity parity assertion.
 
 Prop/scene script relay and AdditionalAvatarData workloads are covered by the
-live suite as well. See [script-data-harness.md](../../docs/performance/script-data-harness.md)
+live suite as well. A long-interval scene regression verifies that `quit` exits
+within two seconds and writes the CSV between 60-second send ticks.
+See [script-data-harness.md](../../docs/performance/script-data-harness.md)
 for benchmark commands, metrics, and limitations.

@@ -15,7 +15,10 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::{sync::Mutex, time};
+use tokio::{
+    sync::{Mutex, Notify},
+    time,
+};
 
 pub(crate) const MESSAGE_INDEX: u16 = 60000;
 const MAGIC: &[u8; 4] = b"BSCR";
@@ -146,6 +149,7 @@ impl SceneSession {
 pub(crate) async fn run(
     clients: Arc<Mutex<Vec<Arc<BasisClient>>>>,
     shutdown: Arc<AtomicBool>,
+    stop: Arc<Notify>,
     session: Arc<SceneSession>,
     interval: Duration,
     reliable: bool,
@@ -154,7 +158,11 @@ pub(crate) async fn run(
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut sequences = HashMap::<usize, u64>::new();
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            biased;
+            _ = stop.notified() => break,
+            _ = ticker.tick() => {}
+        }
         if shutdown.load(Ordering::Relaxed) {
             break;
         }

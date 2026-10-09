@@ -33,7 +33,9 @@ The runner owns its processes, uses available local ports, waits for authenticat
 population, warms up, starts script sends with a marker, and checks population
 throughout the measurement. Each sender emits once per interval; missed ticks
 are skipped instead of caught up in a burst. Reliable sends report backpressure
-when the pending queue reaches 256. This is one scheduled sender worker, so high
+when the pending queue reaches 256. Shutdown interrupts the scene timer so long
+send intervals do not delay CSV output or client disconnection.
+This is one scheduled sender worker, so high
 loads can become client-limited; inspect client CPU alongside server CPU.
 
 Outputs:

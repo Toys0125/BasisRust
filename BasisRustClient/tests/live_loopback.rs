@@ -319,6 +319,41 @@ async fn actual_clients_forward_avatar_state_and_exact_opus_payload_to_other_pee
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scene_shutdown_does_not_wait_for_long_interval() {
+    Live::start_with_args(
+        "default_password",
+        1,
+        false,
+        Fault::None,
+        &[
+            "--scene-data-bytes",
+            "64",
+            "--scene-data-interval-ms",
+            "60000",
+            "--observe-scene-csv",
+            "scene.csv",
+        ],
+    )
+    .await
+    .run(|live| {
+        Box::pin(async move {
+            live.until(|p| {
+                !p.from_server
+                    && p.property() == PacketProperty::Unreliable
+                    && p.bytes[1] == channels::SCENE
+            })
+            .await;
+            timeout(std::time::Duration::from_secs(2), live.finish())
+                .await
+                .expect("scene shutdown waited for the next 60-second tick");
+            let csv = std::fs::read_to_string(live.dir.path().join("scene.csv")).unwrap();
+            assert!(csv.lines().any(|line| line == "sent_messages,1"));
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scene_script_payloads_survive_unreliable_and_reliable_relay() {
     for reliable in [false, true] {
         let mut args = vec![

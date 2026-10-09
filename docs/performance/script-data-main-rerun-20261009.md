@@ -86,3 +86,26 @@ capacity, Unity script execution, every receiver's application, or exact C#
 additional-byte preservation. C# still translates the shared fixture and
 serializes zero `IncreaseRate` as 0.005; colocated clients minimize that policy
 difference.
+
+## PR review follow-up
+
+The avatar runner now honors `--ready-timeout` for server startup as well as
+client population readiness. Scene shutdown now wakes the worker with a
+notification rather than waiting for its next send tick. A real executable
+regression with a 60-second interval failed its two-second quit deadline before
+the fix and passed after it, also verifying that the CSV is written.
+
+125 Rust workspace tests (nine live tests), Clippy, and formatting passed after
+the shutdown fix. Both scene delivery modes were rechecked twice against Rust,
+then C#, with the same 100-client workload and unchanged server binaries.
+All eight runs passed: seven recorded 100% delivery and one Rust reliable run
+recorded 99.5%. Prompt shutdown can exclude final in-flight receipts; the
+existing harness delivery gate remains 95%, with sender cadence, coverage,
+integrity and error checks unchanged. Avatar code was unchanged.
+
+These follow-up measurements used client SHA256
+`0133330d56aacd2e0a8b9eb2b2e23a643b5b24d423969389369b8052846b7695`.
+The ignored local JSON
+`docs/performance/results/pr33-scene-shutdown-recheck-20261009.json` and archive
+`captures/pr33-scene-shutdown-recheck-20261009.tar.gz` preserve the exact results,
+working patch snapshot, commands/hashes, and before/after regression logs.

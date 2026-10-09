@@ -331,10 +331,12 @@ pub async fn run(
     if !args.no_movement && !shutdown.load(Ordering::Relaxed) {
         movement_workers(managed_clients.clone(), shutdown.clone(), cadence).await;
     }
+    let scene_stop = Arc::new(Notify::new());
     let scene_task = config.scene_session.as_ref().map(|session| {
         tokio::spawn(crate::scene::run(
             managed_clients.clone(),
             shutdown.clone(),
+            scene_stop.clone(),
             session.clone(),
             Duration::from_millis(args.scene_data_interval_ms),
             args.scene_data_reliable,
@@ -502,6 +504,7 @@ pub async fn run(
         }
     }
     shutdown.store(true, Ordering::SeqCst);
+    scene_stop.notify_one();
     if let Some(task) = voice_diagnostic_task {
         match task.await {
             Ok(Ok(())) => {}
