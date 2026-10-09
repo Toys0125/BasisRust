@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "purpose": "PR #31 benchmark summary; raw captures are local.",
-  "reviewed_revision": "6380dce67b82eeedabdb7b7ad2ba19218f759742",
+  "reviewed_revision": "2f5d358ef517605873de5535c432cd9f167bc752",
   "reliable_receive": {
     "report": "reliable-receive-review-20261008.md",
     "baseline_revision": "6009c2bc556cd483e02e07d4b07030147645b548",
@@ -1231,5 +1231,211 @@
     "changes": ["Transport routes connection requests, replacement disconnect/request pairs, remote disconnects and timeout disconnects through an optional bounded lifecycle queue; legacy transport consumers retain the original queue.", "Server installs 256 lifecycle ingress slots and two independent lifecycle workers, separate from ordinary and identity capacity.", "Retirement still reserves event capacity first; full lifecycle admission does not discard committed disconnect state.", "Shutdown closes lifecycle admission, drains committed disconnect cleanup with bounded workers and skips new connection requests."],
     "correctness_regressions": ["Real UDP connection finishes while every ordinary worker is held; real UDP disconnect removes authentication and ownership while those workers remain held.", "Two real disconnect callbacks hold lifecycle workers; third disconnect is buffered; receiver closure is observed before release, proving shutdown drain cleans all three.", "Transport lifecycle events bypass a full regular queue, saturation does not retire a replaced peer or publish a pending request, and invalid/duplicate queue installation is rejected."],
     "limitations": ["Four samples per revision/configuration on one shared host; descriptive medians without statistical significance established.", "Active cooperative observer polling shares four Tokio workers with the server and driver; not isolated server processing or CPU.", "Identity is disabled in speed trials; separate existing signed-identity regressions cover correctness.", "Lifecycle remains bounded: when both lifecycle workers are busy, additional lifecycle work queues. Cleanup must wait for active read leases on its session.", "No voice/avatar or 1000-user capacity workload rerun."]
+  },
+  "split_lifecycle_capacity": {
+    "report": "docs/performance/processing-speed-20261008.md#split-lifecycle-capacity-follow-up",
+    "revisions": {
+      "reference_runtime": "ae10e95d09d0707318f62ff4ca799a2a821dcfad",
+      "previous_runtime": "6380dce67b82eeedabdb7b7ad2ba19218f759742",
+      "previous_head": "ea12b5862179f458804ec33063a1809b72c1cf61",
+      "candidate": "2f5d358ef517605873de5535c432cd9f167bc752"
+    },
+    "host": {
+      "cpu": "AMD Ryzen 9 5900HX with Radeon Graphics",
+      "ram_bytes": 33492484096,
+      "gpu": "NVIDIA GeForce RTX 3080 Laptop GPU",
+      "logical_processors": 16,
+      "governors": ["performance"]
+    },
+    "configuration": {
+      "profile": "release",
+      "rustc": "1.95.0",
+      "tokio_workers": 4,
+      "rayon_threads": 16,
+      "ordinary_handler_workers": 64,
+      "identity_handler_workers": 2,
+      "regular_total": 4096,
+      "regular_per_peer": 256,
+      "regular_per_lane": 128,
+      "critical_total": 128,
+      "critical_per_peer": 2,
+      "critical_per_lane": 2,
+      "operations_per_trial": 32768,
+      "samples_per_revision_per_case": 4,
+      "order_per_case": ["reference", "previous", "candidate", "candidate", "previous", "reference", "reference", "previous", "candidate", "candidate", "previous", "reference"],
+      "fixture": "docs/performance/fixtures/avatar-cpu-only-server.xml",
+      "fixture_sha256": "21f6aaa39b91a21358077c0023ce28b555439c8731d8a96050d1272f7ddee6c9",
+      "allocator": "system",
+      "identity_enabled_in_speed_probe": false,
+      "cpu_scope": "whole process, including server, UDP driver, observation, setup and shutdown",
+      "connection_ingress_capacity": 256,
+      "disconnect_ingress_capacity": 256,
+      "connection_handler_workers": 2,
+      "disconnect_handler_workers": 2,
+      "max_tracked_lifecycle_handlers": 4,
+      "ordinary_dispatch_ingress_classes": 3,
+      "retired_ordered_lane_prune_interval_ms": 50
+    },
+    "binary_sha256": {
+      "reference": "8bb468d280623df0f4a2f63bda8011145d76fb5045a3c2ca8feaaea53d9869ae",
+      "previous": "4b44d8439e1d8d049dd9ab6845471e51e42ad3c740827b6cc2966f874115037c",
+      "candidate": "dfb92a7638771ceb3cc68b73644d3b85935d4196bcbbe6975fa906dc707a39ca"
+    },
+    "candidate_source_sha256": {
+      "BasisRustServer/crates/basis-server-core/src/lib.rs": "8f660f26853630df61669a2c62edfb071eb5d8e62710ba182ee28b97a4b7c31d",
+      "BasisRustServer/crates/basis-server-core/src/admin_runtime/wire_tests.rs": "50932c3dc83b7fb8b7570ae3631028a7ee5a74890c0042661fd38d7b8f34ebba",
+      "BasisRustServer/crates/basis-transport/src/lib.rs": "440f60be0be7b4d3e91d806a1b821d5be17ed6b77700b29fd3bd866abb07dafc",
+      "BasisRustServer/crates/basis-server-core/examples/registry-processing-benchmark.rs": "10c7705abec650d4362bc893e0e6415b174e7838bb3ce5344415489fd6670a9b"
+    },
+    "cases": [
+      {
+        "peers": 1,
+        "batch_size_per_peer": 1,
+        "reference": {
+          "samples": 4,
+          "median_operations_per_second": 42476.114735639916,
+          "median_batch_p50_ms": 0.022873,
+          "median_batch_p95_ms": 0.0296825,
+          "median_process_total_cpu_seconds": 2.3210685000000004,
+          "client_retransmits_total": 0
+        },
+        "previous": {
+          "samples": 4,
+          "median_operations_per_second": 42572.796197443255,
+          "median_batch_p50_ms": 0.022768,
+          "median_batch_p95_ms": 0.029123999999999997,
+          "median_process_total_cpu_seconds": 2.3206824999999993,
+          "client_retransmits_total": 0
+        },
+        "candidate": {
+          "samples": 4,
+          "median_operations_per_second": 42660.72282693093,
+          "median_batch_p50_ms": 0.022838,
+          "median_batch_p95_ms": 0.029298499999999998,
+          "median_process_total_cpu_seconds": 2.3196624999999993,
+          "client_retransmits_total": 0
+        },
+        "throughput_change_vs_previous_percent": 0.2065324276091518,
+        "throughput_change_vs_reference_percent": 0.4346162365366002
+      },
+      {
+        "peers": 64,
+        "batch_size_per_peer": 1,
+        "reference": {
+          "samples": 4,
+          "median_operations_per_second": 125053.09379610822,
+          "median_batch_p50_ms": 0.49863199999999996,
+          "median_batch_p95_ms": 0.5782859999999999,
+          "median_process_total_cpu_seconds": 1.5085345000000014,
+          "client_retransmits_total": 0
+        },
+        "previous": {
+          "samples": 4,
+          "median_operations_per_second": 124919.22988769446,
+          "median_batch_p50_ms": 0.499051,
+          "median_batch_p95_ms": 0.581429,
+          "median_process_total_cpu_seconds": 1.5151750000000028,
+          "client_retransmits_total": 0
+        },
+        "candidate": {
+          "samples": 4,
+          "median_operations_per_second": 124510.23242362225,
+          "median_batch_p50_ms": 0.498178,
+          "median_batch_p95_ms": 0.5878545,
+          "median_process_total_cpu_seconds": 1.4955534999999962,
+          "client_retransmits_total": 0
+        },
+        "throughput_change_vs_previous_percent": -0.32740953049414934,
+        "throughput_change_vs_reference_percent": -0.43410471185229005
+      },
+      {
+        "peers": 64,
+        "batch_size_per_peer": 64,
+        "reference": {
+          "samples": 4,
+          "median_operations_per_second": 128975.47004760327,
+          "median_batch_p50_ms": 31.299904,
+          "median_batch_p95_ms": 33.3314125,
+          "median_process_total_cpu_seconds": 1.4131360000000015,
+          "client_retransmits_total": 0
+        },
+        "previous": {
+          "samples": 4,
+          "median_operations_per_second": 128696.32185664543,
+          "median_batch_p50_ms": 31.5066695,
+          "median_batch_p95_ms": 33.444695,
+          "median_process_total_cpu_seconds": 1.4182570000000005,
+          "client_retransmits_total": 0
+        },
+        "candidate": {
+          "samples": 4,
+          "median_operations_per_second": 130016.3147786455,
+          "median_batch_p50_ms": 31.0111445,
+          "median_batch_p95_ms": 34.067994,
+          "median_process_total_cpu_seconds": 1.4183984999999915,
+          "client_retransmits_total": 0
+        },
+        "throughput_change_vs_previous_percent": 1.0256648387126477,
+        "throughput_change_vs_reference_percent": 0.8070098373419876
+      }
+    ],
+    "sample_columns": ["revision_label", "sample", "valid", "peers", "batch_size_per_peer", "processed_operations", "elapsed_seconds", "operations_per_second", "batch_completion_p50_ms", "batch_completion_p95_ms", "client_transmissions", "client_retransmits", "client_pending_at_end", "client_ack_errors", "protocol_errors_delta", "process_total_cpu_seconds", "process_total_wall_seconds"],
+    "samples": [
+      ["reference", 0, true, 1, 1, 32768, 0.772887685, 42396.84579784707, 0.022977, 0.030311, 32768, 0, 0, 0, 0, 2.328658, 1.1339749819599092],
+      ["previous", 1, true, 1, 1, 32768, 0.768042661, 42664.296742756065, 0.022838, 0.029543000000000003, 32768, 0, 0, 0, 0, 2.3217049999999997, 1.1305659669451416],
+      ["candidate", 2, true, 1, 1, 32768, 0.766904184, 42727.63232179732, 0.022908, 0.029124, 32768, 0, 0, 0, 0, 2.320837, 1.110698991920799],
+      ["candidate", 3, true, 1, 1, 32768, 0.776787989, 42183.9684238475, 0.022768, 0.030451, 32768, 0, 0, 0, 0, 2.365546, 1.1317888360936195],
+      ["previous", 4, true, 1, 1, 32768, 0.769910024, 42560.81747027624, 0.022419, 0.028635, 32768, 0, 0, 0, 0, 2.2991210000000013, 1.0804512328468263],
+      ["reference", 5, true, 1, 1, 32768, 0.774808908, 42291.71820518099, 0.022908, 0.029822, 32768, 0, 0, 0, 0, 2.356351, 1.1320270809810609],
+      ["reference", 6, true, 1, 1, 32768, 0.767983255, 42667.596964728094, 0.022838, 0.029543000000000003, 32768, 0, 0, 0, 0, 2.313479000000001, 1.1318918080069125],
+      ["previous", 7, true, 1, 1, 32768, 0.769476886, 42584.774924610276, 0.022978, 0.029193999999999998, 32768, 0, 0, 0, 0, 2.319659999999999, 1.1110426529776305],
+      ["candidate", 8, true, 1, 1, 32768, 0.769313603, 42593.813332064536, 0.022908, 0.029473, 32768, 0, 0, 0, 0, 2.3184879999999986, 1.1319858999922872],
+      ["candidate", 9, true, 1, 1, 32768, 0.765001537, 42833.90086835865, 0.022419, 0.028146, 32768, 0, 0, 0, 0, 2.2953909999999986, 1.0816524040419608],
+      ["previous", 10, true, 1, 1, 32768, 0.773423636, 42367.46651481957, 0.022698, 0.029054, 32768, 0, 0, 0, 0, 2.3634109999999993, 1.1338797342032194],
+      ["reference", 11, true, 1, 1, 32768, 0.770008332, 42555.38367343277, 0.022419, 0.028914000000000002, 32768, 0, 0, 0, 0, 2.3039010000000033, 1.081896933959797],
+      ["reference", 0, true, 64, 1, 32768, 0.261162313, 125469.86440574219, 0.490984, 0.6109009999999999, 32768, 0, 0, 0, 0, 1.505475999999998, 0.7126213479787111],
+      ["previous", 1, true, 64, 1, 32768, 0.265279179, 123522.69832680689, 0.49908600000000003, 0.614604, 32768, 0, 0, 0, 0, 1.5453650000000003, 0.7128464488778263],
+      ["candidate", 2, true, 64, 1, 32768, 0.258994441, 126520.09005861248, 0.49426699999999996, 0.566063, 32768, 0, 0, 0, 0, 1.4849299999999985, 0.6775362978223711],
+      ["candidate", 3, true, 64, 1, 32768, 0.26345772, 124376.69315592649, 0.49726999999999993, 0.597213, 32768, 0, 0, 0, 0, 1.5197160000000025, 0.7129857901018113],
+      ["previous", 4, true, 64, 1, 32768, 0.261765328, 125180.82608709736, 0.49803800000000004, 0.570743, 32768, 0, 0, 0, 0, 1.4993729999999985, 0.7128255770076066],
+      ["reference", 5, true, 64, 1, 32768, 0.264765641, 123762.28228193703, 0.501112, 0.5717209999999999, 32768, 0, 0, 0, 0, 1.5169700000000006, 0.7133093699812889],
+      ["reference", 6, true, 64, 1, 32768, 0.262908911, 124636.32318647426, 0.499924, 0.5848509999999999, 32768, 0, 0, 0, 0, 1.4986589999999964, 0.7128241171594709],
+      ["previous", 7, true, 64, 1, 32768, 0.262067954, 125036.27208079016, 0.499016, 0.578356, 32768, 0, 0, 0, 0, 1.5087940000000089, 0.6739705670624971],
+      ["candidate", 8, true, 64, 1, 32768, 0.264322083, 123969.9673522927, 0.5010410000000001, 0.592255, 32768, 0, 0, 0, 0, 1.5061769999999939, 0.6747175920754671],
+      ["candidate", 9, true, 64, 1, 32768, 0.2628932, 124643.771691318, 0.49908600000000003, 0.5834539999999999, 32768, 0, 0, 0, 0, 1.483068000000003, 0.6745350300334394],
+      ["previous", 10, true, 64, 1, 32768, 0.2625595, 124802.18769459875, 0.49957500000000005, 0.584502, 32768, 0, 0, 0, 0, 1.5215559999999968, 0.7133841880131513],
+      ["reference", 11, true, 64, 1, 32768, 0.260337291, 125867.48473156693, 0.49734, 0.555518, 32768, 0, 0, 0, 0, 1.5115930000000048, 0.7133155360352248],
+      ["reference", 0, true, 64, 64, 32768, 0.266223865, 123084.38238622973, 32.780851999999996, 34.971495, 32768, 0, 0, 0, 0, 1.5119099999999932, 0.713431476149708],
+      ["previous", 1, true, 64, 64, 32768, 0.253302249, 129363.2414609947, 31.324313, 33.743056, 32768, 0, 0, 0, 0, 1.4169630000000097, 0.6757045360282063],
+      ["candidate", 2, true, 64, 64, 32768, 0.257185147, 127410.15716588018, 31.481525000000005, 34.539946, 32768, 0, 0, 0, 0, 1.4197909999999894, 0.6757549641188234],
+      ["candidate", 3, true, 64, 64, 32768, 0.252511926, 129768.12825862331, 31.189379, 33.541005999999996, 32768, 0, 0, 0, 0, 1.4322080000000028, 0.6769424770027399],
+      ["previous", 4, true, 64, 64, 32768, 0.256966405, 127518.61473876322, 31.672472, 33.541844000000005, 32768, 0, 0, 0, 0, 1.423411999999999, 0.6752629380207509],
+      ["reference", 5, true, 64, 64, 32768, 0.253729263, 129145.52942204385, 31.440809, 33.081032, 32768, 0, 0, 0, 0, 1.393215000000005, 0.6777513171546161],
+      ["reference", 6, true, 64, 64, 32768, 0.254399251, 128805.41067316271, 31.143563999999998, 33.581793, 32768, 0, 0, 0, 0, 1.4132530000000045, 0.6740585300140083],
+      ["previous", 7, true, 64, 64, 32768, 0.255941209, 128029.40225229615, 31.709557999999998, 33.347546, 32768, 0, 0, 0, 0, 1.4195509999999913, 0.6754866479896009],
+      ["candidate", 8, true, 64, 64, 32768, 0.251409627, 130337.09325697379, 30.647761, 34.918976, 32768, 0, 0, 0, 0, 1.4059780000000046, 0.6741948670241982],
+      ["candidate", 9, true, 64, 64, 32768, 0.251549729, 130264.50129866767, 30.832910000000002, 33.596042, 32768, 0, 0, 0, 0, 1.4170059999999935, 0.6748554978985339],
+      ["previous", 10, true, 64, 64, 32768, 0.252574791, 129735.82941616686, 31.340867000000003, 32.770308, 32768, 0, 0, 0, 0, 1.4023260000000022, 0.6757097991649061],
+      ["reference", 11, true, 64, 64, 32768, 0.249492417, 131338.66108644096, 31.158999, 31.885070000000002, 32768, 0, 0, 0, 0, 1.4130189999999985, 0.6755817150697112]
+    ],
+    "validation": {
+      "valid_trials": 36,
+      "all_exact_application_counts": true,
+      "all_final_subscription_checks_passed": true,
+      "all_client_windows_drained": true,
+      "all_zero_protocol_and_ack_errors": true,
+      "client_retransmits_total": 0,
+      "server_workspace_tests_passed": 339,
+      "server_workspace_tests_ignored": 3,
+      "server_core_tests_passed": 111,
+      "transport_tests_passed": 87,
+      "targeted_all_targets_clippy_warnings_denied": "passed",
+      "formatting_and_diff_checks": "passed",
+      "coderabbit": "review_completed, 3 changed server files reviewed, zero findings",
+      "luna_audit": "split admission reservations, independent worker bounds, session/ID safety, shutdown and held-lease regressions"
+    },
+    "changes": ["Independent bounded connection and disconnect queues replace shared lifecycle admission; replacement reserves both before pending insertion or retirement.", "A separate lifecycle dispatcher gives each class two workers and caps the combined JoinSet at four entries, including completed handlers not yet joined.", "Disconnect lease waits cannot consume connection worker capacity; no unbounded per-session waiting tasks are introduced.", "Ordinary dispatcher returns to three ingress branches; retired ordered sessions are pruned on the existing 50ms join-flush tick and shutdown.", "Pending stale lanes release their admission permits; active lanes retain their generation until completion, with ready keys compacted once per pass.", "Shutdown closes both lifecycle queues, skips new connection requests, drains committed disconnect events and joins all handlers before final persistence."],
+    "correctness_regressions": ["Fill connection ingress with 256 requests, then admit an existing peer disconnect in its separate queue.", "Full connection or disconnect class prevents replacement mutation and rolls back reserved capacity.", "Two real UDP disconnected sessions hold read leases; new clients still authenticate; IDs recycle individually only after each lease is released and cleanup completes.", "Shutdown closes disconnect ingress while both cleanup callbacks are held, then drains the buffered third disconnect after release.", "Retired ordered lane preserves its running head/new generation; repeated retirement compacts stale ready keys."],
+    "limitations": ["Four samples per revision/configuration on one shared host; descriptive medians without statistical significance established.", "P95 completion was slightly higher in all three cases versus the previous revision; throughput changes are not a general speedup claim.", "Active cooperative observer polling shares four Tokio workers with the server and driver; CPU includes setup/shutdown and driver.", "Identity is disabled in speed trials; signed identity and held-lease correctness regressions run separately.", "Each lifecycle class can queue behind its own occupied workers; cleanup must still wait for read leases, and its full queue backpressures retirement.", "Retired ordered lane pruning is periodic, not immediate; pending permits can remain until the next join-flush tick.", "No voice/avatar or 1000-user capacity workload rerun."]
   }
 }

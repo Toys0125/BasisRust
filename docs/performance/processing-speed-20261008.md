@@ -204,3 +204,38 @@ The burst throughput/p95 observation is less favorable than the previous revisio
 Lifecycle capacity remains bounded: if both lifecycle workers are busy, subsequent lifecycle events queue. Disconnect cleanup cannot complete while an existing handler holds a read lease on that same session. The fix provides capacity independent of unrelated ordinary handlers; it does not bypass that safety requirement.
 
 The [compact JSON](benchmark-summary.json) retains all 36 new observations, revision/source/binary hashes, configuration, validation and limitations. Raw captures remain ignored.
+
+## Split lifecycle capacity follow-up
+
+Runtime `2f5d358ef517605873de5535c432cd9f167bc752` resolves both remaining lifecycle admission dependencies. Connection requests and disconnect notifications now have **independent 256-event queues**, with **two connection workers and two disconnect workers**. Filling connection admission cannot consume disconnect capacity. Cleanup waiting for departing sessions' read leases cannot consume connection worker slots.
+
+A separate lifecycle dispatcher selects the two classes fairly, with at most **four tracked handlers**, including completed tasks awaiting collection. It admits work only when that class has a permit; it creates no unbounded collection of tasks waiting for leases or worker slots. The ordinary dispatcher returns to three ingress branches. Session retirement remains atomic with event reservation: replacement must reserve both its connection and disconnect event before mutating state, and reservation failure rolls back. Unconfigured transport consumers retain the original queue behavior.
+
+The ordinary dispatcher prunes retired ordered lanes on its existing **50 ms join-flush tick** and during shutdown. It drops pending envelopes and their admission permits, retains active lanes until their handlers complete, and compacts stale ready keys once per pass without allocating a fresh key snapshot. Pending retired-session permits can therefore remain until the next tick. Session read gates and captured connection identity still prevent stale processing, and peer IDs remain retired until keyed cleanup finishes. Separate queues provide no cross-class completion ordering; the earlier two-worker dispatcher also allowed replacement callbacks to run concurrently.
+
+Shutdown closes both lifecycle queues, skips buffered connection requests, drains committed disconnect cleanup and joins the lifecycle dispatcher after ordinary handlers drain. Each class remains bounded and can queue behind its own busy workers; a full disconnect queue backpressures retirement. Active read leases must still finish before their session's cleanup and ID recycling.
+
+### Correctness checks
+
+- A transport test fills connection admission with **256 distinct requests**, then verifies an existing peer's disconnect is admitted and retired through the independent queue.
+- Replacement tests exhaust either class, verifying no premature retirement or pending-request insertion and that partial reservations release capacity.
+- A real UDP regression holds read leases on **two disconnected sessions** while both cleanup callbacks wait. New clients still authenticate. Releasing one lease completes only its cleanup and permits only that ID to recycle; the other session stays protected until its lease is released.
+- The deterministic shutdown regression still drains a third disconnect buffered behind two held cleanup callbacks. Ordered queue tests preserve a running head and replacement generation and compact repeated stale ready keys.
+
+**339 server workspace tests passed, three ignored**, including 111 core and 87 transport tests. Transport/core all-target Clippy with warnings denied, formatting and diff checks passed. Luna audited admission rollback, bounded worker/task counts, session/ID safety and shutdown. CodeRabbit completed its review of the three changed server files with zero findings.
+
+### Matched control measurements
+
+Frozen `6380dce` and pre-lifecycle `ae10e95` binaries were compared with the new runtime using the same fixture/probe, host, allocator, 32,768 operations per trial, four Tokio workers, 16 Rayon threads, 64 ordinary slots and two identity slots. The new lifecycle class has four slots rather than the previous two. Each case used reference / previous / new / new / previous / reference twice: **four samples per revision/case**. Builds and test suites ran before measurements.
+
+| Peers / requests in flight per peer | Previous (`6380dce`) requests/s | New requests/s | Change | Previous / new p95 batch completion |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / 1 | 42,573 | 42,661 | +0.2% | 29.12 / 29.30 µs |
+| 64 / 1 | 124,919 | 124,510 | −0.3% | 0.581 / 0.588 ms |
+| 64 / 64 | 128,696 | 130,016 | +1.0% | 33.44 / 34.07 ms |
+
+All **36 trials** passed exact processing totals, final-subscription checks, zero protocol/ACK errors and drained client windows, with **zero retransmissions across all revisions**. Previous/new whole-process CPU medians were 2.321/2.320 seconds, 1.515/1.496 seconds and 1.418/1.418 seconds, including driver and setup/shutdown. Versus simultaneous `ae10e95`, throughput changed by +0.4%, −0.4% and +0.8%.
+
+These small throughput differences do not establish statistical significance. P95 completion was slightly higher in all three cases, so this is not presented as a general speedup. Active observer polling and the UDP driver still share runtime workers with the server, and identity is disabled in speed trials. The correctness regressions establish the intended overload isolation; these measurements do not establish throughput during lifecycle floods, production packet loss or **1,000-user voice capacity**.
+
+The [compact JSON](benchmark-summary.json) retains all 36 new samples, configuration/revision/source/binary hashes, validation checks and limitations. Historical evidence is preserved; raw captures remain ignored.
