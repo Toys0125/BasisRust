@@ -176,3 +176,31 @@ The corresponding `94b42f9` medians were 40,946, 122,158 and 128,072 requests/s.
 Validation passed **106 server-core tests**, the focused transport critical-fairness regression, core all-target Clippy with warnings denied, workspace formatting, and diff checks. Luna verified that the shared wrappers preserve state identity and that the change leaves lifecycle, ordering, session and permit handling intact. CodeRabbit reviewed the changed server file and completed successfully with zero findings. The full workspace was not rerun for this small core-only follow-up; the preceding runtime's 330-test result remains historical.
 
 The [compact JSON](benchmark-summary.json) retains all 36 new samples, revisions, configuration, binary/source hashes, validation checks and limitations. Raw captures remain ignored. **No voice/avatar or 1,000-user capacity workload was rerun at this revision.**
+
+## Lifecycle isolation follow-up
+
+Runtime `6380dce67b82eeedabdb7b7ad2ba19218f759742` fixes the confirmed admission dependency between ordinary worker capacity and lifecycle events. The transport now offers an optional, independently bounded lifecycle receiver. The server installs **256 queued slots and two reserved lifecycle workers** for connection requests and disconnect notifications; ordinary messages and identity keep their existing queues and workers. Transport consumers that do not install the new queue retain the previous bind receiver behavior.
+
+Connection replacement still reserves both its disconnect and connection-request events before retiring the existing peer. Remote disconnects reserve capacity before retirement, and timeout cleanup retains its awaited reservation. A full lifecycle queue therefore does not silently drop committed retirement state. Session admission closes before publication, queued ordered work for that incarnation is discarded, and application cleanup still waits for active read leases. During shutdown, the dispatcher closes lifecycle ingress, drains queued disconnect cleanup with the same bounded workers, and skips new connection requests.
+
+The real UDP regression holds every ordinary worker, then completes a new connection and processes another client's disconnect, removing authenticated player and ownership state before ordinary workers are released. A separate shutdown regression holds both lifecycle callbacks, buffers a third real disconnect, waits until the dispatcher closes ingress, then releases the callbacks and verifies all three sessions are cleaned before return. Transport tests cover routing around a full ordinary queue, preserving peer/pending-request state when replacement admission is full, and positive/one-time installation.
+
+**335 server workspace tests passed, three ignored**, including 108 core and 86 transport tests. Targeted transport/core all-target Clippy with warnings denied, formatting and diff checks passed. Luna audited queue/worker bounds, session safety, shutdown drain and the deterministic test barrier. CodeRabbit reviewed the three changed server files and completed with zero findings.
+
+### Matched control measurements
+
+The same probe, fixture, host, allocator, 32,768 operations per trial, four Tokio workers, 16 Rayon threads, 64 ordinary handler slots and two identity workers were retained. The new lifecycle class adds two worker slots. Frozen `ae10e95` and `94b42f9` binaries were compared with the new runtime in reference / previous / new / new / previous / reference order twice: **four samples per revision/case**. No builds or test suites ran during measurements.
+
+| Peers / requests in flight per peer | Previous (`ae10e95`) requests/s | New requests/s | Change | Previous / new p95 batch completion |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / 1 | 42,604 | 42,535 | −0.2% | 29.26 / 28.84 µs |
+| 64 / 1 | 120,987 | 120,425 | −0.5% | 0.631 / 0.635 ms |
+| 64 / 64 | 129,942 | 127,265 | −2.1% | 33.33 / 34.36 ms |
+
+All **36 trials** passed exact operation totals, final-subscription checks, drained client windows and zero protocol/ACK errors, with **zero retransmissions across all revisions**. Whole-process CPU medians changed from 2.330 to 2.341 seconds, 1.529 to 1.571 seconds, and 1.415 to 1.432 seconds, including driver and setup/shutdown. Against the simultaneous `94b42f9` reference, throughput changed by +2.3%, −0.1% and −0.6% respectively.
+
+The burst throughput/p95 observation is less favorable than the previous revision. Four samples on one shared host do not establish statistical significance or isolate its cause, so this change is not described as regression-free. The probe's active observer and UDP driver share runtime workers with the server; identity is disabled in speed trials. These measurements do not cover lifecycle flooding, production loss, voice/avatar throughput or 1,000-user capacity.
+
+Lifecycle capacity remains bounded: if both lifecycle workers are busy, subsequent lifecycle events queue. Disconnect cleanup cannot complete while an existing handler holds a read lease on that same session. The fix provides capacity independent of unrelated ordinary handlers; it does not bypass that safety requirement.
+
+The [compact JSON](benchmark-summary.json) retains all 36 new observations, revision/source/binary hashes, configuration, validation and limitations. Raw captures remain ignored.
