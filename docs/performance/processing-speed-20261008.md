@@ -239,3 +239,31 @@ All **36 trials** passed exact processing totals, final-subscription checks, zer
 These small throughput differences do not establish statistical significance. P95 completion was slightly higher in all three cases, so this is not presented as a general speedup. Active observer polling and the UDP driver still share runtime workers with the server, and identity is disabled in speed trials. The correctness regressions establish the intended overload isolation; these measurements do not establish throughput during lifecycle floods, production packet loss or **1,000-user voice capacity**.
 
 The [compact JSON](benchmark-summary.json) retains all 36 new samples, configuration/revision/source/binary hashes, validation checks and limitations. Historical evidence is preserved; raw captures remain ignored.
+
+## Ordered generation retirement follow-up
+
+Runtime `92adc0ab94ac92d351c32a56dca6541f92950cb2` (2026-10-09) fixes the session-replacement window in ordered admission accounting. The registry tracks only the latest generation per peer/channel: previously, replacing that entry before periodic pruning could orphan the old queued lane and its admission permits. Before registry replacement, the dispatcher now discards the prior generation from **both ordered queues** and compacts the affected ready lists. A running head remains until keyed completion, which cannot remove the new generation. Other retired channels retain the existing 50 ms pruning behavior.
+
+The same-session hot path now borrows the envelope's session, avoiding an extra `Arc` clone/drop. Queue cleanup occurs only on session replacement. Admission quotas, ACK timing, handler ordering and session leases are unchanged.
+
+### Correctness checks
+
+A deterministic wire regression stages two real UDP `OrderedEvent` admission guards for session A in the production queue while all fixture ordinary permits are held. After A retires and cleanup recycles its numeric ID, session B admits a head using the last global slot. The production generation helper clears A's pending lane before installing B's entry; two more B packets then obtain the released quota. This exercises real transport admission and ID reuse with explicit queue/helper staging, rather than reproducing the full event-loop tick race. Temporarily disabling the cleanup makes the regression fail at its stale-lane assertion; restoring it passes. Existing queue tests cover preservation of a running old head and generation-keyed completion.
+
+**340 server workspace tests passed, three ignored**, including 112 core and 87 transport tests. Transport/core all-target Clippy with warnings denied, workspace formatting and diff checks passed. Luna audited replacement bookkeeping and guard lifetimes; CodeRabbit completed review of both changed server files with zero findings.
+
+### Matched control measurements
+
+The frozen `2f5d358` binary from head `0922c9e` and the new binary used the unchanged fixture/probe, release profile, system allocator, performance CPU governor, four Tokio workers, 16 Rayon threads and 32,768 operations per trial. Previous / new / new / previous ran twice per case: **four samples per revision/case**, after builds and tests completed.
+
+| Peers / requests in flight per peer | Previous requests/s | New requests/s | Change | Previous / new p95 batch completion |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / 1 | 43,606 | 42,956 | -1.5% | 29.228 / 30.241 µs |
+| 64 / 1 | 126,660 | 126,075 | -0.5% | 0.581 / 0.605 ms |
+| 64 / 64 | 132,075 | 133,618 | +1.2% | 32.143 / 31.916 ms |
+
+All **24 trials** passed exact processing totals, final-subscription checks, drained client windows and zero protocol/ACK errors, with **zero retransmissions**. Previous/new whole-process CPU medians were 2.258/2.268 seconds, 1.467/1.480 seconds, 1.364/1.364 seconds. CPU includes the server, driver, observer and setup/shutdown.
+
+Throughput was slightly lower in the first two cases and higher in bursts; p95 was higher in the first two cases. Four shared-host samples do not establish statistical significance, a regression, or a general speedup. Active observer polling and the UDP driver share runtime workers with the server; identity is disabled. These speed trials do not cover session churn or **1,000-user voice capacity**.
+
+The [compact JSON](benchmark-summary.json) retains all 24 observations, configuration, source/revision/binary hashes and validation checks. Earlier evidence is preserved; raw captures remain ignored.

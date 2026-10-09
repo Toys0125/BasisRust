@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "purpose": "PR #31 benchmark summary; raw captures are local.",
-  "reviewed_revision": "2f5d358ef517605873de5535c432cd9f167bc752",
+  "reviewed_revision": "92adc0ab94ac92d351c32a56dca6541f92950cb2",
   "reliable_receive": {
     "report": "reliable-receive-review-20261008.md",
     "baseline_revision": "6009c2bc556cd483e02e07d4b07030147645b548",
@@ -1437,5 +1437,170 @@
     "changes": ["Independent bounded connection and disconnect queues replace shared lifecycle admission; replacement reserves both before pending insertion or retirement.", "A separate lifecycle dispatcher gives each class two workers and caps the combined JoinSet at four entries, including completed handlers not yet joined.", "Disconnect lease waits cannot consume connection worker capacity; no unbounded per-session waiting tasks are introduced.", "Ordinary dispatcher returns to three ingress branches; retired ordered sessions are pruned on the existing 50ms join-flush tick and shutdown.", "Pending stale lanes release their admission permits; active lanes retain their generation until completion, with ready keys compacted once per pass.", "Shutdown closes both lifecycle queues, skips new connection requests, drains committed disconnect events and joins all handlers before final persistence."],
     "correctness_regressions": ["Fill connection ingress with 256 requests, then admit an existing peer disconnect in its separate queue.", "Full connection or disconnect class prevents replacement mutation and rolls back reserved capacity.", "Two real UDP disconnected sessions hold read leases; new clients still authenticate; IDs recycle individually only after each lease is released and cleanup completes.", "Shutdown closes disconnect ingress while both cleanup callbacks are held, then drains the buffered third disconnect after release.", "Retired ordered lane preserves its running head/new generation; repeated retirement compacts stale ready keys."],
     "limitations": ["Four samples per revision/configuration on one shared host; descriptive medians without statistical significance established.", "P95 completion was slightly higher in all three cases versus the previous revision; throughput changes are not a general speedup claim.", "Active cooperative observer polling shares four Tokio workers with the server and driver; CPU includes setup/shutdown and driver.", "Identity is disabled in speed trials; signed identity and held-lease correctness regressions run separately.", "Each lifecycle class can queue behind its own occupied workers; cleanup must still wait for read leases, and its full queue backpressures retirement.", "Retired ordered lane pruning is periodic, not immediate; pending permits can remain until the next join-flush tick.", "No voice/avatar or 1000-user capacity workload rerun."]
+  },
+  "ordered_generation_retirement": {
+    "report": "docs/performance/processing-speed-20261008.md#ordered-generation-retirement-follow-up",
+    "revisions": {
+      "previous_runtime": "2f5d358ef517605873de5535c432cd9f167bc752",
+      "previous_head": "0922c9ee94415741ffd27a4da231d71cf6281b68",
+      "candidate": "92adc0ab94ac92d351c32a56dca6541f92950cb2"
+    },
+    "host": {
+      "cpu": "AMD Ryzen 9 5900HX with Radeon Graphics",
+      "ram_bytes": 33492484096,
+      "gpu": "NVIDIA GeForce RTX 3080 Laptop GPU",
+      "logical_processors": 16,
+      "governors": ["performance"]
+    },
+    "configuration": {
+      "profile": "release",
+      "rustc": "1.95.0",
+      "tokio_workers": 4,
+      "rayon_threads": 16,
+      "ordinary_handler_workers": 64,
+      "identity_handler_workers": 2,
+      "regular_total": 4096,
+      "regular_per_peer": 256,
+      "regular_per_lane": 128,
+      "critical_total": 128,
+      "critical_per_peer": 2,
+      "critical_per_lane": 2,
+      "operations_per_trial": 32768,
+      "samples_per_revision_per_case": 4,
+      "order_per_case": ["previous", "candidate", "candidate", "previous", "previous", "candidate", "candidate", "previous"],
+      "fixture": "docs/performance/fixtures/avatar-cpu-only-server.xml",
+      "fixture_sha256": "21f6aaa39b91a21358077c0023ce28b555439c8731d8a96050d1272f7ddee6c9",
+      "allocator": "system",
+      "identity_enabled_in_speed_probe": false,
+      "cpu_scope": "whole process, including server, UDP driver, observation, setup and shutdown",
+      "connection_ingress_capacity": 256,
+      "disconnect_ingress_capacity": 256,
+      "connection_handler_workers": 2,
+      "disconnect_handler_workers": 2,
+      "max_tracked_lifecycle_handlers": 4,
+      "ordinary_dispatch_ingress_classes": 3,
+      "retired_ordered_lane_prune_interval_ms": 50
+    },
+    "binary_sha256": {
+      "previous": "dfb92a7638771ceb3cc68b73644d3b85935d4196bcbbe6975fa906dc707a39ca",
+      "candidate": "2d79e2e235412f1b6026ed0e05187def735e404de67336f182663c998888ac43"
+    },
+    "candidate_source_sha256": {
+      "BasisRustServer/crates/basis-server-core/src/lib.rs": "eddc16f18d647338387cd0f4df3796f0781dffa4ed640120905553366173a362",
+      "BasisRustServer/crates/basis-server-core/src/admin_runtime/wire_tests.rs": "a5a4f4c6296313e664de6cef339f70c08545138e0f6642fe5e8e696871dab5ff",
+      "BasisRustServer/crates/basis-transport/src/lib.rs": "440f60be0be7b4d3e91d806a1b821d5be17ed6b77700b29fd3bd866abb07dafc",
+      "BasisRustServer/crates/basis-server-core/examples/registry-processing-benchmark.rs": "10c7705abec650d4362bc893e0e6415b174e7838bb3ce5344415489fd6670a9b"
+    },
+    "cases": [
+      {
+        "peers": 1,
+        "batch_size_per_peer": 1,
+        "previous": {
+          "samples": 4,
+          "median_operations_per_second": 43605.6516152291,
+          "median_batch_p50_ms": 0.0222795,
+          "median_batch_p95_ms": 0.029227999999999997,
+          "median_process_total_cpu_seconds": 2.257991999999999,
+          "client_retransmits_total": 0
+        },
+        "candidate": {
+          "samples": 4,
+          "median_operations_per_second": 42955.78348094318,
+          "median_batch_p50_ms": 0.022419,
+          "median_batch_p95_ms": 0.030240999999999997,
+          "median_process_total_cpu_seconds": 2.268402,
+          "client_retransmits_total": 0
+        },
+        "throughput_change_percent": -1.4903300609294345
+      },
+      {
+        "peers": 64,
+        "batch_size_per_peer": 1,
+        "previous": {
+          "samples": 4,
+          "median_operations_per_second": 126659.90083091965,
+          "median_batch_p50_ms": 0.48899399999999993,
+          "median_batch_p95_ms": 0.5809759999999999,
+          "median_process_total_cpu_seconds": 1.4670954999999992,
+          "client_retransmits_total": 0
+        },
+        "candidate": {
+          "samples": 4,
+          "median_operations_per_second": 126075.09322549638,
+          "median_batch_p50_ms": 0.49136899999999994,
+          "median_batch_p95_ms": 0.604547,
+          "median_process_total_cpu_seconds": 1.4802055000000003,
+          "client_retransmits_total": 0
+        },
+        "throughput_change_percent": -0.46171487707379333
+      },
+      {
+        "peers": 64,
+        "batch_size_per_peer": 64,
+        "previous": {
+          "samples": 4,
+          "median_operations_per_second": 132075.01886482214,
+          "median_batch_p50_ms": 30.7207925,
+          "median_batch_p95_ms": 32.142658999999995,
+          "median_process_total_cpu_seconds": 1.3638274999999993,
+          "client_retransmits_total": 0
+        },
+        "candidate": {
+          "samples": 4,
+          "median_operations_per_second": 133618.46373708718,
+          "median_batch_p50_ms": 30.3712715,
+          "median_batch_p95_ms": 31.915639499999997,
+          "median_process_total_cpu_seconds": 1.3637220000000028,
+          "client_retransmits_total": 0
+        },
+        "throughput_change_percent": 1.1686122671273225
+      }
+    ],
+    "sample_columns": ["revision_label", "sample", "valid", "peers", "batch_size_per_peer", "processed_operations", "elapsed_seconds", "operations_per_second", "batch_completion_p50_ms", "batch_completion_p95_ms", "client_transmissions", "client_retransmits", "client_pending_at_end", "client_ack_errors", "protocol_errors_delta", "process_total_cpu_seconds", "process_total_wall_seconds"],
+    "samples": [
+      ["previous", 0, true, 1, 1, 32768, 0.75690048, 43292.349345583716, 0.022348999999999997, 0.029613, 32768, 0, 0, 0, 0, 2.22392, 1.081034671049565],
+      ["candidate", 1, true, 1, 1, 32768, 0.76931549, 42593.70885668765, 0.022489000000000002, 0.031428, 32768, 0, 0, 0, 0, 2.257737, 1.0815289411693811],
+      ["candidate", 2, true, 1, 1, 32768, 0.751230059, 43619.1278655957, 0.02186, 0.028984, 32768, 0, 0, 0, 0, 2.2588340000000002, 1.1116226289886981],
+      ["previous", 3, true, 1, 1, 32768, 0.747056199, 43862.83126204271, 0.021931, 0.028635, 32768, 0, 0, 0, 0, 2.261564999999999, 1.0802467281464487],
+      ["previous", 4, true, 1, 1, 32768, 0.752827965, 43526.544607040465, 0.02228, 0.029123, 32768, 0, 0, 0, 0, 2.2643890000000013, 1.1104232491925359],
+      ["candidate", 5, true, 1, 1, 32768, 0.756454761, 43317.858105198706, 0.022348999999999997, 0.029054, 32768, 0, 0, 0, 0, 2.27797, 1.1118295080959797],
+      ["candidate", 6, true, 1, 1, 32768, 0.776781128, 42184.3410181304, 0.022768, 0.031918, 32768, 0, 0, 0, 0, 2.3438799999999986, 1.133718506898731],
+      ["previous", 7, true, 1, 1, 32768, 0.750101432, 43684.75862341774, 0.022279, 0.029332999999999998, 32768, 0, 0, 0, 0, 2.2544189999999986, 1.1121838891413063],
+      ["previous", 0, true, 64, 1, 32768, 0.260154018, 125956.15571080668, 0.490636, 0.5902299999999999, 32768, 0, 0, 0, 0, 1.472998000000004, 0.6772093491163105],
+      ["candidate", 1, true, 64, 1, 32768, 0.259249432, 126395.64818795823, 0.487353, 0.608528, 32768, 0, 0, 0, 0, 1.4808949999999967, 0.6738930700812489],
+      ["candidate", 2, true, 64, 1, 32768, 0.263876077, 124179.5026382782, 0.496014, 0.6112519999999999, 32768, 0, 0, 0, 0, 1.4917310000000015, 0.7129847758915275],
+      ["previous", 3, true, 64, 1, 32768, 0.257279067, 127363.64595103264, 0.4893779999999999, 0.575843, 32768, 0, 0, 0, 0, 1.466584000000001, 0.6752010630443692],
+      ["previous", 4, true, 64, 1, 32768, 0.254714421, 128646.03374773193, 0.484001, 0.567252, 32768, 0, 0, 0, 0, 1.443336999999996, 0.6759297188837081],
+      ["candidate", 5, true, 64, 1, 32768, 0.258436689, 126793.14274917057, 0.490426, 0.5537730000000001, 32768, 0, 0, 0, 0, 1.4748230000000007, 0.7134140250273049],
+      ["candidate", 6, true, 64, 1, 32768, 0.260571113, 125754.53826303454, 0.49231199999999997, 0.6005659999999999, 32768, 0, 0, 0, 0, 1.4795160000000038, 0.6739820539951324],
+      ["previous", 7, true, 64, 1, 32768, 0.262308907, 124921.41564983153, 0.48861, 0.586109, 32768, 0, 0, 0, 0, 1.4676069999999974, 0.7131162930745631],
+      ["previous", 0, true, 64, 64, 32768, 0.241949927, 135432.9815524185, 30.023147, 30.776246999999998, 32768, 0, 0, 0, 0, 1.3470949999999995, 0.6759107960388064],
+      ["candidate", 1, true, 64, 64, 32768, 0.246551499, 132905.2961872278, 30.655071999999997, 31.719524999999997, 32768, 0, 0, 0, 0, 1.3377869999999987, 0.6743857399560511],
+      ["candidate", 2, true, 64, 64, 32768, 0.244316504, 134121.10710294053, 30.12763, 33.026746, 32768, 0, 0, 0, 0, 1.3739419999999996, 0.674465499818325],
+      ["previous", 3, true, 64, 64, 32768, 0.248631097, 131793.65089637198, 30.627903, 32.285728999999996, 32768, 0, 0, 0, 0, 1.3772749999999974, 0.676176544977352],
+      ["previous", 4, true, 64, 64, 32768, 0.247628105, 132327.46743347248, 30.813682, 31.999589, 32768, 0, 0, 0, 0, 1.3582190000000054, 0.6750162020325661],
+      ["candidate", 5, true, 64, 64, 32768, 0.246161575, 133115.82037123383, 30.614913, 31.408591, 32768, 0, 0, 0, 0, 1.3623740000000026, 0.6760031310841441],
+      ["candidate", 6, true, 64, 64, 32768, 0.243891032, 134355.08362603508, 30.064284, 32.111754, 32768, 0, 0, 0, 0, 1.365070000000003, 0.6749747178982943],
+      ["previous", 7, true, 64, 64, 32768, 0.248576552, 131822.5702961718, 30.956437, 33.133883000000004, 32768, 0, 0, 0, 0, 1.3694359999999932, 0.6750801100861281]
+    ],
+    "validation": {
+      "valid_trials": 24,
+      "all_exact_application_counts": true,
+      "all_final_subscription_checks_passed": true,
+      "all_client_windows_drained": true,
+      "all_zero_protocol_and_ack_errors": true,
+      "client_retransmits_total": 0,
+      "server_workspace_tests_passed": 340,
+      "server_workspace_tests_ignored": 3,
+      "server_core_tests_passed": 112,
+      "transport_tests_passed": 87,
+      "targeted_all_targets_clippy_warnings_denied": "passed",
+      "formatting_and_diff_checks": "passed",
+      "coderabbit": "review_completed, 2 changed server files reviewed, zero findings",
+      "luna_audit": "generation replacement, pending permit release, running-head preservation and generation-keyed completion"
+    },
+    "changes": ["Before replacing a peer/channel session registry entry, discard its previous generation from both ordered queues and compact changed ready lists.", "Preserve a running head until its keyed completion; it cannot erase the replacement generation.", "Borrow the envelope session on the same-session hot path instead of cloning and dropping an extra Arc."],
+    "correctness_regressions": ["Real UDP admitted OrderedEvents retain two old-session permits while all fixture ordinary permits are held; retire and clean up the old session, reuse its peer ID, then exercise the production generation helper before periodic pruning.", "Old queued lane is removed and replacement mapping remains intact; new traffic obtains the freed global admission slots.", "Temporarily disabling replacement cleanup makes the new regression fail at the old-lane removal assertion; restored fix passes.", "Existing queue regression verifies retired running-head preservation and replacement-generation independence."],
+    "limitations": ["Four samples per revision/configuration on one shared host; descriptive medians without statistical significance established.", "P95 completion increased in the one-peer and 64-peer steady cases; this is not a demonstrated general speedup or proof of no regression.", "Active cooperative observer polling shares four Tokio workers with the server and driver; CPU includes setup/shutdown and driver.", "Speed trials do not exercise session churn; the deterministic wire regression stages the production queue/helper rather than timing the full dispatcher/pruning race.", "Identity disabled in speed trials; no new voice/avatar or 1000-user capacity workload.", "Other retired channels remain subject to existing 50 ms pruning; replacement immediately clears the affected old channel generation."]
   }
 }
