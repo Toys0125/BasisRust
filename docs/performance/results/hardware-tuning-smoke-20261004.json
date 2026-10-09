@@ -32,303 +32,37 @@
     "startup_timeout": 30,
     "ready_timeout": 360
   },
-  "order": [
-    0,
-    6,
-    6,
-    0
-  ],
+  "order": [0, 6, 6, 0],
   "ranking": {
     "status": "inconclusive",
     "recommended_lanes": null,
     "reason": "No unique setting clears every paired delivery/cadence/CPU comparison; ties and variable runs are inconclusive.",
     "statistics": {
-      "0": {
-        "gap_p50_ms": {
-          "median": 20.015,
-          "min": 20.01,
-          "max": 20.02
-        },
-        "gap_p95_ms": {
-          "median": 21.255000000000003,
-          "min": 21.25,
-          "max": 21.26
-        },
-        "observer_applied_items_per_second": {
-          "median": 12381.833333333334,
-          "min": 12380.066666666668,
-          "max": 12383.6
-        },
-        "built_logical_avatar_work_per_second": {
-          "median": 3091518.944145225,
-          "min": 3091337.8216237836,
-          "max": 3091700.066666667
-        },
-        "inbound_updates_per_second": {
-          "median": 12499.166777762965,
-          "min": 12498.33355552593,
-          "max": 12500.0
-        },
-        "diagnostic_counter_seconds": {
-          "median": 15.001000000000001,
-          "min": 15.0,
-          "max": 15.002
-        },
-        "tick_ms_per_tick": {
-          "median": 1.0726175920982381,
-          "min": 1.0708230112119594,
-          "max": 1.0744121729845169
-        },
-        "build_ms_per_tick": {
-          "median": 0.5493781366791244,
-          "min": 0.5330160170848905,
-          "max": 0.5657402562733582
-        },
-        "flush_ms_per_tick": {
-          "median": 0.2534947944474106,
-          "min": 0.23338174052322477,
-          "max": 0.2736078483715964
-        },
-        "server_cpu_cores": {
-          "median": 2.9707451788010295,
-          "min": 2.9475652870969222,
-          "max": 2.993925070505137
-        },
-        "server_rss_mean_mib": {
-          "median": 63.193157327586206,
-          "min": 62.547413793103445,
-          "max": 63.83890086206897
-        },
-        "server_rss_peak_mib": {
-          "median": 72.060546875,
-          "min": 71.30078125,
-          "max": 72.8203125
-        },
-        "client_cpu_cores": {
-          "median": 0.2620094888681676,
-          "min": 0.25904927107580605,
-          "max": 0.26496970666052916
-        },
-        "client_rss_mean_mib": {
-          "median": 12.039197198275861,
-          "min": 11.76751077586207,
-          "max": 12.310883620689655
-        },
-        "client_rss_peak_mib": {
-          "median": 12.80859375,
-          "min": 12.5390625,
-          "max": 13.078125
-        },
-        "combined_cpu_cores": {
-          "median": 3.232754667669197,
-          "min": 3.212534993757451,
-          "max": 3.2529743415809427
-        },
-        "sender_socket_items_per_second": {
-          "median": 12500.0,
-          "min": 12500.0,
-          "max": 12500.0
-        },
-        "sender_generated_items_per_second": {
-          "median": 12500.0,
-          "min": 12500.0,
-          "max": 12500.0
-        }
-      },
+      "0": {"gap_p50_ms": {"median": 20.015, "min": 20.01, "max": 20.02}, "gap_p95_ms": {"median": 21.255000000000003, "min": 21.25, "max": 21.26}, "observer_applied_items_per_second": {"median": 12381.833333333334, "min": 12380.066666666668, "max": 12383.6}, "built_logical_avatar_work_per_second": {"median": 3091518.944145225, "min": 3091337.8216237836, "max": 3091700.066666667}, "inbound_updates_per_second": {"median": 12499.166777762965, "min": 12498.33355552593, "max": 12500.0}, "diagnostic_counter_seconds": {"median": 15.001000000000001, "min": 15.0, "max": 15.002}, "tick_ms_per_tick": {"median": 1.0726175920982381, "min": 1.0708230112119594, "max": 1.0744121729845169}, "build_ms_per_tick": {"median": 0.5493781366791244, "min": 0.5330160170848905, "max": 0.5657402562733582}, "flush_ms_per_tick": {"median": 0.2534947944474106, "min": 0.23338174052322477, "max": 0.2736078483715964}, "server_cpu_cores": {"median": 2.9707451788010295, "min": 2.9475652870969222, "max": 2.993925070505137}, "server_rss_mean_mib": {"median": 63.193157327586206, "min": 62.547413793103445, "max": 63.83890086206897}, "server_rss_peak_mib": {"median": 72.060546875, "min": 71.30078125, "max": 72.8203125}, "client_cpu_cores": {"median": 0.2620094888681676, "min": 0.25904927107580605, "max": 0.26496970666052916}, "client_rss_mean_mib": {"median": 12.039197198275861, "min": 11.76751077586207, "max": 12.310883620689655}, "client_rss_peak_mib": {"median": 12.80859375, "min": 12.5390625, "max": 13.078125}, "combined_cpu_cores": {"median": 3.232754667669197, "min": 3.212534993757451, "max": 3.2529743415809427}, "sender_socket_items_per_second": {"median": 12500.0, "min": 12500.0, "max": 12500.0}, "sender_generated_items_per_second": {"median": 12500.0, "min": 12500.0, "max": 12500.0}},
       "6": {
-        "gap_p50_ms": {
-          "median": 20.04,
-          "min": 20.03,
-          "max": 20.05
-        },
-        "gap_p95_ms": {
-          "median": 21.365000000000002,
-          "min": 21.36,
-          "max": 21.37
-        },
-        "observer_applied_items_per_second": {
-          "median": 12296.928938310237,
-          "min": 12275.285019001267,
-          "max": 12318.572857619207
-        },
-        "built_logical_avatar_work_per_second": {
-          "median": 3073669.9739002935,
-          "min": 3068695.7478005867,
-          "max": 3078644.2
-        },
-        "inbound_updates_per_second": {
-          "median": 12506.664889362837,
-          "min": 12500.0,
-          "max": 12513.329778725674
-        },
-        "diagnostic_counter_seconds": {
-          "median": 15.001999999999999,
-          "min": 15.0,
-          "max": 15.004
-        },
-        "tick_ms_per_tick": {
-          "median": 1.1418346256684493,
-          "min": 1.1343454545454545,
-          "max": 1.1493237967914438
-        },
-        "build_ms_per_tick": {
-          "median": 0.5362905080213904,
-          "min": 0.5285754010695187,
-          "max": 0.544005614973262
-        },
-        "flush_ms_per_tick": {
-          "median": 0.33540213903743316,
-          "min": 0.315494385026738,
-          "max": 0.3553098930481283
-        },
-        "server_cpu_cores": {
-          "median": 2.8266116205404943,
-          "min": 2.8118413480314595,
-          "max": 2.8413818930495287
-        },
-        "server_rss_mean_mib": {
-          "median": 63.93393049568965,
-          "min": 62.69800646551724,
-          "max": 65.16985452586206
-        },
-        "server_rss_peak_mib": {
-          "median": 69.734375,
-          "min": 68.08203125,
-          "max": 71.38671875
-        },
-        "client_cpu_cores": {
-          "median": 0.29847819661067404,
-          "min": 0.29114549964697595,
-          "max": 0.30581089357437213
-        },
-        "client_rss_mean_mib": {
-          "median": 12.73565463362069,
-          "min": 12.550377155172415,
-          "max": 12.920932112068966
-        },
-        "client_rss_peak_mib": {
-          "median": 13.638671875,
-          "min": 13.3046875,
-          "max": 13.97265625
-        },
-        "combined_cpu_cores": {
-          "median": 3.125089817151168,
-          "min": 3.1176522416058314,
-          "max": 3.1325273926965047
-        },
-        "sender_socket_items_per_second": {
-          "median": 12508.333333333332,
-          "min": 12500.0,
-          "max": 12516.666666666666
-        },
-        "sender_generated_items_per_second": {
-          "median": 12508.333333333332,
-          "min": 12500.0,
-          "max": 12516.666666666666
-        }
+        "gap_p50_ms": {"median": 20.04, "min": 20.03, "max": 20.05},
+        "gap_p95_ms": {"median": 21.365000000000002, "min": 21.36, "max": 21.37},
+        "observer_applied_items_per_second": {"median": 12296.928938310237, "min": 12275.285019001267, "max": 12318.572857619207},
+        "built_logical_avatar_work_per_second": {"median": 3073669.9739002935, "min": 3068695.7478005867, "max": 3078644.2},
+        "inbound_updates_per_second": {"median": 12506.664889362837, "min": 12500.0, "max": 12513.329778725674},
+        "diagnostic_counter_seconds": {"median": 15.001999999999999, "min": 15.0, "max": 15.004},
+        "tick_ms_per_tick": {"median": 1.1418346256684493, "min": 1.1343454545454545, "max": 1.1493237967914438},
+        "build_ms_per_tick": {"median": 0.5362905080213904, "min": 0.5285754010695187, "max": 0.544005614973262},
+        "flush_ms_per_tick": {"median": 0.33540213903743316, "min": 0.315494385026738, "max": 0.3553098930481283},
+        "server_cpu_cores": {"median": 2.8266116205404943, "min": 2.8118413480314595, "max": 2.8413818930495287},
+        "server_rss_mean_mib": {"median": 63.93393049568965, "min": 62.69800646551724, "max": 65.16985452586206},
+        "server_rss_peak_mib": {"median": 69.734375, "min": 68.08203125, "max": 71.38671875},
+        "client_cpu_cores": {"median": 0.29847819661067404, "min": 0.29114549964697595, "max": 0.30581089357437213},
+        "client_rss_mean_mib": {"median": 12.73565463362069, "min": 12.550377155172415, "max": 12.920932112068966},
+        "client_rss_peak_mib": {"median": 13.638671875, "min": 13.3046875, "max": 13.97265625},
+        "combined_cpu_cores": {"median": 3.125089817151168, "min": 3.1176522416058314, "max": 3.1325273926965047},
+        "sender_socket_items_per_second": {"median": 12508.333333333332, "min": 12500.0, "max": 12516.666666666666},
+        "sender_generated_items_per_second": {"median": 12508.333333333332, "min": 12500.0, "max": 12516.666666666666}
       }
     },
     "comparisons": [
-      {
-        "candidate": 0,
-        "control": 6,
-        "matched_input": true,
-        "no_dropped_work": true,
-        "tradeoff": "inconclusive",
-        "dominates": false,
-        "paired_change_percent": [
-          {
-            "gap_p50_ms": -0.09985022466300064,
-            "gap_p95_ms": -0.4681647940074751,
-            "observer_applied_items_per_second": 0.49919588704161466,
-            "built_logical_avatar_work_per_second": 0.4240784520233465,
-            "inbound_updates_per_second": 0.0,
-            "diagnostic_counter_seconds": 0.0,
-            "tick_ms_per_tick": -5.599920472106035,
-            "build_ms_per_tick": 3.9952972362545136,
-            "flush_ms_per_tick": -26.026657969381674,
-            "server_cpu_cores": 5.368626365528439,
-            "server_rss_mean_mib": -2.042284233218472,
-            "server_rss_peak_mib": 2.0082079343365145,
-            "client_cpu_cores": -11.024119764889962,
-            "client_rss_mean_mib": -8.926765702371641,
-            "client_rss_peak_mib": -10.259994408722395,
-            "combined_cpu_cores": 3.8450405626223816,
-            "sender_socket_items_per_second": 0.0,
-            "sender_generated_items_per_second": 0.0
-          },
-          {
-            "gap_p50_ms": -0.149625935162101,
-            "gap_p95_ms": -0.5615348619560145,
-            "observer_applied_items_per_second": 0.8823826154021663,
-            "built_logical_avatar_work_per_second": 0.737840297117276,
-            "inbound_updates_per_second": -0.11984198822315717,
-            "diagnostic_counter_seconds": -0.013329778725668096,
-            "tick_ms_per_tick": -6.517886779692283,
-            "build_ms_per_tick": 0.8401102295692686,
-            "flush_ms_per_tick": -22.994587619170236,
-            "server_cpu_cores": 4.826870447739928,
-            "server_rss_mean_mib": -0.24018733752980692,
-            "server_rss_peak_mib": 4.727752596247625,
-            "client_cpu_cores": -13.35504645909893,
-            "client_rss_mean_mib": -1.9082576684482877,
-            "client_rss_peak_mib": -1.702877275396364,
-            "combined_cpu_cores": 3.043403971917913,
-            "sender_socket_items_per_second": -0.13315579227696217,
-            "sender_generated_items_per_second": -0.13315579227696217
-          }
-        ]
-      },
-      {
-        "candidate": 6,
-        "control": 0,
-        "matched_input": true,
-        "no_dropped_work": false,
-        "tradeoff": "inconclusive",
-        "dominates": false,
-        "paired_change_percent": [
-          {
-            "gap_p50_ms": 0.09995002498750516,
-            "gap_p95_ms": 0.470366886171214,
-            "observer_applied_items_per_second": -0.49671629970323705,
-            "built_logical_avatar_work_per_second": -0.4222876212162108,
-            "inbound_updates_per_second": 0.0,
-            "diagnostic_counter_seconds": 0.0,
-            "tick_ms_per_tick": 5.932114146631973,
-            "build_ms_per_tick": -3.8418056800954004,
-            "flush_ms_per_tick": 35.18383414204671,
-            "server_cpu_cores": -5.095090019399551,
-            "server_rss_mean_mib": 2.084863062834952,
-            "server_rss_peak_mib": -1.9686728891749827,
-            "client_cpu_cores": 12.39000922020641,
-            "client_rss_mean_mib": 9.801744465557105,
-            "client_rss_peak_mib": 11.43302180685357,
-            "combined_cpu_cores": -3.702671347413733,
-            "sender_socket_items_per_second": 0.0,
-            "sender_generated_items_per_second": 0.0
-          },
-          {
-            "gap_p50_ms": 0.14985014985016143,
-            "gap_p95_ms": 0.564705882352956,
-            "observer_applied_items_per_second": -0.8746647259176177,
-            "built_logical_avatar_work_per_second": -0.7324360885056391,
-            "inbound_updates_per_second": 0.11998578156937612,
-            "diagnostic_counter_seconds": 0.013331555792550631,
-            "tick_ms_per_tick": 6.972335728367307,
-            "build_ms_per_tick": -0.8331111773447142,
-            "flush_ms_per_tick": 29.861001854584778,
-            "server_cpu_cores": -4.604611801462022,
-            "server_rss_mean_mib": 0.24076562607677765,
-            "server_rss_peak_mib": -4.514326412096636,
-            "client_cpu_cores": 15.413530636604978,
-            "client_rss_mean_mib": 1.9453805418180314,
-            "client_rss_peak_mib": 1.7323775388291551,
-            "combined_cpu_cores": -2.953516532457845,
-            "sender_socket_items_per_second": 0.13333333333331865,
-            "sender_generated_items_per_second": 0.13333333333331865
-          }
-        ]
-      }
+      {"candidate": 0, "control": 6, "matched_input": true, "no_dropped_work": true, "tradeoff": "inconclusive", "dominates": false, "paired_change_percent": [{"gap_p50_ms": -0.09985022466300064, "gap_p95_ms": -0.4681647940074751, "observer_applied_items_per_second": 0.49919588704161466, "built_logical_avatar_work_per_second": 0.4240784520233465, "inbound_updates_per_second": 0.0, "diagnostic_counter_seconds": 0.0, "tick_ms_per_tick": -5.599920472106035, "build_ms_per_tick": 3.9952972362545136, "flush_ms_per_tick": -26.026657969381674, "server_cpu_cores": 5.368626365528439, "server_rss_mean_mib": -2.042284233218472, "server_rss_peak_mib": 2.0082079343365145, "client_cpu_cores": -11.024119764889962, "client_rss_mean_mib": -8.926765702371641, "client_rss_peak_mib": -10.259994408722395, "combined_cpu_cores": 3.8450405626223816, "sender_socket_items_per_second": 0.0, "sender_generated_items_per_second": 0.0}, {"gap_p50_ms": -0.149625935162101, "gap_p95_ms": -0.5615348619560145, "observer_applied_items_per_second": 0.8823826154021663, "built_logical_avatar_work_per_second": 0.737840297117276, "inbound_updates_per_second": -0.11984198822315717, "diagnostic_counter_seconds": -0.013329778725668096, "tick_ms_per_tick": -6.517886779692283, "build_ms_per_tick": 0.8401102295692686, "flush_ms_per_tick": -22.994587619170236, "server_cpu_cores": 4.826870447739928, "server_rss_mean_mib": -0.24018733752980692, "server_rss_peak_mib": 4.727752596247625, "client_cpu_cores": -13.35504645909893, "client_rss_mean_mib": -1.9082576684482877, "client_rss_peak_mib": -1.702877275396364, "combined_cpu_cores": 3.043403971917913, "sender_socket_items_per_second": -0.13315579227696217, "sender_generated_items_per_second": -0.13315579227696217}]},
+      {"candidate": 6, "control": 0, "matched_input": true, "no_dropped_work": false, "tradeoff": "inconclusive", "dominates": false, "paired_change_percent": [{"gap_p50_ms": 0.09995002498750516, "gap_p95_ms": 0.470366886171214, "observer_applied_items_per_second": -0.49671629970323705, "built_logical_avatar_work_per_second": -0.4222876212162108, "inbound_updates_per_second": 0.0, "diagnostic_counter_seconds": 0.0, "tick_ms_per_tick": 5.932114146631973, "build_ms_per_tick": -3.8418056800954004, "flush_ms_per_tick": 35.18383414204671, "server_cpu_cores": -5.095090019399551, "server_rss_mean_mib": 2.084863062834952, "server_rss_peak_mib": -1.9686728891749827, "client_cpu_cores": 12.39000922020641, "client_rss_mean_mib": 9.801744465557105, "client_rss_peak_mib": 11.43302180685357, "combined_cpu_cores": -3.702671347413733, "sender_socket_items_per_second": 0.0, "sender_generated_items_per_second": 0.0}, {"gap_p50_ms": 0.14985014985016143, "gap_p95_ms": 0.564705882352956, "observer_applied_items_per_second": -0.8746647259176177, "built_logical_avatar_work_per_second": -0.7324360885056391, "inbound_updates_per_second": 0.11998578156937612, "diagnostic_counter_seconds": 0.013331555792550631, "tick_ms_per_tick": 6.972335728367307, "build_ms_per_tick": -0.8331111773447142, "flush_ms_per_tick": 29.861001854584778, "server_cpu_cores": -4.604611801462022, "server_rss_mean_mib": 0.24076562607677765, "server_rss_peak_mib": -4.514326412096636, "client_cpu_cores": 15.413530636604978, "client_rss_mean_mib": 1.9453805418180314, "client_rss_peak_mib": 1.7323775388291551, "combined_cpu_cores": -2.953516532457845, "sender_socket_items_per_second": 0.13333333333331865, "sender_generated_items_per_second": 0.13333333333331865}]}
     ],
     "limits": "Descriptive min/median/max across process runs; not a confidence interval. One synthetic loopback workload and one observer do not establish a universal best setting."
   },
@@ -338,400 +72,59 @@
       "lanes": 0,
       "round": 0,
       "valid": true,
-      "checks": {
-        "completed": true,
-        "fixed_workload_provenance": true,
-        "client_exit": true,
-        "server_exit": true,
-        "observer_window": true,
-        "coverage": true,
-        "uninterrupted_observer": true,
-        "continuous_readiness": true,
-        "counter_window": true,
-        "sender_records": true,
-        "sender_connections": true,
-        "sender_progress": true,
-        "sender_errors": true,
-        "positive_metrics": true,
-        "matching_config_copy": true,
-        "zero_tick_errors": true,
-        "zero_missing_expected_peers": true,
-        "zero_stale_peers_500ms": true,
-        "zero_decode_errors": true,
-        "zero_unapplied_deltas": true,
-        "zero_malformed_items": true,
-        "zero_non_newer_sequences": true,
-        "zero_discontinuities": true,
-        "zero_sequence_ambiguities": true,
-        "zero_sequence_resyncs": true,
-        "zero_sequence_order_unknown_gaps": true,
-        "zero_protocolErrors": true,
-        "zero_wouldBlock": true,
-        "zero_retransmits": true,
-        "zero_transport_drops": true,
-        "setting_provenance": true,
-        "client_config_provenance": true,
-        "frozen_server": true,
-        "frozen_client": true
-      },
-      "metrics": {
-        "gap_p50_ms": 20.01,
-        "gap_p95_ms": 21.26,
-        "observer_applied_items_per_second": 12380.066666666668,
-        "built_logical_avatar_work_per_second": 3091700.066666667,
-        "inbound_updates_per_second": 12500.0,
-        "diagnostic_counter_seconds": 15.0,
-        "tick_ms_per_tick": 1.0708230112119594,
-        "build_ms_per_tick": 0.5657402562733582,
-        "flush_ms_per_tick": 0.23338174052322477,
-        "server_cpu_cores": 2.993925070505137,
-        "server_rss_mean_mib": 63.83890086206897,
-        "server_rss_peak_mib": 72.8203125,
-        "client_cpu_cores": 0.25904927107580605,
-        "client_rss_mean_mib": 11.76751077586207,
-        "client_rss_peak_mib": 12.5390625,
-        "combined_cpu_cores": 3.2529743415809427,
-        "sender_socket_items_per_second": 12500.0,
-        "sender_generated_items_per_second": 12500.0
-      },
-      "observer": {
-        "window_started": "true",
-        "window_ms": "15000",
-        "near_peers": "249",
-        "expected_near_peers": "249",
-        "missing_expected_peers": "0",
-        "stale_peers_500ms": "0",
-        "applied_gaps": "185452",
-        "gap_p50_ms": "20.01",
-        "gap_p95_ms": "21.26",
-        "decode_errors": "0",
-        "unapplied_deltas": "0",
-        "accepted_avatar_items": "185701",
-        "applied_full_items": "1992",
-        "applied_delta_items": "183709",
-        "malformed_items": "0",
-        "ignored_channels": "0",
-        "non_newer_sequences": "0",
-        "decoded_delta_items": "183709",
-        "observed_channel_packets": "4936",
-        "discontinuities": "0",
-        "sequence_ambiguities": "0",
-        "sequence_resyncs": "0",
-        "near_metrics_scope": "current_segment",
-        "near_segment": "0",
-        "near_segment_ms": "15000",
-        "sequence_order_unknown_gaps": "0"
-      },
+      "checks": {"completed": true, "fixed_workload_provenance": true, "client_exit": true, "server_exit": true, "observer_window": true, "coverage": true, "uninterrupted_observer": true, "continuous_readiness": true, "counter_window": true, "sender_records": true, "sender_connections": true, "sender_progress": true, "sender_errors": true, "positive_metrics": true, "matching_config_copy": true, "zero_tick_errors": true, "zero_missing_expected_peers": true, "zero_stale_peers_500ms": true, "zero_decode_errors": true, "zero_unapplied_deltas": true, "zero_malformed_items": true, "zero_non_newer_sequences": true, "zero_discontinuities": true, "zero_sequence_ambiguities": true, "zero_sequence_resyncs": true, "zero_sequence_order_unknown_gaps": true, "zero_protocolErrors": true, "zero_wouldBlock": true, "zero_retransmits": true, "zero_transport_drops": true, "setting_provenance": true, "client_config_provenance": true, "frozen_server": true, "frozen_client": true},
+      "metrics": {"gap_p50_ms": 20.01, "gap_p95_ms": 21.26, "observer_applied_items_per_second": 12380.066666666668, "built_logical_avatar_work_per_second": 3091700.066666667, "inbound_updates_per_second": 12500.0, "diagnostic_counter_seconds": 15.0, "tick_ms_per_tick": 1.0708230112119594, "build_ms_per_tick": 0.5657402562733582, "flush_ms_per_tick": 0.23338174052322477, "server_cpu_cores": 2.993925070505137, "server_rss_mean_mib": 63.83890086206897, "server_rss_peak_mib": 72.8203125, "client_cpu_cores": 0.25904927107580605, "client_rss_mean_mib": 11.76751077586207, "client_rss_peak_mib": 12.5390625, "combined_cpu_cores": 3.2529743415809427, "sender_socket_items_per_second": 12500.0, "sender_generated_items_per_second": 12500.0},
+      "observer": {"window_started": "true", "window_ms": "15000", "near_peers": "249", "expected_near_peers": "249", "missing_expected_peers": "0", "stale_peers_500ms": "0", "applied_gaps": "185452", "gap_p50_ms": "20.01", "gap_p95_ms": "21.26", "decode_errors": "0", "unapplied_deltas": "0", "accepted_avatar_items": "185701", "applied_full_items": "1992", "applied_delta_items": "183709", "malformed_items": "0", "ignored_channels": "0", "non_newer_sequences": "0", "decoded_delta_items": "183709", "observed_channel_packets": "4936", "discontinuities": "0", "sequence_ambiguities": "0", "sequence_resyncs": "0", "near_metrics_scope": "current_segment", "near_segment": "0", "near_segment_ms": "15000", "sequence_order_unknown_gaps": "0"},
       "minimum_sender_socket_items": 750,
       "started_unix_seconds": 1791146056.9796293,
       "finished_unix_seconds": 1791146080.215108,
       "sender_errors": 0,
-      "exits": {
-        "client_exit_code": 0,
-        "server_exit_code": 0
-      }
+      "exits": {"client_exit_code": 0, "server_exit_code": 0}
     },
     {
       "name": "02-lanes-6-round-1",
       "lanes": 6,
       "round": 0,
       "valid": true,
-      "checks": {
-        "completed": true,
-        "fixed_workload_provenance": true,
-        "client_exit": true,
-        "server_exit": true,
-        "observer_window": true,
-        "coverage": true,
-        "uninterrupted_observer": true,
-        "continuous_readiness": true,
-        "counter_window": true,
-        "sender_records": true,
-        "sender_connections": true,
-        "sender_progress": true,
-        "sender_errors": true,
-        "positive_metrics": true,
-        "matching_config_copy": true,
-        "zero_tick_errors": true,
-        "zero_missing_expected_peers": true,
-        "zero_stale_peers_500ms": true,
-        "zero_decode_errors": true,
-        "zero_unapplied_deltas": true,
-        "zero_malformed_items": true,
-        "zero_non_newer_sequences": true,
-        "zero_discontinuities": true,
-        "zero_sequence_ambiguities": true,
-        "zero_sequence_resyncs": true,
-        "zero_sequence_order_unknown_gaps": true,
-        "zero_protocolErrors": true,
-        "zero_wouldBlock": true,
-        "zero_retransmits": true,
-        "zero_transport_drops": true,
-        "setting_provenance": true,
-        "client_config_provenance": true,
-        "frozen_server": true,
-        "frozen_client": true
-      },
-      "metrics": {
-        "gap_p50_ms": 20.03,
-        "gap_p95_ms": 21.36,
-        "observer_applied_items_per_second": 12318.572857619207,
-        "built_logical_avatar_work_per_second": 3078644.2,
-        "inbound_updates_per_second": 12500.0,
-        "diagnostic_counter_seconds": 15.0,
-        "tick_ms_per_tick": 1.1343454545454545,
-        "build_ms_per_tick": 0.544005614973262,
-        "flush_ms_per_tick": 0.315494385026738,
-        "server_cpu_cores": 2.8413818930495287,
-        "server_rss_mean_mib": 65.16985452586206,
-        "server_rss_peak_mib": 71.38671875,
-        "client_cpu_cores": 0.29114549964697595,
-        "client_rss_mean_mib": 12.920932112068966,
-        "client_rss_peak_mib": 13.97265625,
-        "combined_cpu_cores": 3.1325273926965047,
-        "sender_socket_items_per_second": 12500.0,
-        "sender_generated_items_per_second": 12500.0
-      },
-      "observer": {
-        "window_started": "true",
-        "window_ms": "14995",
-        "near_peers": "249",
-        "expected_near_peers": "249",
-        "missing_expected_peers": "0",
-        "stale_peers_500ms": "0",
-        "applied_gaps": "184468",
-        "gap_p50_ms": "20.03",
-        "gap_p95_ms": "21.36",
-        "decode_errors": "0",
-        "unapplied_deltas": "0",
-        "accepted_avatar_items": "184717",
-        "applied_full_items": "4211",
-        "applied_delta_items": "180506",
-        "malformed_items": "0",
-        "ignored_channels": "0",
-        "non_newer_sequences": "0",
-        "decoded_delta_items": "180506",
-        "observed_channel_packets": "6751",
-        "discontinuities": "0",
-        "sequence_ambiguities": "0",
-        "sequence_resyncs": "0",
-        "near_metrics_scope": "current_segment",
-        "near_segment": "0",
-        "near_segment_ms": "14995",
-        "sequence_order_unknown_gaps": "0"
-      },
+      "checks": {"completed": true, "fixed_workload_provenance": true, "client_exit": true, "server_exit": true, "observer_window": true, "coverage": true, "uninterrupted_observer": true, "continuous_readiness": true, "counter_window": true, "sender_records": true, "sender_connections": true, "sender_progress": true, "sender_errors": true, "positive_metrics": true, "matching_config_copy": true, "zero_tick_errors": true, "zero_missing_expected_peers": true, "zero_stale_peers_500ms": true, "zero_decode_errors": true, "zero_unapplied_deltas": true, "zero_malformed_items": true, "zero_non_newer_sequences": true, "zero_discontinuities": true, "zero_sequence_ambiguities": true, "zero_sequence_resyncs": true, "zero_sequence_order_unknown_gaps": true, "zero_protocolErrors": true, "zero_wouldBlock": true, "zero_retransmits": true, "zero_transport_drops": true, "setting_provenance": true, "client_config_provenance": true, "frozen_server": true, "frozen_client": true},
+      "metrics": {"gap_p50_ms": 20.03, "gap_p95_ms": 21.36, "observer_applied_items_per_second": 12318.572857619207, "built_logical_avatar_work_per_second": 3078644.2, "inbound_updates_per_second": 12500.0, "diagnostic_counter_seconds": 15.0, "tick_ms_per_tick": 1.1343454545454545, "build_ms_per_tick": 0.544005614973262, "flush_ms_per_tick": 0.315494385026738, "server_cpu_cores": 2.8413818930495287, "server_rss_mean_mib": 65.16985452586206, "server_rss_peak_mib": 71.38671875, "client_cpu_cores": 0.29114549964697595, "client_rss_mean_mib": 12.920932112068966, "client_rss_peak_mib": 13.97265625, "combined_cpu_cores": 3.1325273926965047, "sender_socket_items_per_second": 12500.0, "sender_generated_items_per_second": 12500.0},
+      "observer": {"window_started": "true", "window_ms": "14995", "near_peers": "249", "expected_near_peers": "249", "missing_expected_peers": "0", "stale_peers_500ms": "0", "applied_gaps": "184468", "gap_p50_ms": "20.03", "gap_p95_ms": "21.36", "decode_errors": "0", "unapplied_deltas": "0", "accepted_avatar_items": "184717", "applied_full_items": "4211", "applied_delta_items": "180506", "malformed_items": "0", "ignored_channels": "0", "non_newer_sequences": "0", "decoded_delta_items": "180506", "observed_channel_packets": "6751", "discontinuities": "0", "sequence_ambiguities": "0", "sequence_resyncs": "0", "near_metrics_scope": "current_segment", "near_segment": "0", "near_segment_ms": "14995", "sequence_order_unknown_gaps": "0"},
       "minimum_sender_socket_items": 750,
       "started_unix_seconds": 1791146080.2381887,
       "finished_unix_seconds": 1791146103.4648995,
       "sender_errors": 0,
-      "exits": {
-        "client_exit_code": 0,
-        "server_exit_code": 0
-      }
+      "exits": {"client_exit_code": 0, "server_exit_code": 0}
     },
     {
       "name": "03-lanes-6-round-2",
       "lanes": 6,
       "round": 1,
       "valid": true,
-      "checks": {
-        "completed": true,
-        "fixed_workload_provenance": true,
-        "client_exit": true,
-        "server_exit": true,
-        "observer_window": true,
-        "coverage": true,
-        "uninterrupted_observer": true,
-        "continuous_readiness": true,
-        "counter_window": true,
-        "sender_records": true,
-        "sender_connections": true,
-        "sender_progress": true,
-        "sender_errors": true,
-        "positive_metrics": true,
-        "matching_config_copy": true,
-        "zero_tick_errors": true,
-        "zero_missing_expected_peers": true,
-        "zero_stale_peers_500ms": true,
-        "zero_decode_errors": true,
-        "zero_unapplied_deltas": true,
-        "zero_malformed_items": true,
-        "zero_non_newer_sequences": true,
-        "zero_discontinuities": true,
-        "zero_sequence_ambiguities": true,
-        "zero_sequence_resyncs": true,
-        "zero_sequence_order_unknown_gaps": true,
-        "zero_protocolErrors": true,
-        "zero_wouldBlock": true,
-        "zero_retransmits": true,
-        "zero_transport_drops": true,
-        "setting_provenance": true,
-        "client_config_provenance": true,
-        "frozen_server": true,
-        "frozen_client": true
-      },
-      "metrics": {
-        "gap_p50_ms": 20.05,
-        "gap_p95_ms": 21.37,
-        "observer_applied_items_per_second": 12275.285019001267,
-        "built_logical_avatar_work_per_second": 3068695.7478005867,
-        "inbound_updates_per_second": 12513.329778725674,
-        "diagnostic_counter_seconds": 15.004,
-        "tick_ms_per_tick": 1.1493237967914438,
-        "build_ms_per_tick": 0.5285754010695187,
-        "flush_ms_per_tick": 0.3553098930481283,
-        "server_cpu_cores": 2.8118413480314595,
-        "server_rss_mean_mib": 62.69800646551724,
-        "server_rss_peak_mib": 68.08203125,
-        "client_cpu_cores": 0.30581089357437213,
-        "client_rss_mean_mib": 12.550377155172415,
-        "client_rss_peak_mib": 13.3046875,
-        "combined_cpu_cores": 3.1176522416058314,
-        "sender_socket_items_per_second": 12516.666666666666,
-        "sender_generated_items_per_second": 12516.666666666666
-      },
-      "observer": {
-        "window_started": "true",
-        "window_ms": "14999",
-        "near_peers": "249",
-        "expected_near_peers": "249",
-        "missing_expected_peers": "0",
-        "stale_peers_500ms": "0",
-        "applied_gaps": "183868",
-        "gap_p50_ms": "20.05",
-        "gap_p95_ms": "21.37",
-        "decode_errors": "0",
-        "unapplied_deltas": "0",
-        "accepted_avatar_items": "184117",
-        "applied_full_items": "1992",
-        "applied_delta_items": "182125",
-        "malformed_items": "0",
-        "ignored_channels": "0",
-        "non_newer_sequences": "0",
-        "decoded_delta_items": "182125",
-        "observed_channel_packets": "5870",
-        "discontinuities": "0",
-        "sequence_ambiguities": "0",
-        "sequence_resyncs": "0",
-        "near_metrics_scope": "current_segment",
-        "near_segment": "0",
-        "near_segment_ms": "14999",
-        "sequence_order_unknown_gaps": "0"
-      },
+      "checks": {"completed": true, "fixed_workload_provenance": true, "client_exit": true, "server_exit": true, "observer_window": true, "coverage": true, "uninterrupted_observer": true, "continuous_readiness": true, "counter_window": true, "sender_records": true, "sender_connections": true, "sender_progress": true, "sender_errors": true, "positive_metrics": true, "matching_config_copy": true, "zero_tick_errors": true, "zero_missing_expected_peers": true, "zero_stale_peers_500ms": true, "zero_decode_errors": true, "zero_unapplied_deltas": true, "zero_malformed_items": true, "zero_non_newer_sequences": true, "zero_discontinuities": true, "zero_sequence_ambiguities": true, "zero_sequence_resyncs": true, "zero_sequence_order_unknown_gaps": true, "zero_protocolErrors": true, "zero_wouldBlock": true, "zero_retransmits": true, "zero_transport_drops": true, "setting_provenance": true, "client_config_provenance": true, "frozen_server": true, "frozen_client": true},
+      "metrics": {"gap_p50_ms": 20.05, "gap_p95_ms": 21.37, "observer_applied_items_per_second": 12275.285019001267, "built_logical_avatar_work_per_second": 3068695.7478005867, "inbound_updates_per_second": 12513.329778725674, "diagnostic_counter_seconds": 15.004, "tick_ms_per_tick": 1.1493237967914438, "build_ms_per_tick": 0.5285754010695187, "flush_ms_per_tick": 0.3553098930481283, "server_cpu_cores": 2.8118413480314595, "server_rss_mean_mib": 62.69800646551724, "server_rss_peak_mib": 68.08203125, "client_cpu_cores": 0.30581089357437213, "client_rss_mean_mib": 12.550377155172415, "client_rss_peak_mib": 13.3046875, "combined_cpu_cores": 3.1176522416058314, "sender_socket_items_per_second": 12516.666666666666, "sender_generated_items_per_second": 12516.666666666666},
+      "observer": {"window_started": "true", "window_ms": "14999", "near_peers": "249", "expected_near_peers": "249", "missing_expected_peers": "0", "stale_peers_500ms": "0", "applied_gaps": "183868", "gap_p50_ms": "20.05", "gap_p95_ms": "21.37", "decode_errors": "0", "unapplied_deltas": "0", "accepted_avatar_items": "184117", "applied_full_items": "1992", "applied_delta_items": "182125", "malformed_items": "0", "ignored_channels": "0", "non_newer_sequences": "0", "decoded_delta_items": "182125", "observed_channel_packets": "5870", "discontinuities": "0", "sequence_ambiguities": "0", "sequence_resyncs": "0", "near_metrics_scope": "current_segment", "near_segment": "0", "near_segment_ms": "14999", "sequence_order_unknown_gaps": "0"},
       "minimum_sender_socket_items": 751,
       "started_unix_seconds": 1791146103.49677,
       "finished_unix_seconds": 1791146126.72255,
       "sender_errors": 0,
-      "exits": {
-        "client_exit_code": 0,
-        "server_exit_code": 0
-      }
+      "exits": {"client_exit_code": 0, "server_exit_code": 0}
     },
     {
       "name": "04-lanes-0-round-2",
       "lanes": 0,
       "round": 1,
       "valid": true,
-      "checks": {
-        "completed": true,
-        "fixed_workload_provenance": true,
-        "client_exit": true,
-        "server_exit": true,
-        "observer_window": true,
-        "coverage": true,
-        "uninterrupted_observer": true,
-        "continuous_readiness": true,
-        "counter_window": true,
-        "sender_records": true,
-        "sender_connections": true,
-        "sender_progress": true,
-        "sender_errors": true,
-        "positive_metrics": true,
-        "matching_config_copy": true,
-        "zero_tick_errors": true,
-        "zero_missing_expected_peers": true,
-        "zero_stale_peers_500ms": true,
-        "zero_decode_errors": true,
-        "zero_unapplied_deltas": true,
-        "zero_malformed_items": true,
-        "zero_non_newer_sequences": true,
-        "zero_discontinuities": true,
-        "zero_sequence_ambiguities": true,
-        "zero_sequence_resyncs": true,
-        "zero_sequence_order_unknown_gaps": true,
-        "zero_protocolErrors": true,
-        "zero_wouldBlock": true,
-        "zero_retransmits": true,
-        "zero_transport_drops": true,
-        "setting_provenance": true,
-        "client_config_provenance": true,
-        "frozen_server": true,
-        "frozen_client": true
-      },
-      "metrics": {
-        "gap_p50_ms": 20.02,
-        "gap_p95_ms": 21.25,
-        "observer_applied_items_per_second": 12383.6,
-        "built_logical_avatar_work_per_second": 3091337.8216237836,
-        "inbound_updates_per_second": 12498.33355552593,
-        "diagnostic_counter_seconds": 15.002,
-        "tick_ms_per_tick": 1.0744121729845169,
-        "build_ms_per_tick": 0.5330160170848905,
-        "flush_ms_per_tick": 0.2736078483715964,
-        "server_cpu_cores": 2.9475652870969222,
-        "server_rss_mean_mib": 62.547413793103445,
-        "server_rss_peak_mib": 71.30078125,
-        "client_cpu_cores": 0.26496970666052916,
-        "client_rss_mean_mib": 12.310883620689655,
-        "client_rss_peak_mib": 13.078125,
-        "combined_cpu_cores": 3.212534993757451,
-        "sender_socket_items_per_second": 12500.0,
-        "sender_generated_items_per_second": 12500.0
-      },
-      "observer": {
-        "window_started": "true",
-        "window_ms": "15000",
-        "near_peers": "249",
-        "expected_near_peers": "249",
-        "missing_expected_peers": "0",
-        "stale_peers_500ms": "0",
-        "applied_gaps": "185505",
-        "gap_p50_ms": "20.02",
-        "gap_p95_ms": "21.25",
-        "decode_errors": "0",
-        "unapplied_deltas": "0",
-        "accepted_avatar_items": "185754",
-        "applied_full_items": "2046",
-        "applied_delta_items": "183708",
-        "malformed_items": "0",
-        "ignored_channels": "0",
-        "non_newer_sequences": "0",
-        "decoded_delta_items": "183708",
-        "observed_channel_packets": "6196",
-        "discontinuities": "0",
-        "sequence_ambiguities": "0",
-        "sequence_resyncs": "0",
-        "near_metrics_scope": "current_segment",
-        "near_segment": "0",
-        "near_segment_ms": "15000",
-        "sequence_order_unknown_gaps": "0"
-      },
+      "checks": {"completed": true, "fixed_workload_provenance": true, "client_exit": true, "server_exit": true, "observer_window": true, "coverage": true, "uninterrupted_observer": true, "continuous_readiness": true, "counter_window": true, "sender_records": true, "sender_connections": true, "sender_progress": true, "sender_errors": true, "positive_metrics": true, "matching_config_copy": true, "zero_tick_errors": true, "zero_missing_expected_peers": true, "zero_stale_peers_500ms": true, "zero_decode_errors": true, "zero_unapplied_deltas": true, "zero_malformed_items": true, "zero_non_newer_sequences": true, "zero_discontinuities": true, "zero_sequence_ambiguities": true, "zero_sequence_resyncs": true, "zero_sequence_order_unknown_gaps": true, "zero_protocolErrors": true, "zero_wouldBlock": true, "zero_retransmits": true, "zero_transport_drops": true, "setting_provenance": true, "client_config_provenance": true, "frozen_server": true, "frozen_client": true},
+      "metrics": {"gap_p50_ms": 20.02, "gap_p95_ms": 21.25, "observer_applied_items_per_second": 12383.6, "built_logical_avatar_work_per_second": 3091337.8216237836, "inbound_updates_per_second": 12498.33355552593, "diagnostic_counter_seconds": 15.002, "tick_ms_per_tick": 1.0744121729845169, "build_ms_per_tick": 0.5330160170848905, "flush_ms_per_tick": 0.2736078483715964, "server_cpu_cores": 2.9475652870969222, "server_rss_mean_mib": 62.547413793103445, "server_rss_peak_mib": 71.30078125, "client_cpu_cores": 0.26496970666052916, "client_rss_mean_mib": 12.310883620689655, "client_rss_peak_mib": 13.078125, "combined_cpu_cores": 3.212534993757451, "sender_socket_items_per_second": 12500.0, "sender_generated_items_per_second": 12500.0},
+      "observer": {"window_started": "true", "window_ms": "15000", "near_peers": "249", "expected_near_peers": "249", "missing_expected_peers": "0", "stale_peers_500ms": "0", "applied_gaps": "185505", "gap_p50_ms": "20.02", "gap_p95_ms": "21.25", "decode_errors": "0", "unapplied_deltas": "0", "accepted_avatar_items": "185754", "applied_full_items": "2046", "applied_delta_items": "183708", "malformed_items": "0", "ignored_channels": "0", "non_newer_sequences": "0", "decoded_delta_items": "183708", "observed_channel_packets": "6196", "discontinuities": "0", "sequence_ambiguities": "0", "sequence_resyncs": "0", "near_metrics_scope": "current_segment", "near_segment": "0", "near_segment_ms": "15000", "sequence_order_unknown_gaps": "0"},
       "minimum_sender_socket_items": 750,
       "started_unix_seconds": 1791146126.7540045,
       "finished_unix_seconds": 1791146150.0815098,
       "sender_errors": 0,
-      "exits": {
-        "client_exit_code": 0,
-        "server_exit_code": 0
-      }
+      "exits": {"client_exit_code": 0, "server_exit_code": 0}
     }
   ],
-  "limitations": [
-    "Linux only; native Windows tests not run",
-    "Two quick repeats per setting, 5s warmup/15s window; no confirmation",
-    "Dense CPU-only synthetic loopback, one observer, no affinity or voice/P2P",
-    "Raw logs/CSV/binaries remain in ignored local captures/tuning-quick-final; no runs removed"
-  ],
+  "limitations": ["Linux only; native Windows tests not run", "Two quick repeats per setting, 5s warmup/15s window; no confirmation", "Dense CPU-only synthetic loopback, one observer, no affinity or voice/P2P", "Raw logs/CSV/binaries remain in ignored local captures/tuning-quick-final; no runs removed"],
   "failure_validation": {
     "repeated_SIGTERM": "exit 130; error/partial config preserved; owned server/client gone; UDP/TCP ports reusable",
     "initial_development_smoke": "TCP TIME_WAIT probe rejected next run; partial capture retained; Linux probe fixed and full 12-client rerun passed"
