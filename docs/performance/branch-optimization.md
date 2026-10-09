@@ -41,6 +41,14 @@ client CPU fell 30.32%. Peak server RSS increased 6.00 MiB (+2.56%), with increa
 in every pair. Premeasurement retransmit counts again failed the strict gate
 but stayed constant during measurement; all other 33 gates passed.
 
+The [fresh merged-source PGO A/B](pgo-main-client1500-20261009.md) trains a new
+profile on two validated 250-client runs, then measures eight 1,500-client trials.
+CPU per built send falls 3.68%, built work rises 3.98%, and median p95 gap falls
+2.43%. Every pair favors PGO on work and normalized CPU; one p95 pair worsens
+slightly. Server CPU is nearly unchanged and transmitted traffic rises 5.96%.
+Strict retransmit validity remains failed on constant premeasurement counts;
+all other gates pass. This is descriptive evidence on one laptop.
+
 Branch: `performance/branch-optimization`, cut from `fix/dedicated-voice-processing` at
 `1e45b3b`. Benchmark harness and checks are in
 `BasisRustServer/crates/basis-transport/src/bench_branches.rs` and

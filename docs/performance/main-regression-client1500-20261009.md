@@ -89,6 +89,10 @@ Every corrected summary was independently rederived from raw captures, and binar
 
 This dense loopback test does not cover voice, churn, malformed traffic, remote networking or deliberate loss. Fixed worker counts/affinity do not establish maximum client capacity or platform-default performance. No hardware branch counters were collected. Existing PGO profiles were not reused across changed source; this is an ordinary-release source-regression test.
 
+The [subsequent fresh PGO A/B](pgo-main-client1500-20261009.md) trains on this
+merged source and compares ordinary/PGO at 1,500 clients with a new matched
+cohort. Its results are independent of these source-regression timings.
+
 ## Reproduction
 
 Exact build commands and runtime invocations are in the evidence. The corrected initial comparison was:

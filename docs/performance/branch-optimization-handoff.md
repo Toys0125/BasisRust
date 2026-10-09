@@ -161,3 +161,10 @@ no clear regression, client CPU falls about 30%, and server peak RSS rises about
 remain invalid while every other gate passes and counters stay constant during
 measurement. Evidence and all attempts are retained. PGO was deliberately off
 for this source comparison; older profiles have not been retrained for main.
+
+The [subsequent fresh PGO experiment](pgo-main-client1500-20261009.md) now trains
+a new merged-source profile on two valid 250-client runs and evaluates eight
+matched 1,500-client runs. CPU per built send improves 3.68% and work rises 3.98%,
+with all four pairs agreeing on those directions. Strict retransmit flags remain
+invalid; all other gates pass. The older pre-main profile is not used. Production
+source and default build settings remain unchanged.
