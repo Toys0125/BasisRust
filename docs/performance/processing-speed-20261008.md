@@ -120,3 +120,39 @@ The runtime changes reserve an independent 128-event identity budget and two ide
 Regression tests verify reserved identity admission at a full ordinary transport budget, a real signed identity response with all ordinary workers blocked, and a real 400-message UDP burst whose delayed handler eventually receives every message in FIFO order after unchanged-packet retries, with its session still connected. Server workspace validation passed **326 tests, two ignored**, targeted transport/core Clippy denied warnings, and formatting passed. CodeRabbit's first review emitted one minor queue-rejection panic concern, addressed by removing the second quota/rejection path. Its follow-up emitted zero findings but completed with an unverified-findings warning; this is not a clean-review guarantee. Luna audits found no additional concrete issue.
 
 The JSON summary retains all 24 individual measurements, binary/source/fixture hashes, revisions, CPU observations, and validation results. Raw captures remain ignored. **No new voice/avatar workload or 1,000-user capacity test was run at this runtime.** Earlier realtime results above apply to `94b42f9`, not this follow-up.
+
+## Authentication fairness and admission optimization
+
+Runtime `51c42ab4f31a7fc3f9a8eeb0a5e636e711f27706` limits critical admission to **two outstanding messages per connection/channel**, independently of the 128 global identity slots. The regression test holds two messages from one connection, verifies its next in-order message is not committed/ACKed, and admits another connection's identity response. Ordinary quotas and ordering guarantees are unchanged.
+
+Admission accounting now uses bounded atomic counters owned by each connection incarnation, with separate global totals for ordinary and critical traffic. Failed partial reservations roll back their counters; permits retain their original session and release capacity on completion or cleanup. This removes the shared accounting mutex and repeated hash-map insertion/removal. It adds **528 bytes per peer** on this 64-bit host, including inactive peers. Global atomic counters can still contend.
+
+The dispatcher now selects its three ingress receivers directly, removing the nested receiver-selection future. Ordered ingress schedules the queue it changed; handler completion and shutdown still schedule both classes. Identity keeps its independent queue and two workers.
+
+### Profiling and controlled iterations
+
+A pre-change `perf` user-cycle capture recorded 3,154 samples with DWARF call stacks. Driver/observer and memory-copy activity dominated the shared-process profile; the sample did **not** establish admission mutex contention as the cause of the full throughput loss.
+
+An isolated reserve-and-drop benchmark measured one million successful immediate reservations per sample, on one thread. Twenty samples per case across both revisions used previous/new/new/previous, five samples per process. Median cost fell from **104.88 to 25.06 ns** for one peer rotating through 64 channels and **105.29 to 24.67 ns** for 64 peers in rotation. This excludes contention, queue handoff, ACKs and handlers. The identical measured loop was backported to the previous transport; its older config omitted the two new critical-local fields. No quota was saturated.
+
+The first atomic-only candidate completed all 24 matched UDP trials, but its throughput changed by −0.4%, +1.1%, and −0.5% across the three cases. Thus faster local accounting did not establish a full-pipeline gain. Receiver-selection flattening was measured next.
+
+### Final matched control comparison
+
+The final experiment used **four samples per revision/case**, in the order `94b42f9` / reviewed runtime / new / new / reviewed runtime / `94b42f9`, twice. All builds used the identical committed UDP probe and fixture, 32,768 operations per trial, four Tokio workers, 16 Rayon threads and the system allocator. Ordinary handler capacity remained 64 and reserved identity workers remained two. These speed trials disable identity authentication; the separate correctness tests exercise signed identity and saturation.
+
+| Peers / requests in flight per peer | Reviewed runtime requests/s | New requests/s | Change | Reviewed / new p95 batch completion |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / 1 | 36,885 | 37,654 | +2.1% | 33.63 / 32.30 µs |
+| 64 / 1 | 119,278 | 121,255 | +1.7% | 0.634 / 0.619 ms |
+| 64 / 64 | 127,641 | 127,846 | +0.2% | 34.52 / 34.54 ms |
+
+All **36 trials** passed exact processing totals, final-subscription checks, zero protocol/ACK errors, and empty client ACK windows. Reviewed and new runtimes had zero client retransmissions. Two `94b42f9` burst trials retried, six retransmissions total, affecting its median and tail; their cause is not identified, so its apparent burst disadvantage is not presented as a clean speedup.
+
+The new one-peer median remains **9.7% below `94b42f9`** (41,682 requests/s), and 64-peer steady throughput remains 1.9% below that reference. The improvement is limited; this does not eliminate the previously reported control-processing regression. Four samples on a shared host do not establish statistical significance. Active cooperative polling still shares the server's runtime, so these measurements include driver/observer interactions rather than isolated server processing.
+
+Median whole-process CPU seconds, including setup/shutdown and the driver, changed from 2.682 to 2.622, 1.713 to 1.699, and 1.535 to 1.538 across the three cases. These are not server-only CPU observations.
+
+Validation passed **330 server tests, three ignored**, targeted transport/core Clippy with warnings denied, formatting, and diff checks. Tests cover critical connection fairness, invalid limits, concurrent global/peer/lane reservations, rollback, stale-session release, auth progress, FIFO bursts and cleanup. Luna audits found no new concrete issue in these changes. CodeRabbit emitted zero findings but completed with unverified warnings, so that run is not a clean-review guarantee.
+
+The compact JSON retains all 36 final UDP trials, all 40 isolated microbenchmark observations, configuration/revision/source/binary hashes, profiling notes and limitations. Raw results and the 25 MB profiling capture remain ignored. No voice/avatar or 1,000-user capacity workload was rerun at this runtime.

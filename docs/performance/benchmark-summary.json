@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "purpose": "PR #31 benchmark summary; raw captures are local.",
-  "reviewed_revision": "a2da362aa1047464b3b789b29928b8f60e112ea9",
+  "reviewed_revision": "51c42ab4f31a7fc3f9a8eeb0a5e636e711f27706",
   "reliable_receive": {
     "report": "reliable-receive-review-20261008.md",
     "baseline_revision": "6009c2bc556cd483e02e07d4b07030147645b548",
@@ -548,5 +548,293 @@
       }
     ],
     "sample_columns": ["revision_label", "sample", "valid", "peers", "batch_size_per_peer", "processed_operations", "elapsed_seconds", "operations_per_second", "batch_completion_p50_ms", "batch_completion_p95_ms", "client_transmissions", "client_retransmits", "client_pending_at_end", "client_ack_errors", "protocol_errors_delta", "process_total_cpu_seconds", "process_total_wall_seconds"]
+  },
+  "admission_optimization": {
+    "report": "docs/performance/processing-speed-20261008.md#authentication-fairness-and-admission-optimization",
+    "revisions": {
+      "pre_admission": "94b42f97c28d203cb7983f5399bc3df27b608639",
+      "previous_runtime": "a2da362aa1047464b3b789b29928b8f60e112ea9",
+      "previous_head": "03ff52516a6bde8569f8c1bb9b4b033c7794a370",
+      "candidate": "51c42ab4f31a7fc3f9a8eeb0a5e636e711f27706"
+    },
+    "host": {
+      "cpu": "AMD Ryzen 9 5900HX with Radeon Graphics",
+      "ram_bytes": 33492484096,
+      "gpu": "NVIDIA GeForce RTX 3080 Laptop GPU",
+      "logical_processors": 16,
+      "governors": ["performance"]
+    },
+    "configuration": {
+      "profile": "release",
+      "rustc": "1.95.0",
+      "tokio_workers": 4,
+      "rayon_threads": 16,
+      "ordinary_handler_workers": 64,
+      "identity_handler_workers": 2,
+      "regular_total": 4096,
+      "regular_per_peer": 256,
+      "regular_per_lane": 128,
+      "critical_total": 128,
+      "critical_per_peer": 2,
+      "critical_per_lane": 2,
+      "operations_per_trial": 32768,
+      "samples_per_revision_per_case": 4,
+      "order_per_case": ["pre_admission", "previous", "candidate", "candidate", "previous", "pre_admission", "pre_admission", "previous", "candidate", "candidate", "previous", "pre_admission"],
+      "fixture": "docs/performance/fixtures/avatar-cpu-only-server.xml",
+      "fixture_sha256": "21f6aaa39b91a21358077c0023ce28b555439c8731d8a96050d1272f7ddee6c9",
+      "allocator": "system",
+      "identity_enabled_in_speed_probe": false,
+      "cpu_scope": "whole process, including server, UDP driver, observation, setup and shutdown"
+    },
+    "binary_sha256": {
+      "pre_admission": "6e6929c0eea6cb0980693ba0775177136d3b681d8e462d142e9c08c45c9f27a2",
+      "previous": "450c2b80311d85b181a8f19088613511375532a96d66ba1698ac559ddb76d9c2",
+      "candidate": "371cedcb0e233ec62532cf27793e5262e35e27c18c85deabd4ad393d2ebfe23a"
+    },
+    "candidate_source_sha256": {
+      "BasisRustServer/crates/basis-transport/src/lib.rs": "c1a953df699ff6b3cc9f02779fd22ed5cb6ccde609b81e151f897bb0174744e2",
+      "BasisRustServer/crates/basis-server-core/src/lib.rs": "839b4280617375945560eec4fc20219b61d70ad3171dd5f16ce81209b02b3cad",
+      "BasisRustServer/crates/basis-server-core/examples/registry-processing-benchmark.rs": "10c7705abec650d4362bc893e0e6415b174e7838bb3ce5344415489fd6670a9b"
+    },
+    "cases": [
+      {
+        "peers": 1,
+        "batch_size_per_peer": 1,
+        "pre_admission": {
+          "samples": 4,
+          "median_operations_per_second": 41682.03622289798,
+          "median_batch_p50_ms": 0.023293,
+          "median_batch_p95_ms": 0.030032,
+          "median_process_total_cpu_seconds": 2.3802165000000013,
+          "client_retransmits_total": 0
+        },
+        "previous": {
+          "samples": 4,
+          "median_operations_per_second": 36885.15938714874,
+          "median_batch_p50_ms": 0.026191,
+          "median_batch_p95_ms": 0.033629,
+          "median_process_total_cpu_seconds": 2.681618499999999,
+          "client_retransmits_total": 0
+        },
+        "candidate": {
+          "samples": 4,
+          "median_operations_per_second": 37654.05384776504,
+          "median_batch_p50_ms": 0.025945999999999997,
+          "median_batch_p95_ms": 0.032302,
+          "median_process_total_cpu_seconds": 2.622327500000001,
+          "client_retransmits_total": 0
+        },
+        "throughput_change_vs_reviewed_percent": 2.084563204799905,
+        "throughput_change_vs_pre_admission_percent": -9.66359309701903
+      },
+      {
+        "peers": 64,
+        "batch_size_per_peer": 1,
+        "pre_admission": {
+          "samples": 4,
+          "median_operations_per_second": 123549.43181069153,
+          "median_batch_p50_ms": 0.500102,
+          "median_batch_p95_ms": 0.616878,
+          "median_process_total_cpu_seconds": 1.5766345000000008,
+          "client_retransmits_total": 0
+        },
+        "previous": {
+          "samples": 4,
+          "median_operations_per_second": 119278.17212891037,
+          "median_batch_p50_ms": 0.5187145,
+          "median_batch_p95_ms": 0.6340585,
+          "median_process_total_cpu_seconds": 1.7128400000000035,
+          "client_retransmits_total": 0
+        },
+        "candidate": {
+          "samples": 4,
+          "median_operations_per_second": 121254.688469224,
+          "median_batch_p50_ms": 0.5093215,
+          "median_batch_p95_ms": 0.6185185,
+          "median_process_total_cpu_seconds": 1.6987614999999998,
+          "client_retransmits_total": 0
+        },
+        "throughput_change_vs_reviewed_percent": 1.6570645785697558,
+        "throughput_change_vs_pre_admission_percent": -1.85734835671576
+      },
+      {
+        "peers": 64,
+        "batch_size_per_peer": 64,
+        "pre_admission": {
+          "samples": 4,
+          "median_operations_per_second": 112579.86392615417,
+          "median_batch_p50_ms": 31.275498499999998,
+          "median_batch_p95_ms": 76.35051100000001,
+          "median_process_total_cpu_seconds": 1.569951500000002,
+          "client_retransmits_total": 6
+        },
+        "previous": {
+          "samples": 4,
+          "median_operations_per_second": 127640.9632860575,
+          "median_batch_p50_ms": 31.3507185,
+          "median_batch_p95_ms": 34.521395,
+          "median_process_total_cpu_seconds": 1.5345594999999967,
+          "client_retransmits_total": 0
+        },
+        "candidate": {
+          "samples": 4,
+          "median_operations_per_second": 127846.36552277143,
+          "median_batch_p50_ms": 31.6118915,
+          "median_batch_p95_ms": 34.536027000000004,
+          "median_process_total_cpu_seconds": 1.5377189999999992,
+          "client_retransmits_total": 0
+        },
+        "throughput_change_vs_reviewed_percent": 0.16092187917260414,
+        "throughput_change_vs_pre_admission_percent": 13.560596952427662
+      }
+    ],
+    "sample_columns": ["revision_label", "sample", "valid", "peers", "batch_size_per_peer", "processed_operations", "elapsed_seconds", "operations_per_second", "batch_completion_p50_ms", "batch_completion_p95_ms", "client_transmissions", "client_retransmits", "client_pending_at_end", "client_ack_errors", "protocol_errors_delta", "process_total_cpu_seconds", "process_total_wall_seconds"],
+    "samples": [
+      ["pre_admission", 0, true, 1, 1, 32768, 0.789089694, 41526.33122591511, 0.023397, 0.03094, 32768, 0, 0, 0, 0, 2.395718, 1.1418518701102585],
+      ["previous", 1, true, 1, 1, 32768, 0.897230473, 36521.27406065041, 0.026261000000000003, 0.034293, 32768, 0, 0, 0, 0, 2.7668999999999997, 1.2336698560975492],
+      ["candidate", 2, true, 1, 1, 32768, 0.866291611, 37825.60004497146, 0.025702, 0.032407000000000005, 32768, 0, 0, 0, 0, 2.6122060000000005, 1.1939688539132476],
+      ["candidate", 3, true, 1, 1, 32768, 0.866714783, 37807.131760899014, 0.025841, 0.031917, 32768, 0, 0, 0, 0, 2.6105529999999995, 1.2214406298007816],
+      ["previous", 4, true, 1, 1, 32768, 0.886867488, 36948.022611468194, 0.026191, 0.032895999999999995, 32768, 0, 0, 0, 0, 2.6775400000000005, 1.1830187800806016],
+      ["pre_admission", 5, true, 1, 1, 32768, 0.793470589, 41297.05682134615, 0.023328, 0.030032, 32768, 0, 0, 0, 0, 2.3753379999999993, 1.0806961709167808],
+      ["pre_admission", 6, true, 1, 1, 32768, 0.78079668, 41967.39156216699, 0.023188, 0.029753, 32768, 0, 0, 0, 0, 2.338833000000001, 1.0814343290403485],
+      ["previous", 7, true, 1, 1, 32768, 0.889895618, 36822.29616282929, 0.02612, 0.033942999999999994, 32768, 0, 0, 0, 0, 2.6818159999999978, 1.1853005809243768],
+      ["candidate", 8, true, 1, 1, 32768, 0.873790593, 37500.97593463106, 0.026050999999999998, 0.032196999999999996, 32768, 0, 0, 0, 0, 2.632449000000001, 1.1831713139545172],
+      ["candidate", 9, true, 1, 1, 32768, 0.895017186, 36611.58747850011, 0.026261000000000003, 0.034851, 32768, 0, 0, 0, 0, 2.738033999999999, 1.2351074090693146],
+      ["previous", 10, true, 1, 1, 32768, 0.885951443, 36986.22566609443, 0.026191, 0.033315000000000004, 32768, 0, 0, 0, 0, 2.6814210000000003, 1.1850762479007244],
+      ["pre_admission", 11, true, 1, 1, 32768, 0.783216279, 41837.74121988085, 0.023258, 0.030032, 32768, 0, 0, 0, 0, 2.3850950000000033, 1.1327332560904324],
+      ["pre_admission", 0, true, 64, 1, 32768, 0.259252342, 126394.22944923675, 0.495248, 0.567954, 32768, 0, 0, 0, 0, 1.5679509999999972, 0.7136528170667589],
+      ["previous", 1, true, 64, 1, 32768, 0.27520616, 119067.10227707113, 0.5229050000000001, 0.631509, 32768, 0, 0, 0, 0, 1.716302000000006, 0.7267255221959203],
+      ["candidate", 2, true, 64, 1, 32768, 0.26990035, 121407.77142378659, 0.5109630000000001, 0.6178899999999999, 32768, 0, 0, 0, 0, 1.7142279999999914, 0.7132996269501746],
+      ["candidate", 3, true, 64, 1, 32768, 0.267048501, 122704.30231697875, 0.505515, 0.601827, 32768, 0, 0, 0, 0, 1.6882640000000038, 0.7132052010856569],
+      ["previous", 4, true, 64, 1, 32768, 0.270151432, 121294.93357636541, 0.510893, 0.614189, 32768, 0, 0, 0, 0, 1.6893309999999957, 0.713387347990647],
+      ["pre_admission", 5, true, 64, 1, 32768, 0.264285629, 123987.06703798864, 0.49874, 0.619637, 32768, 0, 0, 0, 0, 1.5734390000000076, 0.7122952321078628],
+      ["pre_admission", 6, true, 64, 1, 32768, 0.266164583, 123111.79658339442, 0.501464, 0.614119, 32768, 0, 0, 0, 0, 1.579829999999994, 0.7144786959979683],
+      ["previous", 7, true, 64, 1, 32768, 0.274233893, 119489.24198074962, 0.514943, 0.636608, 32768, 0, 0, 0, 0, 1.709378000000001, 0.7149181398563087],
+      ["candidate", 8, true, 64, 1, 32768, 0.27069899, 121049.5835244897, 0.512849, 0.619147, 32768, 0, 0, 0, 0, 1.6984650000000059, 0.7131695819552988],
+      ["candidate", 9, true, 64, 1, 32768, 0.270582705, 121101.60551466141, 0.50768, 0.6287159999999999, 32768, 0, 0, 0, 0, 1.6990579999999937, 0.7125847260467708],
+      ["previous", 10, true, 64, 1, 32768, 0.277661937, 118014.01500703352, 0.522486, 0.63982, 32768, 0, 0, 0, 0, 1.7362789999999961, 0.7268777068238705],
+      ["pre_admission", 11, true, 64, 1, 32768, 0.26795826, 122287.70256979576, 0.502232, 0.622081, 32768, 0, 0, 0, 0, 1.6150149999999996, 0.7124513990711421],
+      ["pre_admission", 0, true, 64, 64, 32768, 0.342538666, 95662.19306757036, 31.363639, 119.59175800000001, 32770, 2, 0, 0, 0, 1.643847000000008, 0.7782105777878314],
+      ["previous", 1, true, 64, 64, 32768, 0.260589044, 125745.88515701375, 32.942343, 35.752356999999996, 32768, 0, 0, 0, 0, 1.6259200000000007, 0.7136227148585021],
+      ["candidate", 2, true, 64, 64, 32768, 0.256471242, 127764.8119316239, 31.457646, 35.359217, 32768, 0, 0, 0, 0, 1.5783339999999981, 0.6774198787752539],
+      ["candidate", 3, true, 64, 64, 32768, 0.259851864, 126102.61668163366, 32.329829999999994, 34.791264000000005, 32768, 0, 0, 0, 0, 1.5521689999999992, 0.7143011579755694],
+      ["previous", 4, true, 64, 64, 32768, 0.252964346, 129536.04141510124, 31.33235, 33.337018, 32768, 0, 0, 0, 0, 1.491019999999999, 0.6763712740503252],
+      ["pre_admission", 5, true, 64, 64, 32768, 0.250574291, 130771.59619699372, 31.071281, 33.100325, 32768, 0, 0, 0, 0, 1.4358819999999994, 0.674467874923721],
+      ["pre_admission", 6, true, 64, 64, 32768, 0.42665471, 76802.15226031373, 33.054928, 124.327729, 32772, 4, 0, 0, 0, 1.7529030000000034, 0.8791265040636063],
+      ["previous", 7, true, 64, 64, 32768, 0.246207992, 133090.72436608802, 30.488312, 31.737432000000002, 32768, 0, 0, 0, 0, 1.4667230000000018, 0.6741271179635078],
+      ["candidate", 8, true, 64, 64, 32768, 0.253259009, 129385.32820366521, 31.074354, 34.280789999999996, 32768, 0, 0, 0, 0, 1.5019810000000007, 0.674489316996187],
+      ["candidate", 9, true, 64, 64, 32768, 0.256144243, 127927.91911391895, 31.766137, 33.579928, 32768, 0, 0, 0, 0, 1.523268999999999, 0.6756772559601814],
+      ["previous", 10, true, 64, 64, 32768, 0.262788571, 124693.39848116909, 31.369086999999997, 35.705771999999996, 32768, 0, 0, 0, 0, 1.5780989999999946, 0.7135293358005583],
+      ["pre_admission", 11, true, 64, 64, 32768, 0.253039566, 129497.53478473797, 31.187358, 33.109263999999996, 32768, 0, 0, 0, 0, 1.4960559999999958, 0.6779574509710073]
+    ],
+    "validation": {
+      "valid_trials": 36,
+      "all_exact_application_counts": true,
+      "all_final_subscription_checks_passed": true,
+      "all_client_windows_drained": true,
+      "all_zero_protocol_and_ack_errors": true,
+      "candidate_client_retransmits": 0,
+      "reviewed_client_retransmits": 0,
+      "pre_admission_client_retransmits": 6,
+      "server_workspace_tests_passed": 330,
+      "server_workspace_tests_ignored": 3,
+      "targeted_clippy_warnings_denied": "passed",
+      "formatting": "passed",
+      "coderabbit": "completed_with_warnings: zero emitted findings, unverified findings warning; not a clean-review guarantee"
+    },
+    "profiling": {
+      "scope": "shared driver/server user-cycle sampling, before optimization; not independent server profiling",
+      "samples": 3154,
+      "recording": "cycles:u at 997 Hz; DWARF call graph, 8192 byte stack dump",
+      "finding": "Driver/observer and memory-copy activity dominate; attribution does not establish shared admission mutex as cause of full probe slowdown.",
+      "raw_capture": "local ignored captures/pr31-admission-optimization-20261008"
+    },
+    "isolated_admission_microbenchmark": {
+      "iterations_per_sample": 1000000,
+      "samples_per_revision_per_case": 10,
+      "order": ["previous", "candidate", "candidate", "previous"],
+      "samples_per_process_per_case": 5,
+      "cases": "One peer across 64 channels; 64 peers in rotation, each associated with its index channel. Single thread, immediate permit drop, uncontended, AUTH_IDENTITY included once per 64 iterations.",
+      "baseline_note": "Identical measured loop backported into previous transport tests; baseline config omitted the two new critical-local fields. No quotas are saturated.",
+      "source": "BasisRustServer/crates/basis-transport/src/lib.rs::tests::ordered_admission_microbench",
+      "median_ns_reserve_and_drop": {
+        "one_peer": {
+          "previous": 104.875,
+          "candidate": 25.06
+        },
+        "sixty_four_peers": {
+          "previous": 105.28999999999999,
+          "candidate": 24.67
+        }
+      },
+      "sample_columns": ["label", "run", "case", "sample", "ns_per_reserve_and_drop"],
+      "samples": [
+        ["previous", 0, "one_peer", 0, 105.21],
+        ["previous", 0, "one_peer", 1, 105.15],
+        ["previous", 0, "one_peer", 2, 104.49],
+        ["previous", 0, "one_peer", 3, 104.55],
+        ["previous", 0, "one_peer", 4, 104.46],
+        ["previous", 0, "sixty_four_peers", 0, 106.87],
+        ["previous", 0, "sixty_four_peers", 1, 106.16],
+        ["previous", 0, "sixty_four_peers", 2, 106.15],
+        ["previous", 0, "sixty_four_peers", 3, 105.24],
+        ["previous", 0, "sixty_four_peers", 4, 104.87],
+        ["candidate", 1, "one_peer", 0, 25.61],
+        ["candidate", 1, "one_peer", 1, 24.88],
+        ["candidate", 1, "one_peer", 2, 25.13],
+        ["candidate", 1, "one_peer", 3, 25.42],
+        ["candidate", 1, "one_peer", 4, 24.85],
+        ["candidate", 1, "sixty_four_peers", 0, 24.7],
+        ["candidate", 1, "sixty_four_peers", 1, 24.7],
+        ["candidate", 1, "sixty_four_peers", 2, 24.65],
+        ["candidate", 1, "sixty_four_peers", 3, 24.69],
+        ["candidate", 1, "sixty_four_peers", 4, 24.65],
+        ["candidate", 2, "one_peer", 0, 25.68],
+        ["candidate", 2, "one_peer", 1, 25.13],
+        ["candidate", 2, "one_peer", 2, 24.83],
+        ["candidate", 2, "one_peer", 3, 24.99],
+        ["candidate", 2, "one_peer", 4, 24.86],
+        ["candidate", 2, "sixty_four_peers", 0, 24.76],
+        ["candidate", 2, "sixty_four_peers", 1, 24.55],
+        ["candidate", 2, "sixty_four_peers", 2, 24.55],
+        ["candidate", 2, "sixty_four_peers", 3, 24.6],
+        ["candidate", 2, "sixty_four_peers", 4, 24.78],
+        ["previous", 3, "one_peer", 0, 105.6],
+        ["previous", 3, "one_peer", 1, 105.83],
+        ["previous", 3, "one_peer", 2, 104.91],
+        ["previous", 3, "one_peer", 3, 104.84],
+        ["previous", 3, "one_peer", 4, 104.14],
+        ["previous", 3, "sixty_four_peers", 0, 105.04],
+        ["previous", 3, "sixty_four_peers", 1, 106.15],
+        ["previous", 3, "sixty_four_peers", 2, 105.34],
+        ["previous", 3, "sixty_four_peers", 3, 104.16],
+        ["previous", 3, "sixty_four_peers", 4, 103.86]
+      ]
+    },
+    "atomic_only_experiment": {
+      "candidate": "Local fairness + atomic accounting variant before dispatcher selection flattening",
+      "valid_trials": 24,
+      "candidate_vs_reviewed_percent": [
+        {
+          "peers": 1,
+          "batch_size_per_peer": 1,
+          "throughput_change_percent": -0.3932198563358358
+        },
+        {
+          "peers": 64,
+          "batch_size_per_peer": 1,
+          "throughput_change_percent": 1.1156317119117798
+        },
+        {
+          "peers": 64,
+          "batch_size_per_peer": 64,
+          "throughput_change_percent": -0.46038552480790473
+        }
+      ],
+      "conclusion": "Local reserve/drop cost improved, but matched full pipeline showed no clear throughput gain; then dispatcher nesting was removed."
+    },
+    "changes": ["Critical admission now limits a single connection/channel to two outstanding messages, independent of the 128 global budget.", "Session-owned bounded atomic lane/peer counters and separate atomic global class totals replace shared mutex and hash maps.", "Failed partial admission rolls back all acquired counters before returning no-ACK; permits retain their original session until completion.", "Direct dispatcher receiver selection replaces nested select; ingress schedules only the class whose queue changed."],
+    "memory_cost": "528 bytes of fixed counters per PeerState on this 64-bit host, even when ordered admission is disabled; global class counters may still contend.",
+    "limitations": ["Four control samples per revision/configuration on one shared host; differences are observations without statistical significance established.", "Active cooperative observer polling shares four Tokio workers with server and driver; full probe does not isolate server CPU.", "Single-peer candidate remains 9.7% below pre-admission 94b runtime in this cohort.", "Two pre-admission burst trials retried (six retransmissions total), affecting its p95/median; cause not identified.", "Uncontended microbenchmark excludes CAS contention, rejected admissions, ACKs, queue handoff and handler processing.", "No latest voice/avatar workload or 1000-user capacity test."]
   }
 }
