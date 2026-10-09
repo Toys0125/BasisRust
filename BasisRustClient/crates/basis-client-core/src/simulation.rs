@@ -81,6 +81,7 @@ pub(crate) struct CadenceOptions {
     pub(crate) movement_jitter_percent: u8,
     pub(crate) voice_jitter_percent: u8,
     pub(crate) allow_position_drift: bool,
+    pub(crate) additional_avatar_bytes: u8,
 }
 
 pub(crate) fn worker_phase_offset(
@@ -179,16 +180,22 @@ pub(crate) async fn movement_workers(
                             if let Some(metadata) = metadata {
                                 let force = client.force_avatar_keyframe.load(Ordering::Acquire);
                                 let mut pose = client.pose.lock().await;
-                                if let Some(datagram) = pose.write_unity_avatar_datagram(
-                                    frame_delta,
-                                    elapsed,
-                                    metadata,
-                                    force,
-                                    cadence.unity_pose_amplitude_radians,
-                                ) {
+                                if let Some(datagram) = pose
+                                    .write_unity_avatar_datagram_with_additional(
+                                        frame_delta,
+                                        elapsed,
+                                        metadata,
+                                        force,
+                                        cadence.unity_pose_amplitude_radians,
+                                        cadence.additional_avatar_bytes,
+                                    )
+                                {
                                     let channel = datagram.get(1).copied().unwrap_or_default();
                                     let sequence = match channel {
-                                        channels::PLAYER_AVATAR_HIGH => datagram.get(2).copied(),
+                                        channels::PLAYER_AVATAR_HIGH
+                                        | channels::PLAYER_AVATAR_HIGH_ADDITIONAL => {
+                                            datagram.get(2).copied()
+                                        }
                                         channels::DELTA_AVATAR => datagram.get(3).copied(),
                                         _ => None,
                                     };
@@ -209,7 +216,11 @@ pub(crate) async fn movement_workers(
                                         }
                                     }
                                     if force
-                                        && datagram.get(1) == Some(&channels::PLAYER_AVATAR_HIGH)
+                                        && matches!(
+                                            channel,
+                                            channels::PLAYER_AVATAR_HIGH
+                                                | channels::PLAYER_AVATAR_HIGH_ADDITIONAL
+                                        )
                                     {
                                         client
                                             .force_avatar_keyframe
@@ -276,10 +287,11 @@ pub(crate) async fn movement_workers(
                         if client.connected.load(Ordering::Relaxed) {
                             let sequence = client.movement_sequence.fetch_add(1, Ordering::Relaxed);
                             let mut pose = client.pose.lock().await;
-                            let datagram = pose.write_movement_datagram(
+                            let datagram = pose.write_movement_datagram_with_additional(
                                 sequence,
                                 start,
                                 cadence.allow_position_drift,
+                                cadence.additional_avatar_bytes,
                             );
                             if let Err(err) = client.send_connected(datagram).await {
                                 trace!("movement send failed for {}: {err}", client.index);
@@ -344,10 +356,11 @@ pub(crate) async fn movement_workers(
                         if client.connected.load(Ordering::Relaxed) {
                             let sequence = client.movement_sequence.fetch_add(1, Ordering::Relaxed);
                             let mut pose = client.pose.lock().await;
-                            let datagram = pose.write_movement_datagram(
+                            let datagram = pose.write_movement_datagram_with_additional(
                                 sequence,
                                 start,
                                 cadence.allow_position_drift,
+                                cadence.additional_avatar_bytes,
                             );
                             if let Err(err) = client.send_connected(datagram).await {
                                 trace!("movement send failed for {}: {err}", client.index);

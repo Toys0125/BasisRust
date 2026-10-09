@@ -127,7 +127,7 @@ async fn shared_receive_drop_diagnostics_preserve_reliable_prefix() {
     let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let client = tests::test_client(1, server.local_addr().unwrap()).await;
     shared_receiver_mark_reliable(&client, &[PacketProperty::Channeled as u8]);
-    let child = [PacketProperty::Channeled as u8, 0, 0, 0];
+    let child = [PacketProperty::Channeled as u8, 0, 0, 74];
     let mut merged = vec![PacketProperty::Merged as u8, 4, 0];
     merged.extend_from_slice(&child);
     merged.push(0);
@@ -137,7 +137,7 @@ async fn shared_receive_drop_diagnostics_preserve_reliable_prefix() {
     assert!(client
         .reliable_receive_state()
         .unwrap()
-        .ack_window(0)
+        .ack_window(74)
         .is_some());
 }
 

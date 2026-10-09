@@ -72,3 +72,7 @@ disabled for this fixture; large IDs, fragmentation, all pose quality levels,
 sequence wrap, extension negotiation, and live C# sockets are outside these
 scenarios. Merged captures are unpacked independently; CompactMerged handling is
 an extension-aware capture helper, not an upstream Unity parity assertion.
+
+Prop/scene script relay and AdditionalAvatarData workloads are covered by the
+live suite as well. See [script-data-harness.md](../../docs/performance/script-data-harness.md)
+for benchmark commands, metrics, and limitations.

@@ -127,8 +127,51 @@ pub(crate) fn shared_receiver_send_mtu_ok(fd: RawFd, packet: &mut [u8], connecti
     }
 }
 
+/// Keep control packets that must reach the async client state machine. Other reliable
+/// load-sink payloads need only the persistent receive window and ACK bookkeeping.
 #[cfg(target_os = "linux")]
-pub(crate) fn shared_receiver_process_merged(client: &BasisClient, fd: RawFd, bytes: &[u8]) {
+fn shared_receiver_process_raw(client: &BasisClient, bytes: &[u8]) -> bool {
+    let Some(packet) = parse_packet(bytes) else {
+        client.record_unparsed_packet(bytes);
+        return false;
+    };
+    match packet.property {
+        PacketProperty::Ack => {
+            if packet.payload.len() != (DEFAULT_WINDOW_SIZE - 1) / 8 + 2 {
+                client
+                    .packet_diagnostics
+                    .record(client.index, DropReason::InvalidAckSize);
+                false
+            } else {
+                true
+            }
+        }
+        PacketProperty::Channeled => {
+            let channel = packet.channel_id.unwrap() / 4;
+            if matches!(
+                channel,
+                basis_protocol::channels::AUTH_IDENTITY
+                    | basis_protocol::channels::META_DATA
+                    | basis_protocol::channels::DELTA_AVATAR
+            ) {
+                // Do not mark this here: handle_channeled must see a new packet to apply it.
+                true
+            } else {
+                shared_receiver_mark_reliable(client, bytes);
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn shared_receiver_process_merged<'a>(
+    client: &BasisClient,
+    fd: RawFd,
+    bytes: &'a [u8],
+) -> Vec<&'a [u8]> {
+    let mut forward = Vec::new();
     let mut pos = 1usize;
     while pos + 2 <= bytes.len() {
         let size = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
@@ -137,41 +180,23 @@ pub(crate) fn shared_receiver_process_merged(client: &BasisClient, fd: RawFd, by
             client
                 .packet_diagnostics
                 .record(client.index, DropReason::InvalidMerged);
-            return;
+            return forward;
         }
         let packet = &bytes[pos..pos + size];
         pos += size;
         let property = packet.first().copied().unwrap_or_default() & 0x1f;
         if property == PacketProperty::Unreliable as u8 {
-            // Load sinks discard unreliable application data: no parse, no
-            // ACK state. A short header keeps the malformed-packet
-            // diagnostic the full parse would have recorded.
             if packet.len() < 2 {
                 client.record_unparsed_packet(packet);
             }
             continue;
         }
-        match parse_packet(packet) {
-            None => client.record_unparsed_packet(packet),
-            Some(packet)
-                if packet.property == PacketProperty::Ack
-                    && packet.payload.len() != (DEFAULT_WINDOW_SIZE - 1) / 8 + 2 =>
-            {
-                client
-                    .packet_diagnostics
-                    .record(client.index, DropReason::InvalidAckSize);
-            }
-            _ => {}
+        if shared_receiver_process_raw(client, packet) {
+            forward.push(packet);
         }
-        match property {
-            p if p == PacketProperty::Channeled as u8 && packet.len() >= 4 => {
-                shared_receiver_mark_reliable(client, packet);
-            }
-            p if p == PacketProperty::Ping as u8 && packet.len() >= 3 => {
-                let sequence = u16::from_le_bytes([packet[1], packet[2]]);
-                shared_receiver_send_pong(fd, packet[0], sequence);
-            }
-            _ => {}
+        if property == PacketProperty::Ping as u8 && packet.len() >= 3 {
+            let sequence = u16::from_le_bytes([packet[1], packet[2]]);
+            shared_receiver_send_pong(fd, packet[0], sequence);
         }
     }
     if pos != bytes.len() {
@@ -179,6 +204,84 @@ pub(crate) fn shared_receiver_process_merged(client: &BasisClient, fd: RawFd, by
             .packet_diagnostics
             .record(client.index, DropReason::InvalidMerged);
     }
+    forward
+}
+
+/// Compact unreliable entries are discarded without allocating; raw control packets
+/// survive for async dispatch, and other raw reliable entries update the ACK window.
+#[cfg(target_os = "linux")]
+pub(crate) fn shared_receiver_process_compact<'a>(
+    client: &BasisClient,
+    bytes: &'a [u8],
+) -> Vec<&'a [u8]> {
+    const LONG_LENGTH: u8 = 0x80;
+    const RAW_PACKET: u8 = 0x40;
+    let mut forward = Vec::new();
+    let mut pos = 1usize;
+    while pos < bytes.len() {
+        if bytes.len() - pos < 2 {
+            client
+                .packet_diagnostics
+                .record(client.index, DropReason::InvalidMerged);
+            return forward;
+        }
+        let tag = bytes[pos];
+        pos += 1;
+        let raw = tag & RAW_PACKET != 0;
+        if raw && tag & 0x3f != 0 {
+            client
+                .packet_diagnostics
+                .record(client.index, DropReason::InvalidMerged);
+            return forward;
+        }
+        let len = if tag & LONG_LENGTH != 0 {
+            if bytes.len() - pos < 2 {
+                client
+                    .packet_diagnostics
+                    .record(client.index, DropReason::InvalidMerged);
+                return forward;
+            }
+            let len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+            pos += 2;
+            if len <= u8::MAX as usize {
+                client
+                    .packet_diagnostics
+                    .record(client.index, DropReason::InvalidMerged);
+                return forward;
+            }
+            len
+        } else {
+            let len = bytes[pos] as usize;
+            pos += 1;
+            len
+        };
+        if len > bytes.len() - pos {
+            client
+                .packet_diagnostics
+                .record(client.index, DropReason::InvalidMerged);
+            return forward;
+        }
+        let packet = &bytes[pos..pos + len];
+        pos += len;
+        if !raw {
+            continue;
+        }
+        if len < 4
+            || !matches!(
+                PacketProperty::from_byte(packet[0]),
+                Some(PacketProperty::Ack | PacketProperty::Channeled)
+            )
+        {
+            client
+                .packet_diagnostics
+                .record(client.index, DropReason::InvalidMerged);
+            return forward;
+        }
+        if shared_receiver_process_raw(client, packet) {
+            forward.push(packet);
+        }
+    }
+    forward
 }
 
 #[cfg(target_os = "linux")]
@@ -284,19 +387,39 @@ pub(crate) fn run_shared_epoll_receiver(
                         packet_mix[property as usize] += 1;
                     }
 
-                    // Registered sockets are authenticated load sinks. Handle the overwhelmingly
-                    // common post-auth control traffic here so it never allocates/copies into the
-                    // epoll-thread -> Tokio handoff. Reliable payloads still receive protocol ACKs,
-                    // but their application data is intentionally discarded for synthetic peers.
-                    match property {
+                    // Forward only raw packets that change client state. Bulk compact
+                    // avatar entries never allocate/copy into the Tokio handoff.
+                    let control = match property {
                         p if p == PacketProperty::Merged as u8 => {
-                            shared_receiver_process_merged(&client, fd, &buffer[..len]);
-                            continue;
+                            Some(shared_receiver_process_merged(&client, fd, &buffer[..len]))
+                        }
+                        p if p == PacketProperty::CompactMerged as u8 => {
+                            Some(shared_receiver_process_compact(&client, &buffer[..len]))
                         }
                         p if p == PacketProperty::Channeled as u8 => {
-                            shared_receiver_mark_reliable(&client, &buffer[..len]);
-                            continue;
+                            Some(if shared_receiver_process_raw(&client, &buffer[..len]) {
+                                vec![&buffer[..len]]
+                            } else {
+                                Vec::new()
+                            })
                         }
+                        _ => None,
+                    };
+                    if let Some(control) = control {
+                        for packet in control {
+                            let offset = batch_data.len();
+                            batch_data.extend_from_slice(packet);
+                            batch.push(SharedReceivePacket {
+                                index,
+                                fd,
+                                client: Arc::downgrade(&client),
+                                offset,
+                                len: packet.len(),
+                            });
+                        }
+                        continue;
+                    }
+                    match property {
                         p if p == PacketProperty::Ping as u8 => {
                             if len >= 3 {
                                 let sequence = u16::from_le_bytes([buffer[1], buffer[2]]);

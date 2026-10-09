@@ -20,16 +20,18 @@ use crate::receiver::shared_receive_registration_matches;
 #[cfg(target_os = "linux")]
 use crate::receiver::shared_receiver_mark_reliable;
 #[cfg(target_os = "linux")]
+use crate::receiver::shared_receiver_process_compact;
+#[cfg(target_os = "linux")]
 use crate::receiver::shared_receiver_process_merged;
 #[cfg(target_os = "linux")]
 use crate::receiver::shared_receiver_send_mtu_ok;
 use crate::receiver::{ping_bucket_matches, shared_maintenance_loop};
 use crate::simulation::{cadence_seed, jittered_duration, worker_phase_offset, SpawnLayout};
+#[cfg(target_os = "linux")]
+use crate::transport::LITENETLIB_MAX_MTU;
 use crate::transport::{
     parse_packet, MaintenanceOptions, ReliableReceiveState, ReliableSend, PING_INTERVAL_TICKS,
 };
-#[cfg(target_os = "linux")]
-use crate::transport::{ParsedPacket, LITENETLIB_MAX_MTU};
 #[cfg(unix)]
 use crate::voice::VoiceLibrary;
 use crate::voice::{
@@ -49,7 +51,7 @@ use basis_protocol::io::{
     NetReader as ProtocolNetReader, NetWriter, NetWriter as ProtocolNetWriter,
 };
 use basis_protocol::messages::{
-    BasisDeserialize, BasisSerialize, ClientMetaDataMessage,
+    AdditionalAvatarData, BasisDeserialize, BasisSerialize, ClientMetaDataMessage,
     ClientMetaDataMessage as ProtocolClientMetaDataMessage,
 };
 use basis_protocol::version::SERVER_VERSION;
@@ -532,6 +534,7 @@ async fn test_client_with_voice_diagnostics(
         force_avatar_keyframe: AtomicBool::new(false),
         pose: Mutex::new(PoseState::new_at([0.0; 3])),
         avatar_observer: None,
+        scene_session: None,
         packet_diagnostics: PacketDiagnostics::default(),
         avatar_diagnostics: None,
         voice_diagnostics: enable_voice_diagnostics
@@ -659,6 +662,19 @@ fn connection_payload_starts_with_v55_application_auth_and_ready() {
     let auth_len = u16::from_le_bytes([payload[3], payload[4]]) as usize;
     assert_eq!(&payload[5..5 + auth_len], b"default_password");
     assert!(payload.len() > 5 + auth_len);
+}
+
+#[test]
+fn ready_message_includes_configured_additional_avatar_data() {
+    let config = Config {
+        additional_avatar_bytes: 2,
+        ..Config::default()
+    };
+    let ready = ready_message(&config, [0.0; 3]).unwrap();
+    let additional = &ready.local_avatar_sync_message.additional_avatar_datas;
+    assert_eq!(additional.len(), 1);
+    assert_eq!(additional[0].message_index, 0);
+    assert_eq!(additional[0].data.len(), 2);
 }
 
 #[test]
@@ -1252,6 +1268,78 @@ fn unity_policy_emits_high_keyframe_then_decodable_delta_and_periodic_keyframe()
         .find(|(elapsed, packet, _)| packet[1] == channels::PLAYER_AVATAR_HIGH && *elapsed >= 0.53)
         .expect("500ms keyframe deadline should emit a new keyframe");
     assert!(later_keyframe.0 >= 0.53);
+}
+
+#[test]
+fn additional_avatar_data_is_sent_on_full_and_delta_avatar_channels() {
+    let byte_count = 3;
+    let mut ordinary = PoseState::new_at([0.0; 3]);
+    let full = ordinary
+        .write_movement_datagram_with_additional(7, SystemTime::now(), false, byte_count)
+        .to_vec();
+    assert_eq!(full[1], channels::PLAYER_AVATAR_HIGH_ADDITIONAL);
+    assert_additional_avatar_tail(&full[3 + BitQuality::High.payload_len()..], 7, byte_count);
+
+    let metadata = ServerAvatarMetadata {
+        sync_interval_ms: 20,
+        base_multiplier: 1.0,
+        increase_rate: 0.0,
+        slowest_send_rate_secs: 2.5,
+        uplink_delta_enabled: true,
+    };
+    let mut pose = PoseState::new_at([0.0; 3]);
+    let mut keyframe = None;
+    let mut delta = None;
+    for frame in 0..30 {
+        let elapsed = (frame + 1) as f64 / 60.0;
+        if let Some(packet) = pose.write_unity_avatar_datagram_with_additional(
+            1.0 / 60.0,
+            elapsed,
+            metadata,
+            false,
+            20.0_f32.to_radians(),
+            byte_count,
+        ) {
+            if packet[1] == channels::PLAYER_AVATAR_HIGH_ADDITIONAL {
+                keyframe = Some(packet.to_vec());
+            } else if packet[1] == channels::DELTA_AVATAR {
+                delta = Some(packet.to_vec());
+                break;
+            }
+        }
+    }
+    let keyframe = keyframe.expect("Unity policy should begin with an additional-data keyframe");
+    assert_additional_avatar_tail(
+        &keyframe[3 + BitQuality::High.payload_len()..],
+        keyframe[2],
+        byte_count,
+    );
+    let delta = delta.expect("Unity policy should follow its keyframe with a delta");
+    assert_ne!(delta[2] & channels::DELTA_HEADER_ADDITIONAL_DATA, 0);
+    let (decoded, delta_len) = apply_delta(
+        &keyframe[3..3 + BitQuality::High.payload_len()],
+        &delta[5..],
+        BitQuality::High,
+    )
+    .unwrap();
+    assert_eq!(decoded.len(), BitQuality::High.payload_len());
+    assert_additional_avatar_tail(&delta[5 + delta_len..], delta[3], byte_count);
+}
+
+fn assert_additional_avatar_tail(bytes: &[u8], sequence: u8, byte_count: u8) {
+    let mut reader = ProtocolNetReader::new(bytes);
+    assert_eq!(reader.get_u8().unwrap(), 1);
+    assert_eq!(reader.get_u8().unwrap(), 0);
+    let data = AdditionalAvatarData::deserialize(&mut reader).unwrap();
+    assert_eq!(data.message_index, 0);
+    assert_eq!(data.data.len(), byte_count as usize);
+    assert_eq!(
+        data.data,
+        (0..byte_count)
+            .map(|offset| sequence.wrapping_add(offset.wrapping_mul(37)))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(reader.remaining(), 0);
 }
 
 #[test]
@@ -1932,19 +2020,35 @@ async fn shared_receiver_echoes_only_valid_mtu_probe() {
 async fn shared_receive_keeps_one_reliable_window_across_merged_and_compact_packets() {
     let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let client = test_client(1, server.local_addr().unwrap()).await;
-    let channel_id =
-        DeliveryMethod::channel_id(channels::AUTH_IDENTITY, DeliveryMethod::ReliableOrdered);
+    let channel_id = DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
 
-    // The shared epoll fast path handles Merged reliably, but it must update the same
-    // persistent window as CompactMerged packets that fall through to handle_packet.
+    // The shared epoll fast path handles Merged and CompactMerged reliably, updating
+    // the same persistent window while discarding application payload for load sinks.
     let seq1 = vec![PacketProperty::Channeled as u8, 1, 0, channel_id, 0];
     shared_receiver_mark_reliable(&client, &seq1);
     let seq2 = vec![PacketProperty::Channeled as u8, 2, 0, channel_id, 0];
     let mut merged = vec![PacketProperty::Merged as u8];
     merged.extend_from_slice(&(seq2.len() as u16).to_le_bytes());
     merged.extend_from_slice(&seq2);
-    shared_receiver_process_merged(&client, client.socket.as_raw_fd(), &merged);
+    assert!(shared_receiver_process_merged(&client, client.socket.as_raw_fd(), &merged).is_empty());
     assert!(client.ack_pending.load(Ordering::Relaxed));
+
+    // Compact unreliable-only traffic remains allocation-free and produces no handoff.
+    let compact_unreliable = [
+        PacketProperty::CompactMerged as u8,
+        channels::PLAYER_AVATAR_HIGH,
+        1,
+        7,
+    ];
+    assert!(shared_receiver_process_compact(&client, &compact_unreliable).is_empty());
+
+    // A CompactMerged raw SCENE packet participates in the same ACK bitmap.
+    let scene_channel =
+        DeliveryMethod::channel_id(channels::SCENE, DeliveryMethod::ReliableOrdered);
+    let seq3 = vec![PacketProperty::Channeled as u8, 3, 0, scene_channel, 0];
+    let mut compact = vec![PacketProperty::CompactMerged as u8, 0x40, seq3.len() as u8];
+    compact.extend_from_slice(&seq3);
+    assert!(shared_receiver_process_compact(&client, &compact).is_empty());
 
     let clients = Arc::new(Mutex::new(vec![Arc::clone(&client)]));
     let refresh = Arc::new(Notify::new());
@@ -1956,8 +2060,8 @@ async fn shared_receive_keeps_one_reliable_window_across_merged_and_compact_pack
         async move { shared_maintenance_loop(clients, refresh, shutdown).await }
     });
 
-    // The old stateless path immediately emitted header window 1 here. The persistent
-    // window instead flushes header 0 with bit 1 after the shared 15 ms maintenance tick.
+    // The persistent window flushes header 0 with bits 1, 2 and 3 after the shared
+    // maintenance tick, even though sequence zero has not arrived yet.
     let mut buffer = [0u8; 2048];
     let len = time::timeout(Duration::from_secs(1), server.recv(&mut buffer))
         .await
@@ -1975,55 +2079,22 @@ async fn shared_receive_keeps_one_reliable_window_across_merged_and_compact_pack
     assert_eq!(buffer[3], channel_id);
     assert_eq!(buffer[4] & 0b110, 0b110);
 
-    // Sequence zero arrives as a CompactMerged raw entry and must be treated as new,
-    // dispatched to the auth handler, and included in the same ACK window.
-    let mut challenge = NetWriter::default();
-    challenge
-        .put_bytes_with_length(b"csharp-challenge")
+    let len = time::timeout(Duration::from_secs(1), server.recv(&mut buffer))
+        .await
+        .unwrap()
         .unwrap();
-    let mut seq0 = vec![PacketProperty::Channeled as u8, 0, 0, channel_id];
-    seq0.extend_from_slice(&challenge.into_vec());
-    let mut compact = vec![PacketProperty::CompactMerged as u8, 0x40, seq0.len() as u8];
-    compact.extend_from_slice(&seq0);
-    client.handle_packet(&compact).await.unwrap();
+    assert_eq!(
+        parse_packet(&buffer[..len]).unwrap().property,
+        PacketProperty::Ack
+    );
+    assert_eq!(buffer[3], scene_channel);
+    assert_eq!(buffer[4] & 0b1000, 0b1000);
 
-    let mut saw_auth_response = false;
-    let mut saw_recovered_ack = false;
-    while !(saw_auth_response && saw_recovered_ack) {
-        let len = time::timeout(Duration::from_secs(1), server.recv(&mut buffer))
-            .await
-            .unwrap()
-            .unwrap();
-        match parse_packet(&buffer[..len]).unwrap() {
-            ParsedPacket {
-                property: PacketProperty::Channeled,
-                channel_id: Some(id),
-                payload,
-                ..
-            } if id == channel_id => {
-                assert!(
-                    payload.len() >= 68 && u16::from_le_bytes([payload[0], payload[1]]) == 64,
-                    "sequence-zero auth challenge must produce a signature response"
-                );
-                saw_auth_response = true;
-            }
-            ParsedPacket {
-                property: PacketProperty::Ack,
-                sequence: Some(0),
-                channel_id: Some(id),
-                payload,
-                ..
-            } if id == channel_id => {
-                assert_eq!(payload[0] & 0b11, 0b11);
-                saw_recovered_ack = true;
-            }
-            _ => {}
-        }
-    }
-
-    // A duplicate CompactMerged packet is ACKed from the accumulated window but does not
-    // dispatch another auth response.
-    client.handle_packet(&compact).await.unwrap();
+    // A duplicate CompactMerged packet is ACKed from the accumulated window.
+    assert!(shared_receiver_process_compact(&client, &compact).is_empty());
+    assert!(client.ack_pending.load(Ordering::Relaxed));
+    client.ack_pending.store(false, Ordering::Relaxed);
+    client.flush_acks().await.unwrap();
     let len = time::timeout(Duration::from_secs(1), server.recv(&mut buffer))
         .await
         .unwrap()
@@ -2036,12 +2107,100 @@ async fn shared_receive_keeps_one_reliable_window_across_merged_and_compact_pack
         time::timeout(Duration::from_millis(40), server.recv(&mut buffer))
             .await
             .is_err(),
-        "a duplicate must not trigger a second auth response"
+        "discardable reliable payloads must never reach application dispatch"
     );
 
     shutdown.store(true, Ordering::Relaxed);
     refresh.notify_one();
     let _ = time::timeout(Duration::from_secs(1), task).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shared_receive_hands_critical_reliable_packets_to_normal_dispatch() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(1, server.local_addr().unwrap()).await;
+
+    let mut metadata = ProtocolNetWriter::new();
+    ProtocolClientMetaDataMessage {
+        player_uuid: "test-uuid".to_string(),
+        player_display_name: "test".to_string(),
+        player_platform: "Headless".to_string(),
+    }
+    .serialize(&mut metadata)
+    .unwrap();
+    metadata.put_i32(20);
+    metadata.put_i32(1);
+    metadata.put_f32(0.0);
+    metadata.put_f32(2.5);
+    metadata.put_i32(1500);
+    metadata.put_bytes_with_length(&[]).unwrap();
+    metadata.put_u16(0);
+    metadata.put_u8(1);
+
+    let auth_channel =
+        DeliveryMethod::channel_id(channels::AUTH_IDENTITY, DeliveryMethod::ReliableOrdered);
+    let metadata_channel =
+        DeliveryMethod::channel_id(channels::META_DATA, DeliveryMethod::ReliableOrdered);
+    let delta_channel =
+        DeliveryMethod::channel_id(channels::DELTA_AVATAR, DeliveryMethod::ReliableOrdered);
+
+    client
+        .send_reliable_ordered(channels::AUTH_IDENTITY, b"pending-ack")
+        .await
+        .unwrap();
+
+    let mut auth_payload = NetWriter::default();
+    auth_payload.put_bytes_with_length(b"challenge").unwrap();
+    let auth = [
+        vec![PacketProperty::Channeled as u8, 0, 0, auth_channel],
+        auth_payload.into_vec(),
+    ]
+    .concat();
+    let metadata_packet = [
+        vec![PacketProperty::Channeled as u8, 0, 0, metadata_channel],
+        metadata.into_vec(),
+    ]
+    .concat();
+    let mut ack = vec![PacketProperty::Ack as u8, 0, 0, auth_channel];
+    let mut ack_bits = vec![0; (basis_transport::DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
+    ack_bits[0] = 1;
+    ack.extend_from_slice(&ack_bits);
+
+    let mut merged = vec![PacketProperty::Merged as u8];
+    for packet in [&ack[..], &auth[..], &metadata_packet[..]] {
+        merged.extend_from_slice(&(packet.len() as u16).to_le_bytes());
+        merged.extend_from_slice(packet);
+    }
+    let handoff = shared_receiver_process_merged(&client, client.socket.as_raw_fd(), &merged);
+    assert_eq!(handoff, vec![&ack[..], &auth[..], &metadata_packet[..]]);
+    assert!(client.metadata_state().is_none());
+    assert!(!client.ack_pending.load(Ordering::Relaxed));
+    client.handle_packet(handoff[0]).await.unwrap();
+    assert!(
+        client.pending_reliable.lock().await.is_empty(),
+        "the ACK handed out of Merged must release the matching send-window packet"
+    );
+    for packet in handoff.into_iter().skip(1) {
+        client.handle_packet(packet).await.unwrap();
+    }
+    assert!(client.metadata_state().is_some());
+    assert!(client.ack_pending.load(Ordering::Relaxed));
+
+    let delta = [
+        PacketProperty::Channeled as u8,
+        0,
+        0,
+        delta_channel,
+        channels::DELTA_CONTROL_UPLINK_KEYFRAME_REQUEST,
+    ];
+    let mut compact = vec![PacketProperty::CompactMerged as u8, 0x40, delta.len() as u8];
+    compact.extend_from_slice(&delta);
+    let handoff = shared_receiver_process_compact(&client, &compact);
+    assert_eq!(handoff, vec![&delta[..]]);
+    assert!(!client.reliable_receive_state().unwrap().started[delta_channel as usize]);
+    client.handle_packet(handoff[0]).await.unwrap();
+    assert!(client.force_avatar_keyframe.load(Ordering::Acquire));
 }
 
 #[tokio::test]
@@ -2319,6 +2478,38 @@ async fn connect_accept_filters_non_observers_only() {
         .unwrap()
         .unwrap();
     assert_eq!(&buffer[..load_sink_len], merged);
+
+    // CompactMerged can contain raw Channeled and Ack entries alongside
+    // compact Unreliable avatar entries. Load sinks need those reliable
+    // control packets for metadata and reliable-window progress.
+    let raw_metadata = [PacketProperty::Channeled as u8, 0, 0, channel_id, 42];
+    let raw_ack = [PacketProperty::Ack as u8, 0, 0, channel_id, 1];
+    let compact = [
+        vec![
+            PacketProperty::CompactMerged as u8,
+            channels::PLAYER_AVATAR_HIGH,
+            1,
+            7,
+        ],
+        vec![0x40, raw_metadata.len() as u8],
+        raw_metadata.to_vec(),
+        vec![0x40, raw_ack.len() as u8],
+        raw_ack.to_vec(),
+    ]
+    .concat();
+    server
+        .send_to(&compact, load_sink.socket.local_addr().unwrap())
+        .await
+        .unwrap();
+    let load_sink_len = time::timeout(Duration::from_secs(1), load_sink.socket.recv(&mut buffer))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        &buffer[..load_sink_len],
+        compact,
+        "the load-sink kernel filter must admit CompactMerged raw control entries"
+    );
 }
 
 #[tokio::test]
@@ -2956,4 +3147,26 @@ async fn profile_750_clients_framing_cpu() {
         100.0 * (compact_best.as_secs_f64() / merged_best.as_secs_f64() - 1.0),
         (compact_best.as_nanos() as f64 - merged_best.as_nanos() as f64) / total_packets / 1000.0,
     );
+}
+
+#[test]
+fn additional_avatar_payload_boundaries_and_sequence_wrap_do_not_leave_stale_bytes() {
+    let mut pose = PoseState::new_at([0.0; 3]);
+    for (sequence, size) in [(255, 255), (0, 1), (1, 0), (2, 255)] {
+        let packet =
+            pose.write_movement_datagram_with_additional(sequence, SystemTime::now(), false, size);
+        assert_eq!(
+            packet.len(),
+            3 + BitQuality::High.payload_len() + if size > 0 { 4 + size as usize } else { 0 }
+        );
+        if size > 0 {
+            assert_additional_avatar_tail(
+                &packet[3 + BitQuality::High.payload_len()..],
+                sequence,
+                size,
+            );
+        } else {
+            assert_eq!(packet[1], channels::PLAYER_AVATAR_HIGH);
+        }
+    }
 }

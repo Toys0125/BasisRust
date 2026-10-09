@@ -317,3 +317,138 @@ async fn actual_clients_forward_avatar_state_and_exact_opus_payload_to_other_pee
         })
         .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scene_script_payloads_survive_unreliable_and_reliable_relay() {
+    for reliable in [false, true] {
+        let mut args = vec![
+            "--scene-data-bytes",
+            "64",
+            "--scene-data-interval-ms",
+            "20",
+            "--observe-scene-csv",
+            "scene.csv",
+        ];
+        if reliable {
+            args.push("--scene-data-reliable");
+        }
+        Live::start_with_args("default_password", 2, false, Fault::None, &args)
+            .await
+            .run(move |live| {
+                Box::pin(async move {
+                    let deadline = Instant::now() + LIMIT;
+                    let mut uplinks = HashSet::new();
+                    let mut senders = HashSet::new();
+                    while senders.len() < 2 {
+                        let packet = live.next(deadline).await;
+                        let offset = if reliable && packet.channeled(channels::SCENE) {
+                            4
+                        } else if !reliable
+                            && packet.property() == PacketProperty::Unreliable
+                            && packet.bytes[1] == channels::SCENE
+                        {
+                            2
+                        } else {
+                            continue;
+                        };
+                        let body = &packet.bytes[offset..];
+                        assert_eq!(body.len(), 68);
+                        if packet.from_server {
+                            assert_eq!(&body[2..4], &60000u16.to_le_bytes());
+                            assert!(uplinks.contains(&body[4..]), "relay changed script bytes");
+                            senders.insert(u16::from_le_bytes(body[..2].try_into().unwrap()));
+                        } else {
+                            assert_eq!(&body[..2], &60000u16.to_le_bytes());
+                            assert_eq!(&body[2..4], &[0, 0], "expected broadcast recipient list");
+                            uplinks.insert(body[4..].to_vec());
+                        }
+                    }
+                    // The capture precedes socket delivery. Wait for further sends before shutdown.
+                    for _ in 0..4 {
+                        live.next(deadline).await;
+                    }
+                    live.finish().await;
+                    let csv = std::fs::read_to_string(live.dir.path().join("scene.csv")).unwrap();
+                    let metric = |name: &str| -> u64 {
+                        csv.lines()
+                            .find_map(|l| l.strip_prefix(&format!("{name},")))
+                            .unwrap()
+                            .parse()
+                            .unwrap()
+                    };
+                    assert!(
+                        metric("received_messages") > 0,
+                        "client did not observe scene relay: {csv}"
+                    );
+                    assert_eq!(metric("observed_senders"), 1);
+                    assert_eq!(metric("malformed_messages"), 0);
+                    assert_eq!(metric("send_errors"), 0);
+                })
+            })
+            .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn additional_avatar_data_survives_real_client_fanout() {
+    Live::start_with_args(
+        "default_password",
+        2,
+        true,
+        Fault::None,
+        &["--additional-avatar-bytes", "32"],
+    )
+    .await
+    .run(|live| {
+        Box::pin(async move {
+            let deadline = Instant::now() + LIMIT;
+            let mut uplinks = HashSet::new();
+            let mut senders = HashSet::new();
+            while senders.len() < 2 {
+                let packet = live.next(deadline).await;
+                if packet.property() != PacketProperty::Unreliable
+                    || packet.bytes[1] != channels::PLAYER_AVATAR_HIGH_ADDITIONAL
+                {
+                    continue;
+                }
+                let (pose_start, seq_offset) = if packet.from_server { (5, 4) } else { (3, 2) };
+                assert_eq!(packet.bytes.len(), pose_start + 159 + 4 + 32);
+                let tail = &packet.bytes[pose_start + 159..];
+                assert_eq!(&tail[..4], &[1, 0, 32, 0]);
+                let update = (
+                    packet.bytes[seq_offset],
+                    packet.bytes[pose_start..].to_vec(),
+                );
+                if packet.from_server {
+                    if uplinks.contains(&update) {
+                        senders.insert(packet.bytes[2]);
+                    }
+                } else {
+                    uplinks.insert(update);
+                }
+            }
+            // Captures precede delivery; require later fanout before shutdown.
+            live.until(|p| {
+                p.from_server
+                    && p.property() == PacketProperty::Unreliable
+                    && p.bytes[1] == channels::PLAYER_AVATAR_HIGH_ADDITIONAL
+            })
+            .await;
+            live.finish().await;
+            let csv = std::fs::read_to_string(live.dir.path().join("avatar.csv")).unwrap();
+            let applied: u64 = csv
+                .lines()
+                .find_map(|l| l.strip_prefix("applied_full_items,"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(
+                applied > 0,
+                "observer did not apply additional avatar state: {csv}"
+            );
+            assert!(csv.contains("decode_errors,0"));
+            assert!(csv.contains("malformed_items,0"));
+        })
+    })
+    .await;
+}

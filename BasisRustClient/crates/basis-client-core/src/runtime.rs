@@ -89,8 +89,23 @@ pub async fn run(
     };
     let _ = signal_ready_rx.await;
     info!("tokio runtime workers={worker_threads}");
+    anyhow::ensure!(
+        args.scene_data_bytes == 0 || (24..=1024).contains(&args.scene_data_bytes),
+        "scene data bytes must be 0 or 24..=1024"
+    );
+    anyhow::ensure!(
+        args.scene_data_interval_ms > 0,
+        "scene interval must be positive"
+    );
     let config_path = args.config.clone();
     let mut config = Config::load_or_create(&config_path, args.strict_config)?;
+    config.additional_avatar_bytes = args.additional_avatar_bytes;
+    config.scene_session = (args.scene_data_bytes > 0).then(|| {
+        Arc::new(crate::scene::SceneSession::new(
+            args.scene_data_bytes,
+            args.scene_start_file.clone(),
+        ))
+    });
     if let Some(ip) = args.ip {
         config.ip = ip;
     }
@@ -143,6 +158,7 @@ pub async fn run(
     let voice_reencode = !args.no_voice_reencode;
     let cadence = CadenceOptions {
         sync_batching: args.sync_batching,
+        additional_avatar_bytes: config.additional_avatar_bytes,
         unity_avatar_policy: args.unity_avatar_policy,
         unity_frame_rate: args.unity_frame_rate,
         unity_pose_amplitude_radians: args.unity_pose_amplitude_degrees.to_radians(),
@@ -315,6 +331,15 @@ pub async fn run(
     if !args.no_movement && !shutdown.load(Ordering::Relaxed) {
         movement_workers(managed_clients.clone(), shutdown.clone(), cadence).await;
     }
+    let scene_task = config.scene_session.as_ref().map(|session| {
+        tokio::spawn(crate::scene::run(
+            managed_clients.clone(),
+            shutdown.clone(),
+            session.clone(),
+            Duration::from_millis(args.scene_data_interval_ms),
+            args.scene_data_reliable,
+        ))
+    });
     let avatar_diagnostic_task = if ClientAvatarDiagnostics::enabled_from_env() {
         match (
             config.observe_avatar_start_file.clone(),
@@ -483,6 +508,12 @@ pub async fn run(
             Ok(Err(error)) => warn!("voice diagnostic window failed: {error:#}"),
             Err(error) => warn!("voice diagnostic task failed: {error}"),
         }
+    }
+    if let Some(task) = scene_task {
+        task.await.context("scene workload worker failed")?;
+    }
+    if let (Some(path), Some(session)) = (&args.observe_scene_csv, &config.scene_session) {
+        session.write_csv(path)?;
     }
     if let Some(task) = avatar_diagnostic_task {
         match task.await {
