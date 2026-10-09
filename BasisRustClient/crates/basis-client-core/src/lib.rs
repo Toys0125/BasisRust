@@ -14,6 +14,7 @@ mod packet_diagnostics;
 mod population;
 mod receiver;
 mod runtime;
+mod scene;
 mod simulation;
 mod strict_config;
 mod transport;

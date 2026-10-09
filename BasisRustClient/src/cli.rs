@@ -28,6 +28,23 @@ pub(crate) struct Args {
     reconnect_max_secs: u64,
     #[arg(long)]
     no_movement: bool,
+    /// Bytes per synthetic AdditionalAvatarData item; 0 disables it.
+    #[arg(long, default_value_t = 0)]
+    additional_avatar_bytes: u8,
+    /// Bytes per synthetic prop/scene script payload (24..=1024); 0 disables it.
+    #[arg(long, default_value_t = 0)]
+    scene_data_bytes: usize,
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u64).range(1..))]
+    scene_data_interval_ms: u64,
+    /// Send scene scripts over ReliableOrdered instead of Unreliable.
+    #[arg(long)]
+    scene_data_reliable: bool,
+    /// Write scene throughput, integrity, coverage, and latency metrics at shutdown.
+    #[arg(long)]
+    observe_scene_csv: Option<PathBuf>,
+    /// Begin scene sends when this marker file exists.
+    #[arg(long)]
+    scene_start_file: Option<PathBuf>,
     /// Use synchronized worker batches instead of the default per-client randomized cadence.
     #[arg(long)]
     sync_batching: bool,
@@ -116,6 +133,12 @@ impl From<Args> for ClientOptions {
             reconnect_min_secs: args.reconnect_min_secs,
             reconnect_max_secs: args.reconnect_max_secs,
             no_movement: args.no_movement,
+            additional_avatar_bytes: args.additional_avatar_bytes,
+            scene_data_bytes: args.scene_data_bytes,
+            scene_data_interval_ms: args.scene_data_interval_ms,
+            scene_data_reliable: args.scene_data_reliable,
+            observe_scene_csv: args.observe_scene_csv,
+            scene_start_file: args.scene_start_file,
             sync_batching: args.sync_batching,
             unity_avatar_policy: args.unity_avatar_policy,
             unity_frame_rate: args.unity_frame_rate,

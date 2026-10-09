@@ -1,3 +1,4 @@
+use crate::wire::append_synthetic_additional_avatar_data;
 use anyhow::Result;
 use basis_protocol::avatar::{compress_scale, write_neutral_rotation_region, BitQuality};
 use basis_protocol::avatar_delta::build_delta;
@@ -197,18 +198,39 @@ impl PoseState {
         self.datagram[3..].to_vec()
     }
 
+    #[cfg(test)]
     pub(crate) fn write_movement_datagram(
         &mut self,
         sequence: u8,
         start: SystemTime,
         allow_position_drift: bool,
     ) -> &[u8] {
+        self.write_movement_datagram_with_additional(sequence, start, allow_position_drift, 0)
+    }
+
+    pub(crate) fn write_movement_datagram_with_additional(
+        &mut self,
+        sequence: u8,
+        start: SystemTime,
+        allow_position_drift: bool,
+        additional_avatar_bytes: u8,
+    ) -> &[u8] {
         let elapsed = start.elapsed().unwrap_or_default().as_secs_f32();
         self.update_dynamic_payload_with_drift(elapsed, allow_position_drift);
         self.datagram[2] = sequence;
+        self.datagram.truncate(3 + BitQuality::High.payload_len());
+        let has_additional = additional_avatar_bytes > 0;
+        self.datagram[1] =
+            channels::player_avatar_channel_for_quality(BitQuality::High as u8, has_additional);
+        append_synthetic_additional_avatar_data(
+            &mut self.datagram,
+            additional_avatar_bytes,
+            sequence,
+        );
         &self.datagram
     }
 
+    #[cfg(test)]
     pub(crate) fn write_unity_avatar_datagram(
         &mut self,
         frame_delta_secs: f64,
@@ -216,6 +238,25 @@ impl PoseState {
         metadata: ServerAvatarMetadata,
         force_keyframe: bool,
         pose_amplitude_radians: f32,
+    ) -> Option<&[u8]> {
+        self.write_unity_avatar_datagram_with_additional(
+            frame_delta_secs,
+            elapsed_secs,
+            metadata,
+            force_keyframe,
+            pose_amplitude_radians,
+            0,
+        )
+    }
+
+    pub(crate) fn write_unity_avatar_datagram_with_additional(
+        &mut self,
+        frame_delta_secs: f64,
+        elapsed_secs: f64,
+        metadata: ServerAvatarMetadata,
+        force_keyframe: bool,
+        pose_amplitude_radians: f32,
+        additional_avatar_bytes: u8,
     ) -> Option<&[u8]> {
         if force_keyframe {
             self.unity.force_keyframe = true;
@@ -309,7 +350,11 @@ impl PoseState {
         self.datagram.clear();
         self.datagram.push(PacketProperty::Unreliable as u8);
         if keyframe {
-            self.datagram.push(channels::PLAYER_AVATAR_HIGH);
+            self.datagram
+                .push(channels::player_avatar_channel_for_quality(
+                    BitQuality::High as u8,
+                    additional_avatar_bytes > 0,
+                ));
             self.datagram.push(sequence);
             self.datagram.extend_from_slice(&current);
             if metadata.uplink_delta_enabled {
@@ -321,11 +366,23 @@ impl PoseState {
             self.unity.force_keyframe = false;
         } else if let Some(delta) = delta_body {
             self.datagram.push(channels::DELTA_AVATAR);
-            self.datagram.push(BitQuality::High as u8);
+            self.datagram.push(
+                BitQuality::High as u8
+                    | if additional_avatar_bytes > 0 {
+                        channels::DELTA_HEADER_ADDITIONAL_DATA
+                    } else {
+                        0
+                    },
+            );
             self.datagram.push(sequence);
             self.datagram.push(self.unity.keyframe_sequence);
             self.datagram.extend_from_slice(&delta);
         }
+        append_synthetic_additional_avatar_data(
+            &mut self.datagram,
+            additional_avatar_bytes,
+            sequence,
+        );
         self.unity.sequence = self.unity.sequence.wrapping_add(1);
         self.unity.last_sent_payload.clone_from(&current);
         self.unity.last_sent_angles = angles;

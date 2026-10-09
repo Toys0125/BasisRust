@@ -71,6 +71,16 @@ pub struct Live {
 
 impl Live {
     pub async fn start(password: &str, clients: usize, traffic: bool, fault: Fault) -> Self {
+        Self::start_with_args(password, clients, traffic, fault, &[]).await
+    }
+
+    pub async fn start_with_args(
+        password: &str,
+        clients: usize,
+        traffic: bool,
+        fault: Fault,
+        extra_args: &[&str],
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let config = ServerConfig {
             set_port: 0,
@@ -165,6 +175,7 @@ impl Live {
         } else {
             command.arg("--no-movement");
         }
+        command.args(extra_args);
         let child = command.spawn().unwrap();
         Self {
             server,
