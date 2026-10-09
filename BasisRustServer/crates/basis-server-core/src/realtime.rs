@@ -168,6 +168,11 @@ fn voice_allowed(state: &ServerState, peer: PeerId, shout: bool) -> bool {
             ))
 }
 
+fn should_relay_voice_to_recipient(shout: bool, is_offloaded: impl FnOnce() -> bool) -> bool {
+    // P2P carries spatial voice; upstream announce voice is a non-spatial broadcast relayed to all.
+    shout || !is_offloaded()
+}
+
 pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> {
     let voice = Arc::new(VoiceInbox::default());
     let avatars = Arc::new(Mutex::new(HashMap::<PeerId, AvatarPending>::new()));
@@ -404,7 +409,9 @@ fn voice_loop(state: &ServerState, inbox: &VoiceInbox, lanes: &[Arc<SendLane>]) 
                 for recipient in recipients {
                     if recipient == peer
                         || !sessions.contains_key(&recipient)
-                        || (!shout && state.p2p_broker.is_offloaded(peer, recipient))
+                        || !should_relay_voice_to_recipient(shout, || {
+                            state.p2p_broker.is_offloaded(peer, recipient)
+                        })
                     {
                         continue;
                     }
@@ -551,7 +558,9 @@ fn send_loop(state: &ServerState, transport: &TransportHandle, lane: &SendLane, 
                 let first_frame = frame_refs.len();
                 frame_refs.extend(frames);
                 for recipient in &group.targets[index] {
-                    if !group.shout && state.p2p_broker.is_offloaded(group.peer, *recipient) {
+                    if !should_relay_voice_to_recipient(group.shout, || {
+                        state.p2p_broker.is_offloaded(group.peer, *recipient)
+                    }) {
                         continue;
                     }
                     let sends = &mut packets[*recipient as usize];
@@ -865,5 +874,13 @@ mod tests {
             1000 - VOICE_BATCHES_PER_LANE as u64
         );
         assert_eq!(lane.pending.lock().len(), VOICE_BATCHES_PER_LANE);
+    }
+
+    #[test]
+    fn offloaded_pair_keeps_spatial_voice_off_relay_but_relays_shout() {
+        assert!(!should_relay_voice_to_recipient(false, || true));
+        assert!(should_relay_voice_to_recipient(true, || panic!(
+            "shout must skip P2P lookup"
+        )));
     }
 }

@@ -64,8 +64,10 @@ Raw evidence is retained locally under **`captures/voice-1000-20261005/`**: froz
 Build the separate server and client workspaces with `cargo build --locked --release --jobs 2`. From the repository root, run:
 
 ```powershell
-python scripts/perf/run-windows-voice-workload.py --audio-folder 'C:\Users\mgsta\Desktop\Temp\Basis\AudioClips' --output captures/voice-1000-repeat
+python scripts/perf/run-windows-voice-workload.py --audio-folder 'C:\path\to\audio-corpus' --output captures/voice-1000-repeat
 ```
+
+Replace `C:\path\to\audio-corpus` with your local source-audio folder. Reproducing the recorded comparison requires the same 40 source clips; another corpus produces a different workload. The harness encodes the clips and records source/encoded hashes in its audio manifest.
 
 The reusable suite now applies a 24 GiB server working-set limit to both voice conditions and monitors warmup. For an exact uncapped 100-speaker control, use the [lower-level runner](../../scripts/perf/run-windows-avatar-workload.py) with `--max-server-working-set-mib 0`; its other settings and frozen binary paths are in the captured `commands.txt`. The [analyzer](../../scripts/perf/analyze-windows-voice.py) verifies byte matching, sampled decoding, delivery counters, and capacity checks. Three focused Rust diagnostic tests, Python compile checks, formatting, and the live preflight passed. A separate four-client guard smoke test with a deliberately tiny limit verified early warmup, controlled stop, clean client exit, and analysis of a single-sample partial capture; it is not included in the capacity measurements.
 

@@ -7,6 +7,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import pathlib
 import shutil
 import struct
@@ -22,6 +23,12 @@ spec.loader.exec_module(runner)
 def rows(path):
     with path.open(newline="", encoding="utf-8-sig") as stream:
         return list(csv.DictReader(stream))
+
+
+def server_controlled_stop(exit_code, platform_name=None):
+    platform_name = os.name if platform_name is None else platform_name
+    accepted = (0, 3221225786) if platform_name == "nt" else (0, -2)
+    return exit_code in accepted
 
 
 def crc_ogg(data):
@@ -66,13 +73,30 @@ def validate_samples(path, audio_folder):
         mismatches += hashlib.sha256(packet).digest() not in hashes
         groups[peer].append((packet, duration))
     results = []
+    if not groups:
+        return {"sampled_sources": 0, "sampled_packets": 0, "payload_mismatches": mismatches,
+                "decodes": results, "valid": False, "error": "no sampled voice packets"}
     ffmpeg, rtk = shutil.which("ffmpeg"), shutil.which("rtk")
+    missing = [name for name, value in (("ffmpeg", ffmpeg), ("rtk", rtk)) if not value]
+    if missing:
+        error = "required decode tool(s) unavailable: " + ", ".join(missing)
+        return {"sampled_sources": len(groups), "sampled_packets": sum(map(len, groups.values())),
+                "payload_mismatches": mismatches,
+                "decodes": [{"peer": peer, "packets": len(packets), "valid": False, "error": error}
+                            for peer, packets in sorted(groups.items())],
+                "valid": False, "error": error}
     for peer, packets in sorted(groups.items()):
         sample = path / f"received-peer-{peer}.ogg"
         sample.write_bytes(opus_ogg(packets))
         command = [rtk, "proxy", ffmpeg, "-hide_banner", "-loglevel", "error", "-xerror", "-err_detect", "explode",
                    "-i", str(sample), "-f", "f32le", "pipe:1"]
-        decoded = subprocess.run(command, capture_output=True)
+        try:
+            decoded = subprocess.run(command, capture_output=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            results.append({"peer": peer, "packets": len(packets), "duration_ms": sum(duration for _, duration in packets),
+                            "decode_exit_code": None, "decode_errors": "ffmpeg decode timed out after 60 seconds",
+                            "finite_samples": False, "non_silent": False, "valid": False})
+            continue
         expected_bytes = sum(duration for _, duration in packets) * 48 * 4
         samples = struct.unpack(f"<{len(decoded.stdout) // 4}f", decoded.stdout) if len(decoded.stdout) % 4 == 0 else ()
         finite = all(math.isfinite(value) for value in samples)
@@ -188,7 +212,7 @@ def summarize(path, audio_folder):
         "avatar_window_complete": observer.get("window_started") == "true" and int(observer["window_ms"]) == meta["measurement_window_seconds"] * 1000,
         "observer_avatar_peers_complete": int(observer["near_peers"]) == meta["clients"] - 1,
         "client_clean_exit": meta["client_exit_code"] == 0,
-        "server_controlled_stop": meta["server_exit_code"] in (0, 3221225786),
+        "server_controlled_stop": server_controlled_stop(meta["server_exit_code"], meta.get("os_name", "nt")),
         "zero_non_reliable_drops": all((item["droppedUnreliable"] if csharp else item.get("transport", {}).get("nonReliableDroppedDatagrams", 0)) == 0 for item in health),
     }
     unavailable_checks = []

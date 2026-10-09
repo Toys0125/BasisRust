@@ -937,11 +937,25 @@ impl ServerState {
             .filter_map(|peer| self.transport.peer_session(peer.id))
             .collect::<Vec<_>>();
         for session in sessions {
-            if self
+            let retired = match self
                 .transport
                 .disconnect_session(&session, "Server shutting down")
-                .await?
+                .await
             {
+                Ok(retired) => retired,
+                Err(err) => {
+                    // A disconnect error must not skip the remaining teardown or final save.
+                    // Only Ok(true) grants ownership of the session cleanup.
+                    error!("failed to retire session during shutdown: {err:#}");
+                    if worker_result.is_ok() {
+                        worker_result = Err(anyhow::anyhow!(
+                            "disconnecting session during shutdown: {err:#}"
+                        ));
+                    }
+                    false
+                }
+            };
+            if retired {
                 session.wait_for_read_leases().await;
                 handle_disconnect(self, &session, DisconnectReason::Remote).await;
             }

@@ -16,10 +16,12 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Test voice analyzer and workload receive configuration
         run: python3 -m unittest discover -s scripts/perf -p 'test_*voice*.py'
-      - name: Test avatar calibration defaults and measured rates
-        run: python3 -m unittest discover -s scripts/perf -p 'test_avatar_calibration.py'
+      - name: Test avatar calibration, tuning and transmit metrics
+        run: python3 -m unittest discover -s scripts/perf -p 'test_avatar_*.py'
 
   client-windows:
     name: Client check, test, clippy (Windows)
@@ -29,6 +31,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -50,6 +54,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Test atomic database replacement and failure recovery
@@ -62,6 +68,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -96,6 +104,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

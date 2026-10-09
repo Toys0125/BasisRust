@@ -2,6 +2,7 @@ import importlib.util
 import csv
 import json
 import pathlib
+import struct
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -89,7 +90,8 @@ class AnalyzeReceiptMetricsTests(unittest.TestCase):
             capture = pathlib.Path(temporary)
             (capture / "workload.json").write_text(json.dumps({
                 "clients": 2, "voice": True, "voice_speaker_percent": 100,
-                "measurement_window_seconds": 1, "client_exit_code": 0, "server_exit_code": 0,
+                "measurement_window_seconds": 1, "client_exit_code": 0, "server_exit_code": -2,
+                "os_name": "posix",
             }))
             self._csv(capture / "observer.csv", [
                 ["window_started", "true"], ["window_ms", "1000"], ["near_peers", "1"],
@@ -139,16 +141,63 @@ class AnalyzeReceiptMetricsTests(unittest.TestCase):
             ])
             self._csv(capture / "voice.gaps.csv", [["gap_floor_ms", "count"], ["20", "100"]])
 
-            with patch.object(analyzer, "validate_samples", return_value={"valid": True}):
+            with patch.object(analyzer, "validate_samples", return_value={"valid": True}), \
+                 patch.object(analyzer, "server_controlled_stop", wraps=analyzer.server_controlled_stop) as stop_check, \
+                 patch.object(analyzer.os, "name", "nt"):
                 result = analyzer.summarize(capture, capture)
 
         self.assertTrue(result["valid"])
+        stop_check.assert_called_once_with(-2, "posix")
+        self.assertTrue(result["checks"]["server_controlled_stop"])
         self.assertTrue(result["checks"]["all_clients_unique_receipt_records_complete"])
         self.assertTrue(result["capacity_checks"]["workload_validation_passed"])
         self.assertFalse(result["capacity_pass"])
         self.assertFalse(result["voice_delivery_checks"]["zero_voice_reordered_packets"])
         self.assertFalse(result["voice_delivery_checks"]["zero_voice_ambiguous_sequences"])
         self.assertFalse(result["voice_delivery_checks"]["voice_unique_receipt_metrics_available"])
+
+    def test_voice_decode_reports_missing_tools(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = pathlib.Path(temporary)
+            audio = capture / "audio"
+            audio.mkdir()
+            (capture / "voice.sample.bin").write_bytes(struct.pack("<HBBH", 1, 1, 20, 1) + b"x")
+            with patch.object(analyzer.shutil, "which", side_effect=lambda name: None if name == "ffmpeg" else "/usr/bin/rtk"):
+                result = analyzer.validate_samples(capture, audio)
+        self.assertFalse(result["valid"])
+        self.assertIn("ffmpeg", result["error"])
+        self.assertIn("error", result["decodes"][0])
+
+    def test_voice_decode_reports_missing_rtk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = pathlib.Path(temporary)
+            audio = capture / "audio"
+            audio.mkdir()
+            (capture / "voice.sample.bin").write_bytes(struct.pack("<HBBH", 1, 1, 20, 1) + b"x")
+            with patch.object(analyzer.shutil, "which", side_effect=lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None):
+                result = analyzer.validate_samples(capture, audio)
+        self.assertFalse(result["valid"])
+        self.assertIn("rtk", result["error"])
+        self.assertIn("error", result["decodes"][0])
+
+    def test_voice_decode_timeout_is_invalid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = pathlib.Path(temporary)
+            audio = capture / "audio"
+            audio.mkdir()
+            (capture / "voice.sample.bin").write_bytes(struct.pack("<HBBH", 1, 1, 20, 1) + b"x")
+            with patch.object(analyzer.runner, "ogg_packets", return_value=[b"x"]), \
+                 patch.object(analyzer.shutil, "which", return_value="/tool"), \
+                 patch.object(analyzer.subprocess, "run", side_effect=__import__("subprocess").TimeoutExpired("ffmpeg", 60)):
+                result = analyzer.validate_samples(capture, audio)
+        self.assertFalse(result["valid"])
+        self.assertFalse(result["decodes"][0]["valid"])
+        self.assertIn("timed out", result["decodes"][0]["decode_errors"])
+
+    def test_controlled_server_stop_accepts_platform_signal_status(self):
+        self.assertTrue(analyzer.server_controlled_stop(-2, "posix"))
+        self.assertFalse(analyzer.server_controlled_stop(3221225786, "posix"))
+        self.assertTrue(analyzer.server_controlled_stop(3221225786, "nt"))
 
     @staticmethod
     def _csv(path, rows):
