@@ -1,6 +1,20 @@
 use crate::observer_session::ObserverSession;
 use crate::packet_diagnostics::{DropReason, PacketDiagnostics};
 pub(crate) const OBSERVER_CANDIDATE_COUNT: usize = 3;
+
+/// Whether non-observer load-sink sockets get the bulk-unreliable receive filter.
+///
+/// The filter drops top-level `Unreliable` and `CompactMerged` datagrams in the kernel, which
+/// makes voice reception depend on how the server frames it. The Rust server frames voice as
+/// `Merged` and slips through; LiteNetLib frames it as `CompactMerged` and does not. Disable
+/// this when measuring all-client voice fanout against a non-Rust server so every leg measures
+/// the same population.
+fn load_sink_filter_enabled() -> bool {
+    match std::env::var("BASIS_CLIENT_LOAD_SINK_FILTER") {
+        Ok(value) => value != "0" && !value.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
 use crate::avatar::{
     parse_server_avatar_metadata, shared_receive_handoff_ready, PoseState, ServerAvatarMetadata,
 };
@@ -456,11 +470,7 @@ impl BasisClient {
             }
         };
         trace!("client {} received {:?}", self.index, packet.property);
-        if self.connected.load(Ordering::Acquire) && self.in_use.load(Ordering::Acquire) {
-            if let Some(session) = &self.avatar_observer {
-                session.note_packet((self.index, self.connect_time), std::time::Instant::now());
-            }
-        }
+        self.note_received_packet();
         match packet.property {
             PacketProperty::ConnectAccept
                 if bytes.len() == 15
@@ -468,7 +478,7 @@ impl BasisClient {
             {
                 let remote_peer = i32::from_le_bytes(bytes[11..15].try_into().unwrap());
                 *self.remote_peer_id.lock().await = Some(remote_peer);
-                if self.index != 0 && self.avatar_observer.is_none() {
+                if self.index != 0 && self.avatar_observer.is_none() && load_sink_filter_enabled() {
                     if let Err(err) = configure_load_sink_socket(&self.socket) {
                         warn!(
                             "client {} failed to enable load-sink receive filter: {err}",
@@ -549,8 +559,17 @@ impl BasisClient {
                             .record(self.index, DropReason::InvalidMerged);
                         return Ok(());
                     }
-                    Box::pin(self.handle_packet(&bytes[pos..pos + size])).await?;
+                    let entry = &bytes[pos..pos + size];
                     pos += size;
+                    // Zero-alloc fast path for Unreliable entries: the entry
+                    // is already length-validated, so dispatch directly like
+                    // the CompactMerged arm. Anything else (Channeled/Ack for
+                    // the ACK window, Ping, ...) keeps the recursive path.
+                    if entry.len() >= 2 && entry[0] & 0x1f == PacketProperty::Unreliable as u8 {
+                        self.handle_unreliable_entry(entry[1], &entry[2..]).await;
+                        continue;
+                    }
+                    Box::pin(self.handle_packet(entry)).await?;
                 }
                 if pos != bytes.len() {
                     self.packet_diagnostics
@@ -561,7 +580,6 @@ impl BasisClient {
                 const LONG_LENGTH_FLAG: u8 = 0x80;
                 const RAW_PACKET_FLAG: u8 = 0x40;
                 const CHANNEL_MASK: u8 = 0x3f;
-                let connection_number = (bytes[0] & 0x60) >> 5;
                 let mut pos = 1usize;
                 while pos < bytes.len() {
                     if bytes.len() - pos < 2 {
@@ -621,17 +639,48 @@ impl BasisClient {
                         }
                         Box::pin(self.handle_packet(payload)).await?;
                     } else {
-                        let mut packet = Vec::with_capacity(payload_len + 2);
-                        packet.push(PacketProperty::Unreliable as u8 | (connection_number << 5));
-                        packet.push(channel);
-                        packet.extend_from_slice(payload);
-                        Box::pin(self.handle_packet(&packet)).await?;
+                        // Zero-alloc dispatch: the entry is already
+                        // length-validated above, which is everything
+                        // `parse_packet` would check for an Unreliable
+                        // packet, so run the direct entry dispatch instead
+                        // of synthesizing header bytes (one alloc + memcpy
+                        // + re-parse + Box::pin per entry).
+                        self.handle_unreliable_entry(channel, payload).await;
                     }
                 }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Per-packet observer bookkeeping from `handle_packet`'s prologue, split
+    /// out so merged-packet entries can run it without re-entering `handle_packet`.
+    #[inline]
+    fn note_received_packet(&self) {
+        if self.connected.load(Ordering::Acquire) && self.in_use.load(Ordering::Acquire) {
+            if let Some(session) = &self.avatar_observer {
+                session.note_packet((self.index, self.connect_time), std::time::Instant::now());
+            }
+        }
+    }
+
+    /// Direct dispatch for an already-validated Unreliable entry, shared by
+    /// the Merged/CompactMerged arms: the prologue-equivalent bookkeeping +
+    /// Unreliable body, without re-entering `handle_packet` (no re-parse,
+    /// no Box::pin per entry).
+    #[inline]
+    async fn handle_unreliable_entry(&self, channel: u8, payload: &[u8]) {
+        trace!(
+            "client {} received {:?}",
+            self.index,
+            PacketProperty::Unreliable
+        );
+        self.note_received_packet();
+        if let Some(diagnostics) = &self.voice_diagnostics {
+            diagnostics.receive(channel, payload);
+        }
+        self.observe_avatar_channel(channel, payload).await;
     }
 
     pub(crate) async fn observe_avatar_channel(&self, channel: u8, payload: &[u8]) {
@@ -712,9 +761,6 @@ impl BasisClient {
         payload: &[u8],
     ) -> Result<()> {
         let channel = channel_id / 4;
-        if let Some(diagnostics) = &self.voice_diagnostics {
-            diagnostics.receive(channel, payload);
-        }
         let delivery = DeliveryMethod::from_channel_id(channel_id);
         if matches!(
             delivery,
@@ -741,6 +787,13 @@ impl BasisClient {
                 );
                 return Ok(());
             }
+        }
+
+        // Count reliable voice only after its transport sequence has passed the
+        // existing duplicate/window checks. Unreliable receive paths are counted
+        // at their dispatch points because they have no transport deduplication.
+        if let Some(diagnostics) = &self.voice_diagnostics {
+            diagnostics.receive(channel, payload);
         }
 
         match channel {

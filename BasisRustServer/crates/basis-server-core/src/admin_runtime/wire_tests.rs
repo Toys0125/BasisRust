@@ -121,6 +121,13 @@ impl Client {
         .expect("server did not disconnect rejected identity")
     }
 
+    async fn disconnect(&mut self) {
+        let mut writer = NetWriter::new();
+        writer.put_u8(PacketProperty::Disconnect as u8);
+        writer.put_i64(1); // connect_time from connect_pending_with_contract
+        self.socket.send(writer.as_slice()).await.unwrap();
+    }
+
     async fn send(&mut self, channel: u8, payload: &[u8], reliable: bool) {
         let mut writer = NetWriter::new();
         if reliable {
@@ -169,7 +176,9 @@ impl Client {
             for (channel, sequence, mut payload, fragment) in frames {
                 if let Some((channel_id, sequence)) = sequence {
                     let mut ack = vec![PacketProperty::Ack as u8, 0, 0, channel_id];
-                    ack.extend_from_slice(&[0; 16]);
+                    // LiteNetLib's ACK shape carries one trailing bitmap byte beyond
+                    // the 128 sequence bits; the transport tests use the same 17-byte form.
+                    ack.extend_from_slice(&[0; 17]);
                     ack[4 + (sequence as usize % 128) / 8] |= 1 << (sequence % 8);
                     self.socket.send(&ack).await.unwrap();
                     if !self.received.insert((channel_id, sequence)) {
@@ -198,6 +207,15 @@ impl Client {
 }
 
 type Frame = (u8, Option<(u8, u16)>, Vec<u8>, Option<(u16, u16, u16)>);
+
+fn empty_lifecycle_receivers() -> basis_transport::LifecycleEventReceivers {
+    let (_, connections) = mpsc::channel(1);
+    let (_, disconnects) = mpsc::channel(1);
+    basis_transport::LifecycleEventReceivers {
+        connections,
+        disconnects,
+    }
+}
 
 fn unpack(packet: &[u8], frames: &mut Vec<Frame>) {
     match PacketProperty::from_byte(packet[0]) {
@@ -288,6 +306,168 @@ async fn voice_continues_while_avatar_input_is_blocked() {
         assert_eq!(payload, [sender_id as u8, sequence, 0, 0xf8, 0]);
     }
     drop(avatar_lock);
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+fn session_for_uuid(state: &ServerState, uuid: &str) -> (PeerId, PeerSession) {
+    let peer = state
+        .authenticated_peers
+        .iter()
+        .find(|entry| entry.metadata.player_uuid == uuid)
+        .expect("authenticated peer");
+    (
+        *peer.key(),
+        peer.session.clone().expect("live peer session"),
+    )
+}
+
+fn registry_subscribe_event(peer: PeerId, session: PeerSession) -> ServerEvent {
+    let mut payload = NetWriter::new();
+    payload.put_u8(channels::REGISTRY_SUB_SUBSCRIBE);
+    BasisMessageSubscribe { ids: vec![42] }
+        .serialize(&mut payload)
+        .unwrap();
+    ServerEvent::Message {
+        peer,
+        session,
+        channel: channels::REGISTRY_CONTROL,
+        delivery: DeliveryMethod::ReliableOrdered,
+        payload: Bytes::from(payload.as_slice().to_vec()),
+    }
+}
+
+async fn wait_for_disconnect_cleanups(state: &ServerState) {
+    let tasks = std::mem::take(&mut *state.disconnect_tasks.lock());
+    for task in tasks {
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn queued_old_control_event_cannot_mutate_reused_peer_id() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let mut old_client = Client::connect(&state, "old-control-session").await;
+    let (old_peer, old_session) = session_for_uuid(&state, "old-control-session");
+    let stale = registry_subscribe_event(old_peer, old_session.clone());
+
+    request_disconnect(&state, &old_session, "test disconnect")
+        .await
+        .unwrap();
+    old_client.receive_disconnect().await;
+    wait_for_disconnect_cleanups(&state).await;
+    assert!(!state.authenticated_peers.contains_key(&old_peer));
+
+    let _replacement = Client::connect(&state, "replacement-session").await;
+    let (replacement_peer, replacement_session) = session_for_uuid(&state, "replacement-session");
+    assert_eq!(
+        replacement_peer, old_peer,
+        "the transport should recycle the old id"
+    );
+    assert!(!old_session.same_connection(&replacement_session));
+
+    // Represents an event queued before disconnect whose worker starts only
+    // after the replacement has authenticated.
+    crate::handle_event(&state, stale).await.unwrap();
+    assert!(!state.message_subscriptions.contains_key(&replacement_peer));
+
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn active_old_control_lease_delays_cleanup_and_id_reuse() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let mut old_client = Client::connect(&state, "leased-old-session").await;
+    let (old_peer, old_session) = session_for_uuid(&state, "leased-old-session");
+    let event = registry_subscribe_event(old_peer, old_session.clone());
+    let ServerEvent::Message {
+        payload,
+        channel,
+        delivery,
+        ..
+    } = event
+    else {
+        unreachable!()
+    };
+
+    let (started_tx, started_rx) = oneshot::channel();
+    let (resume_tx, resume_rx) = oneshot::channel();
+    let handler_state = state.clone();
+    let handler_session = old_session.clone();
+    let handler = tokio::spawn(async move {
+        let _lease = handler_session.try_read_lease().expect("session is live");
+        started_tx.send(()).unwrap();
+        resume_rx.await.unwrap();
+        crate::handle_message(
+            &handler_state,
+            old_peer,
+            Some(&handler_session),
+            channel,
+            delivery,
+            payload,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    });
+    started_rx.await.unwrap();
+
+    request_disconnect(&state, &old_session, "test disconnect")
+        .await
+        .unwrap();
+    old_client.receive_disconnect().await;
+    assert!(state.authenticated_peers.contains_key(&old_peer));
+
+    let _replacement = Client::connect(&state, "while-old-handler-paused").await;
+    let (replacement_peer, _) = session_for_uuid(&state, "while-old-handler-paused");
+    assert_ne!(
+        replacement_peer, old_peer,
+        "old id must stay retired while leased"
+    );
+
+    resume_tx.send(()).unwrap();
+    handler.await.unwrap();
+    wait_for_disconnect_cleanups(&state).await;
+    assert!(!state.authenticated_peers.contains_key(&old_peer));
+    assert!(!state.message_subscriptions.contains_key(&old_peer));
+
+    let _next = Client::connect(&state, "after-old-handler-drained").await;
+    let (recycled_peer, _) = session_for_uuid(&state, "after-old-handler-drained");
+    assert_eq!(recycled_peer, old_peer);
+
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn self_disconnect_defers_drain_until_current_lease_returns() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let mut client = Client::connect(&state, "self-disconnecting-session").await;
+    let (peer, session) = session_for_uuid(&state, "self-disconnecting-session");
+    let handler_state = state.clone();
+    let handler_session = session.clone();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::spawn(async move {
+            let _lease = handler_session.try_read_lease().expect("session is live");
+            request_disconnect(&handler_state, &handler_session, "self disconnect")
+                .await
+                .unwrap();
+        }),
+    )
+    .await
+    .expect("self disconnect must not wait on its own lease")
+    .unwrap();
+    client.receive_disconnect().await;
+    wait_for_disconnect_cleanups(&state).await;
+    assert!(!state.authenticated_peers.contains_key(&peer));
+
+    let _replacement = Client::connect(&state, "self-disconnect-replacement").await;
+    let (replacement_peer, _) = session_for_uuid(&state, "self-disconnect-replacement");
+    assert_eq!(replacement_peer, peer);
+
     state.shutdown().await.unwrap();
     let _ = shutdown.send(());
 }
@@ -529,6 +709,33 @@ async fn pending_capacity_rejection_is_clean_and_timeout_allows_reconnect() {
 }
 
 #[tokio::test]
+async fn shutdown_cancels_and_joins_pending_identity_timers() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    state.config.write().use_auth_identity = true;
+    state.config.write().auth_validation_time_out_miliseconds = 60_000;
+    let key = SigningKey::from_bytes(&[94; 32]);
+    let did = client_did(&key);
+    let mut pending = Client::connect_pending(&state, &did).await;
+    pending.receive_identity_challenge().await;
+    assert_eq!(state.pending_identity.len(), 1);
+    assert_eq!(state.transport.connected_peers_count(), 1);
+    assert_eq!(state.identity_timer_tasks.lock().len(), 1);
+
+    state.shutdown().await.unwrap();
+    assert!(state.pending_identity.is_empty());
+    assert_eq!(state.transport.connected_peers_count(), 0);
+    assert_eq!(
+        state.admission_slots.available_permits(),
+        MAX_PENDING_ADMISSIONS
+    );
+    assert!(state.identity_timer_tasks.lock().is_empty());
+    assert!(state.disconnect_tasks.lock().is_empty());
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(state.disconnect_tasks.lock().is_empty());
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
 async fn legitimate_identity_batch_completes_and_releases_capacity() {
     let (state, shutdown, _) = super::tests::test_server(false).await;
     state.config.write().use_auth_identity = true;
@@ -676,6 +883,992 @@ async fn identity_admission_rejects_spoofed_rejoin_and_editor_claims_and_replay(
         1
     );
 
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn saturated_ordered_lane_does_not_block_other_control_or_disconnects() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let _saturated = Client::connect(&state, "saturated-control").await;
+    let _other = Client::connect(&state, "independent-control").await;
+    let mut leaving = Client::connect(&state, "independent-disconnect").await;
+    let (a, a_session) = session_for_uuid(&state, "saturated-control");
+    let (b, b_session) = session_for_uuid(&state, "independent-control");
+    let (c, c_session) = session_for_uuid(&state, "independent-disconnect");
+    let release = Arc::new(tokio::sync::Notify::new());
+    let a_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (progress, mut observed) = mpsc::unbounded_channel();
+    let (events, receiver) = mpsc::channel(8);
+    let (ordered, ordered_receiver) = mpsc::channel(crate::MAX_PENDING_ORDERED_EVENTS);
+    let (_critical, critical_receiver) = mpsc::channel(crate::MAX_CRITICAL_ORDERED_EVENTS);
+    let (stop, stopping) = oneshot::channel();
+    let handler_release = release.clone();
+    let handler_calls = a_calls.clone();
+    // Exercise the production event receiver/scheduler with real connected sessions.
+    // Only the handler is injected, so the first session can be paused deterministically.
+    let dispatcher = tokio::spawn(crate::event_loop_with_handler(
+        state.clone(),
+        receiver,
+        ordered_receiver,
+        critical_receiver,
+        empty_lifecycle_receivers(),
+        stopping,
+        move |state, event| {
+            let release = handler_release.clone();
+            let calls = handler_calls.clone();
+            let progress = progress.clone();
+            async move {
+                match &event {
+                    ServerEvent::Message { peer, session, .. }
+                        if *peer == a && calls.fetch_add(1, Ordering::Relaxed) == 0 =>
+                    {
+                        let _lease = session.try_read_lease().expect("first handler is live");
+                        progress.send("blocked").unwrap();
+                        release.notified().await;
+                        return Ok(());
+                    }
+                    ServerEvent::PeerDisconnected { peer, session, .. } if *peer == c => {
+                        // This supplied lifecycle event initiates actual transport retirement
+                        // and deferred core cleanup, as an internal disconnect request does.
+                        request_disconnect(&state, session, "independent disconnect").await?;
+                        progress.send("disconnect").unwrap();
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                let other_control =
+                    matches!(&event, ServerEvent::Message { peer, .. } if *peer == b);
+                crate::handle_event(&state, event).await?;
+                if other_control {
+                    progress.send("control").unwrap();
+                }
+                Ok(())
+            }
+        },
+    ));
+    ordered
+        .send(registry_subscribe_event(a, a_session.clone()).into())
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), observed.recv())
+            .await
+            .unwrap(),
+        Some("blocked")
+    );
+    // Keep this injected lane within the same 128-event admission bound as transport.
+    // Pre-ACK overload and retry behavior are covered at the transport boundary.
+    for _ in 0..crate::MAX_PENDING_ORDERED_PER_LANE - 1 {
+        ordered
+            .send(registry_subscribe_event(a, a_session.clone()).into())
+            .await
+            .unwrap();
+    }
+    ordered
+        .send(registry_subscribe_event(b, b_session.clone()).into())
+        .await
+        .unwrap();
+    events
+        .send(ServerEvent::PeerDisconnected {
+            peer: c,
+            session: c_session,
+            reason: DisconnectReason::Remote,
+        })
+        .await
+        .unwrap();
+    let mut signals = Vec::new();
+    for _ in 0..2 {
+        signals.push(
+            tokio::time::timeout(Duration::from_secs(3), observed.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    signals.sort_unstable();
+    assert_eq!(signals, ["control", "disconnect"]);
+    assert!(state.message_subscriptions.contains_key(&b));
+    assert!(state.transport.is_current_session(&a_session));
+    assert_eq!(a_calls.load(Ordering::Relaxed), 1);
+    // A's first handler remains blocked while B and C progress independently.
+    assert!(state.authenticated_peers.contains_key(&a));
+    leaving.receive_disconnect().await;
+    release.notify_one();
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), dispatcher)
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for_disconnect_cleanups(&state).await;
+    assert!(state.transport.is_current_session(&a_session));
+    assert_eq!(
+        a_calls.load(Ordering::Relaxed),
+        crate::MAX_PENDING_ORDERED_PER_LANE
+    );
+    assert!(!state.authenticated_peers.contains_key(&c));
+    assert!(state.transport.is_current_session(&b_session));
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn saturated_ordinary_handlers_do_not_block_transport_lifecycle_cleanup() {
+    let (mut state, shutdown, _) = super::tests::test_server(false).await;
+    let (transport, transport_events) =
+        basis_transport::TransportHandle::bind_with_statistics_options(
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+    let (ordered_receiver, critical_receiver) = transport
+        .enable_ordered_admission(basis_transport::OrderedAdmissionConfig {
+            regular_capacity: crate::MAX_PENDING_ORDERED_EVENTS,
+            critical_capacity: crate::MAX_CRITICAL_ORDERED_EVENTS,
+            per_lane: crate::MAX_PENDING_ORDERED_PER_LANE,
+            per_peer: crate::MAX_PENDING_ORDERED_PER_PEER,
+            critical_per_lane: 2,
+            critical_per_peer: 2,
+            critical_channel: channels::AUTH_IDENTITY,
+        })
+        .unwrap();
+    let lifecycle_receivers = transport.enable_lifecycle_event_queues(256, 256).unwrap();
+    state.transport = transport.clone();
+
+    let worker_limit = std::thread::available_parallelism()
+        .map(|count| (count.get() * 4).clamp(8, 256))
+        .unwrap_or(32);
+    let (events, event_receiver) = mpsc::channel(worker_limit);
+    let (stop, stopping) = oneshot::channel();
+    let (blocked_tx, mut blocked_rx) = mpsc::unbounded_channel();
+    let (disconnected_tx, mut disconnected_rx) = mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handler_release = release.clone();
+    let dispatcher = tokio::spawn(crate::event_loop_with_handler(
+        state.clone(),
+        event_receiver,
+        ordered_receiver,
+        critical_receiver,
+        lifecycle_receivers,
+        stopping,
+        move |state, event| {
+            let release = handler_release.clone();
+            let blocked = blocked_tx.clone();
+            let disconnected = disconnected_tx.clone();
+            async move {
+                if matches!(&event, ServerEvent::NetworkError(_)) {
+                    blocked.send(()).unwrap();
+                    release.notified().await;
+                    return Ok(());
+                }
+                let was_disconnect = matches!(&event, ServerEvent::PeerDisconnected { .. });
+                crate::handle_event(&state, event).await?;
+                if was_disconnect {
+                    disconnected.send(()).unwrap();
+                }
+                Ok(())
+            }
+        },
+    ));
+
+    // ConnectionRequest carries ReadyMessage on the lifecycle queue, so the real UDP
+    // handshake can finish even after every ordinary handler slot is held below.
+    let mut client = Client::connect(&state, "lifecycle-under-load").await;
+    let (peer, session) = session_for_uuid(&state, "lifecycle-under-load");
+    state
+        .ownership
+        .switch_ownership("lifecycle-cleanup-object", peer);
+    assert!(state
+        .ownership
+        .all()
+        .iter()
+        .any(|item| item.player_id == peer));
+
+    for _ in 0..worker_limit {
+        events
+            .send(ServerEvent::NetworkError("hold ordinary handler".into()))
+            .await
+            .unwrap();
+    }
+    for _ in 0..worker_limit {
+        tokio::time::timeout(Duration::from_secs(3), blocked_rx.recv())
+            .await
+            .expect("ordinary handler started")
+            .expect("ordinary handler signal");
+    }
+
+    let _late_client = Client::connect(&state, "lifecycle-connected-under-load").await;
+    let (late_peer, _) = session_for_uuid(&state, "lifecycle-connected-under-load");
+    assert!(state.authenticated_peers.contains_key(&late_peer));
+
+    client.disconnect().await;
+    tokio::time::timeout(Duration::from_secs(3), disconnected_rx.recv())
+        .await
+        .expect("lifecycle handler must run while ordinary workers are blocked")
+        .expect("disconnect lifecycle progress signal");
+    assert!(!state.transport.is_current_session(&session));
+    assert!(!state.authenticated_peers.contains_key(&peer));
+    assert!(!state
+        .ownership
+        .all()
+        .iter()
+        .any(|ownership| ownership.player_id == peer));
+    assert_eq!(blocked_rx.len(), 0, "ordinary handlers remain held");
+
+    release.notify_waiters();
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), dispatcher)
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for_disconnect_cleanups(&state).await;
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+    drop(transport_events);
+}
+
+#[tokio::test]
+async fn held_disconnect_leases_do_not_block_new_connections_or_reuse_peer_ids_early() {
+    let (mut state, shutdown, _) = super::tests::test_server(false).await;
+    let (transport, events) = basis_transport::TransportHandle::bind_with_statistics_options(
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+        true,
+        true,
+    )
+    .await
+    .unwrap();
+    let (ordered_events, critical_events) = transport
+        .enable_ordered_admission(basis_transport::OrderedAdmissionConfig {
+            regular_capacity: crate::MAX_PENDING_ORDERED_EVENTS,
+            critical_capacity: crate::MAX_CRITICAL_ORDERED_EVENTS,
+            per_lane: crate::MAX_PENDING_ORDERED_PER_LANE,
+            per_peer: crate::MAX_PENDING_ORDERED_PER_PEER,
+            critical_per_lane: 2,
+            critical_per_peer: 2,
+            critical_channel: channels::AUTH_IDENTITY,
+        })
+        .unwrap();
+    let lifecycle_events = transport.enable_lifecycle_event_queues(256, 256).unwrap();
+    state.transport = transport.clone();
+
+    let (disconnect_started_tx, mut disconnect_started_rx) = mpsc::unbounded_channel();
+    let (disconnect_done_tx, mut disconnect_done_rx) = mpsc::unbounded_channel();
+    let (stop, stopping) = oneshot::channel();
+    let dispatcher = tokio::spawn(crate::event_loop_with_handler(
+        state.clone(),
+        events,
+        ordered_events,
+        critical_events,
+        lifecycle_events,
+        stopping,
+        move |state, event| {
+            let started = disconnect_started_tx.clone();
+            let done = disconnect_done_tx.clone();
+            async move {
+                let peer = match &event {
+                    ServerEvent::PeerDisconnected { peer, .. } => Some(*peer),
+                    _ => None,
+                };
+                if let Some(peer) = peer {
+                    started.send(peer).unwrap();
+                }
+                crate::handle_event(&state, event).await?;
+                if let Some(peer) = peer {
+                    done.send(peer).unwrap();
+                }
+                Ok(())
+            }
+        },
+    ));
+
+    let mut first = Client::connect(&state, "held-disconnect-lease-a").await;
+    let mut second = Client::connect(&state, "held-disconnect-lease-b").await;
+    let (first_peer, first_session) = session_for_uuid(&state, "held-disconnect-lease-a");
+    let (second_peer, second_session) = session_for_uuid(&state, "held-disconnect-lease-b");
+    let first_lease = first_session
+        .try_read_lease()
+        .expect("first authenticated session is live");
+    let second_lease = second_session
+        .try_read_lease()
+        .expect("second authenticated session is live");
+
+    first.disconnect().await;
+    second.disconnect().await;
+    let mut started = vec![
+        tokio::time::timeout(Duration::from_secs(3), disconnect_started_rx.recv())
+            .await
+            .expect("first disconnect handler entered")
+            .unwrap(),
+        tokio::time::timeout(Duration::from_secs(3), disconnect_started_rx.recv())
+            .await
+            .expect("second disconnect handler entered")
+            .unwrap(),
+    ];
+    started.sort_unstable();
+    assert_eq!(started, [first_peer, second_peer]);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while transport.is_current_session(&first_session)
+            || transport.is_current_session(&second_session)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("transport must retire both sessions");
+    assert!(state.authenticated_peers.contains_key(&first_peer));
+    assert!(state.authenticated_peers.contains_key(&second_peer));
+
+    // Disconnect cleanup waits on each held lease; connection admission uses its
+    // separate lifecycle workers and can authenticate another real UDP client.
+    let _third = Client::connect(&state, "held-disconnect-lease-c").await;
+    let (third_peer, _) = session_for_uuid(&state, "held-disconnect-lease-c");
+    assert_ne!(third_peer, first_peer);
+    assert_ne!(third_peer, second_peer);
+    assert!(state.authenticated_peers.contains_key(&third_peer));
+    assert!(state.authenticated_peers.contains_key(&first_peer));
+    assert!(state.authenticated_peers.contains_key(&second_peer));
+
+    drop(first_lease);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), disconnect_done_rx.recv())
+            .await
+            .expect("first disconnect cleanup completes after its lease drains")
+            .unwrap(),
+        first_peer
+    );
+    assert!(!state.authenticated_peers.contains_key(&first_peer));
+    assert!(state.authenticated_peers.contains_key(&second_peer));
+
+    let _fourth = Client::connect(&state, "held-disconnect-lease-d").await;
+    let (fourth_peer, fourth_session) = session_for_uuid(&state, "held-disconnect-lease-d");
+    assert_eq!(
+        fourth_peer, first_peer,
+        "only the drained session ID is reusable"
+    );
+    assert!(!fourth_session.same_connection(&first_session));
+    assert!(state.authenticated_peers.contains_key(&second_peer));
+
+    drop(second_lease);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), disconnect_done_rx.recv())
+            .await
+            .expect("second disconnect cleanup completes after its lease drains")
+            .unwrap(),
+        second_peer
+    );
+    assert!(!state.authenticated_peers.contains_key(&second_peer));
+    assert!(state.transport.is_current_session(&fourth_session));
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), dispatcher)
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for_disconnect_cleanups(&state).await;
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn shutdown_drains_queued_transport_disconnects_after_lifecycle_workers_free() {
+    let (mut state, shutdown, _) = super::tests::test_server(false).await;
+    let (transport, events) = basis_transport::TransportHandle::bind_with_statistics_options(
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+        true,
+        true,
+    )
+    .await
+    .unwrap();
+    let (ordered_events, critical_events) = transport
+        .enable_ordered_admission(basis_transport::OrderedAdmissionConfig {
+            regular_capacity: crate::MAX_PENDING_ORDERED_EVENTS,
+            critical_capacity: crate::MAX_CRITICAL_ORDERED_EVENTS,
+            per_lane: crate::MAX_PENDING_ORDERED_PER_LANE,
+            per_peer: crate::MAX_PENDING_ORDERED_PER_PEER,
+            critical_per_lane: 2,
+            critical_per_peer: 2,
+            critical_channel: channels::AUTH_IDENTITY,
+        })
+        .unwrap();
+    let transport_lifecycle_events = transport.enable_lifecycle_event_queues(16, 16).unwrap();
+    let connections = transport_lifecycle_events.connections;
+    let mut transport_disconnects = transport_lifecycle_events.disconnects;
+    let (lifecycle_sender, lifecycle_events) = mpsc::channel(16);
+    let lifecycle_close_probe = lifecycle_sender.clone();
+    let (forwarded_disconnect_tx, mut forwarded_disconnect_rx) = mpsc::unbounded_channel();
+    let lifecycle_relay = tokio::spawn(async move {
+        while let Some(event) = transport_disconnects.recv().await {
+            let disconnected_peer = match &event {
+                ServerEvent::PeerDisconnected { peer, .. } => Some(*peer),
+                _ => None,
+            };
+            if lifecycle_sender.send(event).await.is_err() {
+                break;
+            }
+            if let Some(peer) = disconnected_peer {
+                let _ = forwarded_disconnect_tx.send(peer);
+            }
+        }
+    });
+    state.transport = transport.clone();
+
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler_release = release.clone();
+    let held_peers = Arc::new(Mutex::new(HashSet::new()));
+    let handler_held_peers = held_peers.clone();
+    let (blocked_tx, mut blocked_rx) = mpsc::unbounded_channel();
+    let (cleaned_tx, mut cleaned_rx) = mpsc::unbounded_channel();
+    let (stop, stopping) = oneshot::channel();
+    let dispatcher = tokio::spawn(crate::event_loop_with_handler(
+        state.clone(),
+        events,
+        ordered_events,
+        critical_events,
+        basis_transport::LifecycleEventReceivers {
+            connections,
+            disconnects: lifecycle_events,
+        },
+        stopping,
+        move |state, event| {
+            let release = handler_release.clone();
+            let held_peers = handler_held_peers.clone();
+            let blocked = blocked_tx.clone();
+            let cleaned = cleaned_tx.clone();
+            async move {
+                let held_disconnect = match &event {
+                    ServerEvent::PeerDisconnected { peer, .. }
+                        if held_peers.lock().contains(peer) =>
+                    {
+                        Some(*peer)
+                    }
+                    _ => None,
+                };
+                if let Some(peer) = held_disconnect {
+                    blocked.send(peer).unwrap();
+                    release.acquire().await.unwrap().forget();
+                }
+                let peer = match &event {
+                    ServerEvent::PeerDisconnected { peer, .. } => Some(*peer),
+                    _ => None,
+                };
+                crate::handle_event(&state, event).await?;
+                if let Some(peer) = peer {
+                    cleaned.send(peer).unwrap();
+                }
+                Ok(())
+            }
+        },
+    ));
+
+    let mut first = Client::connect(&state, "drain-disconnect-a").await;
+    let mut second = Client::connect(&state, "drain-disconnect-b").await;
+    let mut queued = Client::connect(&state, "drain-disconnect-c").await;
+    let (first_peer, first_session) = session_for_uuid(&state, "drain-disconnect-a");
+    let (second_peer, second_session) = session_for_uuid(&state, "drain-disconnect-b");
+    let (queued_peer, queued_session) = session_for_uuid(&state, "drain-disconnect-c");
+    held_peers.lock().extend([first_peer, second_peer]);
+
+    first.disconnect().await;
+    second.disconnect().await;
+    let mut held = vec![
+        tokio::time::timeout(Duration::from_secs(3), blocked_rx.recv())
+            .await
+            .expect("first lifecycle worker entered its disconnect handler")
+            .unwrap(),
+        tokio::time::timeout(Duration::from_secs(3), blocked_rx.recv())
+            .await
+            .expect("second lifecycle worker entered its disconnect handler")
+            .unwrap(),
+    ];
+    held.sort_unstable();
+    assert_eq!(held, [first_peer, second_peer]);
+
+    queued.disconnect().await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while transport.is_current_session(&queued_session) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("transport must retire the queued disconnect before dispatcher shutdown");
+    let mut forwarded_held = vec![
+        tokio::time::timeout(Duration::from_secs(3), forwarded_disconnect_rx.recv())
+            .await
+            .expect("relay must forward the first held disconnect")
+            .unwrap(),
+        tokio::time::timeout(Duration::from_secs(3), forwarded_disconnect_rx.recv())
+            .await
+            .expect("relay must forward the second held disconnect")
+            .unwrap(),
+    ];
+    forwarded_held.sort_unstable();
+    assert_eq!(forwarded_held, held);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), forwarded_disconnect_rx.recv())
+            .await
+            .expect("relay must forward the third disconnect")
+            .unwrap(),
+        queued_peer,
+        "the third disconnect must be buffered at the dispatcher before shutdown"
+    );
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), lifecycle_close_probe.closed())
+        .await
+        .expect("dispatcher must close lifecycle ingress before workers are released");
+    release.add_permits(2);
+    tokio::time::timeout(Duration::from_secs(3), dispatcher)
+        .await
+        .expect("shutdown must drain queued disconnect callbacks")
+        .unwrap();
+
+    let mut cleaned = vec![
+        tokio::time::timeout(Duration::from_secs(3), cleaned_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        tokio::time::timeout(Duration::from_secs(3), cleaned_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        tokio::time::timeout(Duration::from_secs(3), cleaned_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+    ];
+    cleaned.sort_unstable();
+    assert_eq!(cleaned, [first_peer, second_peer, queued_peer]);
+    assert!(!transport.is_current_session(&first_session));
+    assert!(!transport.is_current_session(&second_session));
+    assert!(!transport.is_current_session(&queued_session));
+    for peer in [first_peer, second_peer, queued_peer] {
+        assert!(!state.authenticated_peers.contains_key(&peer));
+    }
+
+    wait_for_disconnect_cleanups(&state).await;
+    lifecycle_relay.abort();
+    let _ = lifecycle_relay.await;
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn signed_identity_uses_reserved_workers_when_ordinary_workers_are_full() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    state.config.write().use_auth_identity = true;
+    let key = SigningKey::from_bytes(&[117; 32]);
+    let did = client_did(&key);
+    let mut client = Client::connect_pending(&state, &did).await;
+    let challenge = client.receive_identity_challenge().await;
+    let (peer, pending) = state
+        .pending_identity
+        .iter()
+        .next()
+        .map(|entry| (*entry.key(), entry.value().session.clone()))
+        .expect("identity challenge reserves a pending session");
+
+    let worker_limit = std::thread::available_parallelism()
+        .map(|count| (count.get() * 4).clamp(8, 256))
+        .unwrap_or(32);
+    let (events, event_receiver) = mpsc::channel(worker_limit);
+    let (_ordered, ordered_receiver) = mpsc::channel(crate::MAX_PENDING_ORDERED_EVENTS);
+    let (_critical, critical_receiver) = mpsc::channel(crate::MAX_CRITICAL_ORDERED_EVENTS);
+    let (stop, stopping) = oneshot::channel();
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handler_release = release.clone();
+    let dispatcher = tokio::spawn(crate::event_loop_with_handler(
+        state.clone(),
+        event_receiver,
+        ordered_receiver,
+        critical_receiver,
+        empty_lifecycle_receivers(),
+        stopping,
+        move |state, event| {
+            let release = handler_release.clone();
+            let started = started_tx.clone();
+            async move {
+                match event {
+                    ServerEvent::NetworkError(_) => {
+                        started.send(()).unwrap();
+                        release.notified().await;
+                        Ok(())
+                    }
+                    event => crate::handle_event(&state, event).await,
+                }
+            }
+        },
+    ));
+
+    for _ in 0..worker_limit {
+        events
+            .send(ServerEvent::NetworkError("hold ordinary worker".into()))
+            .await
+            .unwrap();
+    }
+    for _ in 0..worker_limit {
+        tokio::time::timeout(Duration::from_secs(3), started_rx.recv())
+            .await
+            .expect("ordinary handler started")
+            .expect("ordinary worker signal");
+    }
+    // Queue ordinary ordered work behind the exhausted worker pool. Identity ingress
+    // must still reach its reserved handler while this lane waits.
+    let mut queued_ordinary = NetWriter::new();
+    queued_ordinary.put_u8(channels::REGISTRY_SUB_SUBSCRIBE);
+    BasisMessageSubscribe { ids: vec![42] }
+        .serialize(&mut queued_ordinary)
+        .unwrap();
+    _ordered
+        .send(
+            ServerEvent::Message {
+                peer,
+                session: pending.clone(),
+                channel: channels::REGISTRY_CONTROL,
+                delivery: DeliveryMethod::ReliableOrdered,
+                payload: Bytes::from(queued_ordinary.as_slice().to_vec()),
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+
+    let mut payload = NetWriter::new();
+    DidResponse {
+        signature: key.sign(&challenge).to_bytes().to_vec(),
+        fragment: "N/A".to_owned(),
+    }
+    .serialize(&mut payload)
+    .unwrap();
+    let critical = _critical;
+    critical
+        .send(
+            ServerEvent::Message {
+                peer,
+                session: pending,
+                channel: channels::AUTH_IDENTITY,
+                delivery: DeliveryMethod::ReliableOrdered,
+                payload: Bytes::from(payload.as_slice().to_vec()),
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+
+    client
+        .receive(|channel, _| channel == channels::META_DATA)
+        .await;
+    assert!(state.authenticated_peers.contains_key(&peer));
+    assert!(!state.pending_identity.contains_key(&peer));
+
+    release.notify_waiters();
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), dispatcher)
+        .await
+        .unwrap()
+        .unwrap();
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn replacement_session_releases_old_ordered_admissions_before_new_lane_progress() {
+    let (mut state, shutdown, _) = super::tests::test_server(false).await;
+    let (transport, legacy_events) =
+        basis_transport::TransportHandle::bind_with_statistics_options(
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+    let (mut ordered_events, _critical_events) = transport
+        .enable_ordered_admission(basis_transport::OrderedAdmissionConfig {
+            regular_capacity: 3,
+            critical_capacity: 1,
+            per_lane: 3,
+            per_peer: 3,
+            critical_per_lane: 1,
+            critical_per_peer: 1,
+            critical_channel: channels::AUTH_IDENTITY,
+        })
+        .unwrap();
+    let mut lifecycle_events = transport.enable_lifecycle_event_queues(16, 16).unwrap();
+    state.transport = transport.clone();
+
+    // Run only connection admission. Ordered envelopes below stay in the explicit
+    // lane queues, modeling the dispatcher with no ordinary worker slots available.
+    let lifecycle_state = state.clone();
+    let (stop_connections, mut stopping_connections) = oneshot::channel();
+    let connection_dispatcher = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut stopping_connections => break,
+                event = lifecycle_events.connections.recv() => match event {
+                    Some(event) => crate::handle_event(&lifecycle_state, event).await.unwrap(),
+                    None => break,
+                }
+            }
+        }
+    });
+
+    // Hold every ordinary permit while accepted OrderedEvents are staged in the
+    // production handler queue without starting a lane head.
+    let worker_limit = std::thread::available_parallelism()
+        .map(|count| (count.get() * 4).clamp(8, 256))
+        .unwrap_or(32);
+    let ordinary_workers = Arc::new(Semaphore::new(worker_limit));
+    let mut held_workers = Vec::with_capacity(worker_limit);
+    for _ in 0..worker_limit {
+        held_workers.push(ordinary_workers.clone().acquire_owned().await.unwrap());
+    }
+    assert_eq!(ordinary_workers.available_permits(), 0);
+
+    let mut old_client = Client::connect(&state, "ordered-admission-old").await;
+    let (peer, old_session) = session_for_uuid(&state, "ordered-admission-old");
+    let base = (peer, channels::REGISTRY_CONTROL);
+    let mut ordered_queue = crate::OrderedHandlerQueue::<basis_transport::OrderedEvent>::default();
+    let mut critical_queue = crate::OrderedHandlerQueue::<basis_transport::OrderedEvent>::default();
+    let mut ordered_sessions = HashMap::new();
+    let mut next_generation = 1;
+    let old_generation = crate::ordered_lane_generation(
+        base,
+        &old_session,
+        &mut next_generation,
+        &mut ordered_sessions,
+        &mut ordered_queue,
+        &mut critical_queue,
+    );
+    let old_key = (peer, channels::REGISTRY_CONTROL, old_generation);
+
+    for sequence in 0..2u8 {
+        old_client
+            .send(channels::REGISTRY_CONTROL, &[sequence], true)
+            .await;
+        let envelope = tokio::time::timeout(Duration::from_secs(3), ordered_events.recv())
+            .await
+            .expect("old ordered message admitted before ACK")
+            .expect("ordered ingress remains open");
+        assert!(envelope.admission.is_some());
+        assert!(matches!(
+            &envelope.event,
+            ServerEvent::Message { peer: event_peer, session, .. }
+                if *event_peer == peer && session.same_connection(&old_session)
+        ));
+        ordered_queue.enqueue(old_key, envelope);
+    }
+    assert_eq!(ordered_queue.pending(), 2);
+
+    assert!(transport
+        .disconnect_session(&old_session, "replace ordered lane")
+        .await
+        .unwrap());
+    old_session.wait_for_read_leases().await;
+    crate::handle_disconnect(&state, &old_session, DisconnectReason::Remote).await;
+    assert!(!state.authenticated_peers.contains_key(&peer));
+
+    let mut new_client = Client::connect(&state, "ordered-admission-new").await;
+    let (new_peer, new_session) = session_for_uuid(&state, "ordered-admission-new");
+    assert_eq!(new_peer, peer, "the old peer ID is now reusable");
+
+    // One spare global admission carries the replacement head. The helper must
+    // discard the retired generation, releasing both old transport permits.
+    new_client
+        .send(channels::REGISTRY_CONTROL, &[0], true)
+        .await;
+    let first_new = tokio::time::timeout(Duration::from_secs(3), ordered_events.recv())
+        .await
+        .expect("replacement lane head gets the remaining global permit")
+        .expect("ordered ingress remains open");
+    assert!(first_new.admission.is_some());
+    let new_generation = crate::ordered_lane_generation(
+        base,
+        &new_session,
+        &mut next_generation,
+        &mut ordered_sessions,
+        &mut ordered_queue,
+        &mut critical_queue,
+    );
+    assert_ne!(new_generation, old_generation);
+    let new_key = (new_peer, channels::REGISTRY_CONTROL, new_generation);
+    assert!(!ordered_queue.contains(old_key));
+    assert_eq!(ordered_queue.pending(), 0);
+    assert!(ordered_sessions
+        .get(&base)
+        .is_some_and(
+            |(session, generation)| session.same_connection(&new_session)
+                && *generation == new_generation
+        ));
+    ordered_queue.enqueue(new_key, first_new);
+
+    // If the old generation still held its two ACKed admissions, these two packets
+    // would remain unacknowledged at the transport's three-event global limit.
+    for sequence in 1..3u8 {
+        new_client
+            .send(channels::REGISTRY_CONTROL, &[sequence], true)
+            .await;
+        let envelope = tokio::time::timeout(Duration::from_secs(3), ordered_events.recv())
+            .await
+            .expect("replacement lane progresses after retired permits release")
+            .expect("ordered ingress remains open");
+        assert!(envelope.admission.is_some());
+        assert!(matches!(
+            &envelope.event,
+            ServerEvent::Message { peer: event_peer, session, .. }
+                if *event_peer == new_peer && session.same_connection(&new_session)
+        ));
+        ordered_queue.enqueue(new_key, envelope);
+    }
+    assert_eq!(ordered_queue.pending(), 3);
+    assert_eq!(critical_queue.pending(), 0);
+
+    drop(held_workers);
+    drop(ordered_queue);
+    let _ = stop_connections.send(());
+    tokio::time::timeout(Duration::from_secs(3), connection_dispatcher)
+        .await
+        .unwrap()
+        .unwrap();
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+    drop((legacy_events, old_client, new_client));
+}
+
+#[tokio::test]
+async fn ordered_udp_burst_backpressures_and_retries_in_fifo_order() {
+    let (mut state, shutdown, _) = super::tests::test_server(false).await;
+    let (transport, events) = basis_transport::TransportHandle::bind_with_statistics_options(
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+        true,
+        true,
+    )
+    .await
+    .unwrap();
+    let (ordered_receiver, critical_receiver) = transport
+        .enable_ordered_admission(basis_transport::OrderedAdmissionConfig {
+            regular_capacity: crate::MAX_PENDING_ORDERED_EVENTS,
+            critical_capacity: crate::MAX_CRITICAL_ORDERED_EVENTS,
+            per_lane: crate::MAX_PENDING_ORDERED_PER_LANE,
+            per_peer: crate::MAX_PENDING_ORDERED_PER_PEER,
+            critical_per_lane: 2,
+            critical_per_peer: 2,
+            critical_channel: channels::AUTH_IDENTITY,
+        })
+        .unwrap();
+    state.transport = transport.clone();
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handler_release = release.clone();
+    let (blocked_tx, mut blocked_rx) = mpsc::unbounded_channel();
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+    let (stop, stopping) = oneshot::channel();
+    let dispatcher = tokio::spawn(crate::event_loop_with_handler(
+        state.clone(),
+        events,
+        ordered_receiver,
+        critical_receiver,
+        empty_lifecycle_receivers(),
+        stopping,
+        move |state, event| {
+            let release = handler_release.clone();
+            let blocked = blocked_tx.clone();
+            let seen = seen_tx.clone();
+            async move {
+                if let ServerEvent::Message {
+                    channel: channels::REGISTRY_CONTROL,
+                    payload,
+                    ..
+                } = &event
+                {
+                    let mut reader = NetReader::new(payload);
+                    assert_eq!(reader.get_u8().unwrap(), channels::REGISTRY_SUB_SUBSCRIBE);
+                    let subscription = BasisMessageSubscribe::deserialize(&mut reader).unwrap();
+                    let id = subscription.ids[0];
+                    if id == 0 {
+                        let _ = blocked.send(());
+                        release.notified().await;
+                    }
+                    seen.send(id).unwrap();
+                }
+                crate::handle_event(&state, event).await
+            }
+        },
+    ));
+    let client = Client::connect(&state, "ordered-retry-burst").await;
+    let (peer, session) = session_for_uuid(&state, "ordered-retry-burst");
+
+    const BURST: u16 = 400;
+    let mut packets = Vec::with_capacity(BURST as usize);
+    for sequence in 0..BURST {
+        let mut payload = NetWriter::new();
+        payload.put_u8(channels::REGISTRY_SUB_SUBSCRIBE);
+        BasisMessageSubscribe {
+            ids: vec![sequence],
+        }
+        .serialize(&mut payload)
+        .unwrap();
+        let mut packet = NetWriter::new();
+        packet.put_u8(PacketProperty::Channeled as u8);
+        packet.put_u16(sequence);
+        packet.put_u8(DeliveryMethod::channel_id(
+            channels::REGISTRY_CONTROL,
+            DeliveryMethod::ReliableOrdered,
+        ));
+        packet.put_bytes(payload.as_slice());
+        packets.push(packet.as_slice().to_vec());
+    }
+    for packet in &packets {
+        client.socket.send(packet).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(3), blocked_rx.recv())
+        .await
+        .expect("first registry handler blocks");
+    // Let the receiver reach its bounded outstanding quota before releasing the head.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(state.transport.is_current_session(&session));
+    release.notify_one();
+
+    let mut seen = Vec::with_capacity(BURST as usize);
+    if let Some(id) = seen_rx.recv().await {
+        seen.push(id);
+    }
+    for _ in 0..8 {
+        for packet in &packets {
+            client.socket.send(packet).await.unwrap();
+        }
+        while seen.len() < BURST as usize {
+            match tokio::time::timeout(Duration::from_millis(30), seen_rx.recv()).await {
+                Ok(Some(id)) => seen.push(id),
+                _ => break,
+            }
+        }
+        if seen.len() == BURST as usize {
+            break;
+        }
+    }
+    while seen.len() < BURST as usize {
+        seen.push(
+            tokio::time::timeout(Duration::from_secs(3), seen_rx.recv())
+                .await
+                .expect("retransmitted reliable ordered packet is dispatched")
+                .expect("handler remains connected"),
+        );
+    }
+    assert_eq!(seen, (0..BURST).collect::<Vec<_>>());
+    assert!(state.transport.is_current_session(&session));
+    assert!(state
+        .message_subscriptions
+        .get(&peer)
+        .unwrap()
+        .contains(&(BURST - 1)));
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), dispatcher)
+        .await
+        .unwrap()
+        .unwrap();
     state.shutdown().await.unwrap();
     let _ = shutdown.send(());
 }

@@ -868,6 +868,10 @@ async fn async_main(
                         inbound: app.inbound_packets,
                         outbound: app.outbound_packets,
                         protocol_errors: app.protocol_errors,
+                        avatar_received: app.avatar_received,
+                        avatar_coalesced: app.avatar_coalesced,
+                        avatar_rejected: app.avatar_rejected,
+                        avatar_processed: app.avatar_processed,
                     },
                     raw_udp: RawUdpMetrics {
                         packets_in: transport.raw_packets_received,

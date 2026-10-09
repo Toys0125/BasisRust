@@ -195,13 +195,13 @@ are on only in the 1,000-client series. Warmup is 45 seconds after all clients
 are ready; measurement is 60 seconds. CPU/UDP deltas use recorded endpoints
 about 58 seconds apart within the marked observer window.
 
-Build in the separate workspaces with `rtk proxy cargo build --locked --release --jobs 2`
+Build in the separate workspaces with `cargo build --locked --release --jobs 2`
 (server: add `-p basis-server-console`). Retain one client and config
 for every variant. Freeze server/client executables before running. From the
 repository root, substituting the recorded frozen binaries:
 
 ```powershell
-rtk proxy python -B scripts/perf/run-windows-avatar-crossover.py --output captures/new-750-repeat --client captures/binaries/client.exe --clients 750 --variants control-1=captures/binaries/control.exe four-1=captures/binaries/four.exe four-2=captures/binaries/four.exe control-2=captures/binaries/control.exe
+python -B scripts/perf/run-windows-avatar-crossover.py --output captures/new-750-repeat --client captures/binaries/client.exe --clients 750 --variants control-1=captures/binaries/control.exe four-1=captures/binaries/four.exe four-2=captures/binaries/four.exe control-2=captures/binaries/control.exe
 ```
 
 For the diagnostic comparison, use a new output directory, `--clients 1000`
@@ -212,7 +212,7 @@ for a tuning series; these final 750-client runs used no override. The validator
 is read-only and returns a failure status for invalid captures:
 
 ```powershell
-rtk proxy python -B scripts/perf/summarize_windows_avatar.py captures/new-750-repeat/control-1 captures/new-750-repeat/four-1
+python -B scripts/perf/summarize_windows_avatar.py captures/new-750-repeat/control-1 captures/new-750-repeat/four-1
 ```
 
 New raw captures, frozen candidate binaries, source patches, build manifests,

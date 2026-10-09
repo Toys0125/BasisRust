@@ -63,6 +63,64 @@ def interpolate(samples, boundary, role):
     raise ValueError('CPU samples do not bracket the fixed measurement window')
 
 
+def interpolate_health_counter(samples, boundary, group, key):
+    """Interpolate a cumulative server health counter at a monotonic boundary."""
+    section = 'transport' if group == 'transport' else 'extended'
+
+    def value(sample):
+        data = sample['health'][section]
+        if section == 'extended':
+            data = data[group]
+        result = float(data[key])
+        if not math.isfinite(result):
+            raise ValueError(f'Invalid health counter: {group}.{key}')
+        return result
+
+    for first, last in zip(samples, samples[1:]):
+        start, end = float(first['monotonic_seconds']), float(last['monotonic_seconds'])
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            raise ValueError('Health samples have a nonpositive monotonic interval')
+        if start <= boundary <= end:
+            first_value, last_value = value(first), value(last)
+            if last_value < first_value:
+                raise ValueError(f'{group}.{key} counter reset between health samples')
+            return first_value + (last_value - first_value) * (boundary - start) / (end - start)
+    raise ValueError('Health samples do not bracket the fixed measurement window')
+
+
+def server_udp_metrics(samples, window_start, window_end, window_seconds, network_capacity_mbps):
+    """Measure raw UDP byte rates over the fixed window from cumulative counters."""
+    if not math.isfinite(window_seconds) or window_seconds <= 0:
+        raise ValueError('Measurement window must be finite and positive')
+    if (not math.isfinite(window_start) or not math.isfinite(window_end)
+            or window_end <= window_start):
+        raise ValueError('Measurement boundaries must be finite and increasing')
+    if not math.isfinite(network_capacity_mbps) or network_capacity_mbps <= 0:
+        raise ValueError('Network capacity must be finite and positive')
+    metrics = {}
+    for direction, counter in (('receive', 'bytesIn'), ('transmit', 'bytesOut')):
+        section = 'extended'
+        for first, last in zip(samples, samples[1:]):
+            start, end = float(first['monotonic_seconds']), float(last['monotonic_seconds'])
+            if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+                raise ValueError('Health samples have a nonpositive monotonic interval')
+            if end < window_start or start > window_end:
+                continue
+            first_value = float(first['health'][section]['rawUdp'][counter])
+            last_value = float(last['health'][section]['rawUdp'][counter])
+            if not math.isfinite(first_value) or not math.isfinite(last_value):
+                raise ValueError(f'Invalid health counter: rawUdp.{counter}')
+            if last_value < first_value:
+                raise ValueError(f'rawUdp.{counter} counter reset during measurement window')
+        begin = interpolate_health_counter(samples, window_start, 'rawUdp', counter)
+        finish = interpolate_health_counter(samples, window_end, 'rawUdp', counter)
+        if finish < begin:
+            raise ValueError(f'rawUdp.{counter} counter reset during measurement window')
+        metrics[f'server_{direction}_mbps'] = (finish - begin) * 8 / window_seconds / 1_000_000
+    metrics['server_transmit_capacity_percent'] = metrics['server_transmit_mbps'] / network_capacity_mbps * 100
+    return metrics
+
+
 def summarize(path, experiment, entry):
     """Retain every gate and metric, including invalid/outlier runs."""
     meta = json.loads((path / 'run.json').read_text())
@@ -100,6 +158,8 @@ def summarize(path, experiment, entry):
     metrics['combined_cpu_cores'] = metrics['server_cpu_cores'] + metrics['client_cpu_cores']
     metrics['sender_socket_items_per_second'] = sum(int(r['socket_sent_full']) + int(r['socket_sent_delta']) for r in senders) / window
     metrics['sender_generated_items_per_second'] = sum(int(r['generated_full']) + int(r['generated_delta']) for r in senders) / window
+    metrics.update(server_udp_metrics(samples, meta['window_start_monotonic'], meta['window_end_monotonic'],
+                                      window, experiment['workload'].get('network_capacity_mbps', 1000)))
     minimum = min(int(r['socket_sent_full']) + int(r['socket_sent_delta']) for r in senders)
     checks = {
         'completed': meta['completed'] and meta['error'] is None,

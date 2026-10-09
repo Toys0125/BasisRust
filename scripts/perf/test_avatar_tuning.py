@@ -133,6 +133,7 @@ class ValidationTests(unittest.TestCase):
                     summary = json.loads((output / 'summary.json').read_text())
                     self.assertEqual(summary['ranking']['status'], 'inconclusive')
                     experiment = json.loads((output / 'experiment.json').read_text())
+                    self.assertEqual(meta['workload'], experiment['workload'])
                     select_port(socket.SOCK_DGRAM, experiment['workload']['port'])
                     select_port(socket.SOCK_STREAM, experiment['workload']['health_port'])
                     pid = json.loads((output / '01-lanes-0-round-1/processes.json').read_text())['server']

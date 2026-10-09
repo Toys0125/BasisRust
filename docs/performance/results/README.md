@@ -1,5 +1,7 @@
 # Performance results
 
+The [PR #31 machine-readable benchmark summary](../benchmark-summary.json) retains reliable-receive samples, historical voice aggregates, and the peer-snapshot enumeration microbenchmark without adding raw captures.
+
 This directory summarizes the measured outcomes and their limits. The Windows
 investigation is consolidated below; the three existing historical JSON files
 remain unchanged. Raw CSVs, binaries, recordings and full Windows exports are

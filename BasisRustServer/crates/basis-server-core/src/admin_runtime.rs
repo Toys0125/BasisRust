@@ -270,21 +270,29 @@ pub(super) async fn handle_request(
                 Err("UUID invalid")
             } else if reason.is_empty() {
                 Err("Reason invalid")
-            } else if let Some(target) = peer_by_uuid(state, &uuid) {
-                if state
-                    .permissions
-                    .has(&uuid, basis_server_permissions::nodes::PROTECTION)
-                {
-                    Err("Target is protected")
-                } else {
-                    Ok(target)
+            } else if let Some((target, target_session)) = peer_session_by_uuid(state, &uuid) {
+                match target_session.try_read_lease() {
+                    None => Err("Player not found"),
+                    Some(target_lease) if !state.transport.is_current_session(&target_session) => {
+                        drop(target_lease);
+                        Err("Player not found")
+                    }
+                    Some(target_lease)
+                        if state
+                            .permissions
+                            .has(&uuid, basis_server_permissions::nodes::PROTECTION) =>
+                    {
+                        drop(target_lease);
+                        Err("Target is protected")
+                    }
+                    Some(target_lease) => Ok((target, target_session, target_lease)),
                 }
             } else {
                 Err("Player not found")
             };
             match target {
                 Err(error) => send_admin_text(state, peer, error).await?,
-                Ok(target) => {
+                Ok((target, target_session, target_lease)) => {
                     if mode != AdminRequestMode::Kick {
                         let ip = if mode == AdminRequestMode::IpAndBan {
                             state
@@ -298,7 +306,8 @@ pub(super) async fn handle_request(
                         };
                         state.moderation.add_ban_with_details(&uuid, &reason, ip)?;
                     }
-                    state.transport.disconnect(target, &reason).await?;
+                    request_disconnect(state, &target_session, &reason).await?;
+                    drop(target_lease);
                     send_admin_text(
                         state,
                         peer,
@@ -759,6 +768,7 @@ mod tests {
                 id,
                 metadata,
                 ready,
+                session: None,
             },
         );
     }

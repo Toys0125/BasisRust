@@ -7,6 +7,7 @@ separate from the Windows binary/revision crossover comparator.
 import argparse
 import contextlib
 import json
+import math
 import os
 import pathlib
 import platform
@@ -19,10 +20,13 @@ import sys
 import tempfile
 
 from avatar_benchmark import ROOT, cpu_list, relevant_env, run_workload, select_port, write_json
-from avatar_tuning import rank, report, run_order, sha256, summarize, validate_series, xml_values
+from avatar_tuning import csv_rows, rank, report, run_order, sha256, summarize, validate_series, xml_values
 
 FIXTURES = ROOT / 'docs/performance/fixtures'
 PRESETS = {'quick': (5, 15, 2), 'screen': (15, 60, 2), 'confirm': (30, 60, 4)}
+CALIBRATION_WARMUP_SECONDS = 5
+CALIBRATION_WINDOW_SECONDS = 10
+DEFAULT_CLIENTS = 250
 
 
 def lane_values(text):
@@ -45,7 +49,13 @@ def parser():
     result.add_argument('--client-config', type=pathlib.Path, default=FIXTURES / 'avatar-1500-client.xml')
     result.add_argument('--lanes', type=lane_values, default=lane_values('0,6'), help='only sweep dimension; default 0,6; range 0..8')
     result.add_argument('--mode', choices=PRESETS, default='screen')
-    result.add_argument('--clients', type=int, default=250, help='fixed offered workload; >=2; default 250')
+    workload = result.add_mutually_exclusive_group()
+    workload.add_argument('--clients', type=int,
+                          help=f'fixed offered user count; defaults to {DEFAULT_CLIENTS}')
+    workload.add_argument('--auto-calibrate', action='store_true',
+                          help='opt in to selecting a fixed population near --network-capacity-mbps')
+    result.add_argument('--network-capacity-mbps', type=float, default=1000,
+                        help='measured server TX target/capacity reference; default 1000 Mbps; auto calibration uses this target')
     result.add_argument('--warmup-seconds', type=int)
     result.add_argument('--window-seconds', type=int)
     result.add_argument('--repeats', type=int, help='even number >=2 per setting; default 2 screen/quick, 4 confirm')
@@ -70,8 +80,9 @@ def validate(args):
     for index, key in enumerate(('warmup_seconds', 'window_seconds', 'repeats')):
         if getattr(args, key) is None:
             setattr(args, key, PRESETS[args.mode][index])
-    if args.clients < 2 or args.warmup_seconds < 0 or args.window_seconds < 2:
-        raise ValueError('Require clients >=2, warmup >=0, window >=2')
+    resolve_client_selection(args)
+    if (args.clients is not None and args.clients < 2) or args.warmup_seconds < 0 or args.window_seconds < 2 or not math.isfinite(args.network_capacity_mbps) or args.network_capacity_mbps <= 0:
+        raise ValueError('Require clients >=2 when specified, warmup >=0, window >=2, and network target >0 Mbps')
     if args.repeats < 2 or args.repeats % 2:
         raise ValueError('Repeats must be even and >=2 to counterbalance run order')
     if args.rayon_threads is not None and args.rayon_threads < 0:
@@ -105,7 +116,7 @@ def validate(args):
     for key in ('Password', 'CompanyName', 'ProductName'):
         if not client.get(key) or client[key] != server.get(key):
             raise ValueError(f'Server/client fixture {key} must match and be nonempty')
-    if int(server.get('PeerLimit', '0')) < args.clients:
+    if args.clients is not None and int(server.get('PeerLimit', '0')) < args.clients:
         raise ValueError('Fixture PeerLimit is lower than requested clients')
     for cpus in (args.server_cpus, args.client_cpus):
         if cpus:
@@ -113,6 +124,37 @@ def validate(args):
             if os.name != 'nt' and not shutil.which('taskset'):
                 raise ValueError('Linux affinity requires taskset on PATH')
     args.output = args.output.resolve()
+
+
+def resolve_client_selection(args):
+    """Resolve omission to the compatible fixed default; calibration stays opt-in."""
+    if args.auto_calibrate and args.clients is not None:
+        raise ValueError('--auto-calibrate cannot be combined with --clients')
+    if args.clients is None and not args.auto_calibrate:
+        args.clients = DEFAULT_CLIENTS
+    return args
+
+
+def interpolate_health_counter(samples, boundary, group, key):
+    """Interpolate one cumulative health counter at a monotonic boundary."""
+    section = 'transport' if group == 'transport' else 'extended'
+
+    def value(sample):
+        data = sample['health'][section]
+        if section == 'extended':
+            data = data[group]
+        return float(data[key])
+
+    for first, last in zip(samples, samples[1:]):
+        start, end = float(first['monotonic_seconds']), float(last['monotonic_seconds'])
+        if start <= boundary <= end:
+            if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+                raise ValueError('Health samples have a nonpositive monotonic interval')
+            first_value, last_value = value(first), value(last)
+            if not math.isfinite(first_value) or not math.isfinite(last_value):
+                raise ValueError(f'Invalid health counter: {group}.{key}')
+            return first_value + (last_value - first_value) * (boundary - start) / (end - start)
+    raise ValueError('Health samples do not bracket the calibration measurement window')
 
 
 def clean_environment(server_config, client_config):
@@ -123,6 +165,98 @@ def clean_environment(server_config, client_config):
     override_keys = {key.upper() for key in overrides}
     cleared = sorted(k for k in os.environ if k.upper() in override_keys or k.upper().startswith('BASIS_') or k.upper() in ('RAYON_NUM_THREADS', 'TOKIO_WORKER_THREADS'))
     return {k: v for k, v in os.environ.items() if k not in cleared}, cleared
+
+
+def next_calibration_clients(current, target_mbps, measured_mbps, maximum):
+    """Scale population toward target TX, assuming dense fanout grows quadratically."""
+    if not math.isfinite(measured_mbps) or measured_mbps <= 0:
+        raise ValueError('Calibration measured no positive server TX traffic')
+    factor = math.sqrt(target_mbps / measured_mbps)
+    factor = min(2.0, max(0.5, factor))
+    candidate = min(maximum, max(2, round(current * factor)))
+    if candidate == current and abs(measured_mbps / target_mbps - 1) > 0.10:
+        candidate = min(maximum, current + 1) if measured_mbps < target_mbps else max(2, current - 1)
+    return candidate
+
+
+def calibration_tx_mbps(byte_delta, window_start_monotonic, window_end_monotonic):
+    """Convert transmitted bytes to Mbps over the recorded monotonic interval."""
+    elapsed = float(window_end_monotonic) - float(window_start_monotonic)
+    byte_delta = float(byte_delta)
+    if not math.isfinite(elapsed) or elapsed <= 0:
+        raise ValueError('Calibration measurement interval must be finite and positive')
+    if not math.isfinite(byte_delta) or byte_delta <= 0:
+        raise ValueError('Calibration measured no positive server TX bytes')
+    return byte_delta * 8 / elapsed / 1_000_000
+
+
+def calibrate_clients(args, server_env, client_env, output, maximum):
+    """Use short loopback runs to select a fixed population near target TX."""
+    if not args.auto_calibrate:
+        return {'mode': 'fixed_clients', 'selected_clients': args.clients, 'target_tx_mbps': args.network_capacity_mbps,
+                'attempts': []}
+    if maximum < 2:
+        raise ValueError('Fixture PeerLimit must allow at least 2 clients for automatic calibration')
+
+    target = args.network_capacity_mbps
+    candidate = min(1000, maximum)
+    original_warmup, original_window = args.warmup_seconds, args.window_seconds
+    attempts = []
+    calibration_root = output / 'calibration'
+    calibration_root.mkdir()
+    args.warmup_seconds, args.window_seconds = CALIBRATION_WARMUP_SECONDS, CALIBRATION_WINDOW_SECONDS
+    try:
+        for index in range(1, 5):
+            args.clients = candidate
+            run_dir = calibration_root / f'{index:02d}-clients-{candidate}'
+            print(f"CALIBRATE {index}/4 ({candidate} clients toward {target:g} Mbps TX)", flush=True)
+            run_workload(args, run_dir, dict(server_env, BASIS_AVATAR_FLUSH_LANES=str(args.lanes[0])), client_env)
+            meta = json.loads((run_dir / 'run.json').read_text())
+            if not meta['completed'] or meta['error'] is not None or meta['client_exit_code'] != 0 or meta['server_exit_code'] not in (0, -2, 3221225786):
+                raise RuntimeError(f"Calibration run {index} did not complete cleanly; evidence retained in {run_dir}")
+            samples = [json.loads(line) for line in (run_dir / 'samples.jsonl').read_text().splitlines()]
+            begin = interpolate_health_counter(samples, meta['window_start_monotonic'], 'rawUdp', 'bytesOut')
+            end = interpolate_health_counter(samples, meta['window_end_monotonic'], 'rawUdp', 'bytesOut')
+            if end < begin:
+                raise ValueError('rawUdp.bytesOut reset during calibration')
+            measured = calibration_tx_mbps(end - begin, meta['window_start_monotonic'], meta['window_end_monotonic'])
+            pilot_errors = {}
+            for group, key in (('appMessages', 'protocolErrors'), ('rawUdp', 'wouldBlock'),
+                               ('reliable', 'retransmits'), ('transport', 'nonReliableDroppedDatagrams')):
+                first = interpolate_health_counter(samples, meta['window_start_monotonic'], group, key)
+                last = interpolate_health_counter(samples, meta['window_end_monotonic'], group, key)
+                if last < first:
+                    raise ValueError(f'{group}.{key} reset during calibration')
+                pilot_errors[key] = last - first
+            senders = csv_rows(run_dir / 'observer.sender.csv')
+            minimum_sent = min((int(row['socket_sent_full']) + int(row['socket_sent_delta']) for row in senders), default=0)
+            attempt = {'run': run_dir.name, 'clients': candidate, 'server_tx_mbps': measured,
+                       'sender_count': len(senders), 'minimum_sender_items': minimum_sent,
+                       'measurement_window_errors': pilot_errors, 'complete': True}
+            attempts.append(attempt)
+            write_json(calibration_root / 'calibration.json', {'target_tx_mbps': target, 'tolerance_percent': 10,
+                                                                'attempts': attempts, 'selected_clients': None})
+            if len(senders) != candidate or any(int(row['send_errors']) for row in senders) or minimum_sent < 10 * 50 * .9:
+                raise RuntimeError(f"Calibration sender workload failed at {candidate} clients; evidence retained in {run_dir}")
+            if any(count > .01 for count in pilot_errors.values()):
+                raise RuntimeError(f"Calibration had transport errors in its measured window at {candidate} clients; evidence retained in {run_dir}")
+            if abs(measured / target - 1) <= .10:
+                selection = {'mode': 'auto_server_tx', 'selected_clients': candidate, 'target_tx_mbps': target,
+                             'tolerance_percent': 10, 'attempts': attempts}
+                write_json(calibration_root / 'calibration.json', selection)
+                print(f"CALIBRATED {candidate} clients at {measured:.1f} Mbps server TX", flush=True)
+                return selection
+            next_candidate = next_calibration_clients(candidate, target, measured, maximum)
+            if next_candidate == candidate:
+                raise RuntimeError(f"Cannot reach {target:g} Mbps TX within the fixture's {maximum}-client limit; latest rate {measured:.1f} Mbps")
+            candidate = next_candidate
+        raise RuntimeError(f"Could not reach {target:g} Mbps TX within four calibration attempts; set --clients explicitly or change --network-capacity-mbps")
+    except BaseException as exc:
+        write_json(calibration_root / 'calibration.json', {'target_tx_mbps': target, 'tolerance_percent': 10,
+                                                            'attempts': attempts, 'error': f'{type(exc).__name__}: {exc}'})
+        raise
+    finally:
+        args.warmup_seconds, args.window_seconds = original_warmup, original_window
 
 
 @contextlib.contextmanager
@@ -166,7 +300,7 @@ def command_metadata(command):
 def save_report(output, experiment, runs):
     validate_series(experiment)
     ranking = rank(runs, experiment['lanes'], experiment['repeats'])
-    write_json(output / 'summary.json', {'schema_version': 1, 'ranking': ranking, 'runs': runs})
+    write_json(output / 'summary.json', {'schema_version': 2, 'ranking': ranking, 'runs': runs})
     markdown = report(experiment, runs, ranking)
     (output / 'report.md').write_text(markdown, encoding='utf-8')
     return ranking
@@ -223,7 +357,7 @@ def main(argv=None):
             artifacts[key] = {'original_path': str(original), 'path': str(destination), 'sha256': sha256(destination)}
             setattr(args, key, destination)
         tool_files = ['tune-avatar-settings.py', 'avatar_benchmark.py', 'avatar_tuning.py', 'run-windows-avatar-workload.py', 'windows_process_job.py']
-        experiment = {'schema_version': 1, 'comparison_kind': 'settings', 'mode': args.mode,
+        experiment = {'schema_version': 2, 'comparison_kind': 'settings', 'mode': args.mode,
                       'invocation': [sys.executable, str(pathlib.Path(__file__).resolve()), *(argv if argv is not None else sys.argv[1:])],
                       'lanes': args.lanes, 'repeats': args.repeats, 'frozen': artifacts, 'runs': [],
                       'intentional_setting_differences': ['BASIS_AVATAR_FLUSH_LANES'],
@@ -234,7 +368,7 @@ def main(argv=None):
                       'platform_default_flush_lanes': 6 if os.name == 'nt' else 0,
                       'platform_default_rayon': 'min(available parallelism,8)' if os.name == 'nt' else 'Rayon available parallelism',
                       'platform_default_tokio': 'available parallelism',
-                      'workload': {k: getattr(args, k) for k in ('clients', 'warmup_seconds', 'window_seconds', 'rayon_threads', 'tokio_workers', 'client_workers', 'port', 'health_port', 'server_cpus', 'client_cpus', 'startup_timeout', 'ready_timeout')},
+                      'workload': {k: getattr(args, k) for k in ('clients', 'network_capacity_mbps', 'warmup_seconds', 'window_seconds', 'rayon_threads', 'tokio_workers', 'client_workers', 'port', 'health_port', 'server_cpus', 'client_cpus', 'startup_timeout', 'ready_timeout')},
                       'workload_policy': '20ms movement, zero jitter/drift, 60FPS Unity-policy synthetic pose, dense all-near, no voice/P2P, CPU-only distances; one applied observer',
                       'source_revision': command_metadata(['git', 'rev-parse', 'HEAD']),
                       'source_status': command_metadata(['git', 'status', '--porcelain']),
@@ -247,6 +381,27 @@ def main(argv=None):
             server_env['RAYON_NUM_THREADS'] = str(args.rayon_threads)
         if args.tokio_workers is not None:
             server_env['TOKIO_WORKER_THREADS'] = str(args.tokio_workers)
+        try:
+            maximum_clients = int(xml_values(args.server_config).get('PeerLimit', '0'))
+            client_selection = calibrate_clients(args, server_env, client_env, args.output, maximum_clients)
+        except (Exception, KeyboardInterrupt) as exc:
+            experiment['error'] = f'{type(exc).__name__}: {exc}'
+            experiment['workload']['clients'] = args.clients
+            calibration_path = args.output / 'calibration' / 'calibration.json'
+            try:
+                calibration = json.loads(calibration_path.read_text())
+            except (OSError, ValueError):
+                calibration = {}
+            experiment['client_selection'] = {
+                'mode': 'auto_server_tx', 'selected_clients': None,
+                'target_tx_mbps': args.network_capacity_mbps, 'tolerance_percent': 10,
+                'attempts': calibration.get('attempts', []), 'error': experiment['error']}
+            write_json(args.output / 'experiment.json', experiment)
+            save_report(args.output, experiment, [])
+            print(f"Calibration stopped: {experiment['error']}. Evidence retained: {args.output}", file=sys.stderr)
+            return 130 if isinstance(exc, KeyboardInterrupt) else 1
+        experiment['workload']['clients'] = args.clients
+        experiment['client_selection'] = client_selection
         manifest_path = args.output / 'experiment.json'
         write_json(manifest_path, experiment)
         try:
@@ -268,7 +423,7 @@ def main(argv=None):
                 runs.append(result)
                 write_json(args.output / entry['name'] / 'validated-summary.json', result)
                 m = result['metrics']
-                print(f"  valid={result['valid']} applied p50/p95={m['gap_p50_ms']:.2f}/{m['gap_p95_ms']:.2f}ms built={m['built_logical_avatar_work_per_second']:.0f}/s input={m['inbound_updates_per_second']:.0f}/s CPU={m['server_cpu_cores']:.2f} cores", flush=True)
+                print(f"  valid={result['valid']} applied p50/p95={m['gap_p50_ms']:.2f}/{m['gap_p95_ms']:.2f}ms TX={m['server_transmit_mbps']:.1f}Mbps ({m['server_transmit_capacity_percent']:.1f}% target) built={m['built_logical_avatar_work_per_second']:.0f}/s CPU={m['server_cpu_cores']:.2f} cores", flush=True)
                 save_report(args.output, experiment, runs)
                 if not result['valid']:
                     raise RuntimeError('Run failed: ' + ', '.join(k for k, v in result['checks'].items() if not v))

@@ -57,15 +57,17 @@ Host: Windows 11 build 26100, Ryzen 7 9800X3D, 8 physical / 16 logical cores, ab
 
 Each large run used 45 seconds of warmup after readiness. CPU and bandwidth rates use endpoint counter deltas across 58.3, 118.7, and 98.5 seconds within their respective observer windows. One CPU core means one process CPU-second per elapsed second. UDP rates include avatar and voice payload before IP/link overhead and do not measure physical NIC traffic. Memory peaks are maxima of sampled working sets, not process high-water marks. No 1,000-way audio playback/mixing, Unity client, headset, physical-network, or remote-host test was performed. This is one run per condition, without repeat-based confidence estimates.
 
-Raw evidence is retained locally under **`captures/voice-1000-20261005/`**: frozen binaries, source/encoded audio hashes, encoded clips, exact launch commands, effective configs, health/CPU/memory CSVs, per-client voice counters, observer sequence/gap data, received Ogg samples, and per-run validation JSON. [Machine-readable results](results/voice-1000-20261005-summary.json) contain all checks and measurements.
+Raw evidence is retained locally under **`captures/voice-1000-20261005/`**: frozen binaries, source/encoded audio hashes, encoded clips, exact launch commands, effective configs, health/CPU/memory CSVs, per-client voice counters, observer sequence/gap data, received Ogg samples, and per-run validation JSON. The tables and validation notes above retain the summary; detailed results are archived locally under `captures/pr31-results-history-cleanup-20261008/results/voice-1000-20261005-summary.json`.
 
 ## Reproduction and next investigation
 
-Build the separate server and client workspaces with `rtk proxy cargo build --locked --release --jobs 2`. From the repository root, run:
+Build the separate server and client workspaces with `cargo build --locked --release --jobs 2`. From the repository root, run:
 
 ```powershell
-rtk proxy python scripts/perf/run-windows-voice-workload.py --audio-folder 'C:\Users\mgsta\Desktop\Temp\Basis\AudioClips' --output captures/voice-1000-repeat
+python scripts/perf/run-windows-voice-workload.py --audio-folder 'C:\path\to\audio-corpus' --output captures/voice-1000-repeat
 ```
+
+Replace `C:\path\to\audio-corpus` with your local source-audio folder. Reproducing the recorded comparison requires the same 40 source clips; another corpus produces a different workload. The harness encodes the clips and records source/encoded hashes in its audio manifest.
 
 The reusable suite now applies a 24 GiB server working-set limit to both voice conditions and monitors warmup. For an exact uncapped 100-speaker control, use the [lower-level runner](../../scripts/perf/run-windows-avatar-workload.py) with `--max-server-working-set-mib 0`; its other settings and frozen binary paths are in the captured `commands.txt`. The [analyzer](../../scripts/perf/analyze-windows-voice.py) verifies byte matching, sampled decoding, delivery counters, and capacity checks. Three focused Rust diagnostic tests, Python compile checks, formatting, and the live preflight passed. A separate four-client guard smoke test with a deliberately tiny limit verified early warmup, controlled stop, clean client exit, and analysis of a single-sample partial capture; it is not included in the capacity measurements.
 

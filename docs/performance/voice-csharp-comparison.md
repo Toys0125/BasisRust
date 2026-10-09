@@ -23,7 +23,7 @@ The normal workloads have nearly matching offered voice rates. In the all-speaki
 
 ## Validation and memory
 
-The machine-readable report is [voice-csharp-20261005-summary.json](results/voice-csharp-20261005-summary.json). It includes hashes, individual failed checks, audio validation, process counters, GC samples, memory slopes, and post-client observations. Raw artifacts and frozen binaries remain under `captures/voice-csharp-20261005`.
+The tables and validation notes in this document retain the summary. Detailed hashes, failed checks, audio validation, process counters, GC samples, memory slopes, and post-client observations are archived locally under `captures/pr31-results-history-cleanup-20261008/results/voice-csharp-20261005-summary.json`. Raw artifacts and frozen binaries remain under `captures/voice-csharp-20261005`.
 
 Both C# voice runs retain all 1,000 clients and observe all 999 remote avatar peers. They also report unreliable/voice drops, stale avatars, and unapplied deltas. Avatar p95 gaps are 270.9 ms with 100 speakers and 2,315.6 ms with all speaking. The 100-speaker avatar observation spans 119,907 ms instead of exactly 120,000 ms, so the strict avatar-window check also fails; the independently timed voice window completes at 120,018 ms. The all-speaking voice window completes at 180,007 ms.
 
@@ -38,8 +38,8 @@ The avatar-only C# baseline passes all validation checks with no reported queue 
 Run `scripts/perf/run-windows-avatar-workload.py` with a published, protocol-compatible C# executable and the same client/audio fixtures:
 
 ```powershell
-rtk proxy python scripts/perf/run-windows-avatar-workload.py --server <BasisNetworkConsole.exe> --server-kind csharp --client <frozen-client.exe> --server-config docs/performance/fixtures/avatar-cpu-only-server.xml --clients 1000 --workers 4 --warmup-seconds 30 --window-seconds 180 --post-client-seconds 15 --voice-audio-folder <encoded-audio-folder> --voice-speaker-percent 100 --no-voice-reencode --output <new-capture-folder>
-rtk proxy python scripts/perf/analyze-windows-voice.py <capture-folder> --audio-folder <encoded-audio-folder>
+python scripts/perf/run-windows-avatar-workload.py --server <BasisNetworkConsole.exe> --server-kind csharp --client <frozen-client.exe> --server-config docs/performance/fixtures/avatar-cpu-only-server.xml --clients 1000 --workers 4 --warmup-seconds 30 --window-seconds 180 --post-client-seconds 15 --voice-audio-folder <encoded-audio-folder> --voice-speaker-percent 100 --no-voice-reencode --output <new-capture-folder>
+python scripts/perf/analyze-windows-voice.py <capture-folder> --audio-folder <encoded-audio-folder>
 ```
 
 Use `--voice-speaker-percent 10 --window-seconds 120` for the 100-speaker workload. Omit voice options and use a 60-second window for the avatar-only baseline.

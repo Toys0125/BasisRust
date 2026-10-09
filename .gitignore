@@ -1,9 +1,12 @@
 Config.xml
 config/
 captures/
-# Local runtime logs; source audio inputs and published result summaries stay visible.
+# Local runtime logs; source audio inputs stay visible.
 /logs/
 /BasisRustClient/logs/
 
 # Python bytecode from local benchmark tools.
 /scripts/perf/__pycache__/
+
+# Keep generated benchmark data local; commit Markdown summaries instead.
+/docs/performance/results/*.json
