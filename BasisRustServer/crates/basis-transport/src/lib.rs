@@ -420,6 +420,17 @@ pub enum ServerEvent {
     },
 }
 
+pub struct LifecycleEventReceivers {
+    pub connections: mpsc::Receiver<ServerEvent>,
+    pub disconnects: mpsc::Receiver<ServerEvent>,
+}
+
+#[derive(Clone)]
+struct LifecycleEventSenders {
+    connections: mpsc::Sender<ServerEvent>,
+    disconnects: mpsc::Sender<ServerEvent>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TransportStatsSnapshot {
     pub raw_packets_received: u64,
@@ -1080,7 +1091,7 @@ pub struct TransportHandle {
     stats: Arc<TransportStats>,
     reorder_budget: Arc<ReorderBudget>,
     realtime_handler: Arc<parking_lot::RwLock<Option<Arc<RealtimeHandler>>>>,
-    lifecycle_event_sender: Arc<parking_lot::RwLock<Option<mpsc::Sender<ServerEvent>>>>,
+    lifecycle_event_senders: Arc<parking_lot::RwLock<Option<LifecycleEventSenders>>>,
     ordered_event_sender: Arc<parking_lot::RwLock<Option<mpsc::Sender<ServerEvent>>>>,
     ordered_admission: Arc<parking_lot::RwLock<Option<Arc<OrderedAdmissionQueues>>>>,
     /// Send-side CompactMerged toggle (BasisVR `LNLTransportConfig` parity).
@@ -1184,7 +1195,7 @@ impl TransportHandle {
             )),
             reorder_budget: Arc::new(ReorderBudget::default()),
             realtime_handler: Arc::new(parking_lot::RwLock::new(None)),
-            lifecycle_event_sender: Arc::new(parking_lot::RwLock::new(None)),
+            lifecycle_event_senders: Arc::new(parking_lot::RwLock::new(None)),
             ordered_event_sender: Arc::new(parking_lot::RwLock::new(None)),
             ordered_admission: Arc::new(parking_lot::RwLock::new(None)),
             compact_merge_send: Arc::new(AtomicBool::new(true)),
@@ -1216,40 +1227,42 @@ impl TransportHandle {
         *self.realtime_handler.write() = handler;
     }
 
-    /// Install a bounded lifecycle ingress queue once, before application dispatch starts.
-    /// With no installed queue, lifecycle events continue using the bind event queue.
-    pub fn enable_lifecycle_event_queue(
+    /// Install bounded connection and disconnect ingress queues once, before application
+    /// dispatch starts. With no installed queues, lifecycle events use the bind event queue.
+    pub fn enable_lifecycle_event_queues(
         &self,
-        capacity: usize,
-    ) -> Result<mpsc::Receiver<ServerEvent>> {
-        if capacity == 0 {
+        connection_capacity: usize,
+        disconnect_capacity: usize,
+    ) -> Result<LifecycleEventReceivers> {
+        if connection_capacity == 0 || disconnect_capacity == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "lifecycle event capacity must be positive",
+                "lifecycle event capacities must be positive",
             )
             .into());
         }
-        let mut configured = self.lifecycle_event_sender.write();
+        let mut configured = self.lifecycle_event_senders.write();
         if configured.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
-                "lifecycle event queue already installed",
+                "lifecycle event queues already installed",
             )
             .into());
         }
-        let (sender, receiver) = mpsc::channel(capacity);
-        *configured = Some(sender);
-        Ok(receiver)
+        let (connection_sender, connections) = mpsc::channel(connection_capacity);
+        let (disconnect_sender, disconnects) = mpsc::channel(disconnect_capacity);
+        *configured = Some(LifecycleEventSenders {
+            connections: connection_sender,
+            disconnects: disconnect_sender,
+        });
+        Ok(LifecycleEventReceivers {
+            connections,
+            disconnects,
+        })
     }
 
-    fn lifecycle_sender_or_legacy(
-        &self,
-        legacy: &mpsc::Sender<ServerEvent>,
-    ) -> mpsc::Sender<ServerEvent> {
-        self.lifecycle_event_sender
-            .read()
-            .clone()
-            .unwrap_or_else(|| legacy.clone())
+    fn lifecycle_senders(&self) -> Option<LifecycleEventSenders> {
+        self.lifecycle_event_senders.read().clone()
     }
 
     /// A nonblocking send handle for a dedicated OS thread. It retains the server's
@@ -2947,7 +2960,6 @@ async fn process_packet_for_peer(
                         connect_time: parsed.connect_time,
                         local_peer_id: parsed.local_peer_id,
                     };
-                    let lifecycle_tx = handle.lifecycle_sender_or_legacy(tx);
                     let retired_session = {
                         // Commit replacement teardown only once both admission and event
                         // capacity are reserved. Serialize against concurrent accepts.
@@ -2972,11 +2984,30 @@ async fn process_packet_for_peer(
                             return Ok(());
                         }
                         let event_count = if old_peer_id.is_some() { 2 } else { 1 };
-                        let Some(mut permits) =
-                            reserve_pre_auth_events(&lifecycle_tx, event_count)?
-                        else {
-                            return Ok(());
-                        };
+                        let lifecycle_senders = handle.lifecycle_senders();
+                        let mut connection_permit = None;
+                        let mut disconnect_permit = None;
+                        let mut legacy_permits = None;
+                        if let Some(senders) = lifecycle_senders.as_ref() {
+                            let Some(permit) = try_reserve_lifecycle_event(&senders.connections)?
+                            else {
+                                return Ok(());
+                            };
+                            connection_permit = Some(permit);
+                            if old_peer_id.is_some() {
+                                let Some(permit) =
+                                    try_reserve_lifecycle_event(&senders.disconnects)?
+                                else {
+                                    return Ok(());
+                                };
+                                disconnect_permit = Some(permit);
+                            }
+                        } else {
+                            let Some(permits) = reserve_pre_auth_events(tx, event_count)? else {
+                                return Ok(());
+                            };
+                            legacy_permits = Some(permits);
+                        }
                         pending.insert(
                             remote_addr,
                             PendingRequestInfo {
@@ -2995,18 +3026,27 @@ async fn process_packet_for_peer(
                                     peer: id,
                                     state: old_peer,
                                 };
-                                permits.next().unwrap().send(ServerEvent::PeerDisconnected {
+                                let event = ServerEvent::PeerDisconnected {
                                     peer: id,
                                     session: session.clone(),
                                     reason: DisconnectReason::Remote,
-                                });
+                                };
+                                if let Some(permit) = disconnect_permit.take() {
+                                    permit.send(event);
+                                } else if let Some(permits) = &mut legacy_permits {
+                                    permits.next().unwrap().send(event);
+                                }
                                 retired_session = Some(session);
                             }
                         }
-                        permits
-                            .next()
-                            .unwrap()
-                            .send(ServerEvent::ConnectionRequest(request));
+                        if let Some(permit) = connection_permit {
+                            permit.send(ServerEvent::ConnectionRequest(request));
+                        } else if let Some(permits) = &mut legacy_permits {
+                            permits
+                                .next()
+                                .unwrap()
+                                .send(ServerEvent::ConnectionRequest(request));
+                        }
                         retired_session
                     };
                     if let Some(session) = retired_session {
@@ -3029,8 +3069,11 @@ async fn process_packet_for_peer(
             }
             // Reserve outside the lock, then publish removal and its event together.
             // A concurrent replacement must not overtake this disconnect event.
-            let lifecycle_tx = handle.lifecycle_sender_or_legacy(tx);
-            let permit = match lifecycle_tx.try_reserve() {
+            let lifecycle_senders = handle.lifecycle_senders();
+            let disconnect_tx = lifecycle_senders
+                .as_ref()
+                .map_or(tx, |senders| &senders.disconnects);
+            let permit = match disconnect_tx.try_reserve() {
                 Ok(permit) => permit,
                 Err(mpsc::error::TrySendError::Full(())) => {
                     #[cfg(test)]
@@ -3667,6 +3710,16 @@ fn reserve_pre_auth_events(
         }
         Err(mpsc::error::TrySendError::Full(_)) => Ok(None),
         Err(mpsc::error::TrySendError::Closed(_)) => Err(TransportError::EventChannelClosed),
+    }
+}
+
+fn try_reserve_lifecycle_event(
+    tx: &mpsc::Sender<ServerEvent>,
+) -> Result<Option<mpsc::Permit<'_, ServerEvent>>> {
+    match tx.try_reserve() {
+        Ok(permit) => Ok(Some(permit)),
+        Err(mpsc::error::TrySendError::Full(())) => Ok(None),
+        Err(mpsc::error::TrySendError::Closed(())) => Err(TransportError::EventChannelClosed),
     }
 }
 
@@ -4388,8 +4441,11 @@ async fn timeout_loop(handle: TransportHandle, tx: mpsc::Sender<ServerEvent>) {
             })
             .collect();
         for peer_id in timed_out {
-            let lifecycle_tx = handle.lifecycle_sender_or_legacy(&tx);
-            let Ok(permit) = lifecycle_tx.reserve().await else {
+            let lifecycle_senders = handle.lifecycle_senders();
+            let disconnect_tx = lifecycle_senders
+                .as_ref()
+                .map_or(&tx, |senders| &senders.disconnects);
+            let Ok(permit) = disconnect_tx.reserve().await else {
                 return;
             };
             let retired = {
@@ -6643,14 +6699,14 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_events_use_separate_queue_while_legacy_queue_is_full() {
         let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
-        let mut lifecycle = handle.enable_lifecycle_event_queue(4).unwrap();
+        let mut lifecycle = handle.enable_lifecycle_event_queues(4, 4).unwrap();
         let (tx, mut legacy) = mpsc::channel(1);
         tx.try_send(ServerEvent::PeerConnected(99)).unwrap();
 
         process_packet(&handle, &tx, loopback_addr(5000), &admission_packet(1))
             .await
             .unwrap();
-        let request = match lifecycle.recv().await.unwrap() {
+        let request = match lifecycle.connections.recv().await.unwrap() {
             ServerEvent::ConnectionRequest(request) => request,
             _ => panic!("connection request should use lifecycle ingress"),
         };
@@ -6663,7 +6719,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            lifecycle.recv().await,
+            lifecycle.disconnects.recv().await,
             Some(ServerEvent::PeerDisconnected {
                 peer: disconnected,
                 reason: DisconnectReason::Remote,
@@ -6681,7 +6737,7 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_queue_saturation_preserves_replaced_peer_and_pending_state() {
         let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
-        let mut lifecycle = handle.enable_lifecycle_event_queue(1).unwrap();
+        let mut lifecycle = handle.enable_lifecycle_event_queues(1, 1).unwrap();
         let (tx, _legacy) = mpsc::channel(8);
         let addr = loopback_addr(5000);
         let request = ConnectionRequest {
@@ -6696,28 +6752,108 @@ mod tests {
         process_packet(&handle, &tx, queued_addr, &admission_packet(1))
             .await
             .unwrap();
-
         process_packet(&handle, &tx, addr, &admission_packet(2))
             .await
             .unwrap();
-
         assert_eq!(*handle.by_addr.get(&addr).unwrap(), peer);
         assert!(handle.peers.contains_key(&peer));
         assert!(!handle.retired_peer_ids.lock().contains(&peer));
         assert!(!handle.pending_requests.lock().contains_key(&addr));
         assert!(matches!(
-            lifecycle.try_recv(),
+            lifecycle.connections.try_recv(),
             Ok(ServerEvent::ConnectionRequest(request)) if request.remote_addr == queued_addr
         ));
+
+        let blocker_addr = loopback_addr(5002);
+        let blocker = handle
+            .accept(&ConnectionRequest {
+                remote_addr: blocker_addr,
+                payload: Bytes::new(),
+                connection_number: 0,
+                connect_time: 1,
+                local_peer_id: 0,
+            })
+            .await
+            .unwrap();
+        let mut disconnect = vec![PacketProperty::Disconnect as u8];
+        disconnect.extend_from_slice(&1i64.to_le_bytes());
+        process_packet(&handle, &tx, blocker_addr, &disconnect)
+            .await
+            .unwrap();
+        assert_eq!(lifecycle.disconnects.len(), 1);
+
+        let rollback_addr = loopback_addr(5003);
+        process_packet(&handle, &tx, addr, &admission_packet(2))
+            .await
+            .unwrap();
+        assert!(!handle.pending_requests.lock().contains_key(&addr));
+        assert!(lifecycle.connections.try_recv().is_err());
+
+        process_packet(&handle, &tx, rollback_addr, &admission_packet(1))
+            .await
+            .unwrap();
+        assert!(handle.pending_requests.lock().contains_key(&rollback_addr));
+        assert!(matches!(
+            lifecycle.connections.try_recv(),
+            Ok(ServerEvent::ConnectionRequest(request)) if request.remote_addr == rollback_addr
+        ));
+        assert!(matches!(
+            lifecycle.disconnects.try_recv(),
+            Ok(ServerEvent::PeerDisconnected { peer: id, .. }) if id == blocker
+        ));
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn full_connection_queue_does_not_block_remote_disconnect() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let mut lifecycle = handle.enable_lifecycle_event_queues(256, 1).unwrap();
+        let (tx, _legacy) = mpsc::channel(8);
+        for offset in 0..256u16 {
+            process_packet(
+                &handle,
+                &tx,
+                loopback_addr(10_000 + offset),
+                &admission_packet(i64::from(offset) + 1),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(lifecycle.connections.len(), 256);
+        assert_eq!(handle.pending_requests.lock().len(), 256);
+
+        let addr = loopback_addr(5000);
+        let peer = handle
+            .accept(&ConnectionRequest {
+                remote_addr: addr,
+                payload: Bytes::new(),
+                connection_number: 0,
+                connect_time: 1,
+                local_peer_id: 0,
+            })
+            .await
+            .unwrap();
+        let mut disconnect = vec![PacketProperty::Disconnect as u8];
+        disconnect.extend_from_slice(&1i64.to_le_bytes());
+        process_packet(&handle, &tx, addr, &disconnect)
+            .await
+            .unwrap();
+        assert!(matches!(
+            lifecycle.disconnects.try_recv(),
+            Ok(ServerEvent::PeerDisconnected { peer: id, .. }) if id == peer
+        ));
+        assert!(!handle.peers.contains_key(&peer));
+        assert_eq!(lifecycle.connections.len(), 256);
         handle.shutdown();
     }
 
     #[tokio::test]
     async fn lifecycle_queue_must_be_positive_and_installed_once() {
         let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
-        assert!(handle.enable_lifecycle_event_queue(0).is_err());
-        let _lifecycle = handle.enable_lifecycle_event_queue(1).unwrap();
-        assert!(handle.enable_lifecycle_event_queue(1).is_err());
+        assert!(handle.enable_lifecycle_event_queues(1, 0).is_err());
+        assert!(handle.enable_lifecycle_event_queues(0, 1).is_err());
+        let _lifecycle = handle.enable_lifecycle_event_queues(1, 1).unwrap();
+        assert!(handle.enable_lifecycle_event_queues(1, 1).is_err());
         handle.shutdown();
     }
 

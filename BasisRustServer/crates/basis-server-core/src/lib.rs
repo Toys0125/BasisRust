@@ -550,7 +550,8 @@ impl ServerState {
             config.health_include_extended_metrics,
         )
         .await?;
-        let lifecycle_events = transport.enable_lifecycle_event_queue(MAX_LIFECYCLE_EVENTS)?;
+        let lifecycle_events =
+            transport.enable_lifecycle_event_queues(MAX_LIFECYCLE_EVENTS, MAX_LIFECYCLE_EVENTS)?;
         let (ordered_events, critical_events) =
             transport.enable_ordered_admission(OrderedAdmissionConfig {
                 regular_capacity: MAX_PENDING_ORDERED_EVENTS,
@@ -1173,7 +1174,7 @@ async fn event_loop(
     events: mpsc::Receiver<ServerEvent>,
     ordered_events: mpsc::Receiver<OrderedEvent>,
     critical_events: mpsc::Receiver<OrderedEvent>,
-    lifecycle_events: mpsc::Receiver<ServerEvent>,
+    lifecycle_events: basis_transport::LifecycleEventReceivers,
     shutdown: oneshot::Receiver<()>,
 ) {
     event_loop_with_handler(
@@ -1193,7 +1194,7 @@ async fn event_loop_with_handler<F, Fut>(
     mut events: mpsc::Receiver<ServerEvent>,
     mut ordered_events: mpsc::Receiver<OrderedEvent>,
     mut critical_events: mpsc::Receiver<OrderedEvent>,
-    mut lifecycle_events: mpsc::Receiver<ServerEvent>,
+    lifecycle_events: basis_transport::LifecycleEventReceivers,
     mut shutdown: oneshot::Receiver<()>,
     handle: F,
 ) where
@@ -1209,17 +1210,22 @@ async fn event_loop_with_handler<F, Fut>(
     let workers = Arc::new(Semaphore::new(worker_limit));
     // Authentication cannot wait for ordinary handlers to release all worker slots.
     let critical_workers = Arc::new(Semaphore::new(2));
-    // Connection admission and disconnect cleanup have their own bounded ingress
-    // and workers, independent of slow ordinary control handlers.
-    let lifecycle_workers = Arc::new(Semaphore::new(2));
-    let diagnostics = event_diagnostics::EventDiagnostics::start_from_env(&state, worker_limit + 4);
+    let diagnostics = event_diagnostics::EventDiagnostics::start_from_env(&state, worker_limit + 6);
+    let (lifecycle_stop, lifecycle_shutdown) = oneshot::channel();
+    let lifecycle = tokio::spawn(lifecycle_loop(
+        state.clone(),
+        lifecycle_events,
+        lifecycle_shutdown,
+        diagnostics.clone(),
+        handle.clone(),
+    ));
     let mut handlers = tokio::task::JoinSet::<()>::new();
     let mut ordered_task_keys = HashMap::<tokio::task::Id, OrderedLaneKey>::new();
     let mut ordered_sessions = HashMap::<(PeerId, u8), (PeerSession, u64)>::new();
     let mut next_session_generation = 1u64;
     let mut ordered_queue = OrderedHandlerQueue::default();
     let mut critical_queue = OrderedHandlerQueue::default();
-    let mut ingress_open = [true, true, true, true];
+    let mut ingress_open = [true, true, true];
     let mut join_flush = tokio::time::interval(JOIN_BATCH_FLUSH_INTERVAL);
     join_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     join_flush.tick().await;
@@ -1228,7 +1234,6 @@ async fn event_loop_with_handler<F, Fut>(
             break;
         }
         let ordered_has_capacity = ordered_queue.pending() < MAX_PENDING_ORDERED_EVENTS;
-        let mut lifecycle_event = false;
         let envelope = tokio::select! {
             completed = handlers.join_next_with_id(), if !handlers.is_empty() => {
                 if let Some(completed) = completed {
@@ -1273,10 +1278,12 @@ async fn event_loop_with_handler<F, Fut>(
                 continue;
             }
             _ = join_flush.tick() => {
-                ordered_sessions.retain(|base, (_, generation)| {
-                    ordered_queue.contains((base.0, base.1, *generation))
-                        || critical_queue.contains((base.0, base.1, *generation))
-                });
+                prune_ordered_sessions(
+                    &state.transport,
+                    &mut ordered_queue,
+                    &mut critical_queue,
+                    &mut ordered_sessions,
+                );
                 if let Err(err) = flush_join_batches(&state).await {
                     error!("join batch serialization failed: {err:#}");
                 }
@@ -1312,18 +1319,7 @@ async fn event_loop_with_handler<F, Fut>(
                     }
                 }
             }
-            event = lifecycle_events.recv(), if ingress_open[3] && lifecycle_workers.available_permits() > 0 => {
-                match event {
-                    Some(event) => {
-                        lifecycle_event = true;
-                        event.into()
-                    }
-                    None => {
-                        ingress_open[3] = false;
-                        continue;
-                    }
-                }
-            }
+
         };
         if let Some(diagnostics) = &diagnostics {
             diagnostics.record_queue_depth(events.len());
@@ -1403,17 +1399,11 @@ async fn event_loop_with_handler<F, Fut>(
             }
             continue;
         }
-        // Each ingress is selected only when its worker class has capacity.
-        // Never wait here and block the other reserved ingress classes.
-        let worker_pool = if lifecycle_event {
-            &lifecycle_workers
-        } else {
-            &workers
-        };
-        let permit = worker_pool
+        // Ordinary ingress is selected only when its worker class has capacity.
+        let permit = workers
             .clone()
             .try_acquire_owned()
-            .expect("ingress selected with worker capacity");
+            .expect("ordinary ingress selected with worker capacity");
         spawn_event_handler(
             &mut handlers,
             &state,
@@ -1427,36 +1417,14 @@ async fn event_loop_with_handler<F, Fut>(
     events.close();
     ordered_events.close();
     critical_events.close();
-    lifecycle_events.close();
-    let mut lifecycle_drained = false;
-    while !handlers.is_empty()
-        || ordered_queue.pending() > 0
-        || critical_queue.pending() > 0
-        || !lifecycle_drained
-    {
-        while !lifecycle_drained {
-            let Ok(permit) = lifecycle_workers.clone().try_acquire_owned() else {
-                break;
-            };
-            let Some(event) = lifecycle_events.recv().await else {
-                lifecycle_drained = true;
-                break;
-            };
-            // Transport retirement already committed these disconnects. Finish
-            // their application cleanup, but admit no new connections on shutdown.
-            if let ServerEvent::PeerDisconnected { session, .. } = &event {
-                discard_ordered_session(&mut ordered_queue, &mut ordered_sessions, session);
-                discard_ordered_session(&mut critical_queue, &mut ordered_sessions, session);
-                spawn_event_handler(
-                    &mut handlers,
-                    &state,
-                    diagnostics.as_ref(),
-                    handle.clone(),
-                    event.into(),
-                    permit,
-                );
-            }
-        }
+    let _ = lifecycle_stop.send(());
+    while !handlers.is_empty() || ordered_queue.pending() > 0 || critical_queue.pending() > 0 {
+        prune_ordered_sessions(
+            &state.transport,
+            &mut ordered_queue,
+            &mut critical_queue,
+            &mut ordered_sessions,
+        );
         spawn_ready_ordered(
             &mut ordered_queue,
             &mut handlers,
@@ -1497,6 +1465,95 @@ async fn event_loop_with_handler<F, Fut>(
                     warn!("event handler failed to join: {err}");
                 }
             }
+        }
+    }
+    if let Err(err) = lifecycle.await {
+        warn!("lifecycle dispatcher failed to join: {err}");
+    }
+}
+
+async fn lifecycle_loop<F, Fut>(
+    state: Arc<ServerState>,
+    mut events: basis_transport::LifecycleEventReceivers,
+    mut shutdown: oneshot::Receiver<()>,
+    diagnostics: Option<Arc<event_diagnostics::EventDiagnostics>>,
+    handle: F,
+) where
+    F: Fn(Arc<ServerState>, ServerEvent) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    // Lease waits occupy only the disconnect class. Both live tasks and queued
+    // events are bounded; no task is spawned merely to wait for a worker permit.
+    let connections = Arc::new(Semaphore::new(LIFECYCLE_WORKERS_PER_CLASS));
+    let disconnects = Arc::new(Semaphore::new(LIFECYCLE_WORKERS_PER_CLASS));
+    let mut handlers = tokio::task::JoinSet::new();
+    let mut open = [true, true];
+    while !state.shutdown.load(Ordering::Relaxed) && open.iter().any(|open| *open) {
+        let (event, workers) = tokio::select! {
+            _ = &mut shutdown => break,
+            completed = handlers.join_next(), if !handlers.is_empty() => {
+                if let Some(Err(err)) = completed {
+                    warn!("lifecycle handler failed to join: {err}");
+                }
+                continue;
+            }
+            event = events.connections.recv(),
+                if open[0] && connections.available_permits() > 0
+                    && handlers.len() < LIFECYCLE_WORKERS_PER_CLASS * 2 => {
+                match event {
+                    Some(event) => (event, &connections),
+                    None => { open[0] = false; continue; }
+                }
+            }
+            event = events.disconnects.recv(),
+                if open[1] && disconnects.available_permits() > 0
+                    && handlers.len() < LIFECYCLE_WORKERS_PER_CLASS * 2 => {
+                match event {
+                    Some(event) => (event, &disconnects),
+                    None => { open[1] = false; continue; }
+                }
+            }
+        };
+        let permit = workers
+            .clone()
+            .try_acquire_owned()
+            .expect("lifecycle capacity selected");
+        spawn_event_handler(
+            &mut handlers,
+            &state,
+            diagnostics.as_ref(),
+            handle.clone(),
+            event.into(),
+            permit,
+        );
+    }
+    events.connections.close();
+    events.disconnects.close();
+    let mut drained = false;
+    while !handlers.is_empty() || !drained {
+        while !drained && handlers.len() < LIFECYCLE_WORKERS_PER_CLASS * 2 {
+            let Ok(permit) = disconnects.clone().try_acquire_owned() else {
+                break;
+            };
+            let Some(event) = events.disconnects.recv().await else {
+                drained = true;
+                break;
+            };
+            // Retirement already committed; finish cleanup before persistence.
+            // Closed connection ingress admits no queued new requests.
+            if matches!(event, ServerEvent::PeerDisconnected { .. }) {
+                spawn_event_handler(
+                    &mut handlers,
+                    &state,
+                    diagnostics.as_ref(),
+                    handle.clone(),
+                    event.into(),
+                    permit,
+                );
+            }
+        }
+        if let Some(Err(err)) = handlers.join_next().await {
+            warn!("lifecycle handler failed to join: {err}");
         }
     }
 }
@@ -1568,6 +1625,7 @@ async fn receive_control_event(
 const MAX_PENDING_ORDERED_EVENTS: usize = 4096;
 const MAX_CRITICAL_ORDERED_EVENTS: usize = 128;
 const MAX_LIFECYCLE_EVENTS: usize = 256;
+const LIFECYCLE_WORKERS_PER_CLASS: usize = 2;
 const MAX_PENDING_ORDERED_PER_LANE: usize = 128;
 const MAX_PENDING_ORDERED_PER_PEER: usize = 256;
 type OrderedLaneKey = (PeerId, u8, u64);
@@ -1659,6 +1717,23 @@ impl<E> OrderedHandlerQueue<E> {
                 self.lanes.remove(&key);
             }
         }
+        self.compact_ready();
+    }
+
+    fn discard_lane(&mut self, key: OrderedLaneKey) -> bool {
+        let Some(lane) = self.lanes.get_mut(&key) else {
+            return false;
+        };
+        let changed = !lane.events.is_empty() || !lane.running;
+        self.pending -= lane.events.len();
+        lane.events.clear();
+        if !lane.running {
+            self.lanes.remove(&key);
+        }
+        changed
+    }
+
+    fn compact_ready(&mut self) {
         self.ready.retain(|key| self.lanes.contains_key(key));
     }
 
@@ -1668,6 +1743,29 @@ impl<E> OrderedHandlerQueue<E> {
 
     fn contains(&self, key: OrderedLaneKey) -> bool {
         self.lanes.contains_key(&key)
+    }
+}
+
+fn prune_ordered_sessions(
+    transport: &TransportHandle,
+    ordered: &mut OrderedHandlerQueue,
+    critical: &mut OrderedHandlerQueue,
+    sessions: &mut HashMap<(PeerId, u8), (PeerSession, u64)>,
+) {
+    let mut changed = false;
+    sessions.retain(|base, (session, generation)| {
+        let key = (base.0, base.1, *generation);
+        if !transport.is_current_session(session) {
+            changed |= ordered.discard_lane(key);
+            changed |= critical.discard_lane(key);
+        }
+        ordered.contains(key) || critical.contains(key)
+    });
+    if changed {
+        // Compact once per pass, so repeated retirement cannot accumulate stale
+        // ready keys while ordinary workers are blocked.
+        ordered.compact_ready();
+        critical.compact_ready();
     }
 }
 
@@ -5870,6 +5968,42 @@ mod tests {
         assert!(queue.lanes.is_empty());
         assert!(keys.is_empty());
         assert_eq!(workers.available_permits(), 2);
+    }
+
+    #[test]
+    fn retiring_ordered_lane_preserves_running_head_and_new_generation() {
+        let mut queue = OrderedHandlerQueue::<u8>::default();
+        let old = (17, 3, 1);
+        let new = (17, 3, 2);
+        queue.enqueue(old, 1);
+        queue.enqueue(old, 2);
+        queue.enqueue(new, 3);
+        assert_eq!(queue.start_next(), Some((old, 1)));
+        assert!(queue.discard_lane(old));
+        assert_eq!(queue.pending(), 1);
+        assert!(queue.contains(old));
+        assert!(!queue.discard_lane(old));
+        queue.complete(old);
+        assert!(!queue.contains(old));
+        assert_eq!(queue.start_next(), Some((new, 3)));
+        queue.complete(new);
+        assert!(queue.lanes.is_empty());
+    }
+
+    #[test]
+    fn retired_ordered_ready_keys_are_compacted_once_per_pass() {
+        let mut queue = OrderedHandlerQueue::<u8>::default();
+        for generation in 1..=4096 {
+            let key = (17, 3, generation);
+            queue.enqueue(key, 1);
+            assert!(queue.discard_lane(key));
+        }
+        let live = (18, 3, 4097);
+        queue.enqueue(live, 2);
+        queue.compact_ready();
+        assert_eq!(queue.pending(), 1);
+        assert_eq!(queue.ready.len(), 1);
+        assert_eq!(queue.start_next(), Some((live, 2)));
     }
 
     #[tokio::test]
