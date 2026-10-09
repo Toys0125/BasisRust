@@ -38,6 +38,8 @@ pub struct OrderedAdmissionConfig {
     pub critical_capacity: usize,
     pub per_lane: usize,
     pub per_peer: usize,
+    pub critical_per_lane: usize,
+    pub critical_per_peer: usize,
     pub critical_channel: u8,
 }
 
@@ -73,23 +75,28 @@ pub struct OrderedAdmissionPermit {
     critical: bool,
 }
 
-#[derive(Debug, Default)]
-struct OrderedAdmissionCounts {
-    regular: OrderedAdmissionClassCounts,
-    critical: OrderedAdmissionClassCounts,
+#[derive(Debug)]
+struct OrderedPeerAdmissionCounts {
+    regular: AtomicUsize,
+    critical: AtomicUsize,
+    regular_lanes: [AtomicUsize; 64],
 }
 
-#[derive(Debug, Default)]
-struct OrderedAdmissionClassCounts {
-    total: usize,
-    peers: HashMap<usize, usize>,
-    lanes: HashMap<(usize, u8), usize>,
+impl Default for OrderedPeerAdmissionCounts {
+    fn default() -> Self {
+        Self {
+            regular: AtomicUsize::new(0),
+            critical: AtomicUsize::new(0),
+            regular_lanes: std::array::from_fn(|_| AtomicUsize::new(0)),
+        }
+    }
 }
 
 #[derive(Debug)]
 struct OrderedAdmissionState {
     limits: OrderedAdmissionConfig,
-    counts: parking_lot::Mutex<OrderedAdmissionCounts>,
+    regular_total: AtomicUsize,
+    critical_total: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -101,24 +108,38 @@ struct OrderedAdmissionQueues {
 
 impl Drop for OrderedAdmissionPermit {
     fn drop(&mut self) {
-        let ptr = Arc::as_ptr(&self.peer) as usize;
-        let mut counts = self.state.counts.lock();
-        let class = if self.critical {
-            &mut counts.critical
+        if self.critical {
+            decrement_admission_counter(&self.peer.ordered_admission.critical);
+            decrement_admission_counter(&self.state.critical_total);
         } else {
-            &mut counts.regular
-        };
-        class.total -= 1;
-        decrement_admission_count(&mut class.peers, ptr);
-        decrement_admission_count(&mut class.lanes, (ptr, self.channel));
+            decrement_admission_counter(
+                &self.peer.ordered_admission.regular_lanes[self.channel as usize],
+            );
+            decrement_admission_counter(&self.peer.ordered_admission.regular);
+            decrement_admission_counter(&self.state.regular_total);
+        }
     }
 }
 
-fn decrement_admission_count<K: std::hash::Hash + Eq>(map: &mut HashMap<K, usize>, key: K) {
-    if let Some(value) = map.get_mut(&key) {
-        *value -= 1;
-        if *value == 0 {
-            map.remove(&key);
+fn decrement_admission_counter(counter: &AtomicUsize) {
+    let previous = counter.fetch_sub(1, Ordering::Relaxed);
+    debug_assert!(previous > 0, "ordered admission counter underflow");
+}
+
+fn try_increment_admission_counter(counter: &AtomicUsize, limit: usize) -> bool {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current >= limit {
+            return false;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
         }
     }
 }
@@ -129,24 +150,38 @@ impl OrderedAdmissionState {
         peer: &Arc<PeerState>,
         channel: u8,
     ) -> Option<OrderedAdmissionPermit> {
-        let ptr = Arc::as_ptr(peer) as usize;
         let critical = channel == self.limits.critical_channel;
-        let mut counts = self.counts.lock();
-        let (class, global_limit) = if critical {
-            (&mut counts.critical, self.limits.critical_capacity)
+        if critical {
+            let peer_limit = self
+                .limits
+                .critical_per_peer
+                .min(self.limits.critical_per_lane);
+            if !try_increment_admission_counter(&peer.ordered_admission.critical, peer_limit) {
+                return None;
+            }
+            if !try_increment_admission_counter(&self.critical_total, self.limits.critical_capacity)
+            {
+                decrement_admission_counter(&peer.ordered_admission.critical);
+                return None;
+            }
         } else {
-            (&mut counts.regular, self.limits.regular_capacity)
-        };
-        let lane = (ptr, channel);
-        if class.total >= global_limit
-            || class.peers.get(&ptr).copied().unwrap_or(0) >= self.limits.per_peer
-            || class.lanes.get(&lane).copied().unwrap_or(0) >= self.limits.per_lane
-        {
-            return None;
+            let lane = &peer.ordered_admission.regular_lanes[channel as usize];
+            if !try_increment_admission_counter(lane, self.limits.per_lane) {
+                return None;
+            }
+            if !try_increment_admission_counter(
+                &peer.ordered_admission.regular,
+                self.limits.per_peer,
+            ) {
+                decrement_admission_counter(lane);
+                return None;
+            }
+            if !try_increment_admission_counter(&self.regular_total, self.limits.regular_capacity) {
+                decrement_admission_counter(&peer.ordered_admission.regular);
+                decrement_admission_counter(lane);
+                return None;
+            }
         }
-        class.total += 1;
-        *class.peers.entry(ptr).or_default() += 1;
-        *class.lanes.entry(lane).or_default() += 1;
         Some(OrderedAdmissionPermit {
             state: self.clone(),
             peer: peer.clone(),
@@ -524,6 +559,8 @@ impl TransportStats {
 struct PeerState {
     id: PeerId,
     addr: SocketAddr,
+    /// Fixed session-owned quota counters. The 64 regular lane counters are inline (~512 B).
+    ordered_admission: OrderedPeerAdmissionCounts,
     connection_number: u8,
     connect_time: i64,
     last_seen: parking_lot::Mutex<Instant>,
@@ -1225,6 +1262,8 @@ impl TransportHandle {
             || config.critical_capacity == 0
             || config.per_lane == 0
             || config.per_peer == 0
+            || config.critical_per_lane == 0
+            || config.critical_per_peer == 0
             || config.critical_channel > 63
         {
             return Err(std::io::Error::new(
@@ -1246,7 +1285,8 @@ impl TransportHandle {
         let (critical_tx, critical_rx) = mpsc::channel(config.critical_capacity);
         let state = Arc::new(OrderedAdmissionState {
             limits: config,
-            counts: parking_lot::Mutex::new(OrderedAdmissionCounts::default()),
+            regular_total: AtomicUsize::new(0),
+            critical_total: AtomicUsize::new(0),
         });
         *configured = Some(Arc::new(OrderedAdmissionQueues {
             regular: regular_tx,
@@ -1611,6 +1651,7 @@ impl TransportHandle {
             let state = Arc::new(PeerState {
                 id,
                 addr: request.remote_addr,
+                ordered_admission: OrderedPeerAdmissionCounts::default(),
                 connection_number: request.connection_number,
                 connect_time: request.connect_time,
                 last_seen: parking_lot::Mutex::new(Instant::now()),
@@ -6672,6 +6713,7 @@ mod tests {
         Arc::new(PeerState {
             id,
             addr: "127.0.0.1:4296".parse().unwrap(),
+            ordered_admission: OrderedPeerAdmissionCounts::default(),
             connection_number: 0,
             connect_time: 1,
             last_seen: parking_lot::Mutex::new(Instant::now()),
@@ -6795,6 +6837,8 @@ mod tests {
                 critical_capacity: 1,
                 per_lane: 1,
                 per_peer: 1,
+                critical_per_lane: 1,
+                critical_per_peer: 1,
                 critical_channel: channels::REGISTRY_CONTROL,
             })
             .unwrap();
@@ -6899,6 +6943,8 @@ mod tests {
                 critical_capacity: 1,
                 per_lane: 1,
                 per_peer: 1,
+                critical_per_lane: 1,
+                critical_per_peer: 1,
                 critical_channel: channels::REGISTRY_CONTROL,
             })
             .unwrap();
@@ -6962,10 +7008,8 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .budget
-                .counts
-                .lock()
-                .regular
-                .total,
+                .regular_total
+                .load(Ordering::Relaxed),
             1
         );
         drop(replacement_event);
@@ -6987,6 +7031,8 @@ mod tests {
                 critical_capacity: 1,
                 per_lane: 1,
                 per_peer: 1,
+                critical_per_lane: 1,
+                critical_per_peer: 1,
                 critical_channel: channels::AUTH_IDENTITY,
             })
             .unwrap();
@@ -7046,6 +7092,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn critical_admission_limits_auth_per_peer_without_blocking_other_peers() {
+        let (handle, tx, _control) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 2, 1)
+                .await
+                .unwrap();
+        let first_peer = test_peer_state(0);
+        let second_peer = test_peer_state(1);
+        handle.peers.insert(0, first_peer.clone());
+        handle.peers.insert(1, second_peer.clone());
+        let (mut _regular, mut critical) = handle
+            .enable_ordered_admission(OrderedAdmissionConfig {
+                regular_capacity: 4,
+                critical_capacity: 4,
+                per_lane: 4,
+                per_peer: 4,
+                critical_per_lane: 2,
+                critical_per_peer: 2,
+                critical_channel: channels::AUTH_IDENTITY,
+            })
+            .unwrap();
+        let event = |id, peer: &Arc<PeerState>| ServerEvent::Message {
+            peer: id,
+            session: PeerSession {
+                peer: id,
+                state: peer.clone(),
+            },
+            channel: channels::AUTH_IDENTITY,
+            delivery: DeliveryMethod::ReliableOrdered,
+            payload: Bytes::new(),
+        };
+        let channel_id =
+            DeliveryMethod::channel_id(channels::AUTH_IDENTITY, DeliveryMethod::ReliableOrdered);
+        let mut first_receive = OrderedReceiveState::default();
+        for sequence in 0..2 {
+            assert!(deliver_ordered_event(
+                &handle,
+                &tx,
+                0,
+                &first_peer,
+                channel_id,
+                sequence,
+                &mut first_receive,
+                event(0, &first_peer),
+            )
+            .unwrap());
+        }
+        assert!(!deliver_ordered_event(
+            &handle,
+            &tx,
+            0,
+            &first_peer,
+            channel_id,
+            2,
+            &mut first_receive,
+            event(0, &first_peer),
+        )
+        .unwrap());
+        assert_eq!(first_receive.expected, 2);
+        assert_eq!(
+            first_peer.outgoing_acks.lock()[&channel_id].bits[0] & (1 << 2),
+            0
+        );
+
+        let mut second_receive = OrderedReceiveState::default();
+        assert!(deliver_ordered_event(
+            &handle,
+            &tx,
+            1,
+            &second_peer,
+            channel_id,
+            0,
+            &mut second_receive,
+            event(1, &second_peer),
+        )
+        .unwrap());
+        assert_eq!(second_receive.expected, 1);
+        let mut admitted = 0;
+        while critical.try_recv().is_ok() {
+            admitted += 1;
+        }
+        assert_eq!(admitted, 3);
+    }
+
+    #[tokio::test]
+    async fn ordered_admission_rejects_zero_quotas() {
+        let (handle, _tx, _control) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 2, 1)
+                .await
+                .unwrap();
+        let config = OrderedAdmissionConfig {
+            regular_capacity: 1,
+            critical_capacity: 1,
+            per_lane: 1,
+            per_peer: 1,
+            critical_per_lane: 1,
+            critical_per_peer: 1,
+            critical_channel: channels::AUTH_IDENTITY,
+        };
+        let zeroers: [fn(&mut OrderedAdmissionConfig); 6] = [
+            |config: &mut OrderedAdmissionConfig| config.regular_capacity = 0,
+            |config: &mut OrderedAdmissionConfig| config.critical_capacity = 0,
+            |config: &mut OrderedAdmissionConfig| config.per_lane = 0,
+            |config: &mut OrderedAdmissionConfig| config.per_peer = 0,
+            |config: &mut OrderedAdmissionConfig| config.critical_per_lane = 0,
+            |config: &mut OrderedAdmissionConfig| config.critical_per_peer = 0,
+        ];
+        for set_zero in zeroers {
+            let mut invalid = config;
+            set_zero(&mut invalid);
+            assert!(handle.enable_ordered_admission(invalid).is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn future_reorder_uses_reorder_budget_then_drains_after_admission_frees() {
         let (handle, tx, _control) =
             TransportHandle::bind_with_options(loopback_addr(0), true, true, 2, 1)
@@ -7059,6 +7219,8 @@ mod tests {
                 critical_capacity: 1,
                 per_lane: 1,
                 per_peer: 1,
+                critical_per_lane: 1,
+                critical_per_peer: 1,
                 critical_channel: channels::REGISTRY_CONTROL,
             })
             .unwrap();
@@ -7114,9 +7276,12 @@ mod tests {
                 critical_capacity: 1,
                 per_lane: 1,
                 per_peer: 1,
+                critical_per_lane: 1,
+                critical_per_peer: 1,
                 critical_channel: channels::REGISTRY_CONTROL,
             },
-            counts: parking_lot::Mutex::new(OrderedAdmissionCounts::default()),
+            regular_total: AtomicUsize::new(0),
+            critical_total: AtomicUsize::new(0),
         });
         let barrier = Arc::new(std::sync::Barrier::new(3));
         let threads: Vec<_> = [channels::CHAT, channels::PLAYER_AVATAR_HIGH]
@@ -7137,9 +7302,171 @@ mod tests {
             .map(|thread| thread.join().unwrap())
             .collect();
         assert_eq!(permits.iter().filter(|permit| permit.is_some()).count(), 1);
-        assert_eq!(state.counts.lock().regular.total, 1);
+        assert_eq!(state.regular_total.load(Ordering::Relaxed), 1);
         drop(permits);
-        assert_eq!(state.counts.lock().regular.total, 0);
+        assert_eq!(state.regular_total.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn concurrent_ordered_reservations_respect_peer_lane_and_global_caps() {
+        let config = OrderedAdmissionConfig {
+            regular_capacity: 3,
+            critical_capacity: 1,
+            per_lane: 2,
+            per_peer: 2,
+            critical_per_lane: 1,
+            critical_per_peer: 1,
+            critical_channel: channels::REGISTRY_CONTROL,
+        };
+        let state = Arc::new(OrderedAdmissionState {
+            limits: config,
+            regular_total: AtomicUsize::new(0),
+            critical_total: AtomicUsize::new(0),
+        });
+        let race = |assignments: Vec<(Arc<PeerState>, u8)>| {
+            let barrier = Arc::new(std::sync::Barrier::new(assignments.len() + 1));
+            let workers: Vec<_> = assignments
+                .into_iter()
+                .map(|(peer, channel)| {
+                    let state = state.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        state.reserve(&peer, channel)
+                    })
+                })
+                .collect();
+            barrier.wait();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        let peer = test_peer_state(0);
+        let permits = race((0..8).map(|index| (peer.clone(), index as u8)).collect());
+        assert!(permits.iter().filter(|permit| permit.is_some()).count() <= 2);
+        assert!(peer.ordered_admission.regular.load(Ordering::Relaxed) <= 2);
+        drop(permits);
+
+        let lane_peer = test_peer_state(1);
+        let permits = race(
+            (0..4)
+                .map(|_| (lane_peer.clone(), channels::CHAT))
+                .collect(),
+        );
+        assert!(permits.iter().filter(|permit| permit.is_some()).count() <= 2);
+        assert_eq!(
+            lane_peer.ordered_admission.regular_lanes[channels::CHAT as usize]
+                .load(Ordering::Relaxed),
+            2
+        );
+        drop(permits);
+
+        let peers: Vec<_> = (10..=13).map(test_peer_state).collect();
+        let permits = race(
+            peers
+                .iter()
+                .enumerate()
+                .map(|(index, peer)| (peer.clone(), index as u8))
+                .collect(),
+        );
+        assert!(permits.iter().filter(|permit| permit.is_some()).count() <= 3);
+        assert_eq!(state.regular_total.load(Ordering::Relaxed), 3);
+        drop(permits);
+        assert_eq!(state.regular_total.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn ordered_reservation_rolls_back_local_counters_when_later_cap_fails() {
+        let state = Arc::new(OrderedAdmissionState {
+            limits: OrderedAdmissionConfig {
+                regular_capacity: 1,
+                critical_capacity: 1,
+                per_lane: 1,
+                per_peer: 1,
+                critical_per_lane: 1,
+                critical_per_peer: 1,
+                critical_channel: channels::REGISTRY_CONTROL,
+            },
+            regular_total: AtomicUsize::new(0),
+            critical_total: AtomicUsize::new(0),
+        });
+        let admitted = test_peer_state(0);
+        let blocked = test_peer_state(1);
+        let held = state.reserve(&admitted, channels::CHAT).unwrap();
+        assert!(state
+            .reserve(&blocked, channels::PLAYER_AVATAR_HIGH)
+            .is_none());
+        assert_eq!(blocked.ordered_admission.regular.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            blocked.ordered_admission.regular_lanes[channels::PLAYER_AVATAR_HIGH as usize]
+                .load(Ordering::Relaxed),
+            0
+        );
+        drop(held);
+        assert_eq!(state.regular_total.load(Ordering::Relaxed), 0);
+
+        let held = state.reserve(&blocked, channels::CHAT).unwrap();
+        assert!(state
+            .reserve(&blocked, channels::PLAYER_AVATAR_HIGH)
+            .is_none());
+        assert_eq!(blocked.ordered_admission.regular.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            blocked.ordered_admission.regular_lanes[channels::CHAT as usize]
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            blocked.ordered_admission.regular_lanes[channels::PLAYER_AVATAR_HIGH as usize]
+                .load(Ordering::Relaxed),
+            0
+        );
+        drop(held);
+        assert_eq!(state.regular_total.load(Ordering::Relaxed), 0);
+        assert_eq!(blocked.ordered_admission.regular.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "microbenchmark; run explicitly for matched before/after samples"]
+    async fn ordered_admission_microbench() {
+        let (handle, _events, _control) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 2, 1)
+                .await
+                .unwrap();
+        handle
+            .enable_ordered_admission(OrderedAdmissionConfig {
+                regular_capacity: 4096,
+                critical_capacity: 2,
+                per_lane: 128,
+                per_peer: 256,
+                critical_per_lane: 2,
+                critical_per_peer: 2,
+                critical_channel: channels::AUTH_IDENTITY,
+            })
+            .unwrap();
+        let budget = handle
+            .ordered_admission
+            .read()
+            .as_ref()
+            .unwrap()
+            .budget
+            .clone();
+        let peers: Vec<_> = (0..64).map(test_peer_state).collect();
+        const ITERATIONS: usize = 1_000_000;
+        for (label, peer_count) in [("one_peer", 1), ("sixty_four_peers", 64)] {
+            for sample in 0..5 {
+                let start = Instant::now();
+                for index in 0..ITERATIONS {
+                    let peer = &peers[index % peer_count];
+                    let channel = (index % 64) as u8;
+                    drop(budget.reserve(peer, channel).expect("quota available"));
+                }
+                let ns_per_reservation = start.elapsed().as_nanos() as f64 / ITERATIONS as f64;
+                eprintln!("ordered_admission_microbench case={label} sample={sample} ns_per_reservation={ns_per_reservation:.2}");
+            }
+        }
+        handle.shutdown();
     }
 
     #[test]
@@ -8962,6 +9289,7 @@ mod tests {
         let state = PeerState {
             id: 7,
             addr: "127.0.0.1:4296".parse().unwrap(),
+            ordered_admission: OrderedPeerAdmissionCounts::default(),
             connection_number: 2,
             connect_time: 123,
             last_seen: parking_lot::Mutex::new(Instant::now()),

@@ -1129,6 +1129,8 @@ async fn ordered_udp_burst_backpressures_and_retries_in_fifo_order() {
             critical_capacity: crate::MAX_CRITICAL_ORDERED_EVENTS,
             per_lane: crate::MAX_PENDING_ORDERED_PER_LANE,
             per_peer: crate::MAX_PENDING_ORDERED_PER_PEER,
+            critical_per_lane: 2,
+            critical_per_peer: 2,
             critical_channel: channels::AUTH_IDENTITY,
         })
         .unwrap();

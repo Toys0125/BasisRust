@@ -556,6 +556,8 @@ impl ServerState {
                 critical_capacity: MAX_CRITICAL_ORDERED_EVENTS,
                 per_lane: MAX_PENDING_ORDERED_PER_LANE,
                 per_peer: MAX_PENDING_ORDERED_PER_PEER,
+                critical_per_lane: 2,
+                critical_per_peer: 2,
                 critical_channel: channels::AUTH_IDENTITY,
             })?;
         transport.set_compact_merge_send(config.compact_merged);
@@ -1211,8 +1213,11 @@ async fn event_loop_with_handler<F, Fut>(
     join_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     join_flush.tick().await;
     while !state.shutdown.load(Ordering::Relaxed) {
+        if !ingress_open.iter().any(|open| *open) {
+            break;
+        }
         let ordered_has_capacity = ordered_queue.pending() < MAX_PENDING_ORDERED_EVENTS;
-        tokio::select! {
+        let envelope = tokio::select! {
             completed = handlers.join_next_with_id(), if !handlers.is_empty() => {
                 if let Some(completed) = completed {
                     let id = match completed {
@@ -1253,6 +1258,7 @@ async fn event_loop_with_handler<F, Fut>(
                     diagnostics.as_ref(),
                     handle.clone(),
                 );
+                continue;
             }
             _ = join_flush.tick() => {
                 ordered_sessions.retain(|base, (_, generation)| {
@@ -1262,114 +1268,141 @@ async fn event_loop_with_handler<F, Fut>(
                 if let Err(err) = flush_join_batches(&state).await {
                     error!("join batch serialization failed: {err:#}");
                 }
+                continue;
             }
             _ = &mut shutdown => {
                 break;
             }
-            maybe_event = receive_control_event(
-                &mut events, &mut ordered_events, &mut critical_events, &mut ingress_open,
-                ordered_has_capacity, critical_queue.pending() < MAX_CRITICAL_ORDERED_EVENTS,
-                workers.available_permits() > 0,
-            ) => {
-                let Some(event) = maybe_event else { break; };
-                if let Some(diagnostics) = &diagnostics {
-                    diagnostics.record_queue_depth(events.len());
-                }
-                let envelope = event;
-                let event = &envelope.event;
-                if let ServerEvent::PeerDisconnected { session, .. } = event {
-                    discard_ordered_session(&mut ordered_queue, &mut ordered_sessions, session);
-                    discard_ordered_session(&mut critical_queue, &mut ordered_sessions, session);
-                }
-                if is_high_frequency_inline_event(event)
-                    && !matches!(
-                        event,
-                        ServerEvent::Message {
-                            delivery: DeliveryMethod::ReliableOrdered,
-                            ..
-                        }
-                    )
-                {
-                    if let Err(err) = handle(state.clone(), envelope.event).await {
-                        error!("server event failed: {err:#}");
-                    }
-                    continue;
-                }
-                if let ServerEvent::Message {
-                    peer,
-                    session,
-                    channel,
-                    delivery: DeliveryMethod::ReliableOrdered,
-                    ..
-                } = event
-                {
-                    if !state.transport.is_current_session(session) {
-                        discard_ordered_session(&mut ordered_queue, &mut ordered_sessions, session);
-                        discard_ordered_session(&mut critical_queue, &mut ordered_sessions, session);
+            event = events.recv(), if ingress_open[0] && workers.available_permits() > 0 => {
+                match event {
+                    Some(event) => event.into(),
+                    None => {
+                        ingress_open[0] = false;
                         continue;
                     }
-                    let session = session.clone();
-                    let base = (*peer, *channel);
-                    let generation = match ordered_sessions.get(&base) {
-                        Some((old_session, generation)) if old_session.same_connection(&session) => *generation,
-                        _ => {
-                            let generation = next_session_generation;
-                            next_session_generation = next_session_generation.wrapping_add(1).max(1);
-                            ordered_sessions.insert(base, (session.clone(), generation));
-                            generation
-                        }
-                    };
-                    let key = (base.0, base.1, generation);
-                    let queue = if *channel == channels::AUTH_IDENTITY {
-                        &mut critical_queue
-                    } else {
-                        &mut ordered_queue
-                    };
-                    // Admission is reserved in transport before ACK, and retained through
-                    // handler completion. Temporary overload leaves packets for retry.
-                    queue.enqueue(key, envelope);
-                    spawn_ready_ordered(
-                        &mut ordered_queue,
-                        &mut handlers,
-                        &mut ordered_task_keys,
-                        workers.clone(),
-                        &state,
-                        diagnostics.as_ref(),
-                        handle.clone(),
-                    );
-                    spawn_ready_ordered(
-                        &mut critical_queue,
-                        &mut handlers,
-                        &mut ordered_task_keys,
-                        critical_workers.clone(),
-                        &state,
-                        diagnostics.as_ref(),
-                        handle.clone(),
-                    );
-                    continue;
                 }
-                // Regular ingress is selected only when an ordinary worker is free;
-                // waiting for one here would also block the reserved identity ingress.
-                let permit = workers.clone().try_acquire_owned()
-                    .expect("regular ingress selected with worker capacity");
-                let OrderedEvent { event, admission } = envelope;
-                let mut diagnostic_guard = diagnostics.as_ref().map(|d| d.spawned(&event));
-                let state = state.clone();
-                let handle = handle.clone();
-                let task = async move {
-                    let _permit = permit;
-                    let _admission = admission;
-                    if let Some(guard) = &mut diagnostic_guard { guard.started(); }
-                    if let Err(err) = handle(state.clone(), event).await {
-                        error!("server event failed: {err:#}");
-                    }
-                };
-                if let Some(diagnostics) = &diagnostics {
-                    diagnostics.record_task_size(std::mem::size_of_val(&task));
-                }
-                handlers.spawn(task);
             }
+            event = ordered_events.recv(), if ingress_open[1] && ordered_has_capacity => {
+                match event {
+                    Some(event) => event,
+                    None => {
+                        ingress_open[1] = false;
+                        continue;
+                    }
+                }
+            }
+            event = critical_events.recv(), if ingress_open[2] && critical_queue.pending() < MAX_CRITICAL_ORDERED_EVENTS => {
+                match event {
+                    Some(event) => event,
+                    None => {
+                        ingress_open[2] = false;
+                        continue;
+                    }
+                }
+            }
+        };
+        if let Some(diagnostics) = &diagnostics {
+            diagnostics.record_queue_depth(events.len());
         }
+        let event = &envelope.event;
+        if let ServerEvent::PeerDisconnected { session, .. } = event {
+            discard_ordered_session(&mut ordered_queue, &mut ordered_sessions, session);
+            discard_ordered_session(&mut critical_queue, &mut ordered_sessions, session);
+        }
+        if is_high_frequency_inline_event(event)
+            && !matches!(
+                event,
+                ServerEvent::Message {
+                    delivery: DeliveryMethod::ReliableOrdered,
+                    ..
+                }
+            )
+        {
+            if let Err(err) = handle(state.clone(), envelope.event).await {
+                error!("server event failed: {err:#}");
+            }
+            continue;
+        }
+        if let ServerEvent::Message {
+            peer,
+            session,
+            channel,
+            delivery: DeliveryMethod::ReliableOrdered,
+            ..
+        } = event
+        {
+            if !state.transport.is_current_session(session) {
+                discard_ordered_session(&mut ordered_queue, &mut ordered_sessions, session);
+                discard_ordered_session(&mut critical_queue, &mut ordered_sessions, session);
+                continue;
+            }
+            let session = session.clone();
+            let base = (*peer, *channel);
+            let generation = match ordered_sessions.get(&base) {
+                Some((old_session, generation)) if old_session.same_connection(&session) => {
+                    *generation
+                }
+                _ => {
+                    let generation = next_session_generation;
+                    next_session_generation = next_session_generation.wrapping_add(1).max(1);
+                    ordered_sessions.insert(base, (session.clone(), generation));
+                    generation
+                }
+            };
+            let key = (base.0, base.1, generation);
+            if *channel == channels::AUTH_IDENTITY {
+                // Admission is reserved before ACK and retained through handler
+                // completion. Temporary overload leaves packets for retry.
+                critical_queue.enqueue(key, envelope);
+                spawn_ready_ordered(
+                    &mut critical_queue,
+                    &mut handlers,
+                    &mut ordered_task_keys,
+                    critical_workers.clone(),
+                    &state,
+                    diagnostics.as_ref(),
+                    handle.clone(),
+                );
+            } else {
+                // Admission is reserved before ACK and retained through handler
+                // completion. Temporary overload leaves packets for retry.
+                ordered_queue.enqueue(key, envelope);
+                spawn_ready_ordered(
+                    &mut ordered_queue,
+                    &mut handlers,
+                    &mut ordered_task_keys,
+                    workers.clone(),
+                    &state,
+                    diagnostics.as_ref(),
+                    handle.clone(),
+                );
+            }
+            continue;
+        }
+        // Regular ingress is selected only when an ordinary worker is free;
+        // waiting for one here would also block the reserved identity ingress.
+        let permit = workers
+            .clone()
+            .try_acquire_owned()
+            .expect("regular ingress selected with worker capacity");
+        let OrderedEvent { event, admission } = envelope;
+        let mut diagnostic_guard = diagnostics.as_ref().map(|d| d.spawned(&event));
+        let state = state.clone();
+        let handle = handle.clone();
+        let task = async move {
+            let _permit = permit;
+            let _admission = admission;
+            if let Some(guard) = &mut diagnostic_guard {
+                guard.started();
+            }
+            if let Err(err) = handle(state.clone(), event).await {
+                error!("server event failed: {err:#}");
+            }
+        };
+        if let Some(diagnostics) = &diagnostics {
+            diagnostics.record_task_size(std::mem::size_of_val(&task));
+        }
+        handlers.spawn(task);
     }
     // Stop admission, then finish accepted handlers before final persistence.
     events.close();
@@ -1420,6 +1453,7 @@ async fn event_loop_with_handler<F, Fut>(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn receive_control_event(
     events: &mut mpsc::Receiver<ServerEvent>,
