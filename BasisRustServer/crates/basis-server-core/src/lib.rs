@@ -83,6 +83,9 @@ pub struct ConnectedPeer {
     // Present for live connections. Unit fixtures that exercise app state without a
     // transport session may leave this absent.
     pub session: Option<PeerSession>,
+    // A fresh counter per authenticated connection. Clones share admission work;
+    // old in-flight permits cannot decrement a replacement connection's quota.
+    pub(crate) scene_pending: Arc<AtomicU64>,
 }
 
 struct PendingIdentity {
@@ -2382,6 +2385,7 @@ async fn finalize_accept(
         metadata: metadata.clone(),
         ready: ready.clone(),
         session: Some(session.clone()),
+        scene_pending: Arc::new(AtomicU64::new(0)),
     };
     let existing_players = {
         let _commit = state.admission_commit.lock();
@@ -6466,6 +6470,7 @@ mod tests {
             metadata: test_ready_message().player_meta_data_message,
             ready: test_ready_message(),
             session: None,
+            scene_pending: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -6514,11 +6519,9 @@ mod tests {
     #[test]
     fn join_batches_wait_for_initial_history_and_preserve_order() {
         let mut state = JoinBroadcastState::default();
-        assert!(
-            state
-                .register_peer(test_connected_peer(1), vec![1])
-                .is_empty()
-        );
+        assert!(state
+            .register_peer(test_connected_peer(1), vec![1])
+            .is_empty());
         let existing = state.register_peer(test_connected_peer(2), vec![2]);
         assert_eq!(
             existing.iter().map(|peer| peer.id).collect::<Vec<_>>(),

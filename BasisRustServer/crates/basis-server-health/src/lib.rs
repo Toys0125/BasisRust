@@ -196,12 +196,33 @@ pub struct AvatarTimingMetrics {
 
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct SceneBatchMetrics {
+    pub peer_queue_limit: u64,
+    pub admitted_recipient_messages: u64,
+    pub rejected_recipient_messages: u64,
+    pub pending_recipient_messages: u64,
+    pub peak_peer_pending_messages: u64,
+    pub enqueued_messages: u64,
+    pub dequeued_messages: u64,
+    pub attempted_recipient_messages: u64,
+    pub stale_recipient_messages: u64,
+    pub send_errors: u64,
+    pub enqueue_errors: u64,
+    pub queue_backpressure: u64,
+    pub fanout_backpressure: u64,
+    pub sent_datagrams: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ExtendedHealthMetrics {
     pub reliable: ReliableMetrics,
     pub app_messages: AppMessageMetrics,
     pub raw_udp: RawUdpMetrics,
     pub avatar_sync: AvatarSyncMetrics,
     pub avatar_timing: AvatarTimingMetrics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scene_batch: Option<SceneBatchMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -557,6 +578,29 @@ mod tests {
         assert_eq!(json["appMessages"]["avatarCoalesced"], 3);
         assert_eq!(json["appMessages"]["avatarRejected"], 2);
         assert_eq!(json["appMessages"]["avatarProcessed"], 9);
+    }
+
+    #[test]
+    fn scene_batch_health_is_optional_and_exposes_explicit_admission_loss() {
+        let disabled = serde_json::to_value(ExtendedHealthMetrics::default()).unwrap();
+        assert!(disabled.get("sceneBatch").is_none());
+        let metrics = ExtendedHealthMetrics {
+            scene_batch: Some(SceneBatchMetrics {
+                peer_queue_limit: 70,
+                admitted_recipient_messages: 100,
+                rejected_recipient_messages: 12,
+                pending_recipient_messages: 5,
+                peak_peer_pending_messages: 70,
+                ..SceneBatchMetrics::default()
+            }),
+            ..ExtendedHealthMetrics::default()
+        };
+        let enabled = serde_json::to_value(metrics).unwrap();
+        assert_eq!(enabled["sceneBatch"]["peerQueueLimit"], 70);
+        assert_eq!(enabled["sceneBatch"]["admittedRecipientMessages"], 100);
+        assert_eq!(enabled["sceneBatch"]["rejectedRecipientMessages"], 12);
+        assert_eq!(enabled["sceneBatch"]["pendingRecipientMessages"], 5);
+        assert_eq!(enabled["sceneBatch"]["peakPeerPendingMessages"], 70);
     }
 
     #[test]

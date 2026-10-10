@@ -12,7 +12,7 @@ use basis_server_health::{
     format_system_time, start_health_server, AppMessageMetrics, AvatarSyncMetrics,
     AvatarTimingMetrics, BsrBundleMetrics, BsrHealthMetrics, BsrLoadMetrics, BsrMsPerTickMetrics,
     BsrWindowMetrics, BsrZstdMetrics, ExtendedHealthMetrics, HealthState, HealthStatistics,
-    RawUdpMetrics, ReliableMetrics, RustTransportMetrics,
+    RawUdpMetrics, ReliableMetrics, RustTransportMetrics, SceneBatchMetrics,
 };
 use clap::Parser;
 use crossterm::{
@@ -852,6 +852,24 @@ async fn async_main(
                 let app = server.statistics.snapshot();
                 let avatar = server.avatar_sync.stats();
                 ExtendedHealthMetrics {
+                    scene_batch: server
+                        .scene_relay_snapshot()
+                        .map(|scene| SceneBatchMetrics {
+                            peer_queue_limit: scene.peer_queue_limit,
+                            admitted_recipient_messages: scene.admitted_recipient_messages,
+                            rejected_recipient_messages: scene.rejected_recipient_messages,
+                            pending_recipient_messages: scene.pending_recipient_messages,
+                            peak_peer_pending_messages: scene.peak_peer_pending_messages,
+                            enqueued_messages: scene.enqueued_messages,
+                            dequeued_messages: scene.dequeued_messages,
+                            attempted_recipient_messages: scene.attempted_recipient_messages,
+                            stale_recipient_messages: scene.stale_recipient_messages,
+                            send_errors: scene.send_errors,
+                            enqueue_errors: scene.enqueue_errors,
+                            queue_backpressure: scene.queue_backpressure,
+                            fanout_backpressure: scene.fanout_backpressure,
+                            sent_datagrams: scene.sent_datagrams,
+                        }),
                     reliable: ReliableMetrics {
                         pending: server.transport.pending_reliable_count(),
                         queued: server.transport.queued_reliable_count(),

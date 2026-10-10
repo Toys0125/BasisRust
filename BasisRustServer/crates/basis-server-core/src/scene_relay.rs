@@ -24,6 +24,13 @@ const MAX_BATCH_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SceneRelaySnapshot {
+    pub peer_queue_limit: u64,
+    /// Reserved recipient work, including work subsequently discarded on errors or staleness.
+    pub admitted_recipient_messages: u64,
+    /// Recipient messages explicitly refused by the pending-work quota.
+    pub rejected_recipient_messages: u64,
+    pub pending_recipient_messages: u64,
+    pub peak_peer_pending_messages: u64,
     pub enqueued_messages: u64,
     pub dequeued_messages: u64,
     /// Logical recipient attempts, not delivered messages.
@@ -39,6 +46,10 @@ pub struct SceneRelaySnapshot {
 
 #[derive(Default)]
 struct Counters {
+    admitted: AtomicU64,
+    rejected: AtomicU64,
+    pending: AtomicU64,
+    peak_peer_pending: AtomicU64,
     enqueued: AtomicU64,
     dequeued: AtomicU64,
     attempted: AtomicU64,
@@ -50,19 +61,85 @@ struct Counters {
     send_errors: AtomicU64,
 }
 
+pub(super) struct SceneRecipient {
+    session: PeerSession,
+    pending: Arc<AtomicU64>,
+}
+
+struct PendingPermit {
+    pending: Arc<AtomicU64>,
+    count: u64,
+}
+
+impl PendingPermit {
+    fn reserve(pending: Arc<AtomicU64>, limit: u64) -> Option<(Self, u64)> {
+        let previous = pending
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                if limit != 0 && count >= limit {
+                    None
+                } else {
+                    count.checked_add(1)
+                }
+            })
+            .ok()?;
+        Some((Self { pending, count: 1 }, previous + 1))
+    }
+}
+
+impl PendingPermit {
+    fn absorb(&mut self, mut other: Self) {
+        debug_assert!(Arc::ptr_eq(&self.pending, &other.pending));
+        self.count += other.count;
+        other.count = 0;
+    }
+}
+
+impl Drop for PendingPermit {
+    fn drop(&mut self) {
+        if self.count != 0 {
+            self.pending.fetch_sub(self.count, Ordering::Relaxed);
+        }
+    }
+}
+
+struct ReservedRecipient {
+    session: PeerSession,
+    permit: PendingPermit,
+}
+
 struct Input {
     payload: Bytes,
-    recipients: Vec<PeerSession>,
+    recipients: Vec<ReservedRecipient>,
+    counters: Arc<Counters>,
+}
+
+impl Drop for Input {
+    fn drop(&mut self) {
+        self.counters
+            .pending
+            .fetch_sub(self.recipients.len() as u64, Ordering::Relaxed);
+    }
 }
 
 struct TargetBatch {
     session: PeerSession,
     packets: Vec<(u8, Bytes)>,
+    permit: PendingPermit,
+    counters: Arc<Counters>,
+}
+
+impl Drop for TargetBatch {
+    fn drop(&mut self) {
+        self.counters
+            .pending
+            .fetch_sub(self.permit.count, Ordering::Relaxed);
+    }
 }
 
 type LaneBatch = Vec<TargetBatch>;
 
 pub(super) struct SceneRelay {
+    peer_queue_limit: u64,
     sender: Mutex<Option<mpsc::Sender<Input>>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     counters: Arc<Counters>,
@@ -80,6 +157,12 @@ pub(super) fn batch_interval(value: Option<&str>) -> Result<Option<Duration>> {
     Ok((millis > 0).then_some(Duration::from_millis(millis)))
 }
 
+pub(super) fn peer_queue_limit(value: Option<&str>) -> Result<u64> {
+    value.unwrap_or("0").parse::<u64>().context(
+        "BASIS_SCENE_PEER_QUEUE_LIMIT must be a nonnegative integer (0 disables the quota)",
+    )
+}
+
 pub(super) fn eligible(channel: u8, delivery: DeliveryMethod, recipients: &[PeerId]) -> bool {
     channel == channels::SCENE && delivery == DeliveryMethod::Unreliable && recipients.is_empty()
 }
@@ -87,11 +170,16 @@ pub(super) fn eligible(channel: u8, delivery: DeliveryMethod, recipients: &[Peer
 pub(super) fn snapshot_recipients(
     peers: &DashMap<PeerId, ConnectedPeer>,
     source: PeerId,
-) -> Vec<PeerSession> {
+) -> Vec<SceneRecipient> {
     peers
         .iter()
         .filter(|peer| *peer.key() != source)
-        .filter_map(|peer| peer.session.clone())
+        .filter_map(|peer| {
+            peer.session.clone().map(|session| SceneRecipient {
+                session,
+                pending: peer.scene_pending.clone(),
+            })
+        })
         .collect()
 }
 
@@ -101,8 +189,13 @@ impl SceneRelay {
         peers: Arc<DashMap<PeerId, ConnectedPeer>>,
     ) -> Result<Option<Self>> {
         let value = std::env::var("BASIS_SCENE_BATCH_MS").ok();
+        let limit = peer_queue_limit(
+            std::env::var("BASIS_SCENE_PEER_QUEUE_LIMIT")
+                .ok()
+                .as_deref(),
+        )?;
         batch_interval(value.as_deref())?
-            .map(|interval| Self::start(transport, peers, interval))
+            .map(|interval| Self::start(transport, peers, interval, limit))
             .transpose()
     }
 
@@ -110,6 +203,7 @@ impl SceneRelay {
         transport: &TransportHandle,
         peers: Arc<DashMap<PeerId, ConnectedPeer>>,
         interval: Duration,
+        peer_queue_limit: u64,
     ) -> Result<Self> {
         let counters = Arc::new(Counters::default());
         let mut threads = Vec::new();
@@ -164,24 +258,60 @@ impl SceneRelay {
             batch_ms = interval.as_millis(),
             lanes = FANOUT_LANES,
             inbox_capacity = INBOX_CAPACITY,
+            peer_queue_limit,
             "scene batching enabled"
         );
         Ok(Self {
+            peer_queue_limit,
             sender: Mutex::new(Some(sender)),
             threads: Mutex::new(threads),
             counters,
         })
     }
 
-    pub(super) async fn enqueue(&self, payload: Bytes, recipients: Vec<PeerSession>) -> Result<()> {
+    pub(super) async fn enqueue(
+        &self,
+        payload: Bytes,
+        recipients: Vec<SceneRecipient>,
+    ) -> Result<()> {
         let sender = self.sender.lock().clone();
         let Some(sender) = sender else {
             self.counters.enqueue_errors.fetch_add(1, Ordering::Relaxed);
             anyhow::bail!("scene relay admission closed");
         };
+        let count = recipients.len();
+        let mut admitted = Vec::with_capacity(count);
+        let mut peak = 0;
+        for recipient in recipients {
+            if let Some((permit, depth)) =
+                PendingPermit::reserve(recipient.pending, self.peer_queue_limit)
+            {
+                peak = peak.max(depth);
+                admitted.push(ReservedRecipient {
+                    session: recipient.session,
+                    permit,
+                });
+            }
+        }
+        self.counters
+            .rejected
+            .fetch_add((count - admitted.len()) as u64, Ordering::Relaxed);
+        if count != 0 && admitted.is_empty() {
+            return Ok(());
+        }
+        self.counters
+            .admitted
+            .fetch_add(admitted.len() as u64, Ordering::Relaxed);
+        self.counters
+            .pending
+            .fetch_add(admitted.len() as u64, Ordering::Relaxed);
+        self.counters
+            .peak_peer_pending
+            .fetch_max(peak, Ordering::Relaxed);
         let input = Input {
             payload,
-            recipients,
+            recipients: admitted,
+            counters: self.counters.clone(),
         };
         let result = match sender.try_send(input) {
             Ok(()) => Ok(()),
@@ -207,6 +337,11 @@ impl SceneRelay {
     pub(super) fn snapshot(&self) -> SceneRelaySnapshot {
         let stats = &self.counters;
         SceneRelaySnapshot {
+            peer_queue_limit: self.peer_queue_limit,
+            admitted_recipient_messages: stats.admitted.load(Ordering::Relaxed),
+            rejected_recipient_messages: stats.rejected.load(Ordering::Relaxed),
+            pending_recipient_messages: stats.pending.load(Ordering::Relaxed),
+            peak_peer_pending_messages: stats.peak_peer_pending.load(Ordering::Relaxed),
             enqueued_messages: stats.enqueued.load(Ordering::Relaxed),
             dequeued_messages: stats.dequeued.load(Ordering::Relaxed),
             attempted_recipient_messages: stats.attempted.load(Ordering::Relaxed),
@@ -320,20 +455,24 @@ fn collect(
 
 fn group_recipients(batch: Vec<Input>) -> Vec<LaneBatch> {
     let mut targets: HashMap<PeerId, Vec<TargetBatch>> = HashMap::new();
-    for input in batch {
-        for session in input.recipients {
+    for mut input in batch {
+        for recipient in std::mem::take(&mut input.recipients) {
+            let session = recipient.session;
             let groups = targets.entry(session.peer_id()).or_default();
-            if let Some(target) = groups
-                .iter_mut()
-                .find(|target| target.session.same_connection(&session))
-            {
+            if let Some(target) = groups.iter_mut().find(|target| {
+                target.session.same_connection(&session)
+                    && Arc::ptr_eq(&target.permit.pending, &recipient.permit.pending)
+            }) {
                 target
                     .packets
                     .push((channels::SCENE, input.payload.clone()));
+                target.permit.absorb(recipient.permit);
             } else {
                 groups.push(TargetBatch {
                     session,
                     packets: vec![(channels::SCENE, input.payload.clone())],
+                    permit: recipient.permit,
+                    counters: input.counters.clone(),
                 });
             }
         }
@@ -494,8 +633,236 @@ mod tests {
         (output, merged)
     }
 
+    fn reserved_input(
+        payload: &'static [u8],
+        session: PeerSession,
+        pending: Arc<AtomicU64>,
+        counters: Arc<Counters>,
+    ) -> Input {
+        let (permit, _) = PendingPermit::reserve(pending, 70).unwrap();
+        counters.admitted.fetch_add(1, Ordering::Relaxed);
+        counters.pending.fetch_add(1, Ordering::Relaxed);
+        Input {
+            payload: Bytes::from_static(payload),
+            recipients: vec![ReservedRecipient { session, permit }],
+            counters,
+        }
+    }
+
+    #[test]
+    fn quota_is_hard_bounded_under_concurrent_reservation() {
+        let pending = Arc::new(AtomicU64::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(17));
+        let mut threads = Vec::new();
+        for _ in 0..16 {
+            let pending = pending.clone();
+            let barrier = barrier.clone();
+            threads.push(thread::spawn(move || {
+                let permits: Vec<_> = (0..10)
+                    .filter_map(|_| PendingPermit::reserve(pending.clone(), 70))
+                    .collect();
+                assert!(pending.load(Ordering::Relaxed) <= 70);
+                barrier.wait();
+                barrier.wait();
+                permits.len()
+            }));
+        }
+        barrier.wait();
+        assert_eq!(pending.load(Ordering::Relaxed), 70);
+        assert!(PendingPermit::reserve(pending.clone(), 70).is_none());
+        barrier.wait();
+        assert_eq!(
+            threads
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .sum::<usize>(),
+            70
+        );
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+        let unlimited: Vec<_> = (0..71)
+            .map(|_| PendingPermit::reserve(pending.clone(), 0).unwrap())
+            .collect();
+        assert_eq!(pending.load(Ordering::Relaxed), 71);
+        drop(unlimited);
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn quota_rejects_only_saturated_recipient_and_restores_capacity_on_discard() {
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (full, _) = connect(&transport, &mut events, 1).await;
+        let (healthy, _) = connect(&transport, &mut events, 2).await;
+        let peers = DashMap::new();
+        admit(&peers, &full);
+        admit(&peers, &healthy);
+        let (sender, mut receiver) = mpsc::channel(8);
+        let relay = SceneRelay {
+            peer_queue_limit: 2,
+            sender: Mutex::new(Some(sender)),
+            threads: Mutex::new(Vec::new()),
+            counters: Arc::new(Counters::default()),
+        };
+        let full_pending = peers.get(&full.peer_id()).unwrap().scene_pending.clone();
+        for _ in 0..2 {
+            relay
+                .enqueue(
+                    Bytes::from_static(b"full"),
+                    snapshot_recipients(&peers, healthy.peer_id()),
+                )
+                .await
+                .unwrap();
+        }
+        // Rejecting every target must return promptly without queueing another input.
+        relay
+            .enqueue(
+                Bytes::from_static(b"rejected"),
+                snapshot_recipients(&peers, healthy.peer_id()),
+            )
+            .await
+            .unwrap();
+        relay
+            .enqueue(
+                Bytes::from_static(b"mixed"),
+                snapshot_recipients(&peers, u16::MAX),
+            )
+            .await
+            .unwrap();
+        let first = receiver.recv().await.unwrap();
+        let second = receiver.recv().await.unwrap();
+        let mixed = receiver.recv().await.unwrap();
+        assert_eq!(mixed.recipients.len(), 1);
+        assert!(mixed.recipients[0].session.same_connection(&healthy));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(relay.snapshot().rejected_recipient_messages, 2);
+        assert_eq!(relay.snapshot().admitted_recipient_messages, 3);
+        assert_eq!(relay.snapshot().pending_recipient_messages, 3);
+        assert_eq!(relay.snapshot().peak_peer_pending_messages, 2);
+        drop((first, second, mixed));
+        assert_eq!(relay.snapshot().pending_recipient_messages, 0);
+        assert_eq!(full_pending.load(Ordering::Relaxed), 0);
+        relay
+            .enqueue(
+                Bytes::from_static(b"restored"),
+                snapshot_recipients(&peers, healthy.peer_id()),
+            )
+            .await
+            .unwrap();
+        drop(receiver.recv().await.unwrap());
+        drop(receiver);
+        assert!(relay
+            .enqueue(
+                Bytes::from_static(b"closed"),
+                snapshot_recipients(&peers, healthy.peer_id())
+            )
+            .await
+            .is_err());
+        assert_eq!(relay.snapshot().pending_recipient_messages, 0);
+        assert_eq!(full_pending.load(Ordering::Relaxed), 0);
+        transport.shutdown();
+    }
+
+    #[tokio::test]
+    async fn lane_failure_and_udp_send_error_release_pending_work() {
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (session, _) = connect(&transport, &mut events, 1).await;
+        let peers = DashMap::new();
+        admit(&peers, &session);
+        let pending = peers.get(&session.peer_id()).unwrap().scene_pending.clone();
+        let counters = Arc::new(Counters::default());
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(reserved_input(
+                b"closed-lane",
+                session.clone(),
+                pending.clone(),
+                counters.clone(),
+            ))
+            .await
+            .unwrap();
+        drop(sender);
+        let lanes = (0..FANOUT_LANES)
+            .map(|_| {
+                let (sender, receiver) = sync_mpsc::sync_channel::<LaneBatch>(1);
+                drop(receiver);
+                sender
+            })
+            .collect();
+        let stats = counters.clone();
+        tokio::task::spawn_blocking(move || {
+            collect(receiver, lanes, stats, Duration::from_millis(1))
+        })
+        .await
+        .unwrap();
+        assert_eq!(counters.send_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.pending.load(Ordering::Relaxed), 0);
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+        // A datagram larger than the UDP payload maximum makes the native send fail.
+        let mut input = reserved_input(b"oversized", session, pending.clone(), counters.clone());
+        input.payload = Bytes::from(vec![0; 70_000]);
+        let grouped = group_recipients(vec![input]);
+        let socket = transport.dedicated_unreliable_sender().unwrap();
+        for target in grouped.into_iter().flatten() {
+            send_target(&socket, &peers, &counters, target);
+        }
+        assert_eq!(counters.send_errors.load(Ordering::Relaxed), 2);
+        assert_eq!(counters.pending.load(Ordering::Relaxed), 0);
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+        transport.shutdown();
+    }
+
+    #[tokio::test]
+    async fn cancelled_inbox_wait_releases_reserved_recipient_work() {
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (session, _) = connect(&transport, &mut events, 1).await;
+        let peers = DashMap::new();
+        admit(&peers, &session);
+        let pending = peers.get(&session.peer_id()).unwrap().scene_pending.clone();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let relay = Arc::new(SceneRelay {
+            peer_queue_limit: 70,
+            sender: Mutex::new(Some(sender)),
+            threads: Mutex::new(Vec::new()),
+            counters: Arc::new(Counters::default()),
+        });
+        relay
+            .enqueue(
+                Bytes::from_static(b"first"),
+                snapshot_recipients(&peers, u16::MAX),
+            )
+            .await
+            .unwrap();
+        let second_recipients = snapshot_recipients(&peers, u16::MAX);
+        let owned = relay.clone();
+        let second = tokio::spawn(async move {
+            owned
+                .enqueue(Bytes::from_static(b"second"), second_recipients)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(pending.load(Ordering::Relaxed), 2);
+        assert_eq!(relay.snapshot().pending_recipient_messages, 2);
+        second.abort();
+        assert!(second.await.unwrap_err().is_cancelled());
+        assert_eq!(pending.load(Ordering::Relaxed), 1);
+        drop(receiver.recv().await.unwrap());
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+        assert_eq!(relay.snapshot().pending_recipient_messages, 0);
+        transport.shutdown();
+    }
+
     #[test]
     fn disabled_and_ineligible_paths_do_not_enter_batching() {
+        assert_eq!(peer_queue_limit(None).unwrap(), 0);
+        assert_eq!(peer_queue_limit(Some("0")).unwrap(), 0);
+        assert_eq!(peer_queue_limit(Some("71")).unwrap(), 71);
+        assert!(peer_queue_limit(Some("-1")).is_err());
+        assert!(peer_queue_limit(Some("garbage")).is_err());
         assert!(batch_interval(None).unwrap().is_none());
         assert!(batch_interval(Some("0")).unwrap().is_none());
         for millis in 1..=3 {
@@ -537,7 +904,7 @@ mod tests {
                 admit(&peers, session);
             }
             let relay =
-                SceneRelay::start(&transport, peers.clone(), Duration::from_millis(3)).unwrap();
+                SceneRelay::start(&transport, peers.clone(), Duration::from_millis(3), 70).unwrap();
             let mut expected_a = Vec::new();
             let mut expected_b = Vec::new();
             let mut expected_observer = Vec::new();
@@ -590,12 +957,18 @@ mod tests {
             assert_eq!(counters.dequeued_messages, 40);
             assert_eq!(counters.attempted_recipient_messages, 80);
             assert!(counters.sent_datagrams < counters.attempted_recipient_messages);
+            assert_eq!(counters.rejected_recipient_messages, 0);
+            assert_eq!(counters.admitted_recipient_messages, 80);
+            assert_eq!(counters.pending_recipient_messages, 0);
             assert_eq!(
                 counters.stale_recipient_messages + counters.enqueue_errors + counters.send_errors,
                 0
             );
             assert!(relay
-                .enqueue(Bytes::from_static(b"closed"), vec![observer])
+                .enqueue(
+                    Bytes::from_static(b"closed"),
+                    snapshot_recipients(&peers, source_a.peer_id())
+                )
                 .await
                 .is_err());
             assert!(relay.threads.lock().is_empty());
@@ -617,15 +990,21 @@ mod tests {
         assert_eq!(old.peer_id(), replacement.peer_id());
         let peers = DashMap::new();
         admit(&peers, &replacement);
+        let counters = Arc::new(Counters::default());
+        let old_pending = Arc::new(AtomicU64::new(0));
+        let new_pending = peers
+            .get(&replacement.peer_id())
+            .unwrap()
+            .scene_pending
+            .clone();
         let mut grouped = group_recipients(vec![
-            Input {
-                payload: Bytes::from_static(b"old-session"),
-                recipients: vec![old],
-            },
-            Input {
-                payload: Bytes::from_static(b"new-session"),
-                recipients: vec![replacement],
-            },
+            reserved_input(b"old-session", old, old_pending.clone(), counters.clone()),
+            reserved_input(
+                b"new-session",
+                replacement,
+                new_pending.clone(),
+                counters.clone(),
+            ),
         ]);
         let targets = &mut grouped[0];
         assert_eq!(
@@ -633,7 +1012,6 @@ mod tests {
             2,
             "distinct incarnations cannot share a target batch"
         );
-        let counters = Counters::default();
         let sender = replacement_transport.dedicated_unreliable_sender().unwrap();
         for target in targets.drain(..) {
             send_target(&sender, &peers, &counters, target);
@@ -642,6 +1020,9 @@ mod tests {
         assert_eq!(received, vec![b"new-session".to_vec()]);
         assert_eq!(counters.stale.load(Ordering::Relaxed), 1);
         assert_eq!(counters.attempted.load(Ordering::Relaxed), 1);
+        assert_eq!(old_pending.load(Ordering::Relaxed), 0);
+        assert_eq!(new_pending.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.pending.load(Ordering::Relaxed), 0);
         old_transport.shutdown();
         replacement_transport.shutdown();
     }
@@ -650,6 +1031,7 @@ mod tests {
     async fn full_inbox_waits_for_capacity_without_discarding_messages() {
         let (sender, mut receiver) = mpsc::channel(1);
         let relay = Arc::new(SceneRelay {
+            peer_queue_limit: 0,
             sender: Mutex::new(Some(sender)),
             threads: Mutex::new(Vec::new()),
             counters: Arc::new(Counters::default()),

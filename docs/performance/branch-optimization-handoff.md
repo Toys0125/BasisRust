@@ -1,5 +1,30 @@
 # Laptop agent handoff — branch optimization
 
+## Per-recipient Scene pending-work quota — 2026-10-10
+
+`BASIS_SCENE_PEER_QUEUE_LIMIT` now bounds pending logical Scene messages per
+recipient connection in the experimental batched unreliable broadcast path.
+Unset/0 leaves this quota disabled; enable batching separately. Reservations
+release through send, discard, failure, cancellation and drain; native health
+reports explicit admission losses. Shared inbox/fanout lanes remain.
+
+The [750-client quota experiment](scene-peer-limit-client750-20261010.md)
+retains ten fresh processes: 20-Hz 0/70 ABBA and 5-Hz 0/70/1024 forward/reverse.
+70 is unsuitable: receipt is about 11–12% and source coverage is lost. At 5 Hz,
+1024 receives 99.90–100%, sees all 749 senders, rejects no work and peaks at 749
+pending messages. It is nonbinding headroom, not a speedup. One process passes
+every gate; the other fails absolute-zero retransmits (2 → 2 during measurement).
+Keep the quota opt-in. 1024 has not been measured at 20 Hz. All original flags,
+raw observations, source/binary/tool hashes and focused checks are retained;
+PGO is off for this changed source.
+
+Correction to the earlier C# explanation: its nominal 70-message gate is inert
+for Unreliable because its queue query returns zero. Actual native bulk
+unreliable queues evict oldest packets above an adaptive recipient limit;
+all four preceding 750-client runs report 3118 per peer. Rust instead rejects
+new admissions and counts Scene work across its batched pipeline. The C# report
+is corrected; historical measurements and raw evidence remain unchanged.
+
 ## 3-ms scene batching interval — 2026-10-10
 
 `BASIS_SCENE_BATCH_MS=3` is now supported to match C#’s numeric 3-ms merge hold.

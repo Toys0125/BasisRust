@@ -769,6 +769,7 @@ mod tests {
                 metadata,
                 ready,
                 session: None,
+                scene_pending: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             },
         );
     }
