@@ -3876,8 +3876,10 @@ async fn relay_scene_generic(
             peer,
             &scene.payload,
             &scene.recipients,
-            &connected,
-            &animation_allowed,
+            image_cache::CachePeers {
+                connected: &connected,
+                animation_allowed: &animation_allowed,
+            },
             allow_animation,
             &state.config.read(),
         );

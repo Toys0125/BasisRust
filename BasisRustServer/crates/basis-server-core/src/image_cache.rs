@@ -11,6 +11,12 @@ use bytes::Bytes;
 
 pub const IMAGE_MANAGER_IDENTIFIER: &str = "BasisImagePickupManager";
 
+#[derive(Clone, Copy)]
+pub(crate) struct CachePeers<'a> {
+    pub connected: &'a [u16],
+    pub animation_allowed: &'a [u16],
+}
+
 const OP_SPAWN: u8 = 1;
 const OP_CHUNK: u8 = 2;
 const OP_TRANSFORM: u8 = 3;
@@ -108,15 +114,13 @@ impl ImageCache {
 
     /// Observe one image payload without changing live relay behavior. `recipients` is the explicit
     /// target list for targeted scene messages; an empty list means the original was broadcast.
-    /// `connected` is the authenticated peer snapshot used to mark those who already saw a
-    /// broadcast. `animation_allowed` contains peers currently allowed to receive cached animations.
+    /// `peers` supplies the authenticated roster and peers allowed to receive cached animations.
     pub(crate) fn observe(
         &mut self,
         owner: u16,
         payload: &[u8],
         recipients: &[u16],
-        connected: &[u16],
-        animation_allowed: &[u16],
+        peers: CachePeers<'_>,
         allow_animation: bool,
         config: &ServerConfig,
     ) -> CacheEffects {
@@ -126,18 +130,17 @@ impl ImageCache {
         }
         match payload[0] {
             OP_SPAWN => {
-                self.observe_spawn(owner, payload, recipients, connected, config, &mut effects);
-            }
-            OP_CHUNK => {
-                self.observe_chunk(
+                self.observe_spawn(
                     owner,
                     payload,
-                    false,
-                    connected,
-                    animation_allowed,
+                    recipients,
+                    peers.connected,
                     config,
                     &mut effects,
                 );
+            }
+            OP_CHUNK => {
+                self.observe_chunk(owner, payload, false, peers, config, &mut effects);
             }
             OP_TRANSFORM => {
                 self.observe_transform(payload, config, &mut effects);
@@ -151,15 +154,7 @@ impl ImageCache {
                 self.observe_animation_spawn(owner, payload, config, &mut effects);
             }
             OP_ANIMATION_CHUNK => {
-                self.observe_chunk(
-                    owner,
-                    payload,
-                    true,
-                    connected,
-                    animation_allowed,
-                    config,
-                    &mut effects,
-                );
+                self.observe_chunk(owner, payload, true, peers, config, &mut effects);
             }
             OP_DESPAWN => {
                 if let Some(id) = read_id(payload) {
@@ -271,8 +266,7 @@ impl ImageCache {
         owner: u16,
         payload: &[u8],
         animation: bool,
-        connected: &[u16],
-        animation_allowed: &[u16],
+        peers: CachePeers<'_>,
         config: &ServerConfig,
         effects: &mut CacheEffects,
     ) {
@@ -333,7 +327,7 @@ impl ImageCache {
 
         if !animation && still_complete {
             effects.sends.push(cache_state_send(owner, id, true));
-            for peer in connected {
+            for peer in peers.connected {
                 if let Some(offer) = self.mark_offered(id, *peer) {
                     effects.sends.push(offer);
                 }
@@ -349,7 +343,7 @@ impl ImageCache {
                         .iter()
                         .filter(|peer| {
                             **peer != image.owner
-                                && animation_allowed.contains(peer)
+                                && peers.animation_allowed.contains(peer)
                                 && !image.animation_delivered.contains(peer)
                         })
                         .copied()
@@ -590,7 +584,7 @@ impl ImageCache {
             .map(|payload| CacheSend {
                 recipient: peer,
                 owner,
-                payload: Bytes::from(payload),
+                payload,
                 paced: true,
             })
             .collect()
@@ -652,7 +646,7 @@ impl ImageCache {
                 .map(|payload| CacheSend {
                     recipient: peer,
                     owner,
-                    payload: Bytes::from(payload),
+                    payload,
                     paced: true,
                 })
                 .collect(),
@@ -799,7 +793,17 @@ mod tests {
         connected: &[u16],
         config: &ServerConfig,
     ) -> CacheEffects {
-        cache.observe(owner, payload, &[], connected, connected, true, config)
+        cache.observe(
+            owner,
+            payload,
+            &[],
+            CachePeers {
+                connected,
+                animation_allowed: connected,
+            },
+            true,
+            config,
+        )
     }
 
     #[test]
@@ -810,8 +814,10 @@ mod tests {
             7,
             &spawn(1, 7, 2, 12.5),
             &[7],
-            &[7, 9],
-            &[7, 9],
+            CachePeers {
+                connected: &[7, 9],
+                animation_allowed: &[7, 9],
+            },
             true,
             &config,
         );
@@ -848,8 +854,10 @@ mod tests {
             7,
             &spawn(2, 7, 1, 0.0),
             &[9],
-            &[7, 9, 11],
-            &[7, 9, 11],
+            CachePeers {
+                connected: &[7, 9, 11],
+                animation_allowed: &[7, 9, 11],
+            },
             true,
             &config,
         );
