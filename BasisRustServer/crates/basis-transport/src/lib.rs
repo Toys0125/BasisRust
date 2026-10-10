@@ -4986,11 +4986,13 @@ async fn reliable_dispatch_loop(handle: TransportHandle, tx: mpsc::Sender<Server
                             .store(false, Ordering::Release);
                     }
                     Err(TransportError::InvalidFragment(_)) => {
-                        if let Some(session) = handle.peer_session(peer_id) {
-                            let _ = handle
-                                .disconnect_session(&session, "invalid reliable fragment sequence")
-                                .await;
-                        }
+                        let session = PeerSession {
+                            peer: peer_id,
+                            state: peer_state.clone(),
+                        };
+                        let _ = handle
+                            .disconnect_session(&session, "invalid reliable fragment sequence")
+                            .await;
                     }
                     Err(err) => warn!("ordered receive drain failed: {err}"),
                 }

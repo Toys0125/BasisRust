@@ -772,17 +772,17 @@ pub async fn run_workload(
     let cache_first = session.options.clients - session.options.cache_recipients;
     let mut senders = Vec::new();
     for owner in 0..session.options.sharers {
-        let recipients = population
+        let mut recipients = Vec::new();
+        for client in population
             .iter()
             .filter(|c| c.index != owner && c.index < cache_first)
-            .map(|c| {
-                c.remote_peer_id
-                    .try_lock()
-                    .ok()
-                    .and_then(|guard| *guard)
-                    .unwrap_or(-1) as u16
-            })
-            .collect::<Vec<_>>();
+        {
+            let peer_id = client
+                .remote_peer_id()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("client {} missing peer id", client.index))?;
+            recipients.push(peer_id);
+        }
         let me = population[owner].clone();
         let session_copy = session.clone();
         let owner_id = owner_peers[owner];
