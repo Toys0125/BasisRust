@@ -189,3 +189,12 @@ dense workload. It uses unchanged production source and a fresh mixed profile.
 The offered scene fanout exceeds this host's delivery capacity. Original
 training and evaluation failures remain explicit in the retained evidence;
 these measurements are overload diagnostics, not a validated PGO speedup.
+
+## 750-client mixed workload checkpoint — 2026-10-10
+
+The [750-client mixed PGO A/B](pgo-mixed-client750-20261010.md) changes only the
+evaluation population, reusing the exact ordinary/PGO/client binaries and the
+250-client diagnostic mixed profile from the 1,500-client cohort. Payloads,
+cadence, workers, affinity, windows, and strict gates are unchanged. All attempts
+and original failed flags are retained; the report distinguishes workload
+capacity observations from validated PGO speedup evidence.
