@@ -1,5 +1,22 @@
 # Laptop agent handoff — branch optimization
 
+## 3-ms scene batching interval — 2026-10-10
+
+`BASIS_SCENE_BATCH_MS=3` is now supported to match C#’s numeric 3-ms merge hold.
+Unset/0 remains disabled; 1/2 ms still work. The
+[750-client 2/3-ms A/B](scene-batch3-client750-20261010.md) uses one new ordinary
+binary in two four-process ABBA cohorts. At 20 Hz, receipt is essentially
+unchanged: 46.27% versus 46.25%, with all processes invalid. At 5 Hz, 3 ms
+reaches 100% receipt with a 131-ms p95 histogram bound; both intervals pass
+every original gate in both repeats. This validates the lower-rate option on
+this host, not a general speedup or success at the original 20-Hz rate.
+
+Rust’s collector interval and C#’s per-peer transport merge hold govern different
+stages. Retain that distinction and the existing app-output accounting limitation
+before promoting the prototype. Exact source/binary/tool hashes, every original
+failure, raw observations and focused test/review output are retained. PGO is off
+for the changed source.
+
 ## C# reference capacity check — 2026-10-10
 
 The [C# 750-client mixed workload check](csharp-mixed-client750-20261010.md)

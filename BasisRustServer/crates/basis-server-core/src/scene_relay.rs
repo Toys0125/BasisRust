@@ -72,10 +72,10 @@ pub(super) fn batch_interval(value: Option<&str>) -> Result<Option<Duration>> {
     let millis = value
         .unwrap_or("0")
         .parse::<u64>()
-        .context("BASIS_SCENE_BATCH_MS must be 0 (disabled), 1, or 2")?;
+        .context("BASIS_SCENE_BATCH_MS must be 0 (disabled), 1, 2, or 3")?;
     anyhow::ensure!(
-        millis <= 2,
-        "BASIS_SCENE_BATCH_MS must be 0 (disabled), 1, or 2"
+        millis <= 3,
+        "BASIS_SCENE_BATCH_MS must be 0 (disabled), 1, 2, or 3"
     );
     Ok((millis > 0).then_some(Duration::from_millis(millis)))
 }
@@ -498,11 +498,13 @@ mod tests {
     fn disabled_and_ineligible_paths_do_not_enter_batching() {
         assert!(batch_interval(None).unwrap().is_none());
         assert!(batch_interval(Some("0")).unwrap().is_none());
-        assert_eq!(
-            batch_interval(Some("2")).unwrap(),
-            Some(Duration::from_millis(2))
-        );
-        assert!(batch_interval(Some("3")).is_err());
+        for millis in 1..=3 {
+            assert_eq!(
+                batch_interval(Some(&millis.to_string())).unwrap(),
+                Some(Duration::from_millis(millis))
+            );
+        }
+        assert!(batch_interval(Some("4")).is_err());
         assert!(batch_interval(Some("garbage")).is_err());
         assert!(eligible(channels::SCENE, DeliveryMethod::Unreliable, &[]));
         for delivery in [
@@ -535,7 +537,7 @@ mod tests {
                 admit(&peers, session);
             }
             let relay =
-                SceneRelay::start(&transport, peers.clone(), Duration::from_millis(2)).unwrap();
+                SceneRelay::start(&transport, peers.clone(), Duration::from_millis(3)).unwrap();
             let mut expected_a = Vec::new();
             let mut expected_b = Vec::new();
             let mut expected_observer = Vec::new();
