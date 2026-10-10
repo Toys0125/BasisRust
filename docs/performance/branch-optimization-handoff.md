@@ -1,5 +1,21 @@
 # Laptop agent handoff — branch optimization
 
+## C# reference capacity check — 2026-10-10
+
+The [C# 750-client mixed workload check](csharp-mixed-client750-20261010.md)
+uses the same frozen Rust client, payloads, affinities and measurement windows.
+Two fresh processes at each scene rate retain all failures. At 20 Hz, C# scene
+receipt is 15.0–15.2% and avatar p95 gaps are 6–19 seconds. At 5 Hz, receipt is
+70.7–71.6% and avatar p95 gaps are 2.62–2.65 seconds. All four runs authenticate
+all 750 clients and exit cleanly, but fail scene, avatar-quality and native-drop
+gates. The compatible protocol-v55 reference uses normal adaptive workers and
+.NET 10.0.12 tiered PGO; it is not a rebuild of the latest C# checkout.
+
+The comparison uses the preceding Rust measurements, not interleaved cross-server
+A/B. Unsupported C# telemetry remains null. Shared configuration translation,
+all runtime hashes, raw measurements and the original failed schema preflight
+are retained. No production server/client code changes in this follow-up.
+
 ## Scene receipt investigation — 2026-10-10
 
 The [750-client scene investigation](scene-receipt-investigation-20261010.md)

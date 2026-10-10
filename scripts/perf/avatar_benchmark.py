@@ -11,6 +11,8 @@ import subprocess
 import time
 import urllib.request
 
+from script_server import prepare_server, ready as server_ready
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MIXED_DEFAULTS = {'additional_avatar_bytes': 0, 'scene_data_bytes': 0,
                   'scene_data_interval_ms': 50, 'scene_data_reliable': False}
@@ -207,16 +209,43 @@ def cpu_list(text):
     return sorted(values)
 
 
+def server_population(status, kind, server_log='', client_log=''):
+    """Keep transport visitors, authenticated joins and avatar state distinct."""
+    if kind == 'csharp':
+        visitors = status.get('visitors')
+        joins = {int(n) for n in re.findall(r'client (\d+) connected as remote peer', client_log)}
+        return {'players_online': visitors if type(visitors) is int else -1,
+                'active_states': None, 'authenticated_client_indices': sorted(joins)}
+    counts = re.findall(r'active_states=(\d+)', server_log)
+    return {'players_online': int(status.get('players_online', -1)),
+            'active_states': int(counts[-1]) if counts else -1}
+
+
+def population_matches(counts, kind, clients):
+    if kind == 'csharp':
+        return (counts['players_online'] == clients
+                and counts['authenticated_client_indices'] == list(range(clients)))
+    return counts['players_online'] == counts['active_states'] == clients
+
+
 def run_workload(args, output, server_env, client_env):
     """Use the existing portable workload policy, with fresh owned processes."""
     output.mkdir()
     base = output / 'server-base'
-    (base / 'config').mkdir(parents=True)
-    config = base / 'config/config.xml'
-    config.write_bytes(args.server_config.read_bytes())
+    kind = getattr(args, 'server_kind', 'rust')
+    if kind not in ('rust', 'csharp'):
+        raise ValueError('server_kind must be rust or csharp')
+    server_metadata = None
     marker = output / 'observe-start.marker'
-    server_cmd = [str(args.server), '--base-dir', str(base), '--port', str(args.port),
-                  '--no-console', '--health-host', '127.0.0.1', '--health-port', str(args.health_port)]
+    if kind == 'csharp':
+        server_cmd, config, server_metadata = prepare_server(
+            kind, args.server, base, args.server_config, args.port, args.health_port)
+    else:
+        (base / 'config').mkdir(parents=True)
+        config = base / 'config/config.xml'
+        config.write_bytes(args.server_config.read_bytes())
+        server_cmd = [str(args.server), '--base-dir', str(base), '--port', str(args.port),
+                      '--no-console', '--health-host', '127.0.0.1', '--health-port', str(args.health_port)]
     client_cmd = [str(args.client), '--config', str(args.client_config), '--ip', '127.0.0.1',
                   '--port', str(args.port), '--clients', str(args.clients), '--no-reconnect',
                   '--connect-timeout-ms', '60000', '--connect-batch-size', '25', '--connect-batch-delay-ms', '250',
@@ -226,21 +255,29 @@ def run_workload(args, output, server_env, client_env):
                   '--avatar-observe-expected-peers', str(args.clients - 1),
                   '--observe-avatar-start-file', str(marker), '--observe-avatar-window-secs', str(args.window_seconds)]
     client_cmd.extend(mixed_client_options(args, output, marker))
-    server_env = dict(server_env, BASIS_STATUS_INTERVAL_SECS='1', BASIS_AVATAR_DIAGNOSTIC_OBSERVER_ID='0',
-                      BASIS_AVATAR_DIAGNOSTIC_START_FILE=str(marker),
-                      BASIS_AVATAR_DIAGNOSTIC_CSV=str(output / 'server-pairs.csv'),
-                      BASIS_AVATAR_DIAGNOSTIC_WINDOW_SECS=str(args.window_seconds))
+    if kind == 'rust':
+        server_env = dict(server_env, BASIS_STATUS_INTERVAL_SECS='1', BASIS_AVATAR_DIAGNOSTIC_OBSERVER_ID='0',
+                          BASIS_AVATAR_DIAGNOSTIC_START_FILE=str(marker),
+                          BASIS_AVATAR_DIAGNOSTIC_CSV=str(output / 'server-pairs.csv'),
+                          BASIS_AVATAR_DIAGNOSTIC_WINDOW_SECS=str(args.window_seconds))
     commands = {'server': server_cmd, 'client': client_cmd, 'cwd': str(ROOT),
                 'executed_server': ['taskset', '-c', args.server_cpus, *server_cmd] if args.server_cpus and os.name != 'nt' else server_cmd,
                 'executed_client': ['taskset', '-c', args.client_cpus, *client_cmd] if args.client_cpus and os.name != 'nt' else client_cmd,
                 'server_affinity': args.server_cpus, 'client_affinity': args.client_cpus,
                 'server_environment': relevant_env(server_env), 'client_environment': relevant_env(client_env)}
+    if server_metadata is not None:
+        commands['server_metadata'] = server_metadata
+        commands['csharp_environment'] = {k: server_env[k] for k in ('EnableConsole', 'EnableBSRProfiling') if k in server_env}
+        (output / 'prepared-config.xml').write_bytes(config.read_bytes())
+        (output / 'prepared-litenetlib.xml').write_bytes(pathlib.Path(server_metadata['transport_config']).read_bytes())
     write_json(output / 'commands.json', commands)
     sampler = native_sampler()
     owner = ProcessTree()
     server = client = None
     meta = {'started_unix_seconds': time.time(), 'error': None, 'completed': False,
             'workload': workload_metadata(args)}
+    if kind == 'csharp':
+        meta['server_kind'] = kind
     if getattr(args, 'scene_data_bytes', 0):
         meta['scene_measurement'] = {'start': 'first scene tick after shared avatar marker',
                                     'end': 'client shutdown, including observer grace',
@@ -266,8 +303,9 @@ def run_workload(args, output, server_env, client_env):
                     status = health(args.health_port)
                 except (OSError, ValueError):
                     status = {}
-                if status.get('status') == 'healthy':
-                    if int(status.get('players_online', -1)) != 0:
+                if server_ready(status, kind):
+                    empty_count = status.get('visitors' if kind == 'csharp' else 'players_online', -1)
+                    if type(empty_count) is not int or empty_count != 0:
                         raise RuntimeError('Health is not an empty fresh server')
                     break
                 if time.monotonic() >= deadline:
@@ -279,39 +317,40 @@ def run_workload(args, output, server_env, client_env):
             def population():
                 alive()
                 status = health(args.health_port)
-                counts = re.findall(r'active_states=(\d+)', (output / 'server.log').read_text(errors='replace'))
-                active = int(counts[-1]) if counts else -1
-                return status, int(status.get('players_online', -1)), active
+                counts = server_population(status, kind,
+                    (output / 'server.log').read_text(errors='replace') if kind == 'rust' else '',
+                    (output / 'client.log').read_text(errors='replace') if kind == 'csharp' else '')
+                return status, counts
 
             deadline = time.monotonic() + args.ready_timeout
             while True:
                 try:
-                    status, players, active = population()
+                    status, counts = population()
                 except OSError:
-                    players = active = -1
-                if players == active == args.clients:
+                    counts = {'players_online': -1, 'active_states': -1, 'authenticated_client_indices': []}
+                if population_matches(counts, kind, args.clients):
                     break
                 if time.monotonic() >= deadline:
-                    raise RuntimeError(f'Clients not ready: players={players}, active={active}, requested={args.clients}')
+                    raise RuntimeError(f'Clients not ready: population={counts}, requested={args.clients}')
                 time.sleep(.5)
             write_json(output / 'ready-health.json', status)
             # Readiness must hold during warmup too, with early exit detection.
             warm_end = time.monotonic() + args.warmup_seconds
             while time.monotonic() < warm_end:
-                _, players, active = population()
-                if players != args.clients or active != args.clients:
+                _, counts = population()
+                if not population_matches(counts, kind, args.clients):
                     raise RuntimeError('Population dropped during warmup')
                 time.sleep(min(.5, max(0, warm_end - time.monotonic())))
 
             with (output / 'samples.jsonl').open('w', encoding='utf-8') as stream:
                 def sample():
-                    status, players, active = population()
+                    status, counts = population()
                     row = {'monotonic_seconds': time.monotonic(), 'unix_seconds': time.time(),
                            'server': sampler(server.pid), 'client': sampler(client.pid),
-                           'players_online': players, 'active_states': active, 'health': status}
+                           **counts, 'health': status}
                     stream.write(json.dumps(row) + '\n')
                     stream.flush()
-                    if players != args.clients or active != args.clients:
+                    if not population_matches(counts, kind, args.clients):
                         raise RuntimeError('Population dropped during measurement')
                 sample()
                 start = time.monotonic()
@@ -336,8 +375,8 @@ def run_workload(args, output, server_env, client_env):
             meta['observer_shutdown_grace_seconds'] = 2
             grace_end = time.monotonic() + meta['observer_shutdown_grace_seconds']
             while time.monotonic() < grace_end:
-                _, players, active = population()
-                if players != args.clients or active != args.clients:
+                _, counts = population()
+                if not population_matches(counts, kind, args.clients):
                     raise RuntimeError('Population dropped during observer shutdown grace')
                 time.sleep(min(.2, max(0, grace_end - time.monotonic())))
             # The client supports a clean console stop on Windows and Linux.
