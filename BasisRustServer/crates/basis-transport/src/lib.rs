@@ -1907,6 +1907,30 @@ impl TransportHandle {
         Ok(())
     }
 
+    /// Queue reliable ordered data synchronously for a captured connection.
+    /// Callers can hold a payload lifetime guard through admission so that a
+    /// concurrent cancellation cannot overtake this send.
+    pub fn queue_reliable_ordered_session(
+        &self,
+        session: &PeerSession,
+        channel: u8,
+        payload: &[u8],
+    ) -> bool {
+        let Some(_lease) = session.try_read_lease() else {
+            return false;
+        };
+        if !self.is_current_session(session) {
+            return false;
+        }
+        enqueue_reliable_payload(
+            &session.state,
+            channel,
+            DeliveryMethod::ReliableOrdered,
+            payload,
+        );
+        true
+    }
+
     pub async fn send_many(
         &self,
         peer: PeerId,
@@ -8960,6 +8984,31 @@ mod tests {
         assert!(events.try_recv().is_err());
         handle.set_realtime_handler(None);
         handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn synchronous_reliable_queue_is_bound_to_the_captured_session() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        handle.shutdown();
+        let old = test_peer_state(0);
+        handle.peers.insert(old.id, old.clone());
+        let session = handle.peer_session(0).unwrap();
+        assert!(handle.queue_reliable_ordered_session(&session, channels::SCENE, b"current"));
+        assert_eq!(old.total_queued(), 1);
+
+        let replacement = test_peer_state(0);
+        handle.peers.insert(0, replacement.clone());
+        assert!(!handle.queue_reliable_ordered_session(&session, channels::SCENE, b"stale"));
+        assert_eq!(replacement.total_queued(), 0);
+        assert_eq!(old.total_queued(), 1);
+        let replacement_session = handle.peer_session(0).unwrap();
+        assert!(handle.close_session_admission(&replacement_session));
+        assert!(!handle.queue_reliable_ordered_session(
+            &replacement_session,
+            channels::SCENE,
+            b"closed"
+        ));
+        assert_eq!(replacement.total_queued(), 0);
     }
 
     #[tokio::test]

@@ -1090,7 +1090,7 @@ fn image_animation_allowed(state: &ServerState, peer: PeerId) -> bool {
         )
 }
 
-async fn send_image_payload(
+fn send_image_payload(
     state: &ServerState,
     session: &PeerSession,
     pending: image_governor::PendingPayload,
@@ -1103,11 +1103,18 @@ async fn send_image_payload(
     if !state.authenticated_peers.contains_key(&pending.owner) {
         return;
     }
+    // Removal cancels the original image's payload handles before relaying its
+    // despawn or recycling its owner ID. Hold the read guard through transport
+    // admission so a previously drained pump batch cannot resurrect that image.
+    let guard = pending.payload.read();
+    let Some(payload) = guard.as_ref() else {
+        return;
+    };
     let message = ServerSceneDataMessage {
         player_id: pending.owner,
         scene_data_message: RemoteSceneDataMessage {
             message_index,
-            payload: pending.payload.to_vec(),
+            payload: payload.to_vec(),
         },
     };
     let mut writer = NetWriter::new();
@@ -1117,14 +1124,7 @@ async fn send_image_payload(
     }
     if state
         .transport
-        .send_session(
-            session,
-            channels::SCENE,
-            DeliveryMethod::ReliableOrdered,
-            writer.as_slice(),
-        )
-        .await
-        .is_ok()
+        .queue_reliable_ordered_session(session, channels::SCENE, writer.as_slice())
     {
         state
             .statistics
@@ -1154,7 +1154,7 @@ async fn deliver_image_cache_sends(state: &ServerState, sends: Vec<image_cache::
                 .1
                 .push(pending);
         } else {
-            send_image_payload(state, &session, pending).await;
+            send_image_payload(state, &session, pending);
         }
     }
     for (peer, (session, payloads)) in replays {
@@ -1166,7 +1166,7 @@ async fn deliver_image_cache_sends(state: &ServerState, sends: Vec<image_cache::
             Instant::now(),
         );
         for pending in inline {
-            send_image_payload(state, &session, pending).await;
+            send_image_payload(state, &session, pending);
         }
     }
 }
@@ -1185,7 +1185,7 @@ fn spawn_image_replay_loop(state: ServerState) -> tokio::task::JoinHandle<()> {
                 .pump(&state.config.read(), Instant::now());
             for (session, payloads) in batches {
                 for pending in payloads {
-                    send_image_payload(&state, &session, pending).await;
+                    send_image_payload(&state, &session, pending);
                 }
             }
         }

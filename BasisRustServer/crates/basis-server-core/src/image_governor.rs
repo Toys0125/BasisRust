@@ -1,7 +1,7 @@
 //! Image relay enforcement and paced cache downloads, matching the C# governor.
+use crate::image_cache::ReplayPayload;
 use basis_protocol::config::ServerConfig;
 use basis_transport::PeerId;
-use bytes::Bytes;
 use parking_lot::Mutex;
 use std::{
     collections::{HashMap, VecDeque},
@@ -41,7 +41,7 @@ impl Bucket {
 #[derive(Clone, Debug)]
 pub(crate) struct PendingPayload {
     pub owner: PeerId,
-    pub payload: Bytes,
+    pub payload: ReplayPayload,
 }
 
 struct ReplayJob<T> {
@@ -120,6 +120,9 @@ impl<T: Clone> ImageBandwidthGovernor<T> {
             bucket: Bucket::new(rate, now),
         });
         job.target = target;
+        // Eviction/despawn clears the buffers immediately. Discard their empty
+        // handles here so churn cannot accumulate stale queue metadata.
+        job.payloads.retain(|pending| pending.payload.len() > 0);
         // Append without renewing credit: repeated pickup requests share a budget.
         job.payloads.extend(payloads);
         Vec::new()
@@ -134,24 +137,30 @@ impl<T: Clone> ImageBandwidthGovernor<T> {
             return Vec::new();
         }
         let mut batches = Vec::new();
-        replays.retain(|_, job| {
+        for job in replays.values_mut() {
+            job.payloads.retain(|pending| pending.payload.len() > 0);
+            if job.payloads.is_empty() {
+                continue;
+            }
             job.bucket.refill(rate, now);
             let mut batch = Vec::new();
             while job.bucket.tokens > 0.0 {
                 let Some(payload) = job.payloads.pop_front() else {
                     break;
                 };
-                if payload.payload.is_empty() {
+                let size = payload.payload.len();
+                if size == 0 {
                     continue;
                 }
-                job.bucket.tokens -= payload.payload.len() as f64;
+                job.bucket.tokens -= size as f64;
                 batch.push(payload);
             }
             if !batch.is_empty() {
                 batches.push((job.target.clone(), batch));
             }
-            !job.payloads.is_empty()
-        });
+            // Keep credit/debt after the queue empties. A new request must not
+            // receive a fresh burst until the recipient disconnects.
+        }
         batches
     }
 
@@ -173,11 +182,22 @@ impl<T: Clone> ImageBandwidthGovernor<T> {
             self.dropped_bytes.load(Ordering::Relaxed),
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn queued_replay_bytes(&self) -> usize {
+        self.replays
+            .lock()
+            .values()
+            .flat_map(|job| &job.payloads)
+            .map(|pending| pending.payload.len())
+            .sum()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use std::time::Duration;
 
     fn config() -> ServerConfig {
@@ -192,7 +212,7 @@ mod tests {
     fn payload(owner: u16, value: u8) -> PendingPayload {
         PendingPayload {
             owner,
-            payload: Bytes::from(vec![value; 125_000]),
+            payload: ReplayPayload::new(Bytes::from(vec![value; 125_000])),
         }
     }
 
@@ -261,7 +281,7 @@ mod tests {
             batches[0]
                 .1
                 .iter()
-                .map(|p| (p.owner, p.payload[0]))
+                .map(|p| (p.owner, p.payload.read().as_ref().unwrap()[0]))
                 .collect::<Vec<_>>(),
             vec![(7, 0), (7, 1)]
         );
@@ -272,13 +292,17 @@ mod tests {
             batches[0]
                 .1
                 .iter()
-                .map(|p| p.payload[0])
+                .map(|p| p.payload.read().as_ref().unwrap()[0])
                 .collect::<Vec<_>>(),
             vec![2, 3]
         );
         let batches = governor.pump(&config, now + Duration::from_secs(3));
-        assert_eq!(batches[0].1[0].payload[0], 4);
-        assert!(governor.replays.lock().is_empty());
+        assert_eq!(batches[0].1[0].payload.read().as_ref().unwrap()[0], 4);
+        assert!(governor
+            .replays
+            .lock()
+            .values()
+            .all(|job| job.payloads.is_empty()));
     }
 
     #[test]
@@ -288,7 +312,7 @@ mod tests {
         let mut config = config();
         let large = PendingPayload {
             owner: 1,
-            payload: Bytes::from(vec![1; 500_000]),
+            payload: ReplayPayload::new(Bytes::from(vec![1; 500_000])),
         };
         governor.enqueue_replay(1, (), vec![large.clone(), large], &config, now);
         assert_eq!(governor.pump(&config, now)[0].1.len(), 1);
@@ -314,5 +338,45 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn successive_downloads_keep_spent_credit_and_debt_after_draining() {
+        let governor = ImageBandwidthGovernor::<()>::default();
+        let now = Instant::now();
+        let config = config();
+        governor.enqueue_replay(9, (), vec![payload(7, 0), payload(7, 1)], &config, now);
+        assert_eq!(governor.pump(&config, now)[0].1.len(), 2);
+        governor.enqueue_replay(9, (), vec![payload(7, 2)], &config, now);
+        assert!(governor.pump(&config, now).is_empty());
+        assert!(
+            governor.pump(&config, now + Duration::from_millis(25))[0]
+                .1
+                .len()
+                == 1
+        );
+        // The preceding oversized charge leaves debt even though the queue emptied.
+        governor.enqueue_replay(
+            9,
+            (),
+            vec![payload(7, 3)],
+            &config,
+            now + Duration::from_millis(25),
+        );
+        assert!(governor
+            .pump(&config, now + Duration::from_millis(50))
+            .is_empty());
+        assert!(governor
+            .pump(&config, now + Duration::from_secs(1))
+            .is_empty());
+        assert_eq!(
+            governor.pump(&config, now + Duration::from_millis(1001))[0]
+                .1
+                .len(),
+            1
+        );
+        governor.remove_peer(9);
+        governor.enqueue_replay(9, (), vec![payload(7, 4), payload(7, 5)], &config, now);
+        assert_eq!(governor.pump(&config, now)[0].1.len(), 2);
     }
 }

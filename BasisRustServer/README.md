@@ -54,12 +54,17 @@ transform, chunks, and eligible animation data in order. Each recipient's replay
 is paced at `ImageShareDownloadMegabitsPerSecond` (default 200), with the same
 two-second burst allowance and a 25 ms pump. A download rate of 0 sends new
 replays inline; switching to 0 discards already queued replay work, matching C#.
+Credit and debt persist between requests even when the replay queue drains.
 GIF locks and their moderation bypass apply to animation uploads and cache requests.
 
 `ImageCacheMaxMegabytes` (default 512) caps retained payload and chunk-slot bytes;
 `ImageCacheMinimumPerOwnerMegabytes` (default 32) sets the floor for each owner's
 fair share. Rust charges its actual chunk-slot size. Cached chunks are shared
-with replay queues rather than copied per recipient. Departure clears the peer's
+with replay queues rather than copied per recipient. Despawn, eviction, and owner
+departure invalidate replay handles and release their buffers immediately,
+including payloads already taken by the pump. Cancellation is ordered against
+transport admission so a removed card cannot be spawned by a later queued replay.
+Departure clears the peer's
 budget, queued downloads, and owned cache entries; server shutdown resets all
 image state. `ServerState::image_egress_dropped()` exposes refused message and
 fan-out byte counts, and `image_cache_stats()` exposes cache occupancy.
@@ -69,10 +74,14 @@ The reference implementation is BasisVR revision
 `Basis Server/BasisNetworkServer/Networking/BasisImageBandwidthGovernor.cs` and
 `BasisNetworkImageCache.cs`. Image scene payloads remain wire-compatible and
 ordinary scene traffic retains its separate governor.
-One integration correction is intentional: data rejected by upload enforcement
+Integration corrections are intentional: data rejected by upload enforcement
 is excluded from the cache, so rejected transfers cannot bypass the limit through
 cached downloads. Cache requests and despawns still update cache state when their
 live relay is refused.
+Download credit survives idle queues, and replay buffers cannot outlive their
+cached image. Cached poses follow the latest relayed pickup transform: any player
+can control a card in the C# protocol, so the original sharer is not a movement
+authority. Server arbitration of pickup claims is outside this port.
 
 Server startup precedence (highest wins): explicit `--port`, `--health-host`,
 `--health-port` and `--no-console`; environment overrides; XML supplied fields;

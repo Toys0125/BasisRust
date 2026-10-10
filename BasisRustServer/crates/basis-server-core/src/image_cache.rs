@@ -5,9 +5,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
+use std::sync::{Arc, Weak};
 
 use basis_protocol::config::ServerConfig;
 use bytes::Bytes;
+use parking_lot::{RwLock, RwLockReadGuard};
 
 pub const IMAGE_MANAGER_IDENTIFIER: &str = "BasisImagePickupManager";
 
@@ -32,14 +34,33 @@ const TRANSFORM_BYTES: usize = HEADER_BYTES + POSE_BYTES + 4;
 const MAX_OWNER_NAME_BYTES: usize = 1024;
 const BYTES_PER_MEGABYTE: u64 = 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
+pub(crate) struct ReplayPayload(Arc<RwLock<Option<Bytes>>>);
+
+impl ReplayPayload {
+    pub(crate) fn new(bytes: Bytes) -> Self {
+        Self(Arc::new(RwLock::new(Some(bytes))))
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.0.read().as_ref().map_or(0, Bytes::len)
+    }
+    pub(crate) fn read(&self) -> RwLockReadGuard<'_, Option<Bytes>> {
+        self.0.read()
+    }
+    #[cfg(test)]
+    fn snapshot(&self) -> Bytes {
+        self.0.read().clone().unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct CacheSend {
     /// Recipient of the server scene payload.
     pub(crate) recipient: u16,
     /// Player id stamped onto the scene payload. Offers and cache-state notices use the recipient;
     /// image data replays use the original image owner.
     pub(crate) owner: u16,
-    pub(crate) payload: Bytes,
+    pub(crate) payload: ReplayPayload,
     /// Image data replay may be queued through the download governor. Offers and status notices are
     /// small control messages and are sent inline.
     pub(crate) paced: bool,
@@ -65,6 +86,7 @@ struct CachedImage {
     animation_spawn: Option<Bytes>,
     animation_chunks: Vec<Option<Bytes>>,
     animation_chunks_held: usize,
+    replay_payloads: Vec<Weak<RwLock<Option<Bytes>>>>,
     bytes: u64,
 }
 
@@ -107,6 +129,11 @@ impl ImageCache {
     }
 
     pub(crate) fn reset(&mut self) {
+        for image in self.images.values() {
+            for payload in image.replay_payloads.iter().filter_map(Weak::upgrade) {
+                payload.write().take();
+            }
+        }
         self.images.clear();
         self.total_bytes = 0;
         self.sequence = 0;
@@ -210,6 +237,7 @@ impl ImageCache {
             animation_spawn: None,
             animation_chunks: Vec::new(),
             animation_chunks_held: 0,
+            replay_payloads: Vec::new(),
             bytes: cost,
         };
         seed_already_held(&mut image, recipients, connected);
@@ -364,6 +392,10 @@ impl ImageCache {
         config: &ServerConfig,
         effects: &mut CacheEffects,
     ) {
+        // Cards use cooperative pickup control: the current mover may differ
+        // from the original sharer. Preserve the latest relayed world pose,
+        // matching the clients and C# cache rather than treating share ownership
+        // as movement authority.
         if payload.len() != TRANSFORM_BYTES {
             return;
         }
@@ -465,8 +497,12 @@ impl ImageCache {
         let Some(image) = self.images.remove(&id) else {
             return false;
         };
+        let still_complete = image.still_complete();
+        for payload in image.replay_payloads.iter().filter_map(Weak::upgrade) {
+            payload.write().take();
+        }
         self.total_bytes = self.total_bytes.saturating_sub(image.bytes);
-        if image.still_complete() {
+        if still_complete {
             effects.sends.push(cache_state_send(image.owner, id, false));
         }
         true
@@ -540,7 +576,7 @@ impl ImageCache {
         Some(CacheSend {
             recipient: peer,
             owner: peer,
-            payload: Bytes::from(payload),
+            payload: ReplayPayload::new(Bytes::from(payload)),
             paced: false,
         })
     }
@@ -579,15 +615,23 @@ impl ImageCache {
         if allow_animation && image.animation_complete() && image.animation_delivered.insert(peer) {
             append_animation(image, &mut payloads);
         }
-        payloads
+        let sends = payloads
             .into_iter()
-            .map(|payload| CacheSend {
-                recipient: peer,
-                owner,
-                payload,
-                paced: true,
+            .map(|payload| {
+                let replay = ReplayPayload::new(payload);
+                image.replay_payloads.push(Arc::downgrade(&replay.0));
+                CacheSend {
+                    recipient: peer,
+                    owner,
+                    payload: replay,
+                    paced: true,
+                }
             })
-            .collect()
+            .collect();
+        image
+            .replay_payloads
+            .retain(|payload| payload.strong_count() > 0);
+        sends
     }
 
     pub(crate) fn resume_animations(
@@ -640,17 +684,23 @@ impl ImageCache {
         let owner = image.owner;
         let mut payloads = Vec::new();
         append_animation(image, &mut payloads);
-        Some(
-            payloads
-                .into_iter()
-                .map(|payload| CacheSend {
+        let sends = payloads
+            .into_iter()
+            .map(|payload| {
+                let replay = ReplayPayload::new(payload);
+                image.replay_payloads.push(Arc::downgrade(&replay.0));
+                CacheSend {
                     recipient: peer,
                     owner,
-                    payload,
+                    payload: replay,
                     paced: true,
-                })
-                .collect(),
-        )
+                }
+            })
+            .collect();
+        image
+            .replay_payloads
+            .retain(|payload| payload.strong_count() > 0);
+        Some(sends)
     }
 }
 
@@ -738,7 +788,7 @@ fn cache_state_send(owner: u16, id: [u8; 16], held: bool) -> CacheSend {
     CacheSend {
         recipient: owner,
         owner,
-        payload: Bytes::from(payload),
+        payload: ReplayPayload::new(Bytes::from(payload)),
         paced: false,
     }
 }
@@ -825,11 +875,21 @@ mod tests {
         let completed = observe(&mut cache, 7, &chunk(1, 1, 4, OP_CHUNK), &[7, 9], &config);
         assert_eq!(cache.servable_count(), 1);
         assert_eq!(completed.sends.len(), 2); // held notice + offer to peer 9
-        assert_eq!(completed.sends[0].payload[0], OP_SERVER_CACHE_STATE);
-        assert_eq!(completed.sends[1].payload[0], OP_SERVER_CACHE_OFFER);
+        assert_eq!(
+            completed.sends[0].payload.snapshot()[0],
+            OP_SERVER_CACHE_STATE
+        );
+        assert_eq!(
+            completed.sends[1].payload.snapshot()[0],
+            OP_SERVER_CACHE_OFFER
+        );
         assert_eq!(completed.sends[1].owner, 9);
         assert_eq!(
-            f32::from_le_bytes(completed.sends[1].payload[41..45].try_into().unwrap()),
+            f32::from_le_bytes(
+                completed.sends[1].payload.snapshot()[41..45]
+                    .try_into()
+                    .unwrap()
+            ),
             12.5
         );
 
@@ -840,10 +900,154 @@ mod tests {
         assert!(replay
             .iter()
             .all(|send| send.owner == 7 && send.recipient == 9 && send.paced));
-        assert_eq!(replay[0].payload[0], OP_SPAWN);
-        assert_eq!(replay[1].payload[0], OP_CHUNK);
-        assert_eq!(replay[2].payload[0], OP_CHUNK);
+        assert_eq!(replay[0].payload.snapshot()[0], OP_SPAWN);
+        assert_eq!(replay[1].payload.snapshot()[0], OP_CHUNK);
+        assert_eq!(replay[2].payload.snapshot()[0], OP_CHUNK);
         assert!(cache.request(9, &request, true, &config).is_empty());
+    }
+
+    fn completed_image(cache: &mut ImageCache, id: u8, config: &ServerConfig) {
+        cache.observe(
+            7,
+            &spawn(id, 7, 1, 1.0),
+            &[7],
+            CachePeers {
+                connected: &[7, 9],
+                animation_allowed: &[7, 9],
+            },
+            true,
+            config,
+        );
+        observe(cache, 7, &chunk(id, 0, 128, OP_CHUNK), &[7, 9], config);
+    }
+
+    #[test]
+    fn queued_replays_are_canceled_on_despawn_eviction_reset_and_owner_departure() {
+        let config = config();
+        for removal in 0..4 {
+            let mut cache = ImageCache::default();
+            completed_image(&mut cache, 1, &config);
+            let mut request = vec![OP_SERVER_CACHE_REQUEST];
+            request.extend([1; 16]);
+            let queued = cache.request(9, &request, false, &config);
+            assert!(!queued.is_empty());
+            let retained = queued[0].payload.clone();
+            let chunk_buffer = queued[1].payload.read().as_ref().unwrap().clone();
+            assert!(!chunk_buffer.is_unique());
+            match removal {
+                0 => {
+                    let despawn = [OP_DESPAWN].into_iter().chain([1; 16]).collect::<Vec<_>>();
+                    observe(&mut cache, 7, &despawn, &[7, 9], &config);
+                }
+                1 => {
+                    cache.drop_image([1; 16], &mut CacheEffects::default());
+                }
+                2 => cache.reset(),
+                _ => {
+                    cache.remove_player(7);
+                }
+            }
+            assert_eq!(retained.len(), 0);
+            assert!(retained.read().is_none());
+            assert!(queued.iter().all(|send| send.payload.read().is_none()));
+            assert!(
+                chunk_buffer.is_unique(),
+                "canceled queues must release the cache's chunk buffer"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_registration_prunes_expired_entries() {
+        let config = config();
+        let mut cache = ImageCache::default();
+        completed_image(&mut cache, 1, &config);
+        let mut request = vec![OP_SERVER_CACHE_REQUEST];
+        request.extend([1; 16]);
+        drop(cache.request(9, &request, false, &config));
+        assert_eq!(cache.images[&[1; 16]].replay_payloads.len(), 2);
+        // A distinct delivered peer allows another request and prunes the previous weak handles.
+        drop(cache.request(8, &request, false, &config));
+        assert_eq!(cache.images[&[1; 16]].replay_payloads.len(), 2);
+    }
+
+    #[test]
+    fn slow_download_churn_releases_evicted_buffers_and_invalidates_taken_batches() {
+        use crate::image_governor::{ImageBandwidthGovernor, PendingPayload};
+        let mut config = config();
+        config.image_cache_max_megabytes = 1;
+        config.image_cache_minimum_per_owner_megabytes = 0;
+        config.image_share_download_megabits_per_second = 1;
+        let mut cache = ImageCache::default();
+        let governor = ImageBandwidthGovernor::<()>::default();
+        let now = std::time::Instant::now();
+        let mut taken = Vec::new();
+        for id in 1..=12 {
+            observe(&mut cache, 7, &spawn(id, 7, 1, 0.0), &[7], &config);
+            observe(
+                &mut cache,
+                7,
+                &chunk(id, 0, 300_000, OP_CHUNK),
+                &[7],
+                &config,
+            );
+            let request = [OP_SERVER_CACHE_REQUEST]
+                .into_iter()
+                .chain([id; 16])
+                .collect::<Vec<_>>();
+            let sends = cache.request(9, &request, false, &config);
+            assert_eq!(sends.len(), 2);
+            governor.enqueue_replay(
+                9,
+                (),
+                sends
+                    .into_iter()
+                    .map(|send| PendingPayload {
+                        owner: send.owner,
+                        payload: send.payload,
+                    })
+                    .collect(),
+                &config,
+                now,
+            );
+            if id == 1 {
+                taken = governor.pump(&config, now);
+            }
+            // The slow recipient stays in debt while uploads replace the cache.
+            // Its queued buffers may only refer to the currently retained images.
+            assert!(governor.queued_replay_bytes() <= cache.total_bytes() as usize);
+            assert!(cache.total_bytes() <= 1024 * 1024);
+        }
+        assert!(taken
+            .iter()
+            .flat_map(|(_, payloads)| payloads)
+            .all(|pending| pending.payload.read().is_none()));
+        cache.remove_player(7);
+        assert_eq!(governor.queued_replay_bytes(), 0);
+        assert!(governor.pump(&config, now).is_empty());
+        // Reusing the owner and image IDs does not revive the old lifetime handles.
+        completed_image(&mut cache, 1, &config);
+        assert!(taken
+            .iter()
+            .flat_map(|(_, payloads)| payloads)
+            .all(|pending| pending.payload.read().is_none()));
+    }
+
+    #[test]
+    fn another_players_pickup_motion_updates_the_cached_world_pose() {
+        let config = config();
+        let mut cache = ImageCache::default();
+        completed_image(&mut cache, 1, &config);
+        observe(&mut cache, 9, &transform(1, 25.0), &[7, 9], &config);
+        let mut request = vec![OP_SERVER_CACHE_REQUEST];
+        request.extend([1; 16]);
+        let replay = cache.request(8, &request, false, &config);
+        assert_eq!(
+            f32::from_le_bytes(replay[0].payload.snapshot()[41..45].try_into().unwrap()),
+            25.0
+        );
+        assert_eq!(replay[1].payload.snapshot()[0], OP_TRANSFORM);
+        assert!(replay.iter().all(|send| send.owner == 7));
     }
 
     #[test]
@@ -871,14 +1075,14 @@ mod tests {
         assert_eq!(
             done.sends
                 .iter()
-                .filter(|send| send.payload[0] == OP_SERVER_CACHE_OFFER)
+                .filter(|send| send.payload.snapshot()[0] == OP_SERVER_CACHE_OFFER)
                 .count(),
             1
         );
         assert_eq!(
             done.sends
                 .iter()
-                .find(|send| send.payload[0] == OP_SERVER_CACHE_OFFER)
+                .find(|send| send.payload.snapshot()[0] == OP_SERVER_CACHE_OFFER)
                 .unwrap()
                 .recipient,
             11
@@ -941,8 +1145,8 @@ mod tests {
         assert_eq!(cache.request(9, &request, false, &config).len(), 2);
         let resumed = cache.resume_animations(&[9], &config);
         assert_eq!(resumed.len(), 2);
-        assert_eq!(resumed[0].payload[0], OP_ANIMATION_SPAWN);
-        assert_eq!(resumed[1].payload[0], OP_ANIMATION_CHUNK);
+        assert_eq!(resumed[0].payload.snapshot()[0], OP_ANIMATION_SPAWN);
+        assert_eq!(resumed[1].payload.snapshot()[0], OP_ANIMATION_CHUNK);
         assert!(cache.resume_animations(&[9], &config).is_empty());
     }
 
@@ -959,7 +1163,7 @@ mod tests {
         assert!(effects
             .sends
             .iter()
-            .any(|send| send.payload[0] == OP_SERVER_CACHE_STATE));
+            .any(|send| send.payload.snapshot()[0] == OP_SERVER_CACHE_STATE));
     }
 
     #[test]
@@ -972,10 +1176,10 @@ mod tests {
         let offer = completed
             .sends
             .iter()
-            .find(|send| send.payload[0] == OP_SERVER_CACHE_OFFER)
+            .find(|send| send.payload.snapshot()[0] == OP_SERVER_CACHE_OFFER)
             .unwrap();
         assert_eq!(
-            f32::from_le_bytes(offer.payload[41..45].try_into().unwrap()),
+            f32::from_le_bytes(offer.payload.snapshot()[41..45].try_into().unwrap()),
             42.25
         );
 
@@ -983,17 +1187,17 @@ mod tests {
         request.extend([8; 16]);
         let replay = cache.request(9, &request, false, &config);
         assert_eq!(replay.len(), 3);
-        assert_eq!(replay[0].payload[0], OP_SPAWN);
+        assert_eq!(replay[0].payload.snapshot()[0], OP_SPAWN);
         assert_eq!(
-            f32::from_le_bytes(replay[0].payload[41..45].try_into().unwrap()),
+            f32::from_le_bytes(replay[0].payload.snapshot()[41..45].try_into().unwrap()),
             42.25
         );
-        assert_eq!(replay[1].payload[0], OP_TRANSFORM);
+        assert_eq!(replay[1].payload.snapshot()[0], OP_TRANSFORM);
         assert_eq!(
-            f32::from_le_bytes(replay[1].payload[17..21].try_into().unwrap()),
+            f32::from_le_bytes(replay[1].payload.snapshot()[17..21].try_into().unwrap()),
             42.25
         );
-        assert_eq!(replay[2].payload[0], OP_CHUNK);
+        assert_eq!(replay[2].payload.snapshot()[0], OP_CHUNK);
     }
 
     #[test]
@@ -1033,7 +1237,8 @@ mod tests {
         assert!(cache.bytes_held_for(7) < 300_000);
         assert!(cache.bytes_held_for(9) > 400_000);
         assert!(replacement.sends.iter().any(|send| {
-            send.payload[0] == OP_SERVER_CACHE_STATE && send.payload.last() == Some(&0)
+            send.payload.snapshot()[0] == OP_SERVER_CACHE_STATE
+                && send.payload.snapshot().last() == Some(&0)
         }));
     }
 
