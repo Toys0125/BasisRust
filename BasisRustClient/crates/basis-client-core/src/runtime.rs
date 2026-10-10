@@ -15,10 +15,15 @@ use crate::transport::{ConnectOptions, MaintenanceOptions};
 use crate::voice::{voice_workers, VoiceLibrary};
 use crate::voice_diagnostics;
 use anyhow::{anyhow, Context, Result};
+use basis_protocol::{
+    channels,
+    io::NetWriter,
+    messages::{BasisSerialize, NetIdMessage},
+};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time;
 use tracing::{error, info, warn};
@@ -54,6 +59,33 @@ pub async fn run(
     args: ClientOptions,
     worker_threads: usize,
     start_console: impl FnOnce() -> mpsc::UnboundedReceiver<ConsoleCommand>,
+) -> Result<()> {
+    run_internal(args, worker_threads, start_console, None).await
+}
+
+pub async fn run_image_benchmark(
+    options: crate::image_benchmark::ImageBenchmarkOptions,
+    worker_threads: usize,
+) -> Result<()> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    drop(tx);
+    let args = ClientOptions {
+        config: options.config_path.clone(),
+        ip: Some(options.ip.clone()),
+        port: Some(options.port),
+        clients: Some(options.clients),
+        no_reconnect: true,
+        no_movement: true,
+        ..ClientOptions::default()
+    };
+    run_internal(args, worker_threads, || rx, Some(options)).await
+}
+
+async fn run_internal(
+    args: ClientOptions,
+    worker_threads: usize,
+    start_console: impl FnOnce() -> mpsc::UnboundedReceiver<ConsoleCommand>,
+    image_options: Option<crate::image_benchmark::ImageBenchmarkOptions>,
 ) -> Result<()> {
     anyhow::ensure!(
         args.unity_frame_rate > 0,
@@ -106,6 +138,9 @@ pub async fn run(
             args.scene_start_file.clone(),
         ))
     });
+    config.image_benchmark = image_options
+        .map(crate::image_benchmark::ImageBenchmarkSession::new)
+        .transpose()?;
     if let Some(ip) = args.ip {
         config.ip = ip;
     }
@@ -309,6 +344,57 @@ pub async fn run(
     } else if !shared_receive_enabled {
         info!("shared client receive disabled; using per-client receive tasks");
     }
+
+    let image_task = if let Some(session) = config.image_benchmark.clone() {
+        let snapshot = managed_clients.lock().await.clone();
+        let ready_deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let mut writer = NetWriter::new();
+            NetIdMessage {
+                player_id: crate::image_benchmark::IMAGE_MANAGER_IDENTIFIER.to_owned(),
+            }
+            .serialize(&mut writer)?;
+            for client in &snapshot {
+                if client.image_network_id.load(Ordering::Acquire) == u16::MAX {
+                    client
+                        .send_reliable_ordered(channels::NET_ID_ASSIGN, writer.as_slice())
+                        .await?;
+                }
+            }
+            let remaining = ready_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                session.wait_ready(Duration::ZERO).await?;
+            }
+            match session
+                .wait_ready(remaining.min(Duration::from_secs(3)))
+                .await
+            {
+                Ok(()) => break,
+                Err(error) if Instant::now() < ready_deadline => {
+                    warn!("retrying manager network-id assignment for clients still missing an id: {error:#}");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        session.set_owner_peers(&snapshot)?;
+        let session_for_task = session.clone();
+        let clients_for_task = managed_clients.clone();
+        let shutdown_for_task = shutdown.clone();
+        Some(tokio::spawn(async move {
+            let result = crate::image_benchmark::run_workload(
+                clients_for_task,
+                session_for_task,
+                shutdown_for_task.clone(),
+            )
+            .await;
+            if result.is_err() {
+                shutdown_for_task.store(true, Ordering::SeqCst);
+            }
+            result
+        }))
+    } else {
+        None
+    };
 
     if !args.no_reconnect && !shutdown.load(Ordering::Relaxed) {
         tokio::spawn(failure_reconnect_loop(
@@ -517,6 +603,13 @@ pub async fn run(
         Some(task) => task.await.context("scene workload worker failed"),
         None => Ok(()),
     };
+    if let Some(task) = image_task {
+        let image_result = task
+            .await
+            .context("image benchmark worker failed")
+            .and_then(|result| result);
+        shutdown_result = shutdown_result.and(image_result);
+    }
     if let (Some(path), Some(session)) = (&args.observe_scene_csv, &config.scene_session) {
         shutdown_result = shutdown_result.and(session.write_csv(path));
     }

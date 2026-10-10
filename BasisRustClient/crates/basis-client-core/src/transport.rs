@@ -1,9 +1,11 @@
 use basis_transport::{relative_sequence, PacketProperty, DEFAULT_WINDOW_SIZE, MAX_SEQUENCE};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
 use tokio::sync::Notify;
 
-#[cfg(any(target_os = "linux", windows, test))]
 pub(crate) const LITENETLIB_MAX_MTU: usize = 1432;
 /// LiteNetLib's `NetManager.UpdateTime` default, and so the cadence at which accumulated ACKs
 /// are flushed. This is the number that matters for throughput: it bounds how long a received
@@ -19,6 +21,10 @@ pub(crate) const PING_INTERVAL_TICKS: usize = 100;
 /// now that it ticks at 15 ms rather than 100 ms.
 pub(crate) const SHARED_SNAPSHOT_REFRESH_TICKS: usize = 64;
 pub(crate) const INITIAL_START_ATTEMPTS: usize = 3;
+const MAX_REASSEMBLIES: usize = DEFAULT_WINDOW_SIZE / 2;
+const MAX_REASSEMBLY_BYTES: usize = DEFAULT_WINDOW_SIZE * (LITENETLIB_MAX_MTU - 10);
+const MAX_REASSEMBLY_PARTS: usize = 128;
+const FRAGMENT_EXPIRY: Duration = Duration::from_secs(10);
 pub(crate) const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 pub(crate) const SOCKET_TTL: u32 = 255;
 #[derive(Debug, Clone)]
@@ -90,6 +96,147 @@ pub(crate) struct ReliableSend {
     pub(crate) sequence: Option<u16>,
     pub(crate) bytes: Vec<u8>,
     pub(crate) last_sent: Option<SystemTime>,
+}
+
+#[derive(Debug)]
+struct FragmentAssembly {
+    total: usize,
+    fragment_size: Option<usize>,
+    parts: Vec<Option<Vec<u8>>>,
+    received: usize,
+    bytes: usize,
+    updated_at: Instant,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ReliableFragmentReassembler {
+    entries: HashMap<(u8, u16), FragmentAssembly>,
+    bytes: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FragmentResult {
+    Pending,
+    Complete(Vec<u8>),
+    Duplicate,
+    Invalid,
+}
+
+impl ReliableFragmentReassembler {
+    pub(crate) fn push(&mut self, channel_id: u8, payload: &[u8], now: Instant) -> FragmentResult {
+        let expired = self
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                (now.saturating_duration_since(entry.updated_at) > FRAGMENT_EXPIRY).then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        if !expired.is_empty() {
+            for key in expired {
+                self.remove(key);
+            }
+            // These packet sequences have already been ACKed. Continuing would leave a
+            // permanently incomplete message with no way to request its missing pieces.
+            return FragmentResult::Invalid;
+        }
+        if payload.len() <= 6 {
+            return FragmentResult::Invalid;
+        }
+        let id = u16::from_le_bytes([payload[0], payload[1]]);
+        let part = u16::from_le_bytes([payload[2], payload[3]]) as usize;
+        let total = u16::from_le_bytes([payload[4], payload[5]]) as usize;
+        let data = &payload[6..];
+        // LiteNetLib derives fragment data length from the negotiated MTU. A peer may
+        // therefore send smaller pieces than our own sender's fixed 1014-byte pieces.
+        let max_fragment_size = LITENETLIB_MAX_MTU - 10; // packet and fragment headers
+        if !(2..=MAX_REASSEMBLY_PARTS).contains(&total)
+            || part >= total
+            || data.is_empty()
+            || data.len() > max_fragment_size
+        {
+            return FragmentResult::Invalid;
+        }
+        let key = (channel_id, id);
+        if let Some(entry) = self.entries.get(&key) {
+            if entry.total != total {
+                self.remove(key);
+                return FragmentResult::Invalid;
+            }
+            if part + 1 < total {
+                if entry.fragment_size.is_some_and(|size| size != data.len()) {
+                    self.remove(key);
+                    return FragmentResult::Invalid;
+                }
+                if entry.fragment_size.is_none()
+                    && entry.parts[total - 1]
+                        .as_ref()
+                        .is_some_and(|last| last.len() > data.len())
+                {
+                    self.remove(key);
+                    return FragmentResult::Invalid;
+                }
+            } else if entry.fragment_size.is_some_and(|size| data.len() > size) {
+                self.remove(key);
+                return FragmentResult::Invalid;
+            }
+            if let Some(existing) = &entry.parts[part] {
+                if existing == data {
+                    return FragmentResult::Duplicate;
+                }
+                self.remove(key);
+                return FragmentResult::Invalid;
+            }
+        } else {
+            if self.entries.len() >= MAX_REASSEMBLIES {
+                return FragmentResult::Invalid;
+            }
+            self.entries.insert(
+                key,
+                FragmentAssembly {
+                    total,
+                    fragment_size: (part + 1 < total).then_some(data.len()),
+                    parts: vec![None; total],
+                    received: 0,
+                    bytes: 0,
+                    updated_at: now,
+                },
+            );
+        }
+        if self.bytes.saturating_add(data.len()) > MAX_REASSEMBLY_BYTES {
+            self.remove(key);
+            return FragmentResult::Invalid;
+        }
+        let entry = self
+            .entries
+            .get_mut(&key)
+            .expect("fragment assembly exists");
+        if part + 1 < total {
+            entry.fragment_size = Some(data.len());
+        }
+        entry.parts[part] = Some(data.to_vec());
+        entry.received += 1;
+        entry.bytes += data.len();
+        entry.updated_at = now;
+        self.bytes += data.len();
+        if entry.received != entry.total {
+            return FragmentResult::Pending;
+        }
+        let mut assembled = Vec::with_capacity(entry.bytes);
+        for bytes in &entry.parts {
+            let Some(bytes) = bytes else {
+                return FragmentResult::Invalid;
+            };
+            assembled.extend_from_slice(bytes);
+        }
+        self.remove(key);
+        FragmentResult::Complete(assembled)
+    }
+
+    fn remove(&mut self, key: (u8, u16)) {
+        if let Some(entry) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(entry.bytes);
+        }
+    }
 }
 
 /// Mirror of the receive side of LiteNetLib's `ReliableChannel`.
@@ -220,4 +367,159 @@ pub(crate) fn read_bytes_message(data: &[u8]) -> Option<&[u8]> {
     }
     let len = u16::from_le_bytes([data[0], data[1]]) as usize;
     data.get(2..2 + len)
+}
+
+#[cfg(test)]
+mod fragment_tests {
+    use super::*;
+
+    fn packet(id: u16, part: usize, total: usize, data: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(6 + data.len());
+        bytes.extend_from_slice(&id.to_le_bytes());
+        bytes.extend_from_slice(&(part as u16).to_le_bytes());
+        bytes.extend_from_slice(&(total as u16).to_le_bytes());
+        bytes.extend_from_slice(data);
+        bytes
+    }
+
+    #[test]
+    fn reassembles_basis_16k_image_chunk_across_negotiated_litenetlib_fragment_sizes() {
+        let source = (0..(16 * 1024 + 29))
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>();
+        for (id, fragment_size) in [500, 1014, LITENETLIB_MAX_MTU - 10].into_iter().enumerate() {
+            let fragments = source.chunks(fragment_size).collect::<Vec<_>>();
+            let total = fragments.len();
+            let mut receiver = ReliableFragmentReassembler::default();
+            let now = Instant::now();
+            assert_eq!(
+                receiver.push(
+                    96,
+                    &packet(id as u16, total - 1, total, fragments[total - 1]),
+                    now
+                ),
+                FragmentResult::Pending
+            );
+            assert_eq!(
+                receiver.push(
+                    96,
+                    &packet(id as u16, total - 1, total, fragments[total - 1]),
+                    now
+                ),
+                FragmentResult::Duplicate
+            );
+            let mut completed = None;
+            for part in (0..total - 1).rev() {
+                match receiver.push(96, &packet(id as u16, part, total, fragments[part]), now) {
+                    FragmentResult::Complete(bytes) => completed = Some(bytes),
+                    FragmentResult::Pending => {}
+                    other => panic!("unexpected fragment result: {other:?}"),
+                }
+            }
+            assert_eq!(completed.unwrap(), source);
+            assert_eq!(receiver.bytes, 0);
+            assert!(receiver.entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn rejects_conflicts_mismatched_totals_oversized_and_expired_state() {
+        let now = Instant::now();
+        let full = vec![7; 500];
+        let mut receiver = ReliableFragmentReassembler::default();
+        assert_eq!(
+            receiver.push(96, &packet(1, 0, 2, &full), now),
+            FragmentResult::Pending
+        );
+        assert_eq!(
+            receiver.push(96, &packet(1, 1, 3, b"x"), now),
+            FragmentResult::Invalid
+        );
+        assert!(receiver.entries.is_empty());
+        assert_eq!(
+            receiver.push(96, &packet(2, 0, 2, &full), now),
+            FragmentResult::Pending
+        );
+        let mut conflict = full.clone();
+        conflict[0] ^= 1;
+        assert_eq!(
+            receiver.push(96, &packet(2, 0, 2, &conflict), now),
+            FragmentResult::Invalid
+        );
+        assert!(receiver.entries.is_empty());
+        assert_eq!(
+            receiver.push(96, &packet(3, 0, MAX_REASSEMBLY_PARTS + 1, &full), now),
+            FragmentResult::Invalid
+        );
+        for id in 4..(4 + MAX_REASSEMBLIES) {
+            assert_eq!(
+                receiver.push(96, &packet(id as u16, 0, 2, &full), now),
+                FragmentResult::Pending
+            );
+        }
+        assert_eq!(
+            receiver.push(96, &packet((4 + MAX_REASSEMBLIES) as u16, 0, 2, &full), now),
+            FragmentResult::Invalid
+        );
+        let expired_at = now + FRAGMENT_EXPIRY + Duration::from_millis(1);
+        assert_eq!(
+            receiver.push(
+                96,
+                &packet((5 + MAX_REASSEMBLIES) as u16, 0, 2, &full),
+                expired_at
+            ),
+            FragmentResult::Invalid
+        );
+        assert!(receiver.entries.is_empty());
+        assert_eq!(
+            receiver.push(
+                96,
+                &packet((6 + MAX_REASSEMBLIES) as u16, 0, 2, &full),
+                expired_at
+            ),
+            FragmentResult::Pending
+        );
+        assert!(receiver.bytes <= MAX_REASSEMBLY_BYTES);
+    }
+
+    #[test]
+    fn rejects_inconsistent_nonfinal_fragment_lengths() {
+        let now = Instant::now();
+        let mut receiver = ReliableFragmentReassembler::default();
+        assert_eq!(
+            receiver.push(96, &packet(12, 2, 3, b"last"), now),
+            FragmentResult::Pending
+        );
+        assert_eq!(
+            receiver.push(96, &packet(12, 0, 3, &[1; 500]), now),
+            FragmentResult::Pending
+        );
+        assert_eq!(
+            receiver.push(96, &packet(12, 1, 3, &[2; 499]), now),
+            FragmentResult::Invalid
+        );
+        assert!(receiver.entries.is_empty());
+    }
+
+    #[test]
+    fn reassembles_full_receive_window_of_interleaved_fragments() {
+        let now = Instant::now();
+        let first = vec![0x31; 500];
+        let last = vec![0x72; 17];
+        let mut receiver = ReliableFragmentReassembler::default();
+        for id in 0..MAX_REASSEMBLIES {
+            assert_eq!(
+                receiver.push(96, &packet(id as u16, 0, 2, &first), now),
+                FragmentResult::Pending
+            );
+        }
+        for id in (0..MAX_REASSEMBLIES).rev() {
+            assert_eq!(
+                receiver.push(96, &packet(id as u16, 1, 2, &last), now),
+                FragmentResult::Complete([first.clone(), last.clone()].concat())
+            );
+        }
+        assert_eq!(receiver.bytes, 0);
+        assert!(receiver.entries.is_empty());
+    }
 }

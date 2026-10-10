@@ -6,6 +6,7 @@ mod client;
 mod config;
 mod diagnostics;
 mod identity;
+mod image_benchmark;
 mod net;
 mod observer;
 mod observer_sequence;
@@ -26,4 +27,6 @@ mod wire;
 mod tests;
 
 pub use config::{ClientOptions, Config};
+pub use image_benchmark::ImageBenchmarkOptions;
+pub use runtime::run_image_benchmark;
 pub use runtime::{run, ConsoleCommand};

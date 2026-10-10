@@ -399,6 +399,18 @@ pub(super) async fn handle_request(
         }
         AdminRequestMode::GlobalToggleGifs => {
             toggle_simple_lock(state, |s| &mut s.gifs_locked, |c| &mut c.gifs_locked).await;
+            if !state.global_state.read().gifs_locked {
+                let allowed = state
+                    .authenticated_peers
+                    .iter()
+                    .map(|peer| *peer.key())
+                    .collect::<Vec<_>>();
+                let sends = state
+                    .image_cache
+                    .lock()
+                    .resume_animations(&allowed, &state.config.read());
+                deliver_image_cache_sends(state, sends).await;
+            }
             save_config(state)?;
         }
         AdminRequestMode::SetAllowlistMode => {
