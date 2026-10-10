@@ -180,3 +180,12 @@ CPU per built send falls 5.17% and built work rises 6.05%, with all pairs agreei
 on those directions. Original retransmit gates remain invalid on premeasurement
 counts, including two warmup increases; measured counts are constant and all
 other gates pass. Source/profile/tool hashes and all attempts are retained.
+
+## Mixed scene/avatar workload checkpoint — 2026-10-10
+
+The [mixed 1,500-client PGO A/B](pgo-mixed-client1500-20261010.md) adds 128-byte
+additional avatar data and 128-byte scene broadcasts every 50 ms to the same
+dense workload. It uses unchanged production source and a fresh mixed profile.
+The offered scene fanout exceeds this host's delivery capacity. Original
+training and evaluation failures remain explicit in the retained evidence;
+these measurements are overload diagnostics, not a validated PGO speedup.

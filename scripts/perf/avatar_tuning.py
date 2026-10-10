@@ -8,6 +8,8 @@ import pathlib
 import statistics
 import xml.etree.ElementTree as ET
 
+from avatar_benchmark import MIXED_DEFAULTS
+
 
 def sha256(path):
     digest = hashlib.sha256()
@@ -121,6 +123,90 @@ def server_udp_metrics(samples, window_start, window_end, window_seconds, networ
     return metrics
 
 
+def scene_summary(metrics, clients, minimum_delivery, interval_ms=None):
+    expected = int(metrics['expected_observer_messages'])
+    received = int(metrics['received_messages'])
+    seconds = float(metrics['window_seconds'])
+    if not math.isfinite(seconds):
+        raise ValueError('Nonfinite scene measurement window')
+    errors = []
+    for key in ('send_errors', 'backpressure_skips', 'malformed_messages'):
+        if int(metrics[key]):
+            errors.append(f'{key}={metrics[key]}')
+    if int(metrics['observed_senders']) != clients - 1:
+        errors.append('observer did not receive every sender')
+    ratio = received / expected if expected else 0
+    if ratio > 1:
+        errors.append('observer received more unique messages than successful sends')
+    if not expected or ratio < minimum_delivery:
+        errors.append(f'delivery ratio {ratio:.4f} below {minimum_delivery}')
+    if expected > int(metrics['sent_messages']):
+        errors.append('expected observer deliveries exceed total successful sends')
+    if not math.isfinite(seconds) or seconds <= 0:
+        errors.append('empty measurement window')
+    if any(int(metrics[key]) < 0 for key in ('expected_observer_messages', 'received_messages',
+                                            'received_bytes', 'observed_senders', 'sent_messages')):
+        errors.append('negative scene counter')
+    cadence = {}
+    if interval_ms is not None:
+        sent = int(metrics['sent_messages'])
+        nominal = seconds * clients * 1000 / interval_ms
+        cadence = {'sent_messages_per_second': sent / seconds if seconds > 0 else 0,
+                   'requested_messages_per_second': clients * 1000 / interval_ms,
+                   'send_cadence_ratio': sent / nominal if nominal > 0 else 0}
+        # Allow one partial tick at shutdown; skipped workload still invalidates a run.
+        if sent < max(0, nominal - clients) * minimum_delivery:
+            errors.append('sender did not sustain requested cadence')
+    return {**cadence, 'valid': not errors, 'errors': errors, 'observer_delivery_ratio': ratio,
+            'observer_messages_per_second': received / seconds if seconds > 0 else 0,
+            'observer_payload_bytes_per_second': int(metrics['received_bytes']) / seconds if seconds > 0 else 0,
+            'metrics': metrics}
+
+
+def mixed_command_provenance(command, workload, path):
+    """Attest mixed flags and both observers' shared start marker."""
+    def option(flag, default=None):
+        count = command.count(flag)
+        if count > 1:
+            raise ValueError('Duplicate workload option: ' + flag)
+        if not count:
+            return default
+        index = command.index(flag)
+        return command[index + 1] if index + 1 < len(command) else None
+    expected = {k: workload.get(k, v) for k, v in MIXED_DEFAULTS.items()}
+    if option('--additional-avatar-bytes', '0') != str(expected['additional_avatar_bytes']):
+        return False
+    if option('--scene-data-bytes', '0') != str(expected['scene_data_bytes']):
+        return False
+    if command.count('--scene-data-reliable') > 1 or ('--scene-data-reliable' in command) != expected['scene_data_reliable']:
+        return False
+    if expected['scene_data_bytes']:
+        return (option('--scene-data-interval-ms') == str(expected['scene_data_interval_ms'])
+                and option('--observe-scene-csv') == str(path / 'scene.csv')
+                and option('--scene-start-file') == option('--observe-avatar-start-file') == str(path / 'observe-start.marker'))
+    return not any(flag in command for flag in ('--observe-scene-csv', '--scene-start-file'))
+
+
+def mixed_scene_result(path, workload):
+    """Scene counters span marker through clean quit, beyond the fixed CPU window."""
+    scene = scene_summary(observer_metrics(path / 'scene.csv'), workload['clients'], .95,
+                          workload['scene_data_interval_ms'])
+    raw = scene['metrics']
+    checks = {'scene_delivery': scene['observer_delivery_ratio'] >= .95 and scene['observer_delivery_ratio'] <= 1,
+              'scene_quality': scene['valid'],
+              'scene_payload_bytes': int(raw['received_bytes']) == int(raw['received_messages']) * workload['scene_data_bytes'],
+              'scene_duration': math.isfinite(float(raw['window_seconds'])) and float(raw['window_seconds']) >= workload['window_seconds'] - .1}
+    metrics = {f'scene_{key}': scene[key] for key in ('sent_messages_per_second', 'requested_messages_per_second',
+                'send_cadence_ratio', 'observer_delivery_ratio', 'observer_messages_per_second', 'observer_payload_bytes_per_second')}
+    metrics['scene_window_seconds'] = float(raw['window_seconds'])
+    for key in ('send_errors', 'backpressure_skips', 'malformed_messages', 'duplicate_messages', 'out_of_order_messages'):
+        metrics['scene_' + key] = int(raw[key])
+    for key in ('p50', 'p95', 'p99'):
+        metrics[f'scene_latency_{key}_upper_ms'] = float(raw[f'latency_{key}_upper_us']) / 1000
+    checks['scene_finite_metrics'] = all(math.isfinite(v) and v >= 0 for v in metrics.values())
+    return scene, checks, metrics
+
+
 def summarize(path, experiment, entry):
     """Retain every gate and metric, including invalid/outlier runs."""
     meta = json.loads((path / 'run.json').read_text())
@@ -204,8 +290,18 @@ def summarize(path, experiment, entry):
     checks['client_config_provenance'] = sha256(pathlib.Path(commands['client'][2])) == experiment['frozen']['client_config']['sha256']
     for role in ('server', 'client'):
         checks['frozen_' + role] = sha256(pathlib.Path(commands[role][0])) == experiment['frozen'][role]['sha256']
+    scene = None
+    if any(key in experiment['workload'] for key in MIXED_DEFAULTS):
+        checks['mixed_command_provenance'] = mixed_command_provenance(commands['client'], experiment['workload'], path)
+    if experiment['workload'].get('scene_data_bytes', 0):
+        scene, scene_checks, scene_metrics = mixed_scene_result(path, experiment['workload'])
+        checks.update(scene_checks)
+        # positive_metrics above applies to the existing avatar/CPU metrics.
+        # Zero scene error counters and zero-microsecond latency are legitimate.
+        metrics.update(scene_metrics)
     return {'name': entry['name'], **identity, 'round': entry['round'], 'valid': all(checks.values()),
             'checks': checks, 'metrics': metrics, 'observer': obs, 'minimum_sender_socket_items': minimum,
+            **({'scene': scene} if scene is not None else {}),
             'started_unix_seconds': meta['started_unix_seconds'], 'finished_unix_seconds': meta['finished_unix_seconds'],
             'sender_errors': sum(int(r['send_errors']) for r in senders), 'exits': {k: meta[k] for k in ('client_exit_code', 'server_exit_code')}}
 

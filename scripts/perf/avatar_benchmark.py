@@ -12,6 +12,60 @@ import time
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+MIXED_DEFAULTS = {'additional_avatar_bytes': 0, 'scene_data_bytes': 0,
+                  'scene_data_interval_ms': 50, 'scene_data_reliable': False}
+WORKLOAD_FIELDS = ('clients', 'network_capacity_mbps', 'warmup_seconds', 'window_seconds',
+                   'rayon_threads', 'tokio_workers', 'client_workers', 'port', 'health_port',
+                   'server_cpus', 'client_cpus', 'startup_timeout', 'ready_timeout')
+
+
+def add_mixed_options(parser):
+    parser.add_argument('--additional-avatar-bytes', type=int, default=0)
+    parser.add_argument('--scene-data-bytes', type=int, default=0, help='0 disables scene; otherwise 24..1024 bytes')
+    parser.add_argument('--scene-data-interval-ms', type=int, default=50)
+    parser.add_argument('--scene-data-reliable', action='store_true')
+
+
+def validate_mixed_options(args):
+    if not 0 <= args.additional_avatar_bytes <= 255:
+        raise ValueError('Additional avatar bytes must be 0..255')
+    if args.scene_data_bytes != 0 and not 24 <= args.scene_data_bytes <= 1024:
+        raise ValueError('Scene data bytes must be 0 or 24..1024')
+    if args.scene_data_interval_ms <= 0:
+        raise ValueError('Scene data interval must be positive')
+    if args.scene_data_reliable and not args.scene_data_bytes:
+        raise ValueError('Reliable scene delivery requires enabled scene data')
+
+
+def mixed_cli(args):
+    flags = []
+    for name, default in MIXED_DEFAULTS.items():
+        value = getattr(args, name, default)
+        if name == 'scene_data_reliable':
+            if value:
+                flags.append('--scene-data-reliable')
+        else:
+            flags.extend(['--' + name.replace('_', '-'), str(value)])
+    return flags
+
+
+def workload_metadata(args):
+    return {**{k: getattr(args, k) for k in WORKLOAD_FIELDS},
+            **{k: getattr(args, k, default) for k, default in MIXED_DEFAULTS.items()}}
+
+
+def mixed_client_options(args, output, marker):
+    flags = []
+    if getattr(args, 'additional_avatar_bytes', 0):
+        flags.extend(['--additional-avatar-bytes', str(args.additional_avatar_bytes)])
+    if getattr(args, 'scene_data_bytes', 0):
+        flags.extend(['--scene-data-bytes', str(args.scene_data_bytes),
+                      '--scene-data-interval-ms', str(args.scene_data_interval_ms),
+                      '--observe-scene-csv', str(output / 'scene.csv'),
+                      '--scene-start-file', str(marker)])
+        if args.scene_data_reliable:
+            flags.append('--scene-data-reliable')
+    return flags
 
 
 def write_json(path, value):
@@ -171,6 +225,7 @@ def run_workload(args, output, server_env, client_env):
                   '--observe-avatar-csv', str(output / 'observer.csv'), '--avatar-observe-radius', '40',
                   '--avatar-observe-expected-peers', str(args.clients - 1),
                   '--observe-avatar-start-file', str(marker), '--observe-avatar-window-secs', str(args.window_seconds)]
+    client_cmd.extend(mixed_client_options(args, output, marker))
     server_env = dict(server_env, BASIS_STATUS_INTERVAL_SECS='1', BASIS_AVATAR_DIAGNOSTIC_OBSERVER_ID='0',
                       BASIS_AVATAR_DIAGNOSTIC_START_FILE=str(marker),
                       BASIS_AVATAR_DIAGNOSTIC_CSV=str(output / 'server-pairs.csv'),
@@ -185,7 +240,12 @@ def run_workload(args, output, server_env, client_env):
     owner = ProcessTree()
     server = client = None
     meta = {'started_unix_seconds': time.time(), 'error': None, 'completed': False,
-            'workload': {k: getattr(args, k) for k in ('clients', 'network_capacity_mbps', 'warmup_seconds', 'window_seconds', 'rayon_threads', 'tokio_workers', 'client_workers', 'port', 'health_port', 'server_cpus', 'client_cpus', 'startup_timeout', 'ready_timeout')}}
+            'workload': workload_metadata(args)}
+    if getattr(args, 'scene_data_bytes', 0):
+        meta['scene_measurement'] = {'start': 'first scene tick after shared avatar marker',
+                                    'end': 'client shutdown, including observer grace',
+                                    'duration_source': 'scene.csv window_seconds',
+                                    'cpu_duration_source': 'fixed run.json monotonic window'}
     try:
         # Re-probe before EVERY fresh run; never accept a prior server's health.
         select_port(socket.SOCK_DGRAM, args.port)

@@ -12,7 +12,7 @@ import statistics
 import sys
 import shutil
 
-from avatar_benchmark import ROOT, relevant_env, run_workload, select_port, write_json
+from avatar_benchmark import add_mixed_options, mixed_cli, workload_metadata, ROOT, relevant_env, run_workload, select_port, write_json
 from avatar_tuning import run_order, sha256, summarize
 
 spec = importlib.util.spec_from_file_location('avatar_settings_cli', Path(__file__).with_name('tune-avatar-settings.py'))
@@ -51,6 +51,7 @@ def main():
     parser.add_argument('--window-seconds', type=int, default=60)
     parser.add_argument('--server-cpus', default='2-9')
     parser.add_argument('--client-cpus', default='10-15')
+    add_mixed_options(parser)
     supplied = parser.parse_args()
     if platform.system() != 'Linux' or supplied.blocks < 1:
         parser.error('This coordinator requires Linux and at least one balanced block')
@@ -61,7 +62,7 @@ def main():
         '--clients', str(supplied.clients), '--warmup-seconds', str(supplied.warmup_seconds),
         '--window-seconds', str(supplied.window_seconds), '--repeats', str(supplied.blocks * 2),
         '--server-cpus', supplied.server_cpus, '--client-cpus', supplied.client_cpus,
-        '--rayon-threads', '4', '--tokio-workers', '4', '--client-workers', '4'])
+        '--rayon-threads', '4', '--tokio-workers', '4', '--client-workers', '4', *mixed_cli(supplied)])
     settings.validate(args)
     if set(settings.cpu_list(args.server_cpus)) & set(settings.cpu_list(args.client_cpus)):
         parser.error('Server and client CPU sets must be disjoint')
@@ -107,7 +108,7 @@ def main():
                       'platform': platform.platform(), 'build': build, 'frozen': artifacts,
                       'cleared_environment_keys': cleared, 'tool_sha256': tools, 'runs': [],
                       'invocation': [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
-                      'workload': {k: getattr(args, k) for k in ('clients', 'network_capacity_mbps', 'warmup_seconds', 'window_seconds', 'rayon_threads', 'tokio_workers', 'client_workers', 'port', 'health_port', 'server_cpus', 'client_cpus', 'startup_timeout', 'ready_timeout')}}
+                      'workload': workload_metadata(args)}
 
         def save():
             write_json(args.output / 'experiment.json', experiment)

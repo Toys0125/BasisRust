@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 
-from avatar_benchmark import ROOT, cpu_list, relevant_env, run_workload, select_port, write_json
+from avatar_benchmark import add_mixed_options, validate_mixed_options, workload_metadata, ROOT, cpu_list, relevant_env, run_workload, select_port, write_json
 from avatar_tuning import csv_rows, rank, report, run_order, sha256, summarize, validate_series, xml_values
 
 FIXTURES = ROOT / 'docs/performance/fixtures'
@@ -69,6 +69,7 @@ def parser():
     result.add_argument('--startup-timeout', type=int, default=30)
     result.add_argument('--ready-timeout', type=int, default=360)
     result.add_argument('--binary-build-note', default='unknown; local toolchain/source metadata does not attest binary origin', help='optional user-supplied binary build/revision description')
+    add_mixed_options(result)
     return result
 
 
@@ -81,6 +82,7 @@ def validate(args):
         if getattr(args, key) is None:
             setattr(args, key, PRESETS[args.mode][index])
     resolve_client_selection(args)
+    validate_mixed_options(args)
     if (args.clients is not None and args.clients < 2) or args.warmup_seconds < 0 or args.window_seconds < 2 or not math.isfinite(args.network_capacity_mbps) or args.network_capacity_mbps <= 0:
         raise ValueError('Require clients >=2 when specified, warmup >=0, window >=2, and network target >0 Mbps')
     if args.repeats < 2 or args.repeats % 2:
@@ -368,7 +370,7 @@ def main(argv=None):
                       'platform_default_flush_lanes': 6 if os.name == 'nt' else 0,
                       'platform_default_rayon': 'min(available parallelism,8)' if os.name == 'nt' else 'Rayon available parallelism',
                       'platform_default_tokio': 'available parallelism',
-                      'workload': {k: getattr(args, k) for k in ('clients', 'network_capacity_mbps', 'warmup_seconds', 'window_seconds', 'rayon_threads', 'tokio_workers', 'client_workers', 'port', 'health_port', 'server_cpus', 'client_cpus', 'startup_timeout', 'ready_timeout')},
+                      'workload': workload_metadata(args),
                       'workload_policy': '20ms movement, zero jitter/drift, 60FPS Unity-policy synthetic pose, dense all-near, no voice/P2P, CPU-only distances; one applied observer',
                       'source_revision': command_metadata(['git', 'rev-parse', 'HEAD']),
                       'source_status': command_metadata(['git', 'status', '--porcelain']),

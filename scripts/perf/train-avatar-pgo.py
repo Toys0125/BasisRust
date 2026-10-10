@@ -9,7 +9,7 @@ import shutil
 import signal
 import socket
 
-from avatar_benchmark import relevant_env, run_workload, select_port, write_json
+from avatar_benchmark import add_mixed_options, mixed_cli, workload_metadata, relevant_env, run_workload, select_port, write_json
 from avatar_tuning import sha256, summarize
 
 spec = importlib.util.spec_from_file_location('avatar_settings_cli', Path(__file__).with_name('tune-avatar-settings.py'))
@@ -21,6 +21,7 @@ def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument('--root', type=Path, required=True, help='fresh PGO build/profile capture root')
     cli.add_argument('--client', type=Path, required=True)
+    add_mixed_options(cli)
     supplied = cli.parse_args()
     if platform.system() != 'Linux':
         cli.error('This experiment requires Linux')
@@ -33,7 +34,7 @@ def main():
         '--client', str(supplied.client), '--output', str(root / 'training'), '--clients', '250',
         '--warmup-seconds', '45', '--window-seconds', '60', '--repeats', '2',
         '--server-cpus', '2-9', '--client-cpus', '10-15', '--rayon-threads', '4',
-        '--tokio-workers', '4', '--client-workers', '4'])
+        '--tokio-workers', '4', '--client-workers', '4', *mixed_cli(supplied)])
     settings.validate(args)
     os.sched_setaffinity(0, {0, 1})
 
@@ -62,7 +63,7 @@ def main():
         experiment = {'comparison_kind': 'revisions', 'purpose': 'PGO training, excluded from evaluation',
                       'os_name': os.name, 'frozen': artifacts, 'cleared_environment_keys': cleared,
                       'training_tool_sha256': sha256(Path(__file__)), 'runs': [],
-                      'workload': {k: getattr(args, k) for k in ('clients', 'network_capacity_mbps', 'warmup_seconds', 'window_seconds', 'rayon_threads', 'tokio_workers', 'client_workers', 'port', 'health_port', 'server_cpus', 'client_cpus', 'startup_timeout', 'ready_timeout')}}
+                      'workload': workload_metadata(args)}
         write_json(args.output / 'experiment.json', experiment)
         for index in range(2):
             entry = {'name': f'{index + 1:02d}-training', 'variant': 'instrumented', 'round': index,

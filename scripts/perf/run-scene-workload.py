@@ -9,43 +9,13 @@ import pathlib
 import socket
 import subprocess
 import time
+from avatar_tuning import scene_summary as summarize
 from script_server import prepare_server, ready, population
 from avatar_benchmark import ROOT, ProcessTree, health, native_sampler, relevant_env, select_port, write_json
 
 FIXTURES = ROOT / 'docs/performance/fixtures'
 
 
-def summarize(metrics, clients, minimum_delivery, interval_ms=None):
-    expected = int(metrics['expected_observer_messages'])
-    received = int(metrics['received_messages'])
-    seconds = float(metrics['window_seconds'])
-    errors = []
-    for key in ('send_errors', 'backpressure_skips', 'malformed_messages'):
-        if int(metrics[key]):
-            errors.append(f'{key}={metrics[key]}')
-    if int(metrics['observed_senders']) != clients - 1:
-        errors.append('observer did not receive every sender')
-    ratio = received / expected if expected else 0
-    if ratio > 1:
-        errors.append('observer received more unique messages than successful sends')
-    if not expected or ratio < minimum_delivery:
-        errors.append(f'delivery ratio {ratio:.4f} below {minimum_delivery}')
-    if seconds <= 0:
-        errors.append('empty measurement window')
-    cadence = {}
-    if interval_ms is not None and seconds > 0:
-        sent = int(metrics['sent_messages'])
-        nominal = seconds * clients * 1000 / interval_ms
-        cadence = {'sent_messages_per_second': sent / seconds,
-                   'requested_messages_per_second': clients * 1000 / interval_ms,
-                   'send_cadence_ratio': sent / nominal}
-        # Allow one partial tick at shutdown; skipped workload still invalidates a run.
-        if sent < max(0, nominal - clients) * minimum_delivery:
-            errors.append('sender did not sustain requested cadence')
-    return {**cadence, 'valid': not errors, 'errors': errors, 'observer_delivery_ratio': ratio,
-            'observer_messages_per_second': received / seconds if seconds > 0 else 0,
-            'observer_payload_bytes_per_second': int(metrics['received_bytes']) / seconds if seconds > 0 else 0,
-            'metrics': metrics}
 
 
 def main():
