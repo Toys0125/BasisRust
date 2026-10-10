@@ -165,6 +165,8 @@ pub struct Config {
     pub additional_avatar_bytes: u8,
     #[serde(skip)]
     pub(crate) scene_session: Option<Arc<crate::scene::SceneSession>>,
+    #[serde(skip)]
+    pub(crate) image_benchmark: Option<Arc<crate::image_benchmark::ImageBenchmarkSession>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -211,6 +213,7 @@ impl Default for Config {
             observer_session: None,
             additional_avatar_bytes: 0,
             scene_session: None,
+            image_benchmark: None,
         }
     }
 }
@@ -310,6 +313,7 @@ impl Config {
             observer_session: None,
             additional_avatar_bytes: 0,
             scene_session: None,
+            image_benchmark: None,
         }
     }
 
