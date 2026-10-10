@@ -13,8 +13,10 @@ mod gpu_policy;
 pub mod memory_reclaim;
 mod p2p;
 mod realtime;
+mod scene_relay;
 
 pub use avatar_sync::BsrProfilerSnapshot;
+pub use scene_relay::SceneRelaySnapshot;
 
 use anyhow::{Context, Result};
 use basis_protocol::{
@@ -462,6 +464,7 @@ pub struct ServerState {
     pub message_subscriptions: Arc<DashMap<PeerId, HashSet<u16>>>,
     uplink_delta_states: Arc<DashMap<PeerId, UplinkDeltaState>>,
     scene_egress: Arc<DashMap<PeerId, SceneEgressBucket>>,
+    scene_relay: Option<Arc<scene_relay::SceneRelay>>,
     jiggle_buckets: Arc<DashMap<PeerId, JiggleTokenBucket>>,
     error_report_hashes: Arc<DashMap<String, HashSet<u64>>>,
     pub avatar_sync: AvatarSyncSystem,
@@ -603,7 +606,7 @@ impl ServerState {
         );
         avatar_sync.set_offloaded_pairs(p2p_broker.offloaded_pairs());
 
-        let state = Self {
+        let mut state = Self {
             config: Arc::new(RwLock::new(config.clone())),
             config_path: Arc::new(config_path.to_path_buf()),
             transport,
@@ -624,6 +627,7 @@ impl ServerState {
             message_subscriptions: Arc::new(DashMap::new()),
             uplink_delta_states: Arc::new(DashMap::new()),
             scene_egress: Arc::new(DashMap::new()),
+            scene_relay: None,
             jiggle_buckets: Arc::new(DashMap::new()),
             error_report_hashes: Arc::new(DashMap::new()),
             avatar_sync,
@@ -639,6 +643,16 @@ impl ServerState {
             disconnect_tasks: Arc::new(Mutex::new(Vec::new())),
             identity_timer_tasks: Arc::new(Mutex::new(Vec::new())),
             realtime_threads: Arc::new(Mutex::new(Vec::new())),
+        };
+        state.scene_relay = match scene_relay::SceneRelay::from_env(
+            &state.transport,
+            state.authenticated_peers.clone(),
+        ) {
+            Ok(relay) => relay.map(Arc::new),
+            Err(error) => {
+                state.shutdown().await?;
+                return Err(error.context("starting scene relay"));
+            }
         };
         let tick_thread = state
             .avatar_sync
@@ -814,6 +828,14 @@ impl ServerState {
     }
 
     pub fn status_text_with_detail(&self, verbose: bool) -> String {
+        let mut text = self.base_status_text_with_detail(verbose);
+        if let Some(snapshot) = self.scene_relay_snapshot() {
+            text.push_str(&format!(" SceneBatch: {snapshot:?}"));
+        }
+        text
+    }
+
+    fn base_status_text_with_detail(&self, verbose: bool) -> String {
         let players = self.player_count();
         if !self.config.read().health_include_extended_metrics {
             return if verbose {
@@ -917,6 +939,15 @@ impl ServerState {
                 worker_result = Err(anyhow::anyhow!("server worker failed to join: {err}"));
             }
         }
+        // No ingress handler can still wait on scene capacity. Drain accepted
+        // batches before retiring recipient sessions; joins run off the runtime.
+        if let Some(relay) = &self.scene_relay {
+            if let Err(error) = relay.drain().await {
+                if worker_result.is_ok() {
+                    worker_result = Err(error);
+                }
+            }
+        }
         // Workers can no longer create identity timers. Dropping pending entries
         // cancels timers that have not started disconnecting; join every timer so
         // any cleanup it already claimed is visible before draining cleanup tasks.
@@ -1017,6 +1048,10 @@ impl ServerState {
         database?;
         permissions?;
         Ok(())
+    }
+
+    pub fn scene_relay_snapshot(&self) -> Option<SceneRelaySnapshot> {
+        self.scene_relay.as_ref().map(|relay| relay.snapshot())
     }
 
     pub async fn broadcast(
@@ -3718,6 +3753,16 @@ async fn relay_scene_generic(
     };
     let mut writer = NetWriter::new();
     message.serialize(&mut writer)?;
+    if let Some(relay) = &state.scene_relay {
+        if scene_relay::eligible(broadcast_channel, delivery, &scene.recipients) {
+            let recipients = scene_relay::snapshot_recipients(&state.authenticated_peers, peer);
+            // The recipient/session snapshot owns its tokens. No map guard
+            // crosses the bounded queue's asynchronous capacity wait.
+            return relay
+                .enqueue(Bytes::from(writer.into_vec()), recipients)
+                .await;
+        }
+    }
     send_to_recipients_or_broadcast(
         state,
         peer,
@@ -6415,7 +6460,7 @@ mod tests {
         }
     }
 
-    fn test_connected_peer(peer_id: PeerId) -> ConnectedPeer {
+    pub(super) fn test_connected_peer(peer_id: PeerId) -> ConnectedPeer {
         ConnectedPeer {
             id: peer_id,
             metadata: test_ready_message().player_meta_data_message,
@@ -6469,9 +6514,11 @@ mod tests {
     #[test]
     fn join_batches_wait_for_initial_history_and_preserve_order() {
         let mut state = JoinBroadcastState::default();
-        assert!(state
-            .register_peer(test_connected_peer(1), vec![1])
-            .is_empty());
+        assert!(
+            state
+                .register_peer(test_connected_peer(1), vec![1])
+                .is_empty()
+        );
         let existing = state.register_peer(test_connected_peer(2), vec![2]);
         assert_eq!(
             existing.iter().map(|peer| peer.id).collect::<Vec<_>>(),

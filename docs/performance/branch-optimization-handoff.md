@@ -1,5 +1,22 @@
 # Laptop agent handoff — branch optimization
 
+## Scene receipt investigation — 2026-10-10
+
+The [750-client scene investigation](scene-receipt-investigation-20261010.md)
+profiles a saturated ordinary event queue and tests one default-off,
+message-preserving batching prototype. Two matched ABBA cohorts retain all
+eight process runs. At 20 Hz, median scene receipt rises from 5.68% to 46.03%,
+still below the original 95% target. At 5 Hz, batching reaches 99.98% median
+receipt with a 131-ms p95 histogram bound; both candidate processes pass every
+original gate. Avatar input is unchanged; the lower scene rate is an explicit
+freshness tradeoff. PGO is off for this changed source.
+
+`BASIS_SCENE_BATCH_MS=2` enables the experimental path; unset/0 keeps the
+existing relay. Before promotion, address its documented app-output accounting
+limitation. If 20-Hz freshness is required, measure scene/interest recipient
+filtering or further transport capacity work. Exact evidence, controls, review
+findings and all failures are retained in the linked report and JSON.
+
 Continue reviewing and measuring `performance/branch-optimization` in
 `https://github.com/Toys0125/BasisRust.git` (remote `origin`). The user explicitly
 requested stopping desktop benchmark runs, pushing the branch, and moving the
