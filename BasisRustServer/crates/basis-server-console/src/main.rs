@@ -12,7 +12,7 @@ use basis_server_health::{
     format_system_time, start_health_server, AppMessageMetrics, AvatarSyncMetrics,
     AvatarTimingMetrics, BsrBundleMetrics, BsrHealthMetrics, BsrLoadMetrics, BsrMsPerTickMetrics,
     BsrWindowMetrics, BsrZstdMetrics, ExtendedHealthMetrics, HealthState, HealthStatistics,
-    RawUdpMetrics, ReliableMetrics, RustTransportMetrics, SceneBatchMetrics,
+    RawUdpMetrics, ReliableMetrics, RustTransportMetrics, SceneBatchMetrics, UploadBudgetMetrics,
 };
 use clap::Parser;
 use crossterm::{
@@ -881,6 +881,21 @@ async fn async_main(
                         acks_released: transport.reliable_acks_released,
                         acks_unknown_channel: transport.reliable_acks_unknown_channel,
                         window_stalls: transport.reliable_window_stalls,
+                    },
+                    upload_budget: {
+                        let upload = server.upload_budget_snapshot();
+                        UploadBudgetMetrics {
+                            bytes_per_second_per_player: upload.bytes_per_second_per_player,
+                            burst_seconds: upload.burst_seconds,
+                            accepted_messages: upload.accepted_messages,
+                            accepted_bytes: upload.accepted_bytes,
+                            rejected_messages: upload.rejected_messages,
+                            rejected_bytes: upload.rejected_bytes,
+                            reliable_rejections: upload.reliable_rejections,
+                            oversized_reliable_messages: upload.oversized_reliable_messages,
+                            image_exempt_messages: upload.image_exempt_messages,
+                            image_exempt_bytes: upload.image_exempt_bytes,
+                        }
                     },
                     app_messages: AppMessageMetrics {
                         inbound: app.inbound_packets,

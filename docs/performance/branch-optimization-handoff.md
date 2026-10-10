@@ -1,5 +1,33 @@
 # Laptop agent handoff — branch optimization
 
+## Per-client upload budget — 2026-10-10
+
+`MaxUploadBytesPerSecondPerPlayer` now defaults to 131072 B/s (128 KiB/s)
+per authenticated connection before fanout. XML/environment use the same name;
+0 disables admission. Counts application payloads once before coalescing/relay,
+with a two-second burst. Best-effort excess is rejected; reliable excess explicitly
+disconnects. One oversized reliable frame may borrow from a full bucket and must
+repay its full byte cost. Reconnects get fresh budgets; image Scene traffic is exempt.
+
+The [750-client upload-limit A/B](client-upload-limit-client750-20261010.md)
+retains four fresh disabled/enabled/enabled/disabled processes at 5-Hz Scene,
+fixed 3-ms batching and 1024 pending-message quota, one ordinary binary (PGO off).
+All four pass every original and added gate, see all 749 senders, and reject no
+upload or Scene work. Median Scene receipt is 100.000%
+disabled / 99.868% enabled; both p95 bounds are
+131.071 ms. CPU medians are 5.440 / 5.448 cores;
+avatar p95 gaps are 476.100 / 494.425 ms. The workload is
+below the cap; focused tests validate enforcement. Two processes per arm limit
+regression conclusions; this does not validate 20-Hz capacity or photo fanout.
+
+C# ordinary Scene byte-rate default is 0 (disabled). Images separately default to
+200 Mb/s per sharer after fanout, with 150% server enforcement and a two-second
+burst. Rust currently advertises image pacing settings but has no equivalent
+server image governor. Do not interpret its exemption as server-enforced image
+bandwidth. Exact C# source excerpts, every measurement, hashes and final source
+verification are retained. Ten focused Rust tests and three analyzer checks pass;
+one minor review issue fixed, fresh CodeRabbit follow-up reports zero findings.
+
 ## Per-recipient Scene pending-work quota — 2026-10-10
 
 `BASIS_SCENE_PEER_QUEUE_LIMIT` now bounds pending logical Scene messages per

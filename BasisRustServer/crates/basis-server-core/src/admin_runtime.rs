@@ -770,6 +770,7 @@ mod tests {
                 ready,
                 session: None,
                 scene_pending: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                upload_bucket: Arc::new(Mutex::new(crate::upload_budget::Bucket::default())),
             },
         );
     }

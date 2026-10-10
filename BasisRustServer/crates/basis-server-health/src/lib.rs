@@ -215,9 +215,25 @@ pub struct SceneBatchMetrics {
 
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct UploadBudgetMetrics {
+    pub bytes_per_second_per_player: u64,
+    pub burst_seconds: u64,
+    pub accepted_messages: u64,
+    pub accepted_bytes: u64,
+    pub rejected_messages: u64,
+    pub rejected_bytes: u64,
+    pub reliable_rejections: u64,
+    pub oversized_reliable_messages: u64,
+    pub image_exempt_messages: u64,
+    pub image_exempt_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ExtendedHealthMetrics {
     pub reliable: ReliableMetrics,
     pub app_messages: AppMessageMetrics,
+    pub upload_budget: UploadBudgetMetrics,
     pub raw_udp: RawUdpMetrics,
     pub avatar_sync: AvatarSyncMetrics,
     pub avatar_timing: AvatarTimingMetrics,
@@ -556,6 +572,30 @@ mod tests {
 
         assert!(response.extended.is_some());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn health_exposes_upload_admission_and_image_exemption() {
+        let metrics = ExtendedHealthMetrics {
+            upload_budget: UploadBudgetMetrics {
+                bytes_per_second_per_player: 131072,
+                burst_seconds: 2,
+                accepted_messages: 4,
+                accepted_bytes: 500,
+                rejected_messages: 2,
+                rejected_bytes: 300,
+                reliable_rejections: 1,
+                oversized_reliable_messages: 0,
+                image_exempt_messages: 3,
+                image_exempt_bytes: 600000,
+            },
+            ..ExtendedHealthMetrics::default()
+        };
+        let json = serde_json::to_value(metrics).unwrap();
+        assert_eq!(json["uploadBudget"]["bytesPerSecondPerPlayer"], 131072);
+        assert_eq!(json["uploadBudget"]["rejectedBytes"], 300);
+        assert_eq!(json["uploadBudget"]["reliableRejections"], 1);
+        assert_eq!(json["uploadBudget"]["imageExemptBytes"], 600000);
     }
 
     #[test]

@@ -408,6 +408,7 @@ async fn active_old_control_lease_delays_cleanup_and_id_reuse() {
             payload,
             false,
             false,
+            false,
         )
         .await
         .unwrap();

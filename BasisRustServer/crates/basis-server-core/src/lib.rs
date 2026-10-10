@@ -14,9 +14,11 @@ pub mod memory_reclaim;
 mod p2p;
 mod realtime;
 mod scene_relay;
+mod upload_budget;
 
 pub use avatar_sync::BsrProfilerSnapshot;
 pub use scene_relay::SceneRelaySnapshot;
+pub use upload_budget::UploadBudgetSnapshot;
 
 use anyhow::{Context, Result};
 use basis_protocol::{
@@ -86,6 +88,7 @@ pub struct ConnectedPeer {
     // A fresh counter per authenticated connection. Clones share admission work;
     // old in-flight permits cannot decrement a replacement connection's quota.
     pub(crate) scene_pending: Arc<AtomicU64>,
+    pub(crate) upload_bucket: Arc<Mutex<upload_budget::Bucket>>,
 }
 
 struct PendingIdentity {
@@ -467,6 +470,7 @@ pub struct ServerState {
     pub message_subscriptions: Arc<DashMap<PeerId, HashSet<u16>>>,
     uplink_delta_states: Arc<DashMap<PeerId, UplinkDeltaState>>,
     scene_egress: Arc<DashMap<PeerId, SceneEgressBucket>>,
+    upload_budget: Arc<upload_budget::UploadBudget>,
     scene_relay: Option<Arc<scene_relay::SceneRelay>>,
     jiggle_buckets: Arc<DashMap<PeerId, JiggleTokenBucket>>,
     error_report_hashes: Arc<DashMap<String, HashSet<u64>>>,
@@ -630,6 +634,9 @@ impl ServerState {
             message_subscriptions: Arc::new(DashMap::new()),
             uplink_delta_states: Arc::new(DashMap::new()),
             scene_egress: Arc::new(DashMap::new()),
+            upload_budget: Arc::new(upload_budget::UploadBudget::new(
+                config.max_upload_bytes_per_second_per_player,
+            )),
             scene_relay: None,
             jiggle_buckets: Arc::new(DashMap::new()),
             error_report_hashes: Arc::new(DashMap::new()),
@@ -794,6 +801,10 @@ impl ServerState {
         self.transport.set_compact_merge_send(config.compact_merged);
         self.statistics
             .set_enabled(config.health_include_extended_metrics);
+        self.upload_budget.rate.store(
+            config.max_upload_bytes_per_second_per_player,
+            Ordering::Relaxed,
+        );
 
         let previous_globals = self.global_state.read().clone();
         admin_runtime::refresh_rejoin_population(
@@ -832,6 +843,22 @@ impl ServerState {
 
     pub fn status_text_with_detail(&self, verbose: bool) -> String {
         let mut text = self.base_status_text_with_detail(verbose);
+        if verbose && self.config.read().health_include_extended_metrics {
+            let upload = self.upload_budget_snapshot();
+            text.push_str(&format!(
+                " UploadBudget: rate={}B/s/peer burst={}s accepted={}/{}B rejected={}/{}B reliable-rejected={} oversized-reliable={} image-exempt={}/{}B",
+                upload.bytes_per_second_per_player,
+                upload.burst_seconds,
+                upload.accepted_messages,
+                upload.accepted_bytes,
+                upload.rejected_messages,
+                upload.rejected_bytes,
+                upload.reliable_rejections,
+                upload.oversized_reliable_messages,
+                upload.image_exempt_messages,
+                upload.image_exempt_bytes,
+            ));
+        }
         if let Some(snapshot) = self.scene_relay_snapshot() {
             text.push_str(&format!(" SceneBatch: {snapshot:?}"));
         }
@@ -1051,6 +1078,10 @@ impl ServerState {
         database?;
         permissions?;
         Ok(())
+    }
+
+    pub fn upload_budget_snapshot(&self) -> UploadBudgetSnapshot {
+        self.upload_budget.snapshot()
     }
 
     pub fn scene_relay_snapshot(&self) -> Option<SceneRelaySnapshot> {
@@ -1987,6 +2018,7 @@ async fn handle_event(state: &ServerState, event: ServerEvent) -> Result<()> {
                 payload,
                 true,
                 false,
+                false,
             )
             .await
         }
@@ -2386,6 +2418,7 @@ async fn finalize_accept(
         ready: ready.clone(),
         session: Some(session.clone()),
         scene_pending: Arc::new(AtomicU64::new(0)),
+        upload_bucket: Arc::new(Mutex::new(upload_budget::Bucket::default())),
     };
     let existing_players = {
         let _commit = state.admission_commit.lock();
@@ -2892,6 +2925,7 @@ async fn handle_message(
     payload: Bytes,
     count_inbound: bool,
     count_avatar: bool,
+    upload_admitted: bool,
 ) -> Result<()> {
     if count_inbound {
         state
@@ -2919,6 +2953,33 @@ async fn handle_message(
                 .fetch_add(1, Ordering::Relaxed);
         }
         return Ok(());
+    }
+    if !upload_admitted && upload_budget::is_data(channel, &payload) {
+        let image = matches!(channel, channels::SCENE | channels::DIRECT_SCENE_SERVER)
+            && is_image_scene_upload(state, &payload);
+        if image {
+            state.upload_budget.exempt_image(payload.len());
+        } else {
+            let bucket = state.authenticated_peers.get(&peer).and_then(|connected| {
+                let matches = match (session, connected.session.as_ref()) {
+                    (Some(expected), Some(current)) => current.same_connection(expected),
+                    (None, None) => true,
+                    _ => false,
+                };
+                matches.then(|| connected.upload_bucket.clone())
+            });
+            let Some(bucket) = bucket else {
+                return Ok(());
+            };
+            if !state.upload_budget.admit(&bucket, payload.len(), delivery) {
+                if !upload_budget::best_effort(delivery) {
+                    if let Some(session) = session {
+                        request_disconnect(state, session, "Application upload rate limit exceeded (MaxUploadBytesPerSecondPerPlayer)").await?;
+                    }
+                }
+                return Ok(());
+            }
+        }
     }
     match channel {
         channels::AUTH_IDENTITY => {
@@ -3724,6 +3785,20 @@ async fn relay_avatar_generic(
         &avatar.recipients,
     )
     .await
+}
+
+// Match a fully valid Scene envelope before granting the image exemption. Image
+// settings currently advertise client pacing; Rust has no server-side image governor.
+fn is_image_scene_upload(state: &ServerState, payload: &[u8]) -> bool {
+    let Some(image_index) = state.net_ids.find("BasisImagePickupManager") else {
+        return false;
+    };
+    let mut reader = NetReader::new(payload);
+    // Scene payload is the entire remaining slice, so there are no trailing bytes.
+    reader.get_u16().is_ok_and(|index| index == image_index)
+        && reader
+            .get_u16()
+            .is_ok_and(|count| reader.remaining() >= usize::from(count) * 2)
 }
 
 async fn relay_scene_generic(
@@ -6471,6 +6546,7 @@ mod tests {
             ready: test_ready_message(),
             session: None,
             scene_pending: Arc::new(AtomicU64::new(0)),
+            upload_bucket: Arc::new(Mutex::new(upload_budget::Bucket::default())),
         }
     }
 

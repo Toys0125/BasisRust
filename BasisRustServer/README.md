@@ -74,6 +74,23 @@ non-empty deployment passwords on clients. `ApiEnabled=false` and
 `MaxSceneRelayMegabitsPerSecondPerPlayer=0` remain upstream defaults. Operators
 can explicitly enable/configure the API or set relay limits.
 
+`MaxUploadBytesPerSecondPerPlayer` defaults to `131072` (128 KiB/s) for each
+authenticated connection before fanout. Set the same XML/environment field to
+`0` to disable admission. The budget counts application payload bytes, including
+avatar additions and Scene envelopes, once before coalescing or relay; transport
+headers, retries and protocol/control traffic are excluded. It allows a two-second
+burst. Excess unreliable/sequenced data is dropped and counted; excess reliable
+data disconnects that connection with an explicit reason. A reliable frame larger
+than the burst can spend from a full bucket and must repay its complete byte cost
+before another such frame is admitted. Smaller data can resume as debt is repaid.
+
+`BasisImagePickupManager` Scene traffic remains exempt and uses the separately
+advertised image allowance. Rust currently broadcasts those image settings for
+client pacing; it does not implement C#’s server-side image bandwidth governor.
+`extended.uploadBudget` reports accepted/rejected bytes/messages, reliable
+rejections, oversized reliable admissions and image exemptions. This is separate
+from the optional after-fanout Scene Mbps limit and pending-message queue quota.
+
 Runtime overrides are not automatically saved. The explicit `/config save`
 command writes all current in-memory values, including environment secrets, to
 the selected config file. Config inspection redacts secret fields, but the saved

@@ -164,6 +164,9 @@ pub struct ServerConfig {
     pub max_content_spheres_per_player: i32,
     pub max_network_ids_per_player: i32,
     pub max_loaded_resources_per_player: i32,
+    /// Authenticated application-data uploads before fanout; 0 disables admission.
+    /// Images retain their separate client-advertised allowance. Transport/control bytes are excluded.
+    pub max_upload_bytes_per_second_per_player: u64,
     pub max_scene_relay_megabits_per_second_per_player: i32,
     pub playspace_mover_locked: bool,
     pub direct_connect_locked: bool,
@@ -294,6 +297,7 @@ impl Default for ServerConfig {
             max_content_spheres_per_player: 32,
             max_network_ids_per_player: 32768,
             max_loaded_resources_per_player: 16384,
+            max_upload_bytes_per_second_per_player: 128 * 1024,
             max_scene_relay_megabits_per_second_per_player: 0,
             playspace_mover_locked: false,
             direct_connect_locked: false,
@@ -620,6 +624,11 @@ impl ServerConfig {
             i32
         );
         override_field!(
+            "MaxUploadBytesPerSecondPerPlayer",
+            max_upload_bytes_per_second_per_player,
+            u64
+        );
+        override_field!(
             "MaxSceneRelayMegabitsPerSecondPerPlayer",
             max_scene_relay_megabits_per_second_per_player,
             i32
@@ -799,6 +808,31 @@ mod tests {
 
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn upload_budget_defaults_and_xml_environment_roundtrip() {
+        assert_eq!(
+            ServerConfig::default().max_upload_bytes_per_second_per_player,
+            131072
+        );
+        let mut config: ServerConfig = quick_xml::de::from_str("<Configuration/>").unwrap();
+        assert_eq!(config.max_upload_bytes_per_second_per_player, 131072);
+        config
+            .process_environment_overrides_with(|name| {
+                (name == "MaxUploadBytesPerSecondPerPlayer")
+                    .then_some("0".to_owned())
+                    .ok_or(env::VarError::NotPresent)
+            })
+            .unwrap();
+        assert_eq!(config.max_upload_bytes_per_second_per_player, 0);
+        let xml = quick_xml::se::to_string(&config).unwrap();
+        assert!(
+            xml.contains("<MaxUploadBytesPerSecondPerPlayer>0</MaxUploadBytesPerSecondPerPlayer>")
+        );
+        let restored: ServerConfig = quick_xml::de::from_str(&xml).unwrap();
+        assert_eq!(restored.max_upload_bytes_per_second_per_player, 0);
+        assert_eq!(restored.max_scene_relay_megabits_per_second_per_player, 0);
+    }
 
     #[test]
     fn compact_merged_toggle_defaults_true_with_xml_and_env_roundtrip() {
