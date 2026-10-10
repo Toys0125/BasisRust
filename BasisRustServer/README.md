@@ -39,6 +39,41 @@ Useful flags:
 
 ## Configuration
 
+Image sharing uses the C# server's bandwidth governor and bounded image cache.
+`ImageShareEgressMegabitsPerSecond` (default 200) sets each sharer's relayed
+payload budget, counting recipient fan-out. Enforcement applies
+`ImageShareEgressEnforcementPercent` (default 150, minimum 100) and permits two
+seconds of burst credit. A chunk can spend beyond that credit; subsequent
+messages are dropped until the debt refills. This can end an over-budget image
+transfer. Setting the egress rate to 0 disables enforcement.
+
+With `ImageCacheEnabled=true` (default), completed images are offered to arriving
+players and peers who missed the original targeted share. Offers are small;
+clients request nearby images, and the server sends the cached spawn, latest
+transform, chunks, and eligible animation data in order. Each recipient's replay
+is paced at `ImageShareDownloadMegabitsPerSecond` (default 200), with the same
+two-second burst allowance and a 25 ms pump. A download rate of 0 sends new
+replays inline; switching to 0 discards already queued replay work, matching C#.
+GIF locks and their moderation bypass apply to animation uploads and cache requests.
+
+`ImageCacheMaxMegabytes` (default 512) caps retained payload and chunk-slot bytes;
+`ImageCacheMinimumPerOwnerMegabytes` (default 32) sets the floor for each owner's
+fair share. Rust charges its actual chunk-slot size. Cached chunks are shared
+with replay queues rather than copied per recipient. Departure clears the peer's
+budget, queued downloads, and owned cache entries; server shutdown resets all
+image state. `ServerState::image_egress_dropped()` exposes refused message and
+fan-out byte counts, and `image_cache_stats()` exposes cache occupancy.
+
+The reference implementation is BasisVR revision
+`978a4b7202f299d20e79f4893bed11c879419f0a`, specifically
+`Basis Server/BasisNetworkServer/Networking/BasisImageBandwidthGovernor.cs` and
+`BasisNetworkImageCache.cs`. Image scene payloads remain wire-compatible and
+ordinary scene traffic retains its separate governor.
+One integration correction is intentional: data rejected by upload enforcement
+is excluded from the cache, so rejected transfers cannot bypass the limit through
+cached downloads. Cache requests and despawns still update cache state when their
+live relay is refused.
+
 Server startup precedence (highest wins): explicit `--port`, `--health-host`,
 `--health-port` and `--no-console`; environment overrides; XML supplied fields;
 `ServerConfig` defaults. `--log-level` controls tracing separately. Environment
