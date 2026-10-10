@@ -49,6 +49,14 @@ slightly. Server CPU is nearly unchanged and transmitted traffic rises 5.96%.
 Strict retransmit validity remains failed on constant premeasurement counts;
 all other gates pass. This is descriptive evidence on one laptop.
 
+The [latest-main PGO rerun](pgo-main-client1500-20261009-rerun.md) pulls `4ce5f8c`,
+rebuilds the updated client and trains another fresh profile. The server source
+is unchanged. Median CPU per built send falls 5.17%, built work rises 6.05%, and
+p95 gap falls 3.31%. All four pairs favor efficiency; one p95 pair is slightly
+worse. All other gates pass, while constant measured retransmit counts preserve
+the strict invalid flags. This new-client cohort is not a matched main-regression
+comparison with the preceding session.
+
 Branch: `performance/branch-optimization`, cut from `fix/dedicated-voice-processing` at
 `1e45b3b`. Benchmark harness and checks are in
 `BasisRustServer/crates/basis-transport/src/bench_branches.rs` and

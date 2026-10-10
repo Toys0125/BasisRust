@@ -168,3 +168,15 @@ matched 1,500-client runs. CPU per built send improves 3.68% and work rises 3.98
 with all four pairs agreeing on those directions. Strict retransmit flags remain
 invalid; all other gates pass. The older pre-main profile is not used. Production
 source and default build settings remain unchanged.
+
+## Latest main rerun — 2026-10-09
+
+Main `4ce5f8c` is merged in `98151c3`. The server production tree remains
+`b7130e68156ca47747f0832c7eac195923ed02f5`; the updated client is rebuilt from
+`aed0f1a0c84cb8f5632157798786e46bc485545f`. The
+[fresh PGO rerun](pgo-main-client1500-20261009-rerun.md) retains two valid
+250-client training processes and eight matched 1,500-client evaluation trials.
+CPU per built send falls 5.17% and built work rises 6.05%, with all pairs agreeing
+on those directions. Original retransmit gates remain invalid on premeasurement
+counts, including two warmup increases; measured counts are constant and all
+other gates pass. Source/profile/tool hashes and all attempts are retained.

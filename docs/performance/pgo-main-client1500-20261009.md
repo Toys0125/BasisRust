@@ -116,3 +116,7 @@ python3 -B scripts/perf/compare-avatar-revisions.py \
 ```
 
 The standard coordinator stops at an original strict gate failure. A supplemental local controller, retained with source/hash/invocation, completes the remaining diagnostic trials without changing gates or controls. A repeat requires new output directories. Complete local binaries/profiles/logs remain under the ignored capture root; their hashes and relevant evidence are committed.
+
+The [latest-main rerun](pgo-main-client1500-20261009-rerun.md) integrates `4ce5f8c`
+and repeats this workflow with a freshly rebuilt client and profile. Its paired
+ordinary/PGO results are independent of this session's historical timings.
