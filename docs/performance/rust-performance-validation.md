@@ -73,8 +73,14 @@ PGO admission/provenance/fallback tests. Both workspaces pass all-targets Clippy
 with warnings denied after fixing four new-Rust test/benchmark-only lints.
 The optional GPU-feature console compiles and passes all-targets Clippy with
 warnings denied. Eight focused upload/status tests
-pass again after the reviewed status-formatting change. Fresh lower-count PGO qualification
-results are appended after execution.
+pass again after the reviewed status-formatting change. [Fresh supported-pipeline qualification](pgo-qualified-client375-20261011.md):
+375 clients, 2/2 training and 4/4 evaluations per arm pass all 51 gates; fresh
+nonempty profiles also pass. Scene receipt is 100% in both arms, p95 bound
+32.767 ms. PGO avatar p95 improves 12.24%, applied items rise 3.38%, built work
+rises 3.34%; CPU rises 0.45%, CPU/million built sends falls 3.57%. All four pairs
+improve p95/work, CPU direction varies. The 250 fallback was unnecessary.
+This validates optional PGO at 375 clients, not the failed 750-client training.
+The generated package extracts with all checksums verified and no JSON/profiles.
 
 Two CodeRabbit review rounds covered changed server and benchmark tooling.
 Three major tooling findings and a minor status-formatting finding were fixed;

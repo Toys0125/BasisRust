@@ -14,8 +14,13 @@ uses a dedicated native Linux x64 runner. Ordinary release defaults are unchange
 benchmark history and current correctness checks. Raw branch-added benchmark
 JSON is archived locally and excluded from the final PR diff. Historical
 commits are preserved. The prior 750-client PGO profile remains diagnostic only.
-A fresh supported-pipeline qualification starts at 375, falling back to 250,
-because the previous 750-client training failed.
+The [fresh supported-pipeline qualification](pgo-qualified-client375-20261011.md)
+passes at 375: 2/2 training, 4/4 evaluations per arm and all 51 gates, with 100%
+Scene receipt and 32.767-ms received p95 bounds. PGO avatar p95 improves 12.24%,
+applied work rises 3.38%, CPU rises 0.45%; CPU/built work falls 3.57%. Artifact
+checksums and contents verify; no JSON/profiles are packaged. The 250 fallback
+was unnecessary. Failed historical 750-client training remains diagnostic;
+a 375-client pass does not certify 750, 20-Hz Scene or photo/image workloads.
 
 ## C# gate check with final Rust client — 2026-10-11
 
@@ -59,7 +64,7 @@ zero image work/drop counters and clean exits. All profiles/builds are fresh,
 matching flags and exact source/client hashes verified, zero profile diagnostics.
 Four processes per arm are descriptive; no validated PGO win, 20-Hz or photo
 capacity claim. PGO remains experimental, without production code/default changes.
-All attempts and original failure flags are retained in portable evidence.
+All attempts and original failure flags are retained in local evidence.
 
 ## Final main pull and regression benchmark — 2026-10-10
 
