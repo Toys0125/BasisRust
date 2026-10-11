@@ -1,5 +1,27 @@
 # Laptop agent handoff — branch optimization
 
+## C# gate check with final Rust client — 2026-10-11
+
+The [fresh C# check](csharp-final-client750-20261011.md) reuses the established
+protocol-v55 C# reference with the exact final `a394…` Rust client. Its entire
+tracked server tree is unchanged in the newer local C# checkout. .NET 10.0.12
+tiered PGO stays enabled; no C# rebuild/upstream pull or production changes.
+Four-client preflight passes. Both fresh 750-client, 5-Hz Scene runs **fail**:
+receipt median 71.584% (gate ≥95%), Scene p95 bound 524.287 ms,
+avatar p95 gaps 1729.560 ms, native unreliable-drop rate about 1.010M counter
+units/s. Both retain all 750 clients/all 749 Scene senders and exit cleanly,
+but fail delivery/quality, stale/unapplied/discontinuity/resync/unknown-order
+avatar checks and zero native transport drops. No failures are relaxed.
+
+Same 128-byte Scene/extra-avatar input, 20-ms updates, Unity-policy 60-FPS poses,
+CPU-only fixture, affinities and timing as the final Rust PGO test. C# keeps
+native adaptive workers/queue (2038 observed); Rust's 1024 logical Scene quota
+and 128-KiB/s generic upload cap are not imposed on C#. This is a sequential
+capacity check, not interleaved cross-server A/B. 17 unavailable Rust-specific
+checks remain null with reasons. Three focused adapter tests pass; all hashes,
+raw observations, source audit, preflight and failures are retained. One laptop,
+two full processes, one observer; no universal C#, 20-Hz or photo-capacity claim.
+
 ## Fresh final-source PGO A/B — 2026-10-11
 
 The [fresh 750-client PGO test](pgo-final-client750-20261011.md) compares ordinary
