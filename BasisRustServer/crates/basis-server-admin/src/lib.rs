@@ -866,10 +866,13 @@ mod tests {
     }
 
     fn unique_temp_dir() -> PathBuf {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("basis-admin-test-{nanos}"))
+        std::env::temp_dir().join(format!("basis-admin-test-{pid}-{nanos}-{sequence}"))
     }
 }

@@ -10,6 +10,10 @@ mod gpu_distance;
 mod gpu_distance_backend;
 mod gpu_distance_types;
 mod gpu_policy;
+mod image_cache;
+mod image_governor;
+#[cfg(test)]
+mod image_tests;
 pub mod memory_reclaim;
 mod p2p;
 mod realtime;
@@ -462,6 +466,8 @@ pub struct ServerState {
     pub message_subscriptions: Arc<DashMap<PeerId, HashSet<u16>>>,
     uplink_delta_states: Arc<DashMap<PeerId, UplinkDeltaState>>,
     scene_egress: Arc<DashMap<PeerId, SceneEgressBucket>>,
+    image_governor: Arc<image_governor::ImageBandwidthGovernor<PeerSession>>,
+    image_cache: Arc<Mutex<image_cache::ImageCache>>,
     jiggle_buckets: Arc<DashMap<PeerId, JiggleTokenBucket>>,
     error_report_hashes: Arc<DashMap<String, HashSet<u64>>>,
     pub avatar_sync: AvatarSyncSystem,
@@ -624,6 +630,8 @@ impl ServerState {
             message_subscriptions: Arc::new(DashMap::new()),
             uplink_delta_states: Arc::new(DashMap::new()),
             scene_egress: Arc::new(DashMap::new()),
+            image_governor: Arc::new(image_governor::ImageBandwidthGovernor::default()),
+            image_cache: Arc::new(Mutex::new(image_cache::ImageCache::default())),
             jiggle_buckets: Arc::new(DashMap::new()),
             error_report_hashes: Arc::new(DashMap::new()),
             avatar_sync,
@@ -658,6 +666,7 @@ impl ServerState {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         state.workers.lock().extend([
             spawn_leave_broadcast_loop(state.clone()),
+            spawn_image_replay_loop(state.clone()),
             admin_runtime::spawn_permission_updates(state.clone()),
             tokio::spawn(event_loop(
                 state.clone(),
@@ -673,6 +682,17 @@ impl ServerState {
 
     pub fn player_count(&self) -> usize {
         self.authenticated_peers.len()
+    }
+
+    /// Image relays refused and payload bytes avoided, including fan-out.
+    pub fn image_egress_dropped(&self) -> (u64, u64) {
+        self.image_governor.dropped()
+    }
+
+    /// Cached images, complete images, and retained payload/chunk-slot bytes.
+    pub fn image_cache_stats(&self) -> (usize, usize, u64) {
+        let cache = self.image_cache.lock();
+        (cache.count(), cache.servable_count(), cache.total_bytes())
     }
 
     fn scene_egress_allowed(&self, peer_id: PeerId, bytes: u64) -> bool {
@@ -970,6 +990,8 @@ impl ServerState {
             }
         }
         // Accepted event handlers and all disconnect cleanup have now finished.
+        self.image_governor.reset();
+        self.image_cache.lock().reset();
         let final_save = self.flush_shutdown_state();
         if let Err(err) = &final_save {
             error!("final shutdown persistence failed: {err:#}");
@@ -1058,6 +1080,117 @@ fn is_p2p_offload_channel(channel: u8) -> bool {
 }
 
 const LEAVE_BROADCAST_INTERVAL: Duration = Duration::from_millis(50);
+
+fn image_animation_allowed(state: &ServerState, peer: PeerId) -> bool {
+    !state.global_state.read().gifs_locked
+        || peer_has_permission(
+            state,
+            peer,
+            basis_server_permissions::nodes::MODERATION_GLOBAL_LOCK,
+        )
+}
+
+fn send_image_payload(
+    state: &ServerState,
+    session: &PeerSession,
+    pending: image_governor::PendingPayload,
+) {
+    let Some(message_index) = state.net_ids.find(image_cache::IMAGE_MANAGER_IDENTIFIER) else {
+        return;
+    };
+    // An owner may leave while another peer's replay is queued. Clients already
+    // removed that owner's cards; do not recreate them after the disconnect.
+    if !state.authenticated_peers.contains_key(&pending.owner) {
+        return;
+    }
+    // Removal cancels the original image's payload handles before relaying its
+    // despawn or recycling its owner ID. Hold the read guard through transport
+    // admission so a previously drained pump batch cannot resurrect that image.
+    let guard = pending.payload.read();
+    let Some(payload) = guard.as_ref() else {
+        return;
+    };
+    let message = ServerSceneDataMessage {
+        player_id: pending.owner,
+        scene_data_message: RemoteSceneDataMessage {
+            message_index,
+            payload: payload.to_vec(),
+        },
+    };
+    let mut writer = NetWriter::new();
+    if let Err(err) = message.serialize(&mut writer) {
+        warn!("failed to serialize image cache replay: {err}");
+        return;
+    }
+    if state
+        .transport
+        .queue_reliable_ordered_session(session, channels::SCENE, writer.as_slice())
+    {
+        state
+            .statistics
+            .outbound_packets
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+async fn deliver_image_cache_sends(state: &ServerState, sends: Vec<image_cache::CacheSend>) {
+    let mut replays = HashMap::<PeerId, (PeerSession, Vec<image_governor::PendingPayload>)>::new();
+    for send in sends {
+        let Some(session) = state
+            .authenticated_peers
+            .get(&send.recipient)
+            .and_then(|peer| peer.session.clone())
+        else {
+            continue;
+        };
+        let pending = image_governor::PendingPayload {
+            owner: send.owner,
+            payload: send.payload,
+        };
+        if send.paced {
+            replays
+                .entry(send.recipient)
+                .or_insert_with(|| (session, Vec::new()))
+                .1
+                .push(pending);
+        } else {
+            send_image_payload(state, &session, pending);
+        }
+    }
+    for (peer, (session, payloads)) in replays {
+        let inline = state.image_governor.enqueue_replay(
+            peer,
+            session.clone(),
+            payloads,
+            &state.config.read(),
+            Instant::now(),
+        );
+        for pending in inline {
+            send_image_payload(state, &session, pending);
+        }
+    }
+}
+
+fn spawn_image_replay_loop(state: ServerState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(25));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if state.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            let batches = state
+                .image_governor
+                .pump(&state.config.read(), Instant::now());
+            for (session, payloads) in batches {
+                for pending in payloads {
+                    send_image_payload(&state, &session, pending);
+                }
+            }
+        }
+    })
+}
 
 fn spawn_leave_broadcast_loop(state: ServerState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -2610,6 +2743,11 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
     if let Err(err) = admin_runtime::send_join_state(state, peer_id).await {
         warn!("failed to replay moderation state to peer {peer_id}: {err:#}");
     }
+    let offers = state
+        .image_cache
+        .lock()
+        .offer_peer(peer_id, &state.config.read());
+    deliver_image_cache_sends(state, offers).await;
 }
 
 async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: DisconnectReason) {
@@ -2630,6 +2768,8 @@ async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: D
     state.message_subscriptions.remove(&peer);
     state.uplink_delta_states.remove(&peer);
     state.scene_egress.remove(&peer);
+    state.image_governor.remove_peer(peer);
+    state.image_cache.lock().remove_player(peer);
     state.jiggle_buckets.remove(&peer);
     if !departed_uuid.is_empty() {
         state.error_report_hashes.remove(&departed_uuid);
@@ -3697,17 +3837,56 @@ async fn relay_scene_generic(
     let mut reader = NetReader::new(payload);
     let scene = SceneDataMessage::deserialize(&mut reader)?;
     let is_image_traffic =
-        state.net_ids.find("BasisImagePickupManager") == Some(scene.message_index);
-    if !is_image_traffic {
-        let fan_out = if scene.recipients.is_empty() {
-            state.authenticated_peers.len().saturating_sub(1)
-        } else {
-            scene.recipients.len()
-        };
-        let egress_bytes = scene.payload.len().saturating_mul(fan_out.max(1)) as u64;
-        if !state.scene_egress_allowed(peer, egress_bytes) {
-            return Ok(());
-        }
+        state.net_ids.find(image_cache::IMAGE_MANAGER_IDENTIFIER) == Some(scene.message_index);
+    let allow_animation = !is_image_traffic || image_animation_allowed(state, peer);
+    if is_image_traffic && matches!(scene.payload.first(), Some(6 | 7)) && !allow_animation {
+        return Ok(());
+    }
+    let fan_out = if scene.recipients.is_empty() {
+        state.authenticated_peers.len().saturating_sub(1)
+    } else {
+        scene.recipients.len()
+    };
+    let egress_bytes = scene.payload.len().saturating_mul(fan_out.max(1)) as u64;
+    let allowed = if is_image_traffic {
+        state.image_governor.try_consume_egress(
+            peer,
+            egress_bytes,
+            &state.config.read(),
+            Instant::now(),
+        )
+    } else {
+        state.scene_egress_allowed(peer, egress_bytes)
+    };
+    // Only admitted data may populate the cache. A rejected spawn must not mark
+    // recipients as delivered, and a refused chunk must not bypass upload limits
+    // through a later cached replay. Requests and despawns still update the cache.
+    if is_image_traffic && (allowed || matches!(scene.payload.first(), Some(4 | 10))) {
+        let connected = state
+            .authenticated_peers
+            .iter()
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        let animation_allowed = connected
+            .iter()
+            .copied()
+            .filter(|peer| image_animation_allowed(state, *peer))
+            .collect::<Vec<_>>();
+        let effects = state.image_cache.lock().observe(
+            peer,
+            &scene.payload,
+            &scene.recipients,
+            image_cache::CachePeers {
+                connected: &connected,
+                animation_allowed: &animation_allowed,
+            },
+            allow_animation,
+            &state.config.read(),
+        );
+        deliver_image_cache_sends(state, effects.sends).await;
+    }
+    if !allowed {
+        return Ok(());
     }
     let message = ServerSceneDataMessage {
         player_id: peer,
