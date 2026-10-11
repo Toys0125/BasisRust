@@ -16,8 +16,8 @@ build at this population, not a universal speedup or 750-client capacity claim.
 ## Frozen build and workload
 
 - Source: `59c708a75070d0efe20ca5d207e8a22f42c1b691`, after merging latest main
-  `f30b248329b213278153bee09995987a66b1a16d`. Subsequent report-only changes do not
-  alter measured server/client or benchmark inputs.
+  `f30b248329b213278153bee09995987a66b1a16d`. Later report, CI action pinning and historical-branch-runner fixes do not
+  alter measured server/client or PGO driver/analysis/workload inputs.
 - Rust 1.99.0 (`b940084d7`, 2026-09-28), matching LLVM 23.1.1 tools,
   native `x86_64-unknown-linux-gnu`, locked dependencies and fresh isolated
   ordinary/client/instrumented/profile-use builds. Every build exits zero with

@@ -82,6 +82,11 @@ RUSTUP_TOOLCHAIN=1.99.0 python3 scripts/perf/review-branches.py \
   --blocks 2 --cpu 2 --pmc
 ```
 
+The runner now defaults to the frozen PMC harness from
+`6b8e7696aba8b6fa14da4971c8dbdebd996fabd1`, rather than overlaying the current
+transport harness. `--benchmark-ref` selects an explicitly compatible harness
+for other revision pairs; the resolved revision and file hashes are recorded.
+Use `--build-only` to verify both historical builds without collecting timings.
 Both studies used the frozen harness from `6b8e769`; the final harness edit corrects only
 the outbound coverage comment. Its executable benchmark logic is unchanged.
 

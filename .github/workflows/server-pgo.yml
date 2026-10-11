@@ -30,13 +30,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: '1.99.0'
           components: llvm-tools-preview
@@ -46,7 +46,7 @@ jobs:
         run: python3 -B scripts/perf/server_pgo.py --output captures/ci-server-pgo --smoke
       - name: Retain smoke summary only
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: server-pgo-smoke-summary
           path: captures/ci-server-pgo/PGO-VALIDATION.md
@@ -60,13 +60,13 @@ jobs:
     runs-on: [self-hosted, Linux, X64, basis-pgo]
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: '1.99.0'
           components: llvm-tools-preview
@@ -81,7 +81,7 @@ jobs:
             --clients "$PGO_CLIENTS" --minimum-clients "$PGO_MINIMUM_CLIENTS" \
             --server-cpus 2-9 --client-cpus 10-15
       - name: Upload qualified PGO server
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: basisrust-server-linux-x64-pgo
           path: ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}/dist/*.tar.gz
@@ -89,7 +89,7 @@ jobs:
           compression-level: 0
       - name: Retain qualification summary, including failures
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: server-pgo-qualification-summary
           path: ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}/PGO-VALIDATION.md

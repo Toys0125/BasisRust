@@ -61,12 +61,14 @@ or imply that PGO improved every metric.
 
 ## CI and artifact workflow
 
-`.github/workflows/server-pgo.yml` runs a four-client end-to-end smoke check on
+All actions in `.github/workflows/server-pgo.yml` are pinned to full commit
+hashes. The workflow runs a four-client end-to-end smoke check on
 relevant PRs. It tests instrumentation, training, merge, use and strict A/B.
 Smoke mode never packages or establishes workload capacity.
 
 For a full build, manually dispatch **Server PGO** with an initial and minimum
-client count. Register a dedicated Linux x64 runner labelled `basis-pgo` with at
+client count. Register a dedicated Linux x64 runner with an up-to-date GitHub Actions runner
+that supports Node 24, labelled `basis-pgo`, with at
 least 16 logical CPUs (CPU IDs 2-15 available), Python 3.12+ and `taskset`.
 Do not share that runner with competing jobs during qualification. Dispatch
 uploads the qualified package and Markdown summary; failures retain the summary

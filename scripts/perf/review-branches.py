@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Freeze two transport binaries, then run sequential, CPU-pinned ABBA blocks.
 
-The current benchmark files are overlaid identically on both source revisions.
+A frozen benchmark revision is overlaid identically on both source revisions.
 Linux: BASIS_BRANCH_PMC=1 collects per-thread user-mode perf groups in each pass.
 No working-tree production source is changed by the runner.
 """
@@ -36,12 +36,17 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--baseline", default="1e45b3b")
     parser.add_argument("--candidate", default="3606a9b")
+    parser.add_argument("--benchmark-ref", default="6b8e7696aba8b6fa14da4971c8dbdebd996fabd1",
+                        help="frozen harness ref; default is the PMC harness used by the original studies")
+    parser.add_argument("--build-only", action="store_true", help="freeze/build both binaries and metadata without measuring")
     parser.add_argument("--blocks", type=int, default=4)
     parser.add_argument("--cpu", type=int, default=2)
     parser.add_argument("--pmc", action="store_true")
     args = parser.parse_args()
     if args.blocks < 1 or args.cpu < 0 or (args.pmc and os.name == "nt"):
         parser.error("positive blocks/nonnegative CPU required; PMC mode requires Linux")
+    if args.build_only and args.reuse:
+        parser.error("--build-only cannot be combined with --reuse")
     repo = args.repository.resolve()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -76,6 +81,8 @@ def main():
     if any(name not in allowed for name in changed):
         raise ValueError("Branch microbenchmark refs differ outside overlaid transport/benchmark files; "
                          "use a full-revision benchmark instead")
+    benchmark_revision = command(git + ["rev-parse", "--verify", args.benchmark_ref + "^{commit}"],
+                                 capture_output=True, text=True).stdout.strip()
     archive = output / "source.tar"
     command(git + ["archive", revisions["candidate"], "BasisRustServer", "-o", archive])
     source = output / "source"
@@ -87,10 +94,12 @@ def main():
     workspace = source / "BasisRustServer"
     crate = Path("BasisRustServer/crates/basis-transport/src")
     for name in ("bench_branches.rs", "bench_pmc.rs"):
-        shutil.copy2(repo / crate / name, source / crate / name)
+        data = command(git + ["show", f"{benchmark_revision}:{crate.as_posix()}/{name}"],
+                       capture_output=True).stdout
+        (source / crate / name).write_bytes(data)
     bench_hashes = {name: digest(source / crate / name)
                    for name in ("bench_branches.rs", "bench_pmc.rs")}
-    metadata = {"revisions": revisions, "benchmark_sha256": bench_hashes,
+    metadata = {"revisions": revisions, "benchmark_revision": benchmark_revision, "benchmark_sha256": bench_hashes,
                 "cpu": args.cpu, "pmc": args.pmc, "blocks": args.blocks,
                 "rustc": command(["rustc", "-Vv"], capture_output=True, text=True).stdout,
                 "kernel": command(["uname", "-a"], capture_output=True, text=True).stdout if os.name != "nt" else "Windows",
@@ -129,6 +138,9 @@ def main():
         command(["rustc", "--crate-type=lib", "-O", "--emit=asm", probe_path, "-o", variant_dir / "property_probe.s"],
                 stdout=subprocess.DEVNULL)
         print(f"built {variant}: {metadata['binary_sha256'][variant]}", flush=True)
+    if args.build_only:
+        (output / "manifest.json").write_text(json.dumps(metadata, indent=2) + "\n")
+        return
     run_series(args, output, environment, metadata, binaries, revisions)
 
 

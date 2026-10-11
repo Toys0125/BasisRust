@@ -94,3 +94,26 @@ Raw benchmark JSON is excluded from the final PR diff and packages. Prior raw
 results are preserved locally under
 `captures/pr-pgo-implementation-20261011/raw-results/`; reports provide the
 reviewable summaries. Historical Git commits were not rewritten.
+
+## PR review follow-up — 2026-10-11
+
+GitHub CI on `8b087f6` passes formatting, Python benchmark validation, Linux
+server/client/GPU tests and Clippy, Windows client checks and storage persistence.
+The hosted PGO smoke completes both instrumented training processes and all four
+ordinary/PGO evaluations with all gates passing at four clients; its artifact
+attests smoke-only mode. This checks the full PGO path, not workload capacity.
+
+Greptile identified a broken historical fresh-build path and mutable workflow
+action references. The historical runner now overlays the exact frozen PMC
+harness from `6b8e7696aba8b6fa14da4971c8dbdebd996fabd1`, logs that revision and
+supports `--build-only`. Both default historical revisions build successfully;
+both recorded harness hashes match Git. New benchmark timings were not collected
+or substituted into historical measurements. All nine PGO workflow action uses
+are pinned to full GitHub commit hashes; JavaScript actions declare Node 24.
+The 93 Python tests still pass with four platform skips; workflow YAML and pins
+validate. Server/client and PGO measurement inputs remain unchanged, so the
+375-client qualification still applies to their exact measured code.
+
+Focused CodeRabbit follow-up: the historical runner review completes with zero
+findings; the pinned workflow review completes with zero findings and an
+unverified-findings warning. No unqualified clean-review claim is made.
