@@ -30,7 +30,8 @@ use crate::simulation::{cadence_seed, jittered_duration, worker_phase_offset, Sp
 #[cfg(target_os = "linux")]
 use crate::transport::LITENETLIB_MAX_MTU;
 use crate::transport::{
-    parse_packet, MaintenanceOptions, ReliableReceiveState, ReliableSend, PING_INTERVAL_TICKS,
+    parse_packet, MaintenanceOptions, ReliableFragmentReassembler, ReliableReceiveState,
+    ReliableSend, PING_INTERVAL_TICKS,
 };
 #[cfg(unix)]
 use crate::voice::VoiceLibrary;
@@ -530,11 +531,14 @@ async fn test_client_with_voice_diagnostics(
         shared_receive_eligible: AtomicBool::new(false),
         receive_shutdown: Notify::new(),
         received_reliable: StdMutex::new(ReliableReceiveState::default()),
+        fragment_reassembler: StdMutex::new(ReliableFragmentReassembler::default()),
         server_avatar_metadata: StdMutex::new(None),
         force_avatar_keyframe: AtomicBool::new(false),
         pose: Mutex::new(PoseState::new_at([0.0; 3])),
         avatar_observer: None,
         scene_session: None,
+        image_benchmark: None,
+        image_network_id: AtomicU16::new(u16::MAX),
         packet_diagnostics: PacketDiagnostics::default(),
         avatar_diagnostics: None,
         voice_diagnostics: enable_voice_diagnostics

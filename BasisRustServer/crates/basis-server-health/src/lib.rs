@@ -230,10 +230,22 @@ pub struct UploadBudgetMetrics {
 
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct ImageMetrics {
+    pub egress_dropped_messages: u64,
+    pub egress_dropped_bytes: u64,
+    pub cached_images: usize,
+    pub complete_images: usize,
+    pub cache_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ExtendedHealthMetrics {
     pub reliable: ReliableMetrics,
     pub app_messages: AppMessageMetrics,
     pub upload_budget: UploadBudgetMetrics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<ImageMetrics>,
     pub raw_udp: RawUdpMetrics,
     pub avatar_sync: AvatarSyncMetrics,
     pub avatar_timing: AvatarTimingMetrics,
@@ -572,6 +584,27 @@ mod tests {
 
         assert!(response.extended.is_some());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn image_metrics_are_optional_and_expose_governor_and_cache_counts() {
+        let absent = serde_json::to_value(ExtendedHealthMetrics::default()).unwrap();
+        assert!(absent.get("images").is_none());
+        let present = serde_json::to_value(ExtendedHealthMetrics {
+            images: Some(ImageMetrics {
+                egress_dropped_messages: 2,
+                egress_dropped_bytes: 300,
+                cached_images: 4,
+                complete_images: 3,
+                cache_bytes: 500,
+            }),
+            ..ExtendedHealthMetrics::default()
+        })
+        .unwrap();
+        assert_eq!(present["images"]["egressDroppedMessages"], 2);
+        assert_eq!(present["images"]["egressDroppedBytes"], 300);
+        assert_eq!(present["images"]["completeImages"], 3);
+        assert_eq!(present["images"]["cacheBytes"], 500);
     }
 
     #[test]

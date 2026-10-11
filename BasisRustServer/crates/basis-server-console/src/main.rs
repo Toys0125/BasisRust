@@ -12,7 +12,8 @@ use basis_server_health::{
     format_system_time, start_health_server, AppMessageMetrics, AvatarSyncMetrics,
     AvatarTimingMetrics, BsrBundleMetrics, BsrHealthMetrics, BsrLoadMetrics, BsrMsPerTickMetrics,
     BsrWindowMetrics, BsrZstdMetrics, ExtendedHealthMetrics, HealthState, HealthStatistics,
-    RawUdpMetrics, ReliableMetrics, RustTransportMetrics, SceneBatchMetrics, UploadBudgetMetrics,
+    ImageMetrics, RawUdpMetrics, ReliableMetrics, RustTransportMetrics, SceneBatchMetrics,
+    UploadBudgetMetrics,
 };
 use clap::Parser;
 use crossterm::{
@@ -852,6 +853,19 @@ async fn async_main(
                 let app = server.statistics.snapshot();
                 let avatar = server.avatar_sync.stats();
                 ExtendedHealthMetrics {
+                    images: {
+                        let (egress_dropped_messages, egress_dropped_bytes) =
+                            server.image_egress_dropped();
+                        let (cached_images, complete_images, cache_bytes) =
+                            server.image_cache_stats();
+                        Some(ImageMetrics {
+                            egress_dropped_messages,
+                            egress_dropped_bytes,
+                            cached_images,
+                            complete_images,
+                            cache_bytes,
+                        })
+                    },
                     scene_batch: server
                         .scene_relay_snapshot()
                         .map(|scene| SceneBatchMetrics {

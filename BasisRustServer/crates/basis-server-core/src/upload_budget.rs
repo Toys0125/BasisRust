@@ -542,4 +542,164 @@ mod tests {
         original.shutdown().await.unwrap();
         transport.shutdown();
     }
+
+    #[tokio::test]
+    async fn fragmented_reliable_upload_is_reassembled_before_single_budget_admission() {
+        use basis_transport::{
+            PacketProperty, LITENETLIB_FRAGMENTED_HEADER_SIZE, RELIABLE_FRAGMENT_PAYLOAD_SIZE,
+        };
+        use tokio::{net::UdpSocket, time::timeout};
+
+        // The transport caps an in-progress fragmented message at 128 KiB. Use
+        // a 126,000-byte upload and a 124,000-byte budget burst to exercise the
+        // same oversized-reliable debt behavior within that transport bound.
+        const PAYLOAD_BYTES: usize = 126_000;
+        const PAYLOAD_FRAGMENTS: u16 =
+            PAYLOAD_BYTES.div_ceil(RELIABLE_FRAGMENT_PAYLOAD_SIZE) as u16;
+        let config = ServerConfig {
+            has_file_support: false,
+            set_port: 0,
+            override_auto_discovery_of_ipv: true,
+            ipv4_address: "127.0.0.1".into(),
+            max_upload_bytes_per_second_per_player: 62_000,
+            ..ServerConfig::default()
+        };
+        let (original, _) = ServerState::start(config, &std::env::temp_dir())
+            .await
+            .unwrap();
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket
+            .connect(transport.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut writer = NetWriter::new();
+        writer.put_u8(PacketProperty::ConnectRequest as u8);
+        writer.put_i32(basis_protocol::version::LITENETLIB_PROTOCOL_ID);
+        writer.put_i64(1);
+        writer.put_i32(0);
+        writer.put_u8(16);
+        writer.put_bytes(&[0; 16]);
+        socket.send(writer.as_slice()).await.unwrap();
+        let ServerEvent::ConnectionRequest(request) =
+            timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected connection request");
+        };
+        let session = transport.accept_session(&request).await.unwrap();
+        let mut buffer = [0; 1024];
+        socket.recv(&mut buffer).await.unwrap();
+        let mut server = original.clone();
+        server.transport = transport.clone();
+        let mut peer = crate::tests::test_connected_peer(session.peer_id());
+        peer.session = Some(session.clone());
+        server.authenticated_peers.insert(peer.id, peer);
+
+        async fn send_and_handle(
+            socket: &UdpSocket,
+            events: &mut tokio::sync::mpsc::Receiver<ServerEvent>,
+            server: &ServerState,
+            session: &basis_transport::PeerSession,
+            payload: Vec<u8>,
+            sequence_start: u16,
+            fragment_id: u16,
+        ) {
+            let channel_id =
+                DeliveryMethod::channel_id(channels::SERVER_BOUND, DeliveryMethod::ReliableOrdered);
+            let chunks = payload
+                .chunks(RELIABLE_FRAGMENT_PAYLOAD_SIZE)
+                .collect::<Vec<_>>();
+            let total = chunks.len() as u16;
+            assert!(total >= 2 && total <= 128);
+            for (part, chunk) in chunks.iter().enumerate() {
+                let mut packet =
+                    Vec::with_capacity(LITENETLIB_FRAGMENTED_HEADER_SIZE + chunk.len());
+                packet.push(PacketProperty::Channeled as u8 | 0x80);
+                packet.extend_from_slice(&(sequence_start + part as u16).to_le_bytes());
+                packet.push(channel_id);
+                packet.extend_from_slice(&fragment_id.to_le_bytes());
+                packet.extend_from_slice(&(part as u16).to_le_bytes());
+                packet.extend_from_slice(&total.to_le_bytes());
+                packet.extend_from_slice(chunk);
+                socket.send(&packet).await.unwrap();
+            }
+            let event = timeout(Duration::from_secs(3), async {
+                loop {
+                    match events.recv().await.unwrap() {
+                        ServerEvent::Message {
+                            peer,
+                            session,
+                            channel,
+                            delivery,
+                            payload,
+                        } if payload.len() == PAYLOAD_BYTES => {
+                            break (peer, session, channel, delivery, payload);
+                        }
+                        _ => continue,
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(event.0, session.peer_id());
+            assert_eq!(event.2, channels::SERVER_BOUND);
+            assert_eq!(event.3, DeliveryMethod::ReliableOrdered);
+            assert_eq!(event.4.len(), payload.len());
+            assert!(event.4.iter().all(|byte| *byte == 7));
+            handle_message(
+                server,
+                event.0,
+                Some(&event.1),
+                event.2,
+                event.3,
+                event.4,
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+
+        send_and_handle(
+            &socket,
+            &mut events,
+            &server,
+            &session,
+            vec![7; PAYLOAD_BYTES],
+            0,
+            0x5151,
+        )
+        .await;
+        let accepted = server.upload_budget_snapshot();
+        assert_eq!(accepted.accepted_messages, 1);
+        assert_eq!(accepted.accepted_bytes, PAYLOAD_BYTES as u64);
+        assert_eq!(accepted.oversized_reliable_messages, 1);
+        assert_eq!(accepted.rejected_messages, 0);
+
+        send_and_handle(
+            &socket,
+            &mut events,
+            &server,
+            &session,
+            vec![7; PAYLOAD_BYTES],
+            PAYLOAD_FRAGMENTS,
+            0x5152,
+        )
+        .await;
+        let rejected = server.upload_budget_snapshot();
+        assert_eq!(rejected.accepted_messages, 1);
+        assert_eq!(rejected.accepted_bytes, PAYLOAD_BYTES as u64);
+        assert_eq!(rejected.rejected_messages, 1);
+        assert_eq!(rejected.rejected_bytes, PAYLOAD_BYTES as u64);
+        assert_eq!(rejected.reliable_rejections, 1);
+        assert_eq!(rejected.oversized_reliable_messages, 1);
+        original.shutdown().await.unwrap();
+        transport.shutdown();
+    }
 }

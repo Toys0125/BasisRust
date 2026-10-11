@@ -27,14 +27,16 @@ use crate::net::{
     any_local_addr, bind_udp_socket, configure_load_sink_socket, resolve_addr, socket_address_bytes,
 };
 use crate::transport::{
-    parse_packet, read_bytes_message, ReliableReceiveState, ReliableSend, ACK_FLUSH_INTERVAL,
-    PING_INTERVAL_TICKS, RESEND_INTERVAL_TICKS,
+    parse_packet, read_bytes_message, FragmentResult, ReliableFragmentReassembler,
+    ReliableReceiveState, ReliableSend, ACK_FLUSH_INTERVAL, PING_INTERVAL_TICKS,
+    RESEND_INTERVAL_TICKS,
 };
 use crate::wire::build_connection_payload;
 use anyhow::{anyhow, Result};
 use basis_protocol::channels;
+use basis_protocol::io::NetReader;
 use basis_protocol::io::NetWriter;
-use basis_protocol::messages::ReadyMessage;
+use basis_protocol::messages::{BasisDeserialize, ReadyMessage, ServerNetIdMessage};
 use basis_protocol::version::LITENETLIB_PROTOCOL_ID;
 use basis_transport::{
     dotnet_utc_ticks, relative_sequence, DeliveryMethod, PacketProperty, DEFAULT_WINDOW_SIZE,
@@ -50,6 +52,60 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify};
 use tokio::time;
 use tracing::{debug, error, info, trace, warn};
+
+fn read_server_net_id_assignments(payload: &[u8]) -> Option<Vec<ServerNetIdMessage>> {
+    let mut reader = NetReader::new(payload);
+    let count = reader.get_u16().ok()?;
+    let mut messages = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        messages.push(ServerNetIdMessage::deserialize(&mut reader).ok()?);
+    }
+    Some(messages)
+}
+
+#[cfg(test)]
+mod net_id_batch_tests {
+    use super::*;
+    use basis_protocol::messages::{
+        BasisSerialize, NetIdMessage, ServerUniqueIdMessages, UshortUniqueIdMessage,
+    };
+
+    #[test]
+    fn parses_batched_network_id_assignments() {
+        let expected = vec![
+            ServerNetIdMessage {
+                net_id_message: NetIdMessage {
+                    player_id: "BasisImagePickupManager".into(),
+                },
+                ushort_unique_id_message: UshortUniqueIdMessage {
+                    unique_id_ushort: 23,
+                },
+            },
+            ServerNetIdMessage {
+                net_id_message: NetIdMessage {
+                    player_id: "another-manager".into(),
+                },
+                ushort_unique_id_message: UshortUniqueIdMessage {
+                    unique_id_ushort: 42,
+                },
+            },
+        ];
+        let mut writer = NetWriter::new();
+        ServerUniqueIdMessages {
+            messages: expected.clone(),
+        }
+        .serialize(&mut writer)
+        .unwrap();
+        assert_eq!(
+            read_server_net_id_assignments(writer.as_slice()).unwrap(),
+            expected
+        );
+        assert!(
+            read_server_net_id_assignments(&writer.as_slice()[..writer.as_slice().len() - 1])
+                .is_none()
+        );
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct BasisClient {
@@ -77,11 +133,14 @@ pub(crate) struct BasisClient {
     pub(crate) shared_receive_eligible: AtomicBool,
     pub(crate) receive_shutdown: Notify,
     pub(crate) received_reliable: StdMutex<ReliableReceiveState>,
+    pub(crate) fragment_reassembler: StdMutex<ReliableFragmentReassembler>,
     pub(crate) server_avatar_metadata: StdMutex<Option<ServerAvatarMetadata>>,
     pub(crate) force_avatar_keyframe: AtomicBool,
     pub(crate) pose: Mutex<PoseState>,
     pub(crate) avatar_observer: Option<Arc<ObserverSession>>,
     pub(crate) scene_session: Option<Arc<crate::scene::SceneSession>>,
+    pub(crate) image_benchmark: Option<Arc<crate::image_benchmark::ImageBenchmarkSession>>,
+    pub(crate) image_network_id: AtomicU16,
     pub(crate) packet_diagnostics: PacketDiagnostics,
     pub(crate) avatar_diagnostics: Option<Arc<ClientAvatarDiagnostics>>,
     pub(crate) voice_diagnostics: Option<crate::voice_diagnostics::VoiceDiagnostics>,
@@ -89,6 +148,21 @@ pub(crate) struct BasisClient {
 }
 
 impl BasisClient {
+    fn observe_image_network_id(&self, message: ServerNetIdMessage) {
+        if message.net_id_message.player_id != crate::image_benchmark::IMAGE_MANAGER_IDENTIFIER {
+            return;
+        }
+        let previous = self.image_network_id.swap(
+            message.ushort_unique_id_message.unique_id_ushort,
+            Ordering::AcqRel,
+        );
+        if previous == u16::MAX {
+            if let Some(session) = &self.image_benchmark {
+                session.note_net_id(self.index);
+            }
+        }
+    }
+
     pub(crate) async fn start(
         index: usize,
         config: &Config,
@@ -127,6 +201,7 @@ impl BasisClient {
             shared_receive_eligible: AtomicBool::new(false),
             receive_shutdown: Notify::new(),
             received_reliable: StdMutex::new(ReliableReceiveState::default()),
+            fragment_reassembler: StdMutex::new(ReliableFragmentReassembler::default()),
             server_avatar_metadata: StdMutex::new(None),
             force_avatar_keyframe: AtomicBool::new(false),
             pose: Mutex::new(PoseState::new_at(spawn_base)),
@@ -134,6 +209,8 @@ impl BasisClient {
                 .then(|| config.observer_session.clone())
                 .flatten(),
             scene_session: (index == 0).then(|| config.scene_session.clone()).flatten(),
+            image_benchmark: config.image_benchmark.clone(),
+            image_network_id: AtomicU16::new(u16::MAX),
             packet_diagnostics: PacketDiagnostics::default(),
             avatar_diagnostics: ClientAvatarDiagnostics::enabled_from_env()
                 .then(|| Arc::new(ClientAvatarDiagnostics::default())),
@@ -214,7 +291,11 @@ impl BasisClient {
 
     pub(crate) fn deactivate(&self) {
         self.in_use.store(false, Ordering::SeqCst);
-        self.connected.store(false, Ordering::SeqCst);
+        if self.connected.swap(false, Ordering::SeqCst) {
+            if let Some(session) = &self.image_benchmark {
+                session.note_disconnect(self.index);
+            }
+        }
         if let Some(session) = &self.avatar_observer {
             session.release((self.index, self.connect_time));
         }
@@ -488,7 +569,11 @@ impl BasisClient {
                         );
                     }
                 }
-                self.connected.store(true, Ordering::SeqCst);
+                if !self.connected.swap(true, Ordering::SeqCst) {
+                    if let Some(session) = &self.image_benchmark {
+                        session.note_connected(self.index);
+                    }
+                }
                 self.refresh_shared_receive_eligibility();
                 info!(
                     "client {} connected as remote peer {}",
@@ -539,8 +624,13 @@ impl BasisClient {
             }
             PacketProperty::Channeled => {
                 if let Some(channel_id) = packet.channel_id {
-                    self.handle_channeled(channel_id, packet.sequence.unwrap_or(0), packet.payload)
-                        .await?;
+                    self.handle_channeled_packet(
+                        channel_id,
+                        packet.sequence.unwrap_or(0),
+                        packet.payload,
+                        bytes[0] & 0x80 != 0,
+                    )
+                    .await?;
                 }
             }
             PacketProperty::Unreliable => {
@@ -687,6 +777,10 @@ impl BasisClient {
 
     pub(crate) async fn observe_avatar_channel(&self, channel: u8, payload: &[u8]) {
         if channel == channels::SCENE {
+            let image_network_id = self.image_network_id.load(Ordering::Acquire);
+            if let (Some(session), true) = (&self.image_benchmark, image_network_id != u16::MAX) {
+                session.observe(self.index, image_network_id, payload);
+            }
             if let Some(session) = &self.scene_session {
                 session.observe(payload);
             }
@@ -761,11 +855,23 @@ impl BasisClient {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn handle_channeled(
         &self,
         channel_id: u8,
         sequence: u16,
         payload: &[u8],
+    ) -> Result<()> {
+        self.handle_channeled_packet(channel_id, sequence, payload, false)
+            .await
+    }
+
+    async fn handle_channeled_packet(
+        &self,
+        channel_id: u8,
+        sequence: u16,
+        packet_payload: &[u8],
+        fragmented: bool,
     ) -> Result<()> {
         let channel = channel_id / 4;
         let delivery = DeliveryMethod::from_channel_id(channel_id);
@@ -796,6 +902,34 @@ impl BasisClient {
             }
         }
 
+        let mut assembled = None;
+        if fragmented {
+            match self.fragment_reassembler.lock().unwrap().push(
+                channel_id,
+                packet_payload,
+                std::time::Instant::now(),
+            ) {
+                FragmentResult::Complete(bytes) => assembled = Some(bytes),
+                FragmentResult::Pending => return Ok(()),
+                FragmentResult::Duplicate => {
+                    if let Some(session) = &self.image_benchmark {
+                        session.note_fragment_duplicate();
+                    }
+                    return Ok(());
+                }
+                FragmentResult::Invalid => {
+                    if let Some(session) = &self.image_benchmark {
+                        session.note_fragment_error();
+                    }
+                    // Reliable fragments have already been ACKed by this point. Dropping
+                    // malformed or timed-out assembly state would strand a message forever.
+                    self.deactivate();
+                    return Ok(());
+                }
+            }
+        }
+        let payload = assembled.as_deref().unwrap_or(packet_payload);
+
         // Count reliable voice only after its transport sequence has passed the
         // existing duplicate/window checks. Unreliable receive paths are counted
         // at their dispatch points because they have no transport deduplication.
@@ -804,11 +938,32 @@ impl BasisClient {
         }
 
         if channel == channels::SCENE {
+            if let (Some(session), Some(network_id)) = (
+                &self.image_benchmark,
+                (self.image_network_id.load(Ordering::Acquire) != u16::MAX)
+                    .then(|| self.image_network_id.load(Ordering::Relaxed)),
+            ) {
+                session.observe(self.index, network_id, payload);
+            }
             if let Some(session) = &self.scene_session {
                 session.observe(payload);
             }
         }
         match channel {
+            channels::NET_ID_ASSIGN => {
+                if let Ok(message) = <ServerNetIdMessage as BasisDeserialize>::deserialize(
+                    &mut NetReader::new(payload),
+                ) {
+                    self.observe_image_network_id(message);
+                }
+            }
+            channels::NET_ID_ASSIGNS => {
+                if let Some(messages) = read_server_net_id_assignments(payload) {
+                    for message in messages {
+                        self.observe_image_network_id(message);
+                    }
+                }
+            }
             channels::AUTH_IDENTITY => {
                 if let Some(challenge) = read_bytes_message(payload) {
                     let response = self.identity.response_payload(challenge)?;

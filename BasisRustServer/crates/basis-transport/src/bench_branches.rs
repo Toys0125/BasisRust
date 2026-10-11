@@ -112,6 +112,7 @@ fn test_peer_state() -> PeerState {
         remote_sequenced_sequence: parking_lot::Mutex::new(HashMap::new()),
         remote_unordered_sequence: parking_lot::Mutex::new(HashMap::new()),
         remote_ordered_sequence: parking_lot::Mutex::new(HashMap::new()),
+        incoming_fragments: parking_lot::Mutex::new(IncomingFragmentState::default()),
         ordered_reorder_active: AtomicBool::new(false),
         reorder_usage: Arc::new(PeerReorderUsage::default()),
         next_fragment_id: AtomicU16::new(0),
@@ -179,7 +180,7 @@ fn parse_message_phase() {
     let mut parsed_none = 0u64;
     measure("parse_message_packet", packets.len(), || {
         for packet in packets.iter() {
-            if let Some((channel, delivery, payload)) =
+            if let Some((channel, delivery, payload, _fragment)) =
                 parse_message_packet(PacketProperty::Channeled, black_box(packet))
             {
                 parsed_ok = parsed_ok.wrapping_add(
