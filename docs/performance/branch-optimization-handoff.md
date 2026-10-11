@@ -1,5 +1,27 @@
 # Laptop agent handoff — branch optimization
 
+## Fresh final-source PGO A/B — 2026-10-11
+
+The [fresh 750-client PGO test](pgo-final-client750-20261011.md) compares ordinary
+and PGO servers from final merged source `c75113f`, with one shared final Rust
+client. Two new 750-client instrumented runs trained the profile; eight fresh
+ABBA/BAAB evaluations retain the exact 5-Hz Scene/128-byte extra avatar workload,
+3-ms batching, 1024 peer queue quota and 128 KiB/s before-fanout upload cap.
+Median CPU: 5.444 / 5.410 cores (-0.63%);
+avatar p95 gaps: 558.090 / 494.775 ms (-11.34%).
+Scene receipt: 99.952% / 99.924%; p95 bounds both 131.071 ms.
+Applied avatar items/s increase 10.47%; accepted upload remains matched.
+
+All four PGO evaluations pass; ordinary passes 3/4. One ordinary run retains
+8 setup retransmits. Training retains 42 and 11 setup retransmits, failing the
+unchanged absolute-zero gate; the new profile is **diagnostic only**. Every run
+retains all 750 clients/all 749 Scene senders, zero upload/Scene quota rejection,
+zero image work/drop counters and clean exits. All profiles/builds are fresh,
+matching flags and exact source/client hashes verified, zero profile diagnostics.
+Four processes per arm are descriptive; no validated PGO win, 20-Hz or photo
+capacity claim. PGO remains experimental, without production code/default changes.
+All attempts and original failure flags are retained in portable evidence.
+
 ## Final main pull and regression benchmark — 2026-10-10
 
 Merged latest fetched main `f30b248329b213278153bee09995987a66b1a16d` at
