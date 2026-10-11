@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 default = []
+benchmark-validation = ["basis-server-core/benchmark-validation"]
 gpu = ["basis-server-core/gpu"]
 
 [[bin]]

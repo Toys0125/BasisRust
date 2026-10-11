@@ -1,5 +1,6 @@
 mod admin_runtime;
 mod avatar_sync;
+mod benchmark_validation;
 mod event_diagnostics;
 #[cfg(feature = "gpu")]
 mod gpu_distance;
@@ -21,7 +22,9 @@ mod scene_relay;
 mod upload_budget;
 
 pub use avatar_sync::BsrProfilerSnapshot;
+#[cfg(any(feature = "benchmark-validation", test))]
 pub use scene_relay::SceneRelaySnapshot;
+#[cfg(any(feature = "benchmark-validation", test))]
 pub use upload_budget::UploadBudgetSnapshot;
 
 use anyhow::{Context, Result};
@@ -862,11 +865,14 @@ impl ServerState {
     }
 
     pub fn status_text_with_detail(&self, verbose: bool) -> String {
-        let mut text = self.base_status_text_with_detail(verbose);
-        let detailed = verbose && self.config.read().health_include_extended_metrics;
-        if detailed {
-            let upload = self.upload_budget_snapshot();
-            text.push_str(&format!(
+        let text = self.base_status_text_with_detail(verbose);
+        #[cfg(any(feature = "benchmark-validation", test))]
+        let text = {
+            let mut text = text;
+            let detailed = verbose && self.config.read().health_include_extended_metrics;
+            if detailed {
+                let upload = self.upload_budget_snapshot();
+                text.push_str(&format!(
                 "\nUploadBudget: rate={}B/s/peer burst={}s accepted={}/{}B rejected={}/{}B reliable-rejected={} oversized-reliable={} image-exempt={}/{}B",
                 upload.bytes_per_second_per_player,
                 upload.burst_seconds,
@@ -879,10 +885,12 @@ impl ServerState {
                 upload.image_exempt_messages,
                 upload.image_exempt_bytes,
             ));
-        }
-        if let Some(snapshot) = self.scene_relay_snapshot().filter(|_| detailed) {
-            text.push_str(&format!("\nSceneBatch: {snapshot:?}"));
-        }
+            }
+            if let Some(snapshot) = self.scene_relay_snapshot().filter(|_| detailed) {
+                text.push_str(&format!("\nSceneBatch: {snapshot:?}"));
+            }
+            text
+        };
         text
     }
 
@@ -1103,10 +1111,12 @@ impl ServerState {
         Ok(())
     }
 
+    #[cfg(any(feature = "benchmark-validation", test))]
     pub fn upload_budget_snapshot(&self) -> UploadBudgetSnapshot {
         self.upload_budget.snapshot()
     }
 
+    #[cfg(any(feature = "benchmark-validation", test))]
     pub fn scene_relay_snapshot(&self) -> Option<SceneRelaySnapshot> {
         self.scene_relay.as_ref().map(|relay| relay.snapshot())
     }

@@ -35,8 +35,8 @@ PROFILE_DIAGNOSTICS = ('no profile data', 'profile data may be out of date', 'ha
 
 
 def populations(clients, minimum):
-    if minimum < 2 or clients < minimum:
-        raise ValueError('Require 2 <= --minimum-clients <= --clients')
+    if minimum < 100 or clients < minimum:
+        raise ValueError('Require 100 <= --minimum-clients <= --clients')
     result = [clients]
     while result[-1] > minimum:
         result.append(max(minimum, result[-1] // 2))
@@ -170,6 +170,8 @@ class Pipeline:
         workspace = 'BasisRustClient' if client else 'BasisRustServer'
         command = ['cargo', '+' + self.options.toolchain, 'build', '--locked', '--release',
                    '--target', TARGET, '--manifest-path', str(self.source / workspace / 'Cargo.toml'), '-p', package]
+        if not client:
+            command += ['--features', 'benchmark-validation']
         record = {'command': command, 'environment': fixed, 'cleared_environment_keys': removed}
         self.manifest['builds'][name] = record
         self.save()
@@ -191,9 +193,11 @@ class Pipeline:
         fingerprint = json.loads(fingerprints[0].read_text())
         if fingerprint['rustflags'] != flags.split():
             raise ValueError('Cargo did not use the requested PGO flags')
+        if not client and 'benchmark-validation' not in json.loads(fingerprint['features']):
+            raise ValueError('Benchmark validation telemetry was not compiled into the server')
         ordinary = self.manifest['builds'].get('ordinary', {}).get('cargo_fingerprint')
-        if not client and ordinary and fingerprint['profile'] != ordinary['profile']:
-            raise ValueError('Release settings differ between PGO stages')
+        if not client and ordinary and (fingerprint['profile'] != ordinary['profile'] or fingerprint['features'] != ordinary['features']):
+            raise ValueError('Release settings or features differ between PGO stages')
         record.update(path=str(binary), sha256=sha256(binary), cargo_fingerprint=fingerprint)
         self.save()
         return {'path': str(binary), 'sha256': record['sha256']}
@@ -346,6 +350,7 @@ class Pipeline:
         lines = ['# Server PGO qualification', '', f'Source: `{self.manifest["source"]["revision"]}`.',
                  f'Target: `{TARGET}`. Smoke only: `{self.options.smoke}`.',
                  f'Qualified client count: `{self.manifest.get("selected_clients", "none")}`.', '',
+                 'Server builds request `benchmark-validation`; Cargo feature parity is checked before workloads run.',
                  'Profiles and A/B results are separate at each client count. Training is excluded from evaluation.',
                  '20-ms avatar updates, Unity-policy 60 FPS poses, 128 B extra avatar, 128 B Scene at 5 Hz; CPU-only, voice off.', '',
                  '| Clients | Phase / process | Scene receipt | Scene p95 bound, ms | Avatar p95 gap, ms | CPU cores | Failed gates |',
@@ -405,31 +410,38 @@ class Pipeline:
                 archive.add(path, arcname=path.name)
 
 
-def main():
+def parse_options(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--toolchain', default='1.99.0')
-    parser.add_argument('--clients', type=int, default=750)
-    parser.add_argument('--minimum-clients', type=int, default=250)
+    parser.add_argument('--clients', type=int, default=300)
+    parser.add_argument('--minimum-clients', type=int, default=100)
     parser.add_argument('--warmup-seconds', type=int, default=45)
     parser.add_argument('--window-seconds', type=int, default=60)
     parser.add_argument('--evaluation-rounds', type=int, default=4)
     parser.add_argument('--server-cpus')
     parser.add_argument('--client-cpus')
-    parser.add_argument('--smoke', action='store_true', help='4-client short end-to-end CI check; never packages a distributable')
-    args = parser.parse_args()
+    parser.add_argument('--smoke', action='store_true', help='Short end-to-end CI check with the selected population and fallback; never packages a distributable')
+    args = parser.parse_args(argv)
     if platform.system() != 'Linux':
         parser.error('PGO qualification currently requires native Linux x86-64 GNU')
     if args.smoke:
-        args.clients = args.minimum_clients = 4
         args.warmup_seconds, args.window_seconds, args.evaluation_rounds = 3, 10, 2
-    populations(args.clients, args.minimum_clients)
+    try:
+        populations(args.clients, args.minimum_clients)
+    except ValueError as error:
+        parser.error(str(error))
     if args.evaluation_rounds < 2 or args.evaluation_rounds % 2 or args.warmup_seconds < 0 or args.window_seconds < 2:
         parser.error('Require an even number of evaluation rounds >=2 and a window >=2 seconds')
     if bool(args.server_cpus) != bool(args.client_cpus):
         parser.error('Specify both CPU sets, or neither')
     if args.server_cpus and set(avatar_benchmark.cpu_list(args.server_cpus)) & set(avatar_benchmark.cpu_list(args.client_cpus)):
         parser.error('Server and client CPU sets must be disjoint')
+    return args
+
+
+def main():
+    args = parse_options()
     pipeline = None
     try:
         pipeline = Pipeline(args)
@@ -439,7 +451,7 @@ def main():
             pipeline.manifest['error'] = str(error)
             pipeline.save()
             pipeline.report()
-        parser.exit(1, str(error) + '\n')
+        raise SystemExit(str(error))
 
 
 if __name__ == '__main__':

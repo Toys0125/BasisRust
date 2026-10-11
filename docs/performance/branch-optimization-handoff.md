@@ -6,8 +6,8 @@ The [supported PGO builder](server-pgo.md) freezes source/toolchain/flags and
 benchmark controls, trains twice, validates ordinary/PGO ABBA/BAAB processes and
 packages only when every gate passes. Invalid training is never merged. Failed
 higher populations remain visible while fresh lower-count attempts retrain;
-the default schedule is 750 -> 375 -> 250. Smoke mode cannot publish a binary.
-PR CI exercises the complete four-client path; manual artifact qualification
+the default schedule is 300 -> 150 -> 100 (minimum 100). Smoke mode cannot publish a binary.
+PR CI exercises the complete short 300-client path with fallback down to 100; manual artifact qualification
 uses a dedicated native Linux x64 runner. Ordinary release defaults are unchanged.
 
 [All Rust validation results](rust-performance-validation.md) consolidate the
@@ -21,6 +21,13 @@ applied work rises 3.38%, CPU rises 0.45%; CPU/built work falls 3.57%. Artifact
 checksums and contents verify; no JSON/profiles are packaged. The 250 fallback
 was unnecessary. Failed historical 750-client training remains diagnostic;
 a 375-client pass does not certify 750, 20-Hz Scene or photo/image workloads.
+
+Scene/upload validation telemetry now requires the opt-in `benchmark-validation`
+Cargo feature; default builds retain limits but omit these snapshots/health fields.
+The supported PGO builder enables and checks identical features in every server
+stage. PR smoke uses the same 300/100 population defaults with short windows.
+Historical measurements below precede this feature split and population change;
+regenerate profiles for the changed source rather than reusing the 375 profile.
 
 ## C# gate check with final Rust client — 2026-10-11
 

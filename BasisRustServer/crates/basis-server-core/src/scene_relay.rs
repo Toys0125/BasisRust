@@ -1,5 +1,6 @@
 //! Opt-in transport packing for unreliable SCENE broadcasts. Messages are never coalesced.
 use super::{ConnectedPeer, DeliveryMethod, PeerId, PeerSession, TransportHandle};
+use crate::benchmark_validation::Counter;
 use anyhow::{Context, Result};
 use basis_protocol::channels;
 use bytes::Bytes;
@@ -22,6 +23,7 @@ const LANE_CAPACITY: usize = 2;
 const MAX_BATCH_MESSAGES: usize = 128;
 const MAX_BATCH_BYTES: usize = 64 * 1024;
 
+#[cfg(any(feature = "benchmark-validation", test))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SceneRelaySnapshot {
     pub peer_queue_limit: u64,
@@ -45,21 +47,42 @@ pub struct SceneRelaySnapshot {
 }
 
 #[derive(Default)]
+#[cfg_attr(not(any(feature = "benchmark-validation", test)), derive(Clone))]
 struct Counters {
-    admitted: AtomicU64,
-    rejected: AtomicU64,
-    pending: AtomicU64,
-    peak_peer_pending: AtomicU64,
-    enqueued: AtomicU64,
-    dequeued: AtomicU64,
-    attempted: AtomicU64,
-    datagrams: AtomicU64,
-    stale: AtomicU64,
-    inbox_waits: AtomicU64,
-    lane_waits: AtomicU64,
-    enqueue_errors: AtomicU64,
-    send_errors: AtomicU64,
+    admitted: Counter,
+    rejected: Counter,
+    pending: Counter,
+    peak_peer_pending: Counter,
+    enqueued: Counter,
+    dequeued: Counter,
+    attempted: Counter,
+    datagrams: Counter,
+    stale: Counter,
+    inbox_waits: Counter,
+    lane_waits: Counter,
+    enqueue_errors: Counter,
+    send_errors: Counter,
 }
+
+#[cfg(any(feature = "benchmark-validation", test))]
+type SharedCounters = Arc<Counters>;
+#[cfg(not(any(feature = "benchmark-validation", test)))]
+type SharedCounters = Counters;
+
+fn new_counters() -> SharedCounters {
+    #[cfg(any(feature = "benchmark-validation", test))]
+    {
+        Arc::new(Counters::default())
+    }
+    #[cfg(not(any(feature = "benchmark-validation", test)))]
+    {
+        Counters::default()
+    }
+}
+
+// No diagnostic storage or reference-counted telemetry handles in normal builds.
+#[cfg(not(any(feature = "benchmark-validation", test)))]
+const _: () = assert!(std::mem::size_of::<SharedCounters>() == 0);
 
 pub(super) struct SceneRecipient {
     session: PeerSession,
@@ -110,7 +133,7 @@ struct ReservedRecipient {
 struct Input {
     payload: Bytes,
     recipients: Vec<ReservedRecipient>,
-    counters: Arc<Counters>,
+    counters: SharedCounters,
 }
 
 impl Drop for Input {
@@ -125,7 +148,7 @@ struct TargetBatch {
     session: PeerSession,
     packets: Vec<(u8, Bytes)>,
     permit: PendingPermit,
-    counters: Arc<Counters>,
+    counters: SharedCounters,
 }
 
 impl Drop for TargetBatch {
@@ -142,7 +165,7 @@ pub(super) struct SceneRelay {
     peer_queue_limit: u64,
     sender: Mutex<Option<mpsc::Sender<Input>>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
-    counters: Arc<Counters>,
+    counters: SharedCounters,
 }
 
 pub(super) fn batch_interval(value: Option<&str>) -> Result<Option<Duration>> {
@@ -205,7 +228,7 @@ impl SceneRelay {
         interval: Duration,
         peer_queue_limit: u64,
     ) -> Result<Self> {
-        let counters = Arc::new(Counters::default());
+        let counters = new_counters();
         let mut threads = Vec::new();
         let mut lanes = Vec::new();
         for index in 0..FANOUT_LANES {
@@ -334,6 +357,7 @@ impl SceneRelay {
         result
     }
 
+    #[cfg(any(feature = "benchmark-validation", test))]
     pub(super) fn snapshot(&self) -> SceneRelaySnapshot {
         let stats = &self.counters;
         SceneRelaySnapshot {
@@ -361,6 +385,7 @@ impl SceneRelay {
         tokio::task::spawn_blocking(move || join_threads(threads))
             .await
             .context("joining scene relay threads")??;
+        #[cfg(any(feature = "benchmark-validation", test))]
         tracing::info!(snapshot = ?self.snapshot(), "scene relay drained");
         Ok(())
     }
@@ -388,7 +413,7 @@ fn join_threads(threads: Vec<JoinHandle<()>>) -> Result<()> {
 fn collect(
     mut receiver: mpsc::Receiver<Input>,
     lanes: Vec<sync_mpsc::SyncSender<LaneBatch>>,
-    counters: Arc<Counters>,
+    counters: SharedCounters,
     interval: Duration,
 ) {
     let mut pending = None;
@@ -637,7 +662,7 @@ mod tests {
         payload: &'static [u8],
         session: PeerSession,
         pending: Arc<AtomicU64>,
-        counters: Arc<Counters>,
+        counters: SharedCounters,
     ) -> Input {
         let (permit, _) = PendingPermit::reserve(pending, 70).unwrap();
         counters.admitted.fetch_add(1, Ordering::Relaxed);
@@ -772,7 +797,7 @@ mod tests {
         let peers = DashMap::new();
         admit(&peers, &session);
         let pending = peers.get(&session.peer_id()).unwrap().scene_pending.clone();
-        let counters = Arc::new(Counters::default());
+        let counters = new_counters();
         let (sender, receiver) = mpsc::channel(1);
         sender
             .send(reserved_input(
@@ -990,7 +1015,7 @@ mod tests {
         assert_eq!(old.peer_id(), replacement.peer_id());
         let peers = DashMap::new();
         admit(&peers, &replacement);
-        let counters = Arc::new(Counters::default());
+        let counters = new_counters();
         let old_pending = Arc::new(AtomicU64::new(0));
         let new_pending = peers
             .get(&replacement.peer_id())

@@ -51,6 +51,7 @@ impl Bucket {
     }
 }
 
+#[cfg(any(feature = "benchmark-validation", test))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UploadBudgetSnapshot {
     pub bytes_per_second_per_player: u64,
@@ -68,15 +69,26 @@ pub struct UploadBudgetSnapshot {
 #[derive(Debug)]
 pub(crate) struct UploadBudget {
     pub rate: AtomicU64,
+    #[cfg(any(feature = "benchmark-validation", test))]
     accepted_messages: AtomicU64,
+    #[cfg(any(feature = "benchmark-validation", test))]
     accepted_bytes: AtomicU64,
+    #[cfg(any(feature = "benchmark-validation", test))]
     rejected_messages: AtomicU64,
+    #[cfg(any(feature = "benchmark-validation", test))]
     rejected_bytes: AtomicU64,
+    #[cfg(any(feature = "benchmark-validation", test))]
     reliable_rejections: AtomicU64,
+    #[cfg(any(feature = "benchmark-validation", test))]
     oversized_reliable_messages: AtomicU64,
+    #[cfg(any(feature = "benchmark-validation", test))]
     image_exempt_messages: AtomicU64,
+    #[cfg(any(feature = "benchmark-validation", test))]
     image_exempt_bytes: AtomicU64,
 }
+
+#[cfg(not(any(feature = "benchmark-validation", test)))]
+const _: () = assert!(std::mem::size_of::<UploadBudget>() == std::mem::size_of::<AtomicU64>());
 
 pub(crate) fn best_effort(delivery: DeliveryMethod) -> bool {
     matches!(
@@ -120,13 +132,21 @@ impl UploadBudget {
     pub fn new(rate: u64) -> Self {
         Self {
             rate: AtomicU64::new(rate),
+            #[cfg(any(feature = "benchmark-validation", test))]
             accepted_messages: AtomicU64::new(0),
+            #[cfg(any(feature = "benchmark-validation", test))]
             accepted_bytes: AtomicU64::new(0),
+            #[cfg(any(feature = "benchmark-validation", test))]
             rejected_messages: AtomicU64::new(0),
+            #[cfg(any(feature = "benchmark-validation", test))]
             rejected_bytes: AtomicU64::new(0),
+            #[cfg(any(feature = "benchmark-validation", test))]
             reliable_rejections: AtomicU64::new(0),
+            #[cfg(any(feature = "benchmark-validation", test))]
             oversized_reliable_messages: AtomicU64::new(0),
+            #[cfg(any(feature = "benchmark-validation", test))]
             image_exempt_messages: AtomicU64::new(0),
+            #[cfg(any(feature = "benchmark-validation", test))]
             image_exempt_bytes: AtomicU64::new(0),
         }
     }
@@ -136,34 +156,41 @@ impl UploadBudget {
         let allowed = bucket
             .lock()
             .admit_at(rate, bytes, Instant::now(), !best_effort(delivery));
-        if allowed {
-            if rate != 0
-                && !best_effort(delivery)
-                && (bytes as u128) > u128::from(rate) * u128::from(BURST_SECONDS)
-            {
-                self.oversized_reliable_messages
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            self.accepted_messages.fetch_add(1, Ordering::Relaxed);
-            self.accepted_bytes
-                .fetch_add(bytes as u64, Ordering::Relaxed);
-        } else {
-            self.rejected_messages.fetch_add(1, Ordering::Relaxed);
-            self.rejected_bytes
-                .fetch_add(bytes as u64, Ordering::Relaxed);
-            if !best_effort(delivery) {
-                self.reliable_rejections.fetch_add(1, Ordering::Relaxed);
+        #[cfg(any(feature = "benchmark-validation", test))]
+        {
+            if allowed {
+                if rate != 0
+                    && !best_effort(delivery)
+                    && (bytes as u128) > u128::from(rate) * u128::from(BURST_SECONDS)
+                {
+                    self.oversized_reliable_messages
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.accepted_messages.fetch_add(1, Ordering::Relaxed);
+                self.accepted_bytes
+                    .fetch_add(bytes as u64, Ordering::Relaxed);
+            } else {
+                self.rejected_messages.fetch_add(1, Ordering::Relaxed);
+                self.rejected_bytes
+                    .fetch_add(bytes as u64, Ordering::Relaxed);
+                if !best_effort(delivery) {
+                    self.reliable_rejections.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         allowed
     }
 
-    pub fn exempt_image(&self, bytes: usize) {
-        self.image_exempt_messages.fetch_add(1, Ordering::Relaxed);
-        self.image_exempt_bytes
-            .fetch_add(bytes as u64, Ordering::Relaxed);
+    pub fn exempt_image(&self, _bytes: usize) {
+        #[cfg(any(feature = "benchmark-validation", test))]
+        {
+            self.image_exempt_messages.fetch_add(1, Ordering::Relaxed);
+            self.image_exempt_bytes
+                .fetch_add(_bytes as u64, Ordering::Relaxed);
+        }
     }
 
+    #[cfg(any(feature = "benchmark-validation", test))]
     pub fn snapshot(&self) -> UploadBudgetSnapshot {
         UploadBudgetSnapshot {
             bytes_per_second_per_player: self.rate.load(Ordering::Relaxed),

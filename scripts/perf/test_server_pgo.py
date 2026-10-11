@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from server_pgo import Pipeline, build_environment, populations, require_valid
+from server_pgo import Pipeline, build_environment, populations, require_valid, parse_options
 
 
 class PromotionTests(unittest.TestCase):
@@ -27,10 +27,28 @@ class PromotionTests(unittest.TestCase):
     def test_750_fallback_is_bounded_and_does_not_repeat_population(self):
         self.assertEqual(populations(750, 250), [750, 375, 250])
         self.assertEqual(populations(375, 250), [375, 250])
-        self.assertEqual(populations(4, 4), [4])
-        for clients, minimum in [(1, 1), (4, 5), (4, 0)]:
+        self.assertEqual(populations(100, 100), [100])
+        for clients, minimum in [(99, 99), (100, 101), (300, 0)]:
             with self.assertRaises(ValueError):
                 populations(clients, minimum)
+
+    @patch("server_pgo.platform.system", return_value="Linux")
+    def test_default_and_smoke_populations_preserve_100_client_floor(self, _system):
+        self.assertEqual(populations(300, 100), [300, 150, 100])
+        for extra in [[], ['--smoke']]:
+            args = parse_options(['--output', '/tmp/pgo-options-test', *extra])
+            self.assertEqual((args.clients, args.minimum_clients), (300, 100))
+        custom = parse_options(['--output', '/tmp/pgo-options-test', '--smoke',
+                                '--clients', '150', '--minimum-clients', '100'])
+        self.assertEqual((custom.clients, custom.minimum_clients), (150, 100))
+        self.assertEqual((custom.warmup_seconds, custom.window_seconds,
+                          custom.evaluation_rounds), (3, 10, 2))
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_options(['--output', '/tmp/pgo-options-test', '--smoke',
+                               '--clients', '100', '--minimum-clients', '99'])
 
     def test_inherited_flags_and_codegen_overrides_cannot_change_stages(self):
         with patch.dict(os.environ, {'CARGO_ENCODED_RUSTFLAGS': 'bad', 'RUSTFLAGS': 'bad',

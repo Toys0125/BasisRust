@@ -12,12 +12,12 @@ on:
       clients:
         description: Initial qualification population
         type: string
-        default: '750'
+        default: '300'
         required: true
       minimum_clients:
         description: Lowest fallback population (failed higher runs remain recorded)
         type: string
-        default: '250'
+        default: '100'
         required: true
 
 permissions:

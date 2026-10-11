@@ -11,6 +11,25 @@ It pins Rust 1.99.0, uses locked dependencies, an explicit target, absolute prof
 paths and isolated output trees. Source, tools, fixtures, flags and executable
 hashes are recorded and checked. Generation and use share release settings.
 
+## Benchmark validation feature
+
+Scene relay and upload-budget counters, snapshot APIs and their detailed status
+reporting are compiled only with `benchmark-validation` (or in core unit tests).
+Normal server builds omit `sceneBatch` and `uploadBudget` from extended health
+JSON instead of reporting fabricated zero counters. Per-peer upload admission,
+Scene quotas, bounded queues and connection checks remain active in every build.
+Other existing server health metrics remain available.
+
+```bash
+cargo build --release --manifest-path BasisRustServer/Cargo.toml \
+  -p basis-server-console --features benchmark-validation
+```
+
+The PGO driver enables this feature identically for ordinary, instrumented and
+PGO-use servers and verifies their Cargo feature fingerprints. Qualified PGO
+packages therefore retain validation telemetry. Their results do not measure
+the counter-free default build; remeasure after changing features or source.
+
 ## Local qualification
 
 Requires Python 3.12+, Linux x64 GNU, Rust 1.99.0 and `taskset`. Commit source,
@@ -22,7 +41,7 @@ power throughout the experiment.
 rustup component add llvm-tools-preview --toolchain 1.99.0
 python3 -B scripts/perf/server_pgo.py \
   --output captures/server-pgo-final \
-  --clients 750 --minimum-clients 250 \
+  --clients 300 --minimum-clients 100 \
   --server-cpus 2-9 --client-cpus 10-15
 ```
 
@@ -45,7 +64,7 @@ remain failures even if the measured-window delta is zero.
 
 If training or either evaluation arm fails quality, retain that attempt and
 retry at a lower fixed population with new, separate training profiles. The
-750-client schedule is 750 -> 375 -> 250. Failed training is never merged.
+default schedule is 300 -> 150 -> 100; counts below 100 are rejected. Failed training is never merged.
 A lower-count pass qualifies only that count; it cannot certify a failed higher
 count. Every attempted run and failure appears in `PGO-VALIDATION.md`.
 If no count passes, exit nonzero and produce no distributable.
@@ -62,7 +81,8 @@ or imply that PGO improved every metric.
 ## CI and artifact workflow
 
 All actions in `.github/workflows/server-pgo.yml` are pinned to full commit
-hashes. The workflow runs a four-client end-to-end smoke check on
+hashes. The workflow runs a short 300-client end-to-end smoke check (falling back
+to 150, then 100 if needed) on
 relevant PRs. It tests instrumentation, training, merge, use and strict A/B.
 Smoke mode never packages or establishes workload capacity.
 

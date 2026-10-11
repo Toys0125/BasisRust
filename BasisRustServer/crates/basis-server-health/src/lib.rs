@@ -243,7 +243,8 @@ pub struct ImageMetrics {
 pub struct ExtendedHealthMetrics {
     pub reliable: ReliableMetrics,
     pub app_messages: AppMessageMetrics,
-    pub upload_budget: UploadBudgetMetrics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_budget: Option<UploadBudgetMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<ImageMetrics>,
     pub raw_udp: RawUdpMetrics,
@@ -609,8 +610,10 @@ mod tests {
 
     #[test]
     fn health_exposes_upload_admission_and_image_exemption() {
+        let disabled = serde_json::to_value(ExtendedHealthMetrics::default()).unwrap();
+        assert!(disabled.get("uploadBudget").is_none());
         let metrics = ExtendedHealthMetrics {
-            upload_budget: UploadBudgetMetrics {
+            upload_budget: Some(UploadBudgetMetrics {
                 bytes_per_second_per_player: 131072,
                 burst_seconds: 2,
                 accepted_messages: 4,
@@ -621,7 +624,7 @@ mod tests {
                 oversized_reliable_messages: 0,
                 image_exempt_messages: 3,
                 image_exempt_bytes: 600000,
-            },
+            }),
             ..ExtendedHealthMetrics::default()
         };
         let json = serde_json::to_value(metrics).unwrap();

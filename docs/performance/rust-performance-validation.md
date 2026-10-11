@@ -66,7 +66,7 @@ admission, six fragment/lifecycle cases, nonblocking queue retry, client fragmen
 receive and health telemetry. Reports retain their exact scopes. Later
 measurement-only commits did not claim new Rust unit tests.
 
-Current Rust 1.99.0 workspace verification: server **389 passed, four ignored**;
+Pre-feature-split Rust 1.99.0 workspace verification: server **389 passed, four ignored**;
 client **137 passed, two ignored**; zero failures. Both workspaces pass formatting.
 Final Python benchmark suites: **93 tests, four platform skips**, including 16
 PGO admission/provenance/fallback tests. Both workspaces pass all-targets Clippy
@@ -117,3 +117,38 @@ validate. Server/client and PGO measurement inputs remain unchanged, so the
 Focused CodeRabbit follow-up: the historical runner review completes with zero
 findings; the pinned workflow review completes with zero findings and an
 unverified-findings warning. No unqualified clean-review claim is made.
+
+## Benchmark telemetry feature and smaller defaults — 2026-10-11
+
+`benchmark-validation` is opt-in on the core/console crates. Normal builds have
+no Scene diagnostic counter storage/reference-counted counter handles and no
+upload diagnostic atomics; compile-time size assertions enforce that separation.
+Actual per-peer Scene permits and upload token/debt admission remain active.
+Snapshots, detailed status and extended health `sceneBatch` / `uploadBudget`
+require the feature; unavailable fields are omitted rather than filled with zero.
+Other existing health telemetry remains available. Core unit tests also enable
+counters to retain their admission/frame-conservation assertions.
+
+The supported PGO driver enables identical validation features in all server
+stages, checks Cargo feature fingerprints and reports that requirement. Both
+ordinary qualification and PR smoke default to 300 clients with 300 -> 150 -> 100
+fallback; counts below 100 are rejected. Smoke still uses 3-second warmup,
+10-second measurement windows, two training processes and four evaluations,
+and cannot publish. Full qualification retains 45/60-second timings and eight
+evaluations. Workload, receipt/provenance/error gates and fallback isolation
+are unchanged.
+
+Focused checks: Rust 1.99.0 core/health **162 tests pass in each feature mode**;
+core/console/health all-targets Clippy with warnings denied passes in both modes;
+default and feature-enabled console builds and server formatting pass. Live
+HTTP checks with extended metrics and 3-ms batching confirm both fields are
+omitted without the feature and present with it, with clean shutdowns. Python
+**94 tests, four platform skips** pass, including 17 PGO guard/default tests;
+workflow YAML/default wiring validates. A focused CodeRabbit review returns
+zero findings with an unverified-findings warning.
+
+CI on `be56000` passed all tests, including the former four-client PGO smoke,
+before this change. New-head CI must validate the changed feature-enabled PGO
+build and 300-client smoke. Earlier 375-client measurements and its package
+remain evidence for their exact recorded source, not qualification of this
+changed source; regenerate profiles. No new capacity or speedup claim is made.
