@@ -2,7 +2,7 @@
 
 **0/8 runs passed the original strict gates.** This cohort changes evaluation population from 1,500 to 750 while reusing the exact ordinary server, PGO server, ordinary Rust client, and diagnostic 250-client training profile. All eight runs failed scene delivery and exceeded the server shutdown deadline. This remains an overload diagnostic, with every attempt retained.
 
-[Portable evidence](results/pgo-mixed-client750-20261010-summary.json) retains strict flags, raw observer/sender/counter CSV data, process and health samples, readiness, commands, binary/tool/profile hashes, and continuation source. Full local artifacts are in `captures/pgo-mixed-client750-20261010`; reused builds/profiles remain in `captures/pgo-mixed-client1500-20261010`.
+local evidence (`captures/pr-pgo-implementation-20261011/raw-results/pgo-mixed-client750-20261010-summary.json`) retains strict flags, raw observer/sender/counter CSV data, process and health samples, readiness, commands, binary/tool/profile hashes, and continuation source. Full local artifacts are in `captures/pgo-mixed-client750-20261010`; reused builds/profiles remain in `captures/pgo-mixed-client1500-20261010`.
 
 ## Matched observations
 

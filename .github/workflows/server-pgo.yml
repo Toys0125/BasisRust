@@ -1,0 +1,96 @@
+name: Server PGO
+
+on:
+  pull_request:
+    paths:
+      - 'BasisRustServer/**'
+      - 'BasisRustClient/**'
+      - 'scripts/perf/**'
+      - '.github/workflows/server-pgo.yml'
+  workflow_dispatch:
+    inputs:
+      clients:
+        description: Initial qualification population
+        type: string
+        default: '750'
+        required: true
+      minimum_clients:
+        description: Lowest fallback population (failed higher runs remain recorded)
+        type: string
+        default: '250'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Server PGO end-to-end smoke
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.0'
+          components: llvm-tools-preview
+      - name: Test PGO admission, provenance and fallback guards
+        run: python3 -B -m unittest discover -s scripts/perf -p 'test_server_pgo*.py'
+      - name: Exercise instrument, train, merge, use and strict A/B
+        run: python3 -B scripts/perf/server_pgo.py --output captures/ci-server-pgo --smoke
+      - name: Retain smoke summary only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-pgo-smoke-summary
+          path: captures/ci-server-pgo/PGO-VALIDATION.md
+          if-no-files-found: warn
+
+  qualified-build:
+    name: Qualify native Linux x64 PGO artifact
+    if: github.event_name == 'workflow_dispatch'
+    # A dedicated runner avoids competing jobs during capacity qualification.
+    # Register a Linux x64 runner with this label and at least 16 logical CPUs.
+    runs-on: [self-hosted, Linux, X64, basis-pgo]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.0'
+          components: llvm-tools-preview
+      - name: Build and qualify with lower-count fallback
+        env:
+          PGO_CLIENTS: ${{ inputs.clients }}
+          PGO_MINIMUM_CLIENTS: ${{ inputs.minimum_clients }}
+          PGO_OUTPUT: ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          python3 -B scripts/perf/server_pgo.py \
+            --output "$PGO_OUTPUT" \
+            --clients "$PGO_CLIENTS" --minimum-clients "$PGO_MINIMUM_CLIENTS" \
+            --server-cpus 2-9 --client-cpus 10-15
+      - name: Upload qualified PGO server
+        uses: actions/upload-artifact@v4
+        with:
+          name: basisrust-server-linux-x64-pgo
+          path: ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}/dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+      - name: Retain qualification summary, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-pgo-qualification-summary
+          path: ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}/PGO-VALIDATION.md
+          if-no-files-found: warn

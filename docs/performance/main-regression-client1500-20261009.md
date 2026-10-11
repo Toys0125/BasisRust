@@ -6,7 +6,7 @@ Client CPU fell **30.32%**, with all four matched pairs improving by 29–31%. T
 
 **The original strict series remains invalid:** all eight corrected runs fail only the cumulative absolute-zero retransmit gate. Those counts were already present at population readiness and stayed constant through all measurement samples. All other 33 gates pass. The separate steady-window checks pass 8/8 but do not change original validity.
 
-[Retained evidence](results/main-regression-client1500-20261009-summary.json) includes every corrected and preliminary attempt, raw inputs used for metrics/gates, strict flags, supplemental checks, provenance and hashes.
+local evidence (`captures/pr-pgo-implementation-20261011/raw-results/main-regression-client1500-20261009-summary.json`) includes every corrected and preliminary attempt, raw inputs used for metrics/gates, strict flags, supplemental checks, provenance and hashes.
 
 ## Corrected results
 

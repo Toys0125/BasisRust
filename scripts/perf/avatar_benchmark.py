@@ -403,4 +403,4 @@ def run_workload(args, output, server_env, client_env):
 
 
 def relevant_env(env):
-    return {key: value for key, value in sorted(env.items()) if key.startswith('BASIS_') or key in ('RAYON_NUM_THREADS', 'TOKIO_WORKER_THREADS')}
+    return {key: value for key, value in sorted(env.items()) if key.startswith('BASIS_') or key in ('RAYON_NUM_THREADS', 'TOKIO_WORKER_THREADS', 'MaxUploadBytesPerSecondPerPlayer')}

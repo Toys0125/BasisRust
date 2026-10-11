@@ -12,7 +12,7 @@ isolated Git snapshots with locked dependencies, Rust 1.99.0 GNU release and two
 jobs. Client source trees are identical; the shared client uses the candidate transport
 dependency and remains unchanged across both server variants. Complete build commands,
 revisions, compiler/OS/CPU metadata and binary/config/tool hashes are in
-[the retained evidence](results/branch-client250-20261008-summary.json).
+local evidence (`captures/pr-pgo-implementation-20261011/raw-results/branch-client250-20261008-summary.json`).
 
 ## Fixed workflow
 

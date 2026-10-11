@@ -54,4 +54,4 @@ Tables are medians of two processes per arm, not pooled percentiles. Scene recei
 - `extended.uploadBudget` exposes accepted/rejected messages and bytes, reliable rejection, oversized reliable admission and image exemption. Counters remain active even when extended health collection is disabled. Upload status text respects verbose/extended metrics settings.
 - The nonbinding workload tests the cost and behavior of enabled admission below the limit. Deterministic tests verify actual burst/refill/overflow enforcement; this does not measure photo fanout, rate-abusing peers, internet packet loss or a general capacity guarantee. One host on loopback and one receiver observer limit inference. Existing batched Scene app-output accounting limitation remains.
 
-[Portable evidence](results/client-upload-limit-client750-20261010-summary.json). Local captures: `captures/client-upload-limit-client750-20261010`.
+local evidence (`captures/pr-pgo-implementation-20261011/raw-results/client-upload-limit-client750-20261010-summary.json`). Local captures: `captures/client-upload-limit-client750-20261010`.

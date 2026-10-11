@@ -1,5 +1,22 @@
 # Laptop agent handoff — branch optimization
 
+## Supported PGO workflow and PR preparation — 2026-10-11
+
+The [supported PGO builder](server-pgo.md) freezes source/toolchain/flags and
+benchmark controls, trains twice, validates ordinary/PGO ABBA/BAAB processes and
+packages only when every gate passes. Invalid training is never merged. Failed
+higher populations remain visible while fresh lower-count attempts retrain;
+the default schedule is 750 -> 375 -> 250. Smoke mode cannot publish a binary.
+PR CI exercises the complete four-client path; manual artifact qualification
+uses a dedicated native Linux x64 runner. Ordinary release defaults are unchanged.
+
+[All Rust validation results](rust-performance-validation.md) consolidate the
+benchmark history and current correctness checks. Raw branch-added benchmark
+JSON is archived locally and excluded from the final PR diff. Historical
+commits are preserved. The prior 750-client PGO profile remains diagnostic only.
+A fresh supported-pipeline qualification starts at 375, falling back to 250,
+because the previous 750-client training failed.
+
 ## C# gate check with final Rust client — 2026-10-11
 
 The [fresh C# check](csharp-final-client750-20261011.md) reuses the established
@@ -276,7 +293,7 @@ not a complete published comparison.
 
 Full totals, per-pass counters, individual run timings, source/harness/binary
 hashes and assembly probes are checked in at
-`docs/performance/results/branch-review-20261007-summary.json`.
+`captures/pr-pgo-implementation-20261011/raw-results/branch-review-20261007-summary.json`.
 
 ## Laptop work
 

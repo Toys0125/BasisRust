@@ -135,7 +135,7 @@ fn parse_property_dispatch_phase() {
     let mut rng = XorShift64::new(0x9E37_79B9_7F4A_7C15);
     let mut headers = Vec::with_capacity(PROPERTY_OPS);
     for index in 0..PROPERTY_OPS {
-        let property = if rng.next() % 100 == 0 {
+        let property = if rng.next().is_multiple_of(100) {
             19 + (index % 13) as u8
         } else {
             (index % 19) as u8
@@ -171,7 +171,7 @@ fn parse_message_phase() {
         packet.extend_from_slice(&0u16.to_le_bytes());
         packet.push((index % 8) as u8);
         packet.extend(std::iter::repeat_n(0u8, payload_len));
-        if rng.next() % 100 == 0 {
+        if rng.next().is_multiple_of(100) {
             packet.truncate(2);
         }
         packets.push(packet);

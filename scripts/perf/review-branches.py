@@ -69,6 +69,13 @@ def main():
         git += [f"--git-dir={args.git_dir.resolve()}"]
     revisions = {name: command(git + ["rev-parse", ref], capture_output=True, text=True).stdout.strip()
                  for name, ref in (("baseline", args.baseline), ("candidate", args.candidate))}
+    changed = command(git + ["diff", "--name-only", revisions["baseline"], revisions["candidate"],
+                             "--", "BasisRustServer"], capture_output=True, text=True).stdout.splitlines()
+    allowed = {"BasisRustServer/crates/basis-transport/src/" + name
+               for name in ("lib.rs", "bench_branches.rs", "bench_pmc.rs")}
+    if any(name not in allowed for name in changed):
+        raise ValueError("Branch microbenchmark refs differ outside overlaid transport/benchmark files; "
+                         "use a full-revision benchmark instead")
     archive = output / "source.tar"
     command(git + ["archive", revisions["candidate"], "BasisRustServer", "-o", archive])
     source = output / "source"

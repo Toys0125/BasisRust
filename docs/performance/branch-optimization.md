@@ -2,7 +2,7 @@
 
 **Historical report — follow-up review:** see
 [the laptop handoff](branch-optimization-handoff.md) and
-[measured counters](results/branch-review-20261007-summary.json). WSL counters
+local evidence (`captures/pr-pgo-implementation-20261011/raw-results/branch-review-20261007-summary.json`). WSL counters
 were subsequently measured. The original decoder already compiled to a
 branchless compare/conditional move in the inspected probe; the jump-table
 rationale below is incorrect for Rust 1.99.0. The timing/layout interpretation
@@ -160,7 +160,7 @@ Eight processes per variant ran sequentially in four ABBA/BAAB blocks, pinned to
 with nine measured passes per phase after one warmup. All 864 counter samples had 100%
 scheduling coverage and matched workload outcomes. Full per-run timings, samples, totals,
 hashes and assembly probes are retained in
-[the desktop evidence](results/branch-review-20261007-summary.json).
+local evidence (`captures/pr-pgo-implementation-20261011/raw-results/branch-review-20261007-summary.json`).
 
 The decoder had 36.3% more misses/op and median timing increased from 0.580 to 0.660 ns/op.
 ACK/refill misses/op fell 47.6%, while median timing increased 2.1%. These mixed observations

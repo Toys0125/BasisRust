@@ -361,7 +361,7 @@ def rank(runs, lanes, repeats):
         for control in lanes:
             if candidate == control:
                 continue
-            changes = [{k: 100 * (a['metrics'][k] / b['metrics'][k] - 1) for k in keys}
+            changes = [{k: (100 * (a['metrics'][k] / b['metrics'][k] - 1) if b['metrics'][k] else None) for k in keys}
                        for a, b in zip(grouped[candidate], grouped[control])]
             matched_input = all(abs(c['inbound_updates_per_second']) <= 5 and abs(c['sender_socket_items_per_second']) <= 5 for c in changes)
             no_dropped_work = all(c['built_logical_avatar_work_per_second'] >= 0 and c['observer_applied_items_per_second'] >= 0 for c in changes)

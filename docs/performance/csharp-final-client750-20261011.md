@@ -61,6 +61,6 @@ python3 -B captures/csharp-final-client750-20261011/run-csharp.py \
   --clients 750 --runs 2 --scene-interval-ms 200
 ```
 
-Local capture root: `captures/csharp-final-client750-20261011`. [Portable evidence](results/csharp-final-client750-20261011-summary.json) retains every attempt, strict flag, unavailable check, raw observer/sender/Scene CSV, native health/CPU/RSS samples, commands, prepared/saved configuration, actual loaded-runtime and binary hashes, source/build provenance and local controller sources.
+Local capture root: `captures/csharp-final-client750-20261011`. local evidence (`captures/pr-pgo-implementation-20261011/raw-results/csharp-final-client750-20261011-summary.json`) retains every attempt, strict flag, unavailable check, raw observer/sender/Scene CSV, native health/CPU/RSS samples, commands, prepared/saved configuration, actual loaded-runtime and binary hashes, source/build provenance and local controller sources.
 
 Two fresh processes on one loopback laptop and one observer establish failure for this tested C# reference/configuration. They do not establish a universal C# capacity limit, 20-Hz or photo-transfer capacity. The 1000-Mbit/s reference is informational, not a traffic shaper.

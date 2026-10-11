@@ -1,0 +1,90 @@
+# Rust performance validation
+
+This branch adds bounded Scene relay admission and 3-ms batching, a configurable
+128-KiB/s per-peer upload budget before fanout, fragment lifecycle fixes after
+merging main, native admission/image telemetry, reproducible benchmarks and an
+opt-in qualified PGO build. It also retains branch/decoder changes whose measured
+benefit was mixed. No broad branch-speedup or universal capacity claim is made.
+
+Latest fetched main is `f30b248329b213278153bee09995987a66b1a16d`; it is merged.
+The previously measured final server tree was `693858532d09d00e67803caa9d9b8222e9605cf5`.
+All A/B comparisons kept each experiment's workload and client fixed. Separate
+experiments changed populations or Scene rates explicitly. Failed runs are
+retained; setup retransmits still fail the absolute-zero gate. Percent changes
+below are candidate relative to its matched baseline, not cross-experiment gains.
+
+## Rust benchmark history
+
+| Experiment | Strict results and user-facing outcome | Interpretation |
+| --- | --- | --- |
+| [Desktop branch microbench](branch-optimization.md), [laptop repeat](branch-optimization-laptop.md) | Desktop mixed. Laptop: 864 samples, matched outcomes and full coverage; decoder +1.20% time, parsing -4.09%, other phases mixed. Decoder-only revert: decoder +0.40%, parsing +4.61%; rejected. | Synthetic results do not establish an application speedup. |
+| [250-client branch A/B](branch-client250-20261008.md) | Eight fresh processes pass. Avatar p95 gap +0.39%, built logical work -0.50%, CPU approximately unchanged; CPU per million sends +0.87%. | No measured branch speedup. |
+| [Initial 250-client PGO](pgo-client250-20261008.md) | Two valid training processes and all eight evaluation processes pass. CPU -4.53%, CPU/work -4.96%, work +0.41%, avatar p95 -0.30%. | CPU-efficiency observation; cadence comparisons mixed. |
+| [1500-client PGO](pgo-client1500-20261008.md) | 0/8 strict passes due to cumulative setup retransmits; other 33 gates pass. Avatar p95 426.430 -> 416.005 ms, work +1.90%, CPU -0.58%, CPU/work -2.32%. | Diagnostic, not a validated win. |
+| [Main regression, 1500 clients](main-regression-client1500-20261009.md) | 0/8 strict, setup retransmits only. Avatar p95 411.755 -> 407.455 ms (-1.04%), work +1.59%, server CPU +0.43%, client CPU -30.32%; peak server RSS +6.00 MiB (+2.56%). | No failed run is promoted to evidence of a pass. |
+| [Fresh-main 1500 PGO](pgo-main-client1500-20261009.md), [repeat](pgo-main-client1500-20261009-rerun.md) | Each 0/8 strict due to setup retransmits; remaining gates pass. First: work +3.98%, CPU -0.16%, CPU/work -3.68%, avatar p95 -2.43%. Repeat: work +6.05%, CPU +0.51%, CPU/work -5.17%, avatar p95 -3.31%. | Descriptive, no validated series win. |
+| [Mixed 1500 PGO, 20-Hz Scene](pgo-mixed-client1500-20261010.md) | 0/8. All server shutdown deadlines fail; Scene receipt about 1.20%, received Scene p95 bound 67.109 s, avatar gaps about 967-972 ms. The 250-client profile training also fails Scene receipt (about 54%) and one shutdown. | Overload; profile diagnostic only. |
+| [Mixed 750 PGO, 20-Hz Scene](pgo-mixed-client750-20261010.md) | 0/8 on Scene/quality and some shutdown gates. | Lower population alone did not resolve that heavy workload. |
+| [Scene relay investigation](scene-receipt-investigation-20261010.md) | At 750 clients, 5-Hz Scene receipt 22.770% -> 99.976%; candidate 2/2 strict, baseline fails shutdown/Scene. At 20 Hz: 5.681% -> 46.025%, 0/4. | Batching improves the supported 5-Hz case; 20 Hz remains overloaded. |
+| [3-ms batching](scene-batch3-client750-20261010.md) | At 20 Hz, 2/3-ms cases both about 46% receipt and all invalid. At 5 Hz all four pass, receipt 99.95-100%. | Small screening sample supports 3 ms for this workload. |
+| [Peer Scene quota](scene-peer-limit-client750-20261010.md) | Quota 70 deliberately rejects work, about 11% receipt and no pass. Quota 1024 at 5 Hz: 1/2 strict (setup retransmit), 99.949% receipt, zero rejects. | Bounded queues prevent unbounded backlog; dropped work is never counted as a performance win. |
+| [128-KiB/s upload cap](client-upload-limit-client750-20261010.md) | All four processes pass. Scene receipt 100% / 99.868%; avatar p95 476.100 / 494.425 ms (+3.85%), CPU +0.15%, zero upload rejects. | Two per arm; confirms admission compatibility, no speedup/image-capacity claim. |
+| [Final main pull, 750 clients](final-main-client750-20261010.md) | 2/2 per arm pass. Scene 100% / 99.943%, p95 bound 131.071 ms both. CPU 5.443 / 5.458 cores (+0.28%); avatar p95 487.180 / 505.725 ms (+3.81%). Paired CPU/gap direction reverses. | No consistent regression observed; small sample limits assurance. |
+| [Final-source PGO, 750 clients](pgo-final-client750-20261011.md) | Ordinary 3/4, PGO 4/4. Training fails on 42 and 11 cumulative setup retransmits; profile diagnostic only. CPU 5.444 -> 5.410 cores (-0.63%); avatar p95 558.090 -> 494.775 ms (-11.34%); Scene 99.952% -> 99.924%, p95 bound 131.071 ms both; applied avatar items +10.47%. | Not a qualified PGO win despite passing PGO evaluations. |
+
+The mixed final workload is 750 clients, 20-ms avatar updates, Unity-policy 60-FPS
+poses, 128 extra avatar bytes and 128-byte Scene payloads at 5 Hz, voice off,
+CPU-only processing, 3-ms batching, quota 1024 and upload 131072 B/s per peer.
+Every final 750-client process retained all clients/all 749 Scene senders,
+zero upload/Scene rejection, zero image work/drop counters and clean exits.
+Received Scene latency excludes lost messages; receipt must be considered with it.
+
+Historical [voice isolation checks](voice-isolation.md), already integrated in
+main, also remain available: original server 284 tests passed (one ignored),
+client 98 passed, Clippy and release/format checks passed. Dense 100-speaker
+receipt reached 97.9%, below the 99% capacity screen; 1000 speakers remained
+overloaded (59.2%). Memory stayed bounded; the avatar-only control passed.
+Those older packet-count observations cannot pass the newer all-client unique
+receipt screen and do not qualify PGO, voice or photo capacity for this PR.
+
+## C# reference gates
+
+[C# with the final Rust client](csharp-final-client750-20261011.md) passes a
+four-client preflight, then fails both fresh 750-client 5-Hz runs. Scene receipt
+median 71.584% (gate >=95%), received p95 bound 524.287 ms, avatar p95 median
+1729.560 ms and native unreliable drops about 1.010M counter units/s. Full
+population/sender coverage and clean exits do not offset dropped work. C# keeps
+its native worker/queue policy and .NET tiered PGO; 17 Rust-specific unavailable
+checks are reported unavailable. This sequential reference is not interleaved
+cross-server A/B and does not establish general C# capacity.
+
+## Correctness and tooling verification
+
+Historical focused checks covered branch packet/transport behavior, 117 server
+core tests and two live client Scene tests during batching, upload/image
+admission, six fragment/lifecycle cases, nonblocking queue retry, client fragment
+receive and health telemetry. Reports retain their exact scopes. Later
+measurement-only commits did not claim new Rust unit tests.
+
+Current Rust 1.99.0 workspace verification: server **389 passed, four ignored**;
+client **137 passed, two ignored**; zero failures. Both workspaces pass formatting.
+Final Python benchmark suites: **93 tests, four platform skips**, including 16
+PGO admission/provenance/fallback tests. Both workspaces pass all-targets Clippy
+with warnings denied after fixing four new-Rust test/benchmark-only lints.
+The optional GPU-feature console compiles and passes all-targets Clippy with
+warnings denied. Eight focused upload/status tests
+pass again after the reviewed status-formatting change. Fresh lower-count PGO qualification
+results are appended after execution.
+
+Two CodeRabbit review rounds covered changed server and benchmark tooling.
+Three major tooling findings and a minor status-formatting finding were fixed;
+follow-up minor missing-telemetry reporting and upload-debt documentation issues
+were also addressed. The first server review completed with an unverified-findings
+warning; no unqualified clean-review claim is made. Ordinary releases remain the default; the supported
+[PGO pipeline](server-pgo.md) rejects failed training before merging profiles,
+retries lower populations independently and packages only a fully passing count.
+
+Raw benchmark JSON is excluded from the final PR diff and packages. Prior raw
+results are preserved locally under
+`captures/pr-pgo-implementation-20261011/raw-results/`; reports provide the
+reviewable summaries. Historical Git commits were not rewritten.

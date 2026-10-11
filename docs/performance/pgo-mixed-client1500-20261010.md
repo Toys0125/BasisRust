@@ -2,7 +2,7 @@
 
 This cohort adds **128 additional avatar bytes** and **128-byte unreliable scene broadcasts every 50 ms** to the dense 20 ms, Unity-policy 60 FPS workload. **0/8 evaluation runs passed the original strict gates.** Treat these measurements as an overload diagnostic: failed scene delivery or avatar quality prevents a clean PGO speedup claim. Every failed attempt and slow trial is retained.
 
-[Portable evidence](results/pgo-mixed-client1500-20261010-summary.json) contains strict flags, raw scene/avatar/sender/global-counter CSV data, process and relevant health samples, readiness, commands, training outcomes, profile/build/tool hashes, and supplemental controller source. Binaries, profiles, and full logs remain locally in `captures/pgo-mixed-client1500-20261010`.
+local evidence (`captures/pr-pgo-implementation-20261011/raw-results/pgo-mixed-client1500-20261010-summary.json`) contains strict flags, raw scene/avatar/sender/global-counter CSV data, process and relevant health samples, readiness, commands, training outcomes, profile/build/tool hashes, and supplemental controller source. Binaries, profiles, and full logs remain locally in `captures/pgo-mixed-client1500-20261010`.
 
 ## Matched observations
 

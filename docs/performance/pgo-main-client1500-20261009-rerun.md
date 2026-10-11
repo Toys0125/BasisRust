@@ -6,7 +6,7 @@ This is a **fresh profile on the merged source**: two separate 250-client traini
 
 **Original strict evaluation validity: 0/8.** Separate steady-window checks pass 8/8. Cumulative retransmit counters and every original gate are retained; the supplemental checks do not overwrite strict invalid flags. Details follow below.
 
-[Retained evidence](results/pgo-main-client1500-20261009-rerun-summary.json) includes all training/evaluation attempts, raw metrics/gate inputs, original flags, compiler/profile/build provenance, hashes and supplemental controller source.
+local evidence (`captures/pr-pgo-implementation-20261011/raw-results/pgo-main-client1500-20261009-rerun-summary.json`) includes all training/evaluation attempts, raw metrics/gate inputs, original flags, compiler/profile/build provenance, hashes and supplemental controller source.
 
 ## Evaluation results
 

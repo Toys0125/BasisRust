@@ -38,7 +38,7 @@ original match and a table load for the candidate, with no baseline indirect jum
 The probes do not represent every production call site.
 
 Full run timings, per-pass counters, workload totals, hashes, environment and assembly:
-[original laptop evidence](results/branch-review-laptop-20261007-summary.json).
+local evidence (`captures/pr-pgo-implementation-20261011/raw-results/branch-review-laptop-20261007-summary.json`).
 
 ```sh
 RUSTUP_TOOLCHAIN=1.99.0 python3 scripts/perf/review-branches.py \
@@ -73,7 +73,7 @@ retained; their general benefit remains unproven. The rejected revision stays in
 history so its evidence remains reproducible. Final changes correct the table rationale,
 fresh-ID frequency, benchmark comment, report claims and runner failure diagnostic.
 
-[Decoder-alternative evidence](results/branch-review-laptop-decoder-20261007-summary.json)
+local evidence (`captures/pr-pgo-implementation-20261011/raw-results/branch-review-laptop-decoder-20261007-summary.json`)
 contains every run, per-pass sample, total, hash, outcome and probe.
 
 ```sh

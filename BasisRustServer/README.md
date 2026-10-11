@@ -17,6 +17,10 @@ retain their tick and flush workers. See the
 Requires Rust 1.95 or later. The Docker builder uses the exact 1.95.0 release;
 see [prerequisites](../README.md#prerequisites).
 
+Optional native Linux x64 [qualified PGO builds](../docs/performance/server-pgo.md)
+train with the Rust client and require passing matched ordinary/PGO gates.
+Ordinary builds retain their current defaults.
+
 ```powershell
 cargo run -p basis-server-console -- --base-dir . --config config/config.xml
 ```
@@ -126,7 +130,7 @@ headers, retries and protocol/control traffic are excluded. It allows a two-seco
 burst. Excess unreliable/sequenced data is dropped and counted; excess reliable
 data disconnects that connection with an explicit reason. A reliable frame larger
 than the burst can spend from a full bucket and must repay its complete byte cost
-before another such frame is admitted. Smaller data can resume as debt is repaid.
+before another such frame is admitted. Other data resumes only after that debt is fully repaid and new credit has accrued.
 
 `BasisImagePickupManager` Scene traffic remains exempt and uses the separately
 advertised image allowance. Rust enforces the separate image fanout governor and cached replay limits

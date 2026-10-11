@@ -71,8 +71,10 @@ impl Counters {
         let mut bytes = [0u8; 40];
         self.leader.read_exact(&mut bytes)?;
         let values: Vec<u64> = bytes
-            .chunks_exact(8)
-            .map(|chunk| u64::from_ne_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| u64::from_ne_bytes(*chunk))
             .collect();
         if values[0] != 2 || values[2] == 0 || values[3] == 0 {
             return Err(io::Error::other("perf group returned missing/zero counts"));

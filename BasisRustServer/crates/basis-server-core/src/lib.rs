@@ -863,10 +863,11 @@ impl ServerState {
 
     pub fn status_text_with_detail(&self, verbose: bool) -> String {
         let mut text = self.base_status_text_with_detail(verbose);
-        if verbose && self.config.read().health_include_extended_metrics {
+        let detailed = verbose && self.config.read().health_include_extended_metrics;
+        if detailed {
             let upload = self.upload_budget_snapshot();
             text.push_str(&format!(
-                " UploadBudget: rate={}B/s/peer burst={}s accepted={}/{}B rejected={}/{}B reliable-rejected={} oversized-reliable={} image-exempt={}/{}B",
+                "\nUploadBudget: rate={}B/s/peer burst={}s accepted={}/{}B rejected={}/{}B reliable-rejected={} oversized-reliable={} image-exempt={}/{}B",
                 upload.bytes_per_second_per_player,
                 upload.burst_seconds,
                 upload.accepted_messages,
@@ -879,8 +880,8 @@ impl ServerState {
                 upload.image_exempt_bytes,
             ));
         }
-        if let Some(snapshot) = self.scene_relay_snapshot() {
-            text.push_str(&format!(" SceneBatch: {snapshot:?}"));
+        if let Some(snapshot) = self.scene_relay_snapshot().filter(|_| detailed) {
+            text.push_str(&format!("\nSceneBatch: {snapshot:?}"));
         }
         text
     }

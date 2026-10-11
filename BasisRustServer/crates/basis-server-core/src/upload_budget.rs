@@ -615,7 +615,7 @@ mod tests {
                 .chunks(RELIABLE_FRAGMENT_PAYLOAD_SIZE)
                 .collect::<Vec<_>>();
             let total = chunks.len() as u16;
-            assert!(total >= 2 && total <= 128);
+            assert!((2..=128).contains(&total));
             for (part, chunk) in chunks.iter().enumerate() {
                 let mut packet =
                     Vec::with_capacity(LITENETLIB_FRAGMENTED_HEADER_SIZE + chunk.len());
