@@ -1,5 +1,30 @@
 # Laptop agent handoff — branch optimization
 
+## Final main pull and regression benchmark — 2026-10-10
+
+Merged latest fetched main `f30b248329b213278153bee09995987a66b1a16d` at
+`48163a20b05fc9eeb0cad982b1905aab4ed88e35`. Preserves upload/Scene controls alongside the
+new image governor/cache and fragment receive support. Fixed invalid-fragment
+lifecycle cleanup, nonblocking full-queue retry and explicit malformed-header
+rejection; focused tests pass. Added optional native image health counters.
+The earlier statement that Rust lacks a server image governor applies to the
+pre-pull revision; the merged server now enforces it and cached replay limits.
+
+The [final 750-client A/B](final-main-client750-20261010.md) compares pre-pull
+`97fd88e` against this merged server with one updated final Rust client shared
+between arms. Four fresh ABBA processes keep upload 131072 B/s, batching 3 ms,
+quota 1024, 20-ms avatar poses, 128 extra avatar/Scene bytes, Scene 5 Hz, voice off
+and CPU-only processing fixed. PGO off. Strict passes: 2/2 pre-pull,
+2/2 merged. Scene receipt medians: 100.000% /
+99.943%; p95 bounds both 131.071 ms. CPU:
+5.443 / 5.458 cores; avatar p95 gaps:
+487.180 / 505.725 ms. All 749 senders observed;
+zero upload/Scene quota rejection, merged image drop/cache counters zero.
+Two processes per arm limit regression conclusions; no 20-Hz or photo-capacity
+claim. Exact source/binary/client hashes, original flags and every review round
+are retained. Final transport review reports 0 findings with an unverified-findings
+warning; do not call it an unqualified clean review.
+
 ## Per-client upload budget — 2026-10-10
 
 `MaxUploadBytesPerSecondPerPlayer` now defaults to 131072 B/s (128 KiB/s)
