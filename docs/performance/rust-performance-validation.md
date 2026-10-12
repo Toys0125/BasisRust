@@ -152,3 +152,35 @@ before this change. New-head CI must validate the changed feature-enabled PGO
 build and 300-client smoke. Earlier 375-client measurements and its package
 remain evidence for their exact recorded source, not qualification of this
 changed source; regenerate profiles. No new capacity or speedup claim is made.
+
+## Automatic PGO release targets — implementation follow-up
+
+Marcus requested PGO for every released server target using GitHub-hosted
+runners. The standard build matrix now runs full per-target training and strict
+A/B qualification before staging any server binary. Native support covers GNU
+and musl Linux x64/ARM64, Windows x64 MSVC and macOS ARM64. Profiles cannot cross
+architectures, operating systems or GNU/musl targets. Docker continues consuming
+its static musl archives, which must now qualify independently. The distributed
+servers retain the validation feature; local plain Cargo releases remain ordinary.
+No self-hosted runner is required, and no ordinary-server fallback is published.
+
+The driver discovers host LLVM tools/executable suffixes, checks target/host
+compatibility, exports the validated server and exact shared client for the
+existing package layout, and adds build-target/compiler/executable hashes to
+Markdown. macOS process CPU/RSS sampling uses BSD `ps`; explicit macOS CPU sets
+are rejected. Windows Ctrl+Break now follows normal server drain/persistence so
+training profiles can flush. PGO adds a clean native server-exit gate; generic
+historical benchmark exit allowances do not qualify a new release artifact.
+
+Local checks: **100 Python tests, four platform skips**, including 20 PGO guards
+and three macOS sampler tests, pass. Eight console tests, console all-targets
+Clippy with warnings denied (validation feature), and server formatting pass.
+Real Rust 1.99.0 GNU and musl probes both instrument, execute, merge fresh
+profiles, build with profile use and reproduce output without diagnostics;
+these probes are compiler/tool checks, not application capacity measurements.
+Package tests verify exact validated binary/client export, checksums and absence
+of JSON/profiles. All six shipping targets have matching hosted PGO smoke
+matrix entries; workflow YAML/pins validate. Focused CodeRabbit review completes
+with zero findings. Native ARM64/Windows/macOS application qualification and the
+full automatic release packaging still require their new GitHub runs; previous
+Linux hosted smoke and 375-client results are historical evidence only.

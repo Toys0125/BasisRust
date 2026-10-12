@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from server_pgo import Pipeline, build_environment, populations, require_valid, parse_options
+from server_pgo import Pipeline, build_environment, populations, require_valid, parse_options, native_target, executable_name
 
 
 class PromotionTests(unittest.TestCase):
@@ -49,6 +49,57 @@ class PromotionTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 parse_options(['--output', '/tmp/pgo-options-test', '--smoke',
                                '--clients', '100', '--minimum-clients', '99'])
+
+    def test_profiles_cannot_cross_native_targets(self):
+        hosts = ['x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu',
+                 'x86_64-pc-windows-msvc', 'aarch64-apple-darwin']
+        for host in hosts:
+            self.assertEqual(native_target(host), host)
+            for other in hosts:
+                if host != other:
+                    with self.assertRaises(ValueError):
+                        native_target(host, other)
+        for arch in ['x86_64', 'aarch64']:
+            host = arch + '-unknown-linux-gnu'
+            self.assertEqual(native_target(host, arch + '-unknown-linux-musl'),
+                             arch + '-unknown-linux-musl')
+        self.assertEqual(executable_name('llvm-profdata', hosts[2]), 'llvm-profdata.exe')
+        self.assertEqual(executable_name('llvm-profdata', hosts[3]), 'llvm-profdata')
+
+    def test_package_exports_only_the_validated_pair_and_markdown(self):
+        from types import SimpleNamespace
+        from avatar_tuning import sha256
+        import tarfile
+        for target in ['x86_64-pc-windows-msvc', 'x86_64-unknown-linux-musl']:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                server = root / 'frozen-server'; server.write_bytes(b'validated PGO')
+                client = root / 'frozen-client'; client.write_bytes(b'shared client')
+                source = root / 'source/BasisRustServer'; source.mkdir(parents=True)
+                (source / 'Config.xml').write_text('<Configuration/>')
+                (root / 'PGO-VALIDATION.md').write_text('Valid test report')
+                pipeline = object.__new__(Pipeline)
+                pipeline.root = root; pipeline.source = root / 'source'; pipeline.target = target
+                pipeline.host_target = target.replace('-musl', '-gnu')
+                pipeline.options = SimpleNamespace(smoke=False)
+                pipeline.verify_source = lambda: None
+                binary = {'path': str(server), 'sha256': sha256(server)}
+                pipeline.client = {'path': str(client), 'sha256': sha256(client)}
+                good = [{'valid': True, 'checks': {'quality': True}}]
+                pipeline.manifest = {'selected_clients': 100, 'validated_binary': binary,
+                                     'attempts': [{'clients': 100, 'qualified': True,
+                                                   'training': good, 'evaluation': good}]}
+                pipeline.package(binary)
+                release = root / 'release'
+                self.assertEqual((release / executable_name('basis-server-console', target)).read_bytes(), server.read_bytes())
+                self.assertEqual((release / executable_name('basis-rust-client', pipeline.host_target)).read_bytes(), client.read_bytes())
+                for row in (release / 'SHA256SUMS').read_text().splitlines():
+                    digest, name = row.split('  ',1)
+                    self.assertEqual(sha256(release / name), digest)
+                with tarfile.open(next((root / 'dist').glob('*.tar.gz'))) as archive:
+                    self.assertEqual(set(archive.getnames()),
+                                     {executable_name('basis-server-console', target),
+                                      'Config.xml', 'PGO-VALIDATION.md', 'SHA256SUMS'})
 
     def test_inherited_flags_and_codegen_overrides_cannot_change_stages(self):
         with patch.dict(os.environ, {'CARGO_ENCODED_RUSTFLAGS': 'bad', 'RUSTFLAGS': 'bad',

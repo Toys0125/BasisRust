@@ -111,6 +111,8 @@ def summarize_pgo(path,experiment,entry):
         if any(isinstance(row[key],bool) or not isinstance(row[key],int) or row[key]<0 for key in fields):
             raise ValueError('Invalid image telemetry')
     result['image_observations']={'available':True,'first':rows[0],'last':rows[-1],'max':{key:max(row[key] for row in rows) for key in fields}}
+    meta=json.loads((path/'run.json').read_text())
+    result['checks']['clean_native_server_shutdown']=type(meta['server_exit_code']) is int and meta['server_exit_code']==0
     result['checks']['no_image_drops_or_cache_work']=all(row[key]==0 for row in rows for key in fields)
     result['valid']=all(result['checks'].values())
     return result

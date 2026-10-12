@@ -6,7 +6,10 @@ on:
       - 'BasisRustServer/**'
       - 'BasisRustClient/**'
       - 'scripts/perf/**'
+      - 'docs/performance/fixtures/**'
       - '.github/workflows/server-pgo.yml'
+      - '.github/workflows/build.yml'
+      - '.github/workflows/release.yml'
   workflow_dispatch:
     inputs:
       clients:
@@ -19,16 +22,48 @@ on:
         type: string
         default: '100'
         required: true
+      target:
+        description: Native server release target
+        type: choice
+        options:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-pc-windows-msvc
+          - aarch64-apple-darwin
+        default: x86_64-unknown-linux-gnu
 
 permissions:
   contents: read
 
 jobs:
   smoke:
-    name: Server PGO end-to-end smoke
+    name: Server PGO smoke (${{ matrix.target }})
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            musl: true
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: aarch64-apple-darwin
+            runner: macos-15
+    defaults:
+      run:
+        shell: bash
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -40,25 +75,32 @@ jobs:
         with:
           toolchain: '1.99.0'
           components: llvm-tools-preview
+          targets: ${{ matrix.target }}
+      - name: Install musl toolchain
+        if: matrix.musl == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
       - name: Test PGO admission, provenance and fallback guards
-        run: python3 -B -m unittest discover -s scripts/perf -p 'test_server_pgo*.py'
+        run: python -B -m unittest discover -s scripts/perf -p 'test_server_pgo*.py'
       - name: Exercise instrument, train, merge, use and strict A/B
-        run: python3 -B scripts/perf/server_pgo.py --output captures/ci-server-pgo --smoke
+        run: python -B scripts/perf/server_pgo.py --output captures/ci-server-pgo --target "${{ matrix.target }}" --smoke
       - name: Retain smoke summary only
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: server-pgo-smoke-summary
+          name: server-pgo-smoke-summary-${{ matrix.target }}
           path: captures/ci-server-pgo/PGO-VALIDATION.md
           if-no-files-found: warn
 
   qualified-build:
-    name: Qualify native Linux x64 PGO artifact
+    name: Qualify hosted native PGO artifact
     if: github.event_name == 'workflow_dispatch'
-    # A dedicated runner avoids competing jobs during capacity qualification.
-    # Register a Linux x64 runner with this label and at least 16 logical CPUs.
-    runs-on: [self-hosted, Linux, X64, basis-pgo]
-    timeout-minutes: 120
+    runs-on: ${{ inputs.target == 'x86_64-pc-windows-msvc' && 'windows-latest' || inputs.target == 'aarch64-apple-darwin' && 'macos-15' || startsWith(inputs.target, 'aarch64-unknown-linux-') && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -70,20 +112,26 @@ jobs:
         with:
           toolchain: '1.99.0'
           components: llvm-tools-preview
+          targets: ${{ inputs.target }}
+      - name: Install musl toolchain
+        if: endsWith(inputs.target, '-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
       - name: Build and qualify with lower-count fallback
         env:
           PGO_CLIENTS: ${{ inputs.clients }}
+          PGO_TARGET: ${{ inputs.target }}
           PGO_MINIMUM_CLIENTS: ${{ inputs.minimum_clients }}
           PGO_OUTPUT: ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          python3 -B scripts/perf/server_pgo.py \
-            --output "$PGO_OUTPUT" \
-            --clients "$PGO_CLIENTS" --minimum-clients "$PGO_MINIMUM_CLIENTS" \
-            --server-cpus 2-9 --client-cpus 10-15
+          python -B scripts/perf/server_pgo.py \
+            --output "$PGO_OUTPUT" --target "$PGO_TARGET" \
+            --clients "$PGO_CLIENTS" --minimum-clients "$PGO_MINIMUM_CLIENTS"
       - name: Upload qualified PGO server
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: basisrust-server-linux-x64-pgo
+          name: basisrust-server-${{ inputs.target }}-pgo
           path: ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}/dist/*.tar.gz
           if-no-files-found: error
           compression-level: 0

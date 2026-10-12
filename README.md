@@ -24,6 +24,12 @@ CARGO_BUILD_JOBS=2 cargo build --locked --release --manifest-path BasisRustServe
 CARGO_BUILD_JOBS=2 cargo build --locked --release --manifest-path BasisRustClient/Cargo.toml
 ```
 
+These local Cargo commands build ordinary releases. Automatic downloadable server
+releases use fresh, target-native PGO on GitHub-hosted runners for every platform,
+including the musl payloads used by Docker. Training and matched A/B validation
+must pass before a server artifact is uploaded; no ordinary-build fallback is
+published. See [server PGO builds](docs/performance/server-pgo.md).
+
 Start the server from the repository root:
 
 ```sh

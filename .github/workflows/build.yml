@@ -19,6 +19,7 @@ jobs:
   build:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -69,14 +70,17 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
+          toolchain: '1.99.0'
           targets: ${{ matrix.target }}
+          components: llvm-tools-preview
 
       - name: Install musl toolchain
         if: matrix.musl == true
@@ -89,33 +93,43 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes musl-tools
 
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+      - name: Install Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          workspaces: |
-            BasisRustServer -> target
-            BasisRustClient -> target
-          key: ${{ matrix.target }}
+          python-version: '3.12'
 
-      - name: Build server
-        run: cargo build --release --target ${{ matrix.target }} --manifest-path BasisRustServer/Cargo.toml -p basis-server-console
+      - name: Train and qualify target-native PGO server
+        shell: bash
+        env:
+          PGO_OUTPUT: ${{ runner.temp }}/server-pgo-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          PGO_TARGET: ${{ matrix.target }}
+        run: |
+          python -B scripts/perf/server_pgo.py \
+            --output "$PGO_OUTPUT" --target "$PGO_TARGET" \
+            --clients 300 --minimum-clients 100
 
-      - name: Build client
-        if: matrix.server_only != true
-        run: cargo build --release --target ${{ matrix.target }} --manifest-path BasisRustClient/Cargo.toml
+      - name: Retain PGO validation summary
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: pgo-validation-${{ matrix.id }}
+          path: ${{ runner.temp }}/server-pgo-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}/PGO-VALIDATION.md
+          if-no-files-found: warn
 
       - name: Stage package
         shell: bash
         env:
           SERVER_ONLY: ${{ matrix.server_only || 'false' }}
+          PGO_OUTPUT: ${{ runner.temp }}/server-pgo-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           mkdir -p package/server
-          cp "BasisRustServer/target/${{ matrix.target }}/release/basis-server-console${{ matrix.exe_suffix }}" package/server/
+          cp "$PGO_OUTPUT/release/basis-server-console${{ matrix.exe_suffix }}" package/server/
+          cp "$PGO_OUTPUT/release/PGO-VALIDATION.md" package/server/PGO-VALIDATION.md
           cp BasisRustServer/Config.xml package/server/Config.xml
           cp README.md package/README.md
           if [ "$SERVER_ONLY" != "true" ]; then
             mkdir -p package/client
-            cp "BasisRustClient/target/${{ matrix.target }}/release/basis-rust-client${{ matrix.exe_suffix }}" package/client/
+            cp "$PGO_OUTPUT/release/basis-rust-client${{ matrix.exe_suffix }}" package/client/
             cp BasisRustClient/Config.xml package/client/Config.xml
           fi
 
@@ -155,6 +169,20 @@ jobs:
                   raise SystemExit(f"{path} was not pretty-printed")
           PY
 
+      - name: Hash final release package contents
+        shell: bash
+        run: |
+          python - <<'PYHASH'
+          import hashlib
+          from pathlib import Path
+          root = Path('package')
+          rows = []
+          for path in sorted(root.rglob('*')):
+              if path.is_file():
+                  rows.append(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(root).as_posix()}\n')
+          (root / 'SHA256SUMS').write_text(''.join(rows), encoding='utf-8')
+          PYHASH
+
       - name: Package Windows build
         if: runner.os == 'Windows'
         shell: pwsh
@@ -166,7 +194,7 @@ jobs:
         run: tar -C package -czf "${{ matrix.archive }}" .
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: basisrust-${{ matrix.id }}
           path: ${{ matrix.archive }}

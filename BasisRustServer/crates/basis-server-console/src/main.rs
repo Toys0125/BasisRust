@@ -1062,13 +1062,13 @@ async fn async_main(
 
     // Keep the listener across timer polls so a delivered stop signal is not
     // discarded when the periodic branch wins select.
-    let stop_signal = tokio::signal::ctrl_c();
+    let stop_signal = shutdown::stop_signal();
     tokio::pin!(stop_signal);
     loop {
         tokio::select! {
             result = &mut stop_signal => {
                 if let Err(err) = result {
-                    warn!("failed to listen for Ctrl+C: {err}");
+                    warn!("failed to listen for stop signal: {err}");
                 }
                 running.store(false, Ordering::SeqCst);
                 break;

@@ -74,8 +74,8 @@ def parser():
 
 
 def validate(args):
-    if platform.system() not in ('Linux', 'Windows'):
-        raise ValueError('Only Linux /proc and Windows native process counters are supported')
+    if platform.system() not in ('Linux', 'Windows', 'Darwin'):
+        raise ValueError('Only native Linux, Windows and macOS process counters are supported')
     if args.output is None or args.output.exists():
         raise ValueError('--output must be a new directory')
     for index, key in enumerate(('warmup_seconds', 'window_seconds', 'repeats')):
@@ -122,6 +122,8 @@ def validate(args):
         raise ValueError('Fixture PeerLimit is lower than requested clients')
     for cpus in (args.server_cpus, args.client_cpus):
         if cpus:
+            if platform.system() == 'Darwin':
+                raise ValueError('macOS process CPU affinity is not supported; omit CPU sets')
             cpu_list(cpus)
             if os.name != 'nt' and not shutil.which('taskset'):
                 raise ValueError('Linux affinity requires taskset on PATH')

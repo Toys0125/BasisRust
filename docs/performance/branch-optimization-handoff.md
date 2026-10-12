@@ -1,5 +1,19 @@
 # Laptop agent handoff — branch optimization
 
+## Automatic hosted PGO releases — implementation follow-up
+
+Marcus requested PGO for every automatic server release without self-hosted
+runners. `build.yml` now runs full fresh PGO qualification for every server
+matrix target (Windows x64, macOS ARM64, GNU/musl Linux x64/ARM64), then stages
+only the validated server and shared client into the existing archives. Docker
+continues consuming musl archives, which now must qualify with their own PGO
+profiles. Failures block publishing rather than substituting ordinary servers.
+`server-pgo.yml` covers every target with hosted PR smoke and supports hosted
+manual qualification. No self-hosted runner or fixed 16-CPU affinity is needed.
+The new macOS sampler and Windows Ctrl+Break shutdown preserve native profiling
+and clean process teardown. See [current PGO policy](server-pgo.md).
+Historical reports below retain their exact measured source and prior policy.
+
 ## Supported PGO workflow and PR preparation — 2026-10-11
 
 The [supported PGO builder](server-pgo.md) freezes source/toolchain/flags and
@@ -8,7 +22,7 @@ packages only when every gate passes. Invalid training is never merged. Failed
 higher populations remain visible while fresh lower-count attempts retrain;
 the default schedule is 300 -> 150 -> 100 (minimum 100). Smoke mode cannot publish a binary.
 PR CI exercises the complete short 300-client path with fallback down to 100; manual artifact qualification
-uses a dedicated native Linux x64 runner. Ordinary release defaults are unchanged.
+used a dedicated native Linux x64 runner before the hosted release policy above.
 
 [All Rust validation results](rust-performance-validation.md) consolidate the
 benchmark history and current correctness checks. Raw branch-added benchmark

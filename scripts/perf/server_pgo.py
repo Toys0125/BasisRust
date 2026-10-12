@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, train and strictly qualify a native Linux x86-64 PGO server.
+"""Build, train and strictly qualify a native release-target PGO server.
 
 Every population attempt owns fresh profiles and A/B observations. Invalid
 training/evaluation is retained and retried at a lower fixed population; only a
@@ -24,7 +24,22 @@ from server_pgo_analysis import summarize_pgo
 import socket
 
 ROOT = Path(__file__).resolve().parents[2]
-TARGET = 'x86_64-unknown-linux-gnu'
+TARGETS = ('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu',
+           'x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl',
+           'x86_64-pc-windows-msvc', 'aarch64-apple-darwin')
+
+
+def native_target(host, requested=None):
+    target = requested or host
+    runnable = target == host or (host.endswith('-unknown-linux-gnu')
+                                 and target == host.removesuffix('-gnu') + '-musl')
+    if target not in TARGETS or not runnable:
+        raise ValueError(f'PGO requires a native release target: host={host}, target={target}')
+    return target
+
+
+def executable_name(name, target):
+    return name + ('.exe' if 'windows' in target else '')
 COMMON_FLAGS = '-Cllvm-args=-pgo-warn-missing-function'
 INTEGRITY_CHECKS = ('fixed_workload_provenance',
                     'control_provenance', 'mixed_command_provenance', 'matching_config_copy',
@@ -93,6 +108,8 @@ def check_artifacts(artifacts):
 
 def host_controls():
     """Keep observable power/governor controls fixed across every fresh process."""
+    if platform.system() != 'Linux':
+        return {}  # These sysfs controls are not observable on macOS/Windows.
     roots = (Path('/sys/class/power_supply'), Path('/sys/devices/system/cpu'))
     files = [*roots[0].glob('*/online'), *roots[0].glob('*/status'),
              *roots[1].glob('cpu*/cpufreq/scaling_governor'),
@@ -114,13 +131,13 @@ class Pipeline:
         self.manifest['source'] = snapshot(self.root)
         self.source = self.root / 'source'
         self.compiler = command_output(['rustc', '+' + options.toolchain, '-vV'])
-        if f'host: {TARGET}' not in self.compiler:
-            raise ValueError('PGO currently supports native Linux x86-64 GNU only')
+        self.host_target = next(line.removeprefix('host: ') for line in self.compiler.splitlines() if line.startswith('host: '))
+        self.target = native_target(self.host_target, options.target)
         sysroot = Path(command_output(['rustc', '+' + options.toolchain, '--print', 'sysroot']))
-        self.llvm = sysroot / 'lib/rustlib' / TARGET / 'bin/llvm-profdata'
+        self.llvm = sysroot / 'lib/rustlib' / self.host_target / 'bin' / executable_name('llvm-profdata', self.host_target)
         if not self.llvm.is_file():
             raise ValueError(f'Install matching LLVM tools: rustup component add llvm-tools-preview --toolchain {options.toolchain}')
-        self.manifest.update(compiler=self.compiler, target=TARGET, common_flags=COMMON_FLAGS,
+        self.manifest.update(compiler=self.compiler, target=self.target, client_target=self.host_target, common_flags=COMMON_FLAGS,
                              llvm_profdata={'path': str(self.llvm), 'sha256': sha256(self.llvm),
                                             'version': command_output([str(self.llvm), '--version'])})
         self.profiles = self.root / 'profiles'
@@ -168,11 +185,12 @@ class Pipeline:
         client = stage == 'client'
         package = 'basis-rust-client' if client else 'basis-server-console'
         workspace = 'BasisRustClient' if client else 'BasisRustServer'
+        build_target = self.host_target if client else self.target
         command = ['cargo', '+' + self.options.toolchain, 'build', '--locked', '--release',
-                   '--target', TARGET, '--manifest-path', str(self.source / workspace / 'Cargo.toml'), '-p', package]
+                   '--target', build_target, '--manifest-path', str(self.source / workspace / 'Cargo.toml'), '-p', package]
         if not client:
             command += ['--features', 'benchmark-validation']
-        record = {'command': command, 'environment': fixed, 'cleared_environment_keys': removed}
+        record = {'target': build_target, 'command': command, 'environment': fixed, 'cleared_environment_keys': removed}
         self.manifest['builds'][name] = record
         self.save()
         print('BUILD ' + name, flush=True)
@@ -186,8 +204,8 @@ class Pipeline:
         self.save()
         if record['exit_code'] or diagnostics:
             raise ValueError('Build failed or emitted profile diagnostics; inspect ' + str(log))
-        binary = target / TARGET / 'release' / package
-        fingerprints = list((target / TARGET / 'release/.fingerprint').glob(package + '-*/bin-' + package + '.json'))
+        binary = target / build_target / 'release' / executable_name(package, build_target)
+        fingerprints = list((target / build_target / 'release/.fingerprint').glob(package + '-*/bin-' + package + '.json'))
         if len(fingerprints) != 1:
             raise ValueError('Ambiguous Cargo fingerprint')
         fingerprint = json.loads(fingerprints[0].read_text())
@@ -348,7 +366,7 @@ class Pipeline:
 
     def report(self):
         lines = ['# Server PGO qualification', '', f'Source: `{self.manifest["source"]["revision"]}`.',
-                 f'Target: `{TARGET}`. Smoke only: `{self.options.smoke}`.',
+                 f'Target: `{self.target}`. Smoke only: `{self.options.smoke}`.',
                  f'Qualified client count: `{self.manifest.get("selected_clients", "none")}`.', '',
                  'Server builds request `benchmark-validation`; Cargo feature parity is checked before workloads run.',
                  'Profiles and A/B results are separate at each client count. Training is excluded from evaluation.',
@@ -382,6 +400,11 @@ class Pipeline:
                           ('server_cpu_cores', 'gap_p95_ms', 'observer_applied_items_per_second',
                            'built_logical_avatar_work_per_second', 'upload_accepted_bytes_per_client_per_second')]
                 lines.append(f'| {variant} | {sum(r["valid"] for r in runs)}/{len(runs)} | ' + ' | '.join(f'{v:.3f}' for v in values) + ' |')
+        lines += ['', '## Build provenance', '', f'Client target: `{self.host_target}`.',
+                  '```text', self.compiler, '```', '', '| Build | Target | Executable SHA-256 |',
+                  '| --- | --- | --- |']
+        for name, record in self.manifest['builds'].items():
+            lines.append(f'| {name} | {record["target"]} | `{record.get("sha256", "build incomplete")}` |')
         lines += ['', 'A lower-count pass does not certify higher-count capacity, 20 Hz Scene or image/photo workloads.',
                   'Loopback and one receiver observer limit conclusions; received latency excludes lost messages.',
                   'All raw measurements remain in the local output directory; no raw profiles/JSON are packaged.']
@@ -401,11 +424,19 @@ class Pipeline:
         dist.mkdir()
         staging = self.root / 'package'
         staging.mkdir()
-        shutil.copy2(binary['path'], staging / 'basis-server-console')
+        shutil.copy2(binary['path'], staging / executable_name('basis-server-console', self.target))
         shutil.copy2(self.source / 'BasisRustServer/Config.xml', staging / 'Config.xml')
         shutil.copy2(self.root / 'PGO-VALIDATION.md', staging / 'PGO-VALIDATION.md')
         (staging / 'SHA256SUMS').write_text(''.join(f'{sha256(p)}  {p.name}\n' for p in sorted(staging.iterdir()) if p.is_file()))
-        with tarfile.open(dist / 'BasisRust-server-linux-x64-pgo.tar.gz', 'w:gz') as archive:
+        check_artifacts({'server': binary, 'client': self.client})
+        self.verify_source()
+        release = self.root / 'release'
+        release.mkdir()
+        shutil.copy2(binary['path'], release / executable_name('basis-server-console', self.target))
+        shutil.copy2(self.client['path'], release / executable_name('basis-rust-client', self.host_target))
+        shutil.copy2(self.root / 'PGO-VALIDATION.md', release / 'PGO-VALIDATION.md')
+        (release / 'SHA256SUMS').write_text(''.join(f'{sha256(p)}  {p.name}\n' for p in sorted(release.iterdir()) if p.is_file()))
+        with tarfile.open(dist / ('BasisRust-server-' + self.target + '-pgo.tar.gz'), 'w:gz') as archive:
             for path in sorted(staging.iterdir()):
                 archive.add(path, arcname=path.name)
 
@@ -414,6 +445,7 @@ def parse_options(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--toolchain', default='1.99.0')
+    parser.add_argument('--target', choices=TARGETS, help='Native server target (defaults to rustc host); same-architecture Linux musl is supported')
     parser.add_argument('--clients', type=int, default=300)
     parser.add_argument('--minimum-clients', type=int, default=100)
     parser.add_argument('--warmup-seconds', type=int, default=45)
@@ -423,8 +455,8 @@ def parse_options(argv=None):
     parser.add_argument('--client-cpus')
     parser.add_argument('--smoke', action='store_true', help='Short end-to-end CI check with the selected population and fallback; never packages a distributable')
     args = parser.parse_args(argv)
-    if platform.system() != 'Linux':
-        parser.error('PGO qualification currently requires native Linux x86-64 GNU')
+    if platform.system() not in ('Linux', 'Windows', 'Darwin'):
+        parser.error('PGO qualification requires a supported native Linux, Windows or macOS runner')
     if args.smoke:
         args.warmup_seconds, args.window_seconds, args.evaluation_rounds = 3, 10, 2
     try:

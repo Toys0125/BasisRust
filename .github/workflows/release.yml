@@ -16,13 +16,13 @@ permissions:
 
 jobs:
   builds:
-    name: Cross-platform builds
+    name: PGO server and client builds
     uses: ./.github/workflows/build.yml
     with:
       ref: ${{ github.event.release.tag_name || inputs.tag }}
 
   attach:
-    name: Attach cross-platform builds
+    name: Attach qualified PGO builds
     needs: builds
     runs-on: ubuntu-24.04
     permissions:
@@ -30,7 +30,7 @@ jobs:
 
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: basisrust-*
           path: release-assets

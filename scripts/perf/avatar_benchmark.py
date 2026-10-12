@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import platform
 import re
 import signal
 import socket
@@ -117,7 +118,32 @@ def linux_metrics(pid):
             'rss_bytes': int(stat[21]) * os.sysconf('SC_PAGE_SIZE')}
 
 
+def macos_metrics(pid):
+    # BSD ps reports cumulative process CPU time and resident memory in KiB.
+    values = subprocess.check_output(['/bin/ps', '-p', str(pid), '-o', 'time=', '-o', 'rss='], text=True).split()
+    if len(values) != 2:
+        raise RuntimeError(f'Cannot sample macOS process {pid}')
+    clock, rss = values
+    days = 0
+    if '-' in clock:
+        day, clock = clock.split('-', 1)
+        days = int(day)
+    parts = clock.split(':')
+    if len(parts) not in (2, 3):
+        raise ValueError('Invalid macOS process CPU time')
+    seconds = float(parts[-1]) + int(parts[-2]) * 60
+    if len(parts) == 3:
+        seconds += int(parts[0]) * 3600
+    seconds += days * 86400
+    resident = int(rss) * 1024
+    if seconds < 0 or resident < 0:
+        raise ValueError('Invalid macOS process counters')
+    return {'cpu_seconds': seconds, 'rss_bytes': resident}
+
+
 def native_sampler():
+    if platform.system() == 'Darwin':
+        return macos_metrics
     if os.name != 'nt':
         return linux_metrics
     # Reuse the declared pointer-sized Win32 counter API from the native runner.

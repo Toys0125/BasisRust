@@ -10,6 +10,25 @@ use std::{
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Workload runners send Ctrl+Break to a private Windows process group.
+/// Handle it through the same persistence/drain path as an interactive Ctrl+C.
+pub async fn stop_signal() -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut ctrl_break = tokio::signal::windows::ctrl_break()?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            signal = ctrl_break.recv() => signal.ok_or_else(|| {
+                io::Error::other("Ctrl+Break listener closed")
+            }),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
 enum Signal {
     Arm(Duration),
     Finished,
