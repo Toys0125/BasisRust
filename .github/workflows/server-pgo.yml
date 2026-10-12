@@ -1,15 +1,6 @@
 name: Server PGO
 
 on:
-  pull_request:
-    paths:
-      - 'BasisRustServer/**'
-      - 'BasisRustClient/**'
-      - 'scripts/perf/**'
-      - 'docs/performance/fixtures/**'
-      - '.github/workflows/server-pgo.yml'
-      - '.github/workflows/build.yml'
-      - '.github/workflows/release.yml'
   workflow_dispatch:
     inputs:
       clients:
@@ -38,61 +29,6 @@ permissions:
   contents: read
 
 jobs:
-  smoke:
-    name: Server PGO smoke (${{ matrix.target }})
-    if: github.event_name == 'pull_request'
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
-            musl: true
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-            musl: true
-          - target: x86_64-pc-windows-msvc
-            runner: windows-latest
-          - target: aarch64-apple-darwin
-            runner: macos-15
-    defaults:
-      run:
-        shell: bash
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: '3.12'
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          toolchain: '1.99.0'
-          components: llvm-tools-preview
-          targets: ${{ matrix.target }}
-      - name: Install musl toolchain
-        if: matrix.musl == true
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes musl-tools
-      - name: Test PGO admission, provenance and fallback guards
-        run: python -B -m unittest discover -s scripts/perf -p 'test_server_pgo*.py'
-      - name: Exercise instrument, train, merge, use and strict A/B
-        run: python -B scripts/perf/server_pgo.py --output captures/ci-server-pgo --target "${{ matrix.target }}" --smoke
-      - name: Retain smoke summary only
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: server-pgo-smoke-summary-${{ matrix.target }}
-          path: captures/ci-server-pgo/PGO-VALIDATION.md
-          if-no-files-found: warn
-
   qualified-build:
     name: Qualify hosted native PGO artifact
     if: github.event_name == 'workflow_dispatch'

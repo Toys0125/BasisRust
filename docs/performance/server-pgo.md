@@ -102,11 +102,13 @@ must exit zero; forced signal termination cannot qualify or train a release.
 
 ## CI and artifact workflow
 
-PGO workflow/build actions are pinned to full commit hashes. Relevant PRs run
-short end-to-end smoke checks on every shipping target, using their matching
-GitHub-hosted runners. Each begins at 300 clients, falls back to 150 then 100,
-and checks fresh training, merge, use and four strict evaluations. Smoke mode
-uploads Markdown only and never publishes a server or establishes capacity.
+PGO workflow/build actions are pinned to full commit hashes. PR changes to the
+PGO pipeline/build workflows/fixtures run the standard six-target build matrix
+as a release preview. It uses the full qualification and package path; artifacts
+are retained in the Actions run, without attaching them to a published release
+or publishing Docker images. Source-only PR checks retain the existing Rust
+correctness workflows. A local `--smoke` still uses short windows/four evaluations
+and never packages; it is not used to qualify automatic release artifacts.
 
 `build.yml` runs automatically on pushes to main, by manual dispatch, or when
 called by `release.yml` for a published release tag. Every server matrix leg

@@ -179,8 +179,18 @@ Real Rust 1.99.0 GNU and musl probes both instrument, execute, merge fresh
 profiles, build with profile use and reproduce output without diagnostics;
 these probes are compiler/tool checks, not application capacity measurements.
 Package tests verify exact validated binary/client export, checksums and absence
-of JSON/profiles. All six shipping targets have matching hosted PGO smoke
-matrix entries; workflow YAML/pins validate. Focused CodeRabbit review completes
+of JSON/profiles. All six shipping targets run the full hosted release preview matrix for
+pipeline/build-workflow/fixture PR changes; workflow YAML/pins validate. Focused CodeRabbit review completes
 with zero findings. Native ARM64/Windows/macOS application qualification and the
 full automatic release packaging still require their new GitHub runs; previous
 Linux hosted smoke and 375-client results are historical evidence only.
+
+The configured GitHub token rejected a manual build dispatch with HTTP 403
+(`Resource not accessible by personal access token`). The full six-target
+release preview therefore runs automatically on PR pipeline/workflow changes,
+using the same `build.yml` packaging path. Standalone `server-pgo.yml` is hosted
+manual qualification; redundant short PR smoke jobs were removed. PR preview
+uploads build artifacts only, without release attachment or Docker publication.
+
+The final workflow-only review returns zero findings with an unverified-findings
+warning; no unqualified clean-review claim is made for that round.

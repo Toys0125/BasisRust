@@ -8,8 +8,8 @@ matrix target (Windows x64, macOS ARM64, GNU/musl Linux x64/ARM64), then stages
 only the validated server and shared client into the existing archives. Docker
 continues consuming musl archives, which now must qualify with their own PGO
 profiles. Failures block publishing rather than substituting ordinary servers.
-`server-pgo.yml` covers every target with hosted PR smoke and supports hosted
-manual qualification. No self-hosted runner or fixed 16-CPU affinity is needed.
+`build.yml` validates pipeline changes through a full six-target PR release
+preview; `server-pgo.yml` supports hosted manual qualification. No self-hosted runner or fixed 16-CPU affinity is needed.
 The new macOS sampler and Windows Ctrl+Break shutdown preserve native profiling
 and clean process teardown. See [current PGO policy](server-pgo.md).
 Historical reports below retain their exact measured source and prior policy.

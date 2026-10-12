@@ -4,6 +4,16 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    paths:
+      - '.github/workflows/build.yml'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/server-pgo.yml'
+      - 'scripts/perf/server_pgo.py'
+      - 'scripts/perf/server_pgo_analysis.py'
+      - 'scripts/perf/avatar_benchmark.py'
+      - 'scripts/perf/tune-avatar-settings.py'
+      - 'docs/performance/fixtures/**'
   workflow_dispatch:
   workflow_call:
     inputs:
