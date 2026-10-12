@@ -277,3 +277,8 @@ all `test_*.py` benchmark suites, including the 23 PGO rejection guards and macO
 sampler checks. The exact CI command passes **103 tests, four platform skips**
 locally. No native source/workload/profile/build-flag changes are made by this
 CI/report-only follow-up.
+The first hosted guard job then exposed two comparison tests requiring local
+RTK. All test subprocesses in that suite now invoke Python directly, including
+Windows ownership fixtures. Full discovery passes all 103 tests with four
+platform skips and `PATH=/usr/bin:/bin` (no RTK). The Windows-only ownership
+checks were not rerun on this Linux host.

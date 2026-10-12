@@ -10,6 +10,9 @@ macOS PGO is slower in this small sample; qualification is correctness, not a
 guaranteed speedup. No actual release/Docker publication was invoked.
 Greptile's missing-guard-tests finding is fixed by full test discovery in the
 existing lightweight Python PR job; no native inputs changed in that follow-up.
+Its first hosted run exposed local-only RTK calls in comparison tests. Those
+test subprocesses now use Python directly; 103 tests pass with four platform
+skips and no RTK on PATH. Follow-up hosted CI must confirm the portable suite.
 
 ## Automatic hosted PGO releases — implementation follow-up
 

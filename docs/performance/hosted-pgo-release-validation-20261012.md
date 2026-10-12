@@ -78,6 +78,11 @@ JSON, JSONL, raw profile or merged-profile files. Local evidence is under
 A later CI-only follow-up restores full Python benchmark discovery, including
 all 23 PGO rejection guards and macOS sampler tests, in the existing lightweight
 PR job. The exact command passes 103 tests locally with four platform skips.
+The first hosted run exposed two comparison tests depending on the local-only
+RTK executable. Test subprocesses now use Python directly; all 103 tests pass
+with `PATH=/usr/bin:/bin`, which excludes RTK. Windows process-tree fixtures
+also use Python directly; their three native Windows checks remain skipped
+in this local Linux verification.
 This change does not modify server/client source, PGO driver, workload, fixtures
 or release packaging; the native results above remain tied to their recorded
 source. Earlier failed attempts remain in the consolidated validation history.

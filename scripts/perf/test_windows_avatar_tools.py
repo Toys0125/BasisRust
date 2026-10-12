@@ -1,6 +1,6 @@
 """Check comparison identity and Windows ownership using isolated local children.
 
-Run with `rtk proxy python -B scripts/perf/test_windows_avatar_tools.py`.
+Run with `python -B scripts/perf/test_windows_avatar_tools.py`.
 Fixtures are retained in a new ignored captures directory for each invocation.
 """
 import ctypes
@@ -63,7 +63,7 @@ class ComparisonTests(unittest.TestCase):
             (directory/run['name']).mkdir()
             (directory/run['name']/'validated-summary.json').write_text(json.dumps(run))
         (directory/'experiment.json').write_text(json.dumps(manifest))
-        return subprocess.run(['rtk','proxy',sys.executable,'-B',
+        return subprocess.run([sys.executable,'-B',
                                str(ROOT/'scripts/perf/compare-windows-avatar-crossover.py'),
                                str(directory),'--summary-only'],capture_output=True,text=True,timeout=20)
 
@@ -113,8 +113,8 @@ class ProcessOwnershipTests(unittest.TestCase):
         finally:
             api.CloseHandle(handle)
 
-    def exercise_cleanup(self,terminate_proxy):
-        """Own an RTK proxy, Python worker and socket-owning grandchild."""
+    def exercise_cleanup(self,terminate_parent):
+        """Own a Python worker and socket-owning child in one process tree."""
         child = self.directory/'child.py'
         worker = self.directory/'worker.py'
         ready = self.directory/'ready.json'
@@ -124,21 +124,21 @@ class ProcessOwnershipTests(unittest.TestCase):
                          'pathlib.Path(sys.argv[1]).write_text(json.dumps({"pid":os.getpid(),"port":s.getsockname()[1]}))\n'
                          'time.sleep(120)\n')
         worker.write_text('import json,os,pathlib,subprocess,sys,time\n'
-                          'child=subprocess.Popen(["rtk","proxy",sys.executable,sys.argv[1],sys.argv[2]])\n'
+                          'child=subprocess.Popen([sys.executable,sys.argv[1],sys.argv[2]])\n'
                           'pathlib.Path(sys.argv[3]).write_text(json.dumps({"pid":os.getpid()}))\n'
                           'time.sleep(120)\n')
         outside_job = WindowsProcessJob()
         outside = None
         try:
-            outside = outside_job.start(['rtk','proxy',sys.executable,'-c','import time; time.sleep(120)'],
+            outside = outside_job.start([sys.executable,'-c','import time; time.sleep(120)'],
                                         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
             with WindowsProcessJob() as job:
-                process = job.start(['rtk','proxy',sys.executable,str(worker),str(child),str(ready),
+                process = job.start([sys.executable,str(worker),str(child),str(ready),
                                      str(self.directory/'worker.json')],
                                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
                 descendant = self.wait_for(ready)
                 worker_pid = self.wait_for(self.directory/'worker.json')['pid']
-                if terminate_proxy:
+                if terminate_parent:
                     process.terminate()
                     process.wait(timeout=10)
             process.wait(timeout=10)
@@ -157,11 +157,11 @@ class ProcessOwnershipTests(unittest.TestCase):
                 outside.wait(timeout=10)
 
     def test_job_close_kills_owned_descendants(self):
-        """Closing ownership cleans descendants even when the proxy is still alive."""
+        """Closing ownership cleans descendants even when the parent is alive."""
         self.exercise_cleanup(False)
 
-    def test_forced_proxy_exit_kills_owned_descendants(self):
-        """A killed RTK proxy cannot strand its worker or socket-owning grandchild."""
+    def test_forced_parent_exit_kills_owned_descendants(self):
+        """A killed parent cannot strand its socket-owning child."""
         self.exercise_cleanup(True)
 
     def test_resume_failure_does_not_start_workload(self):
@@ -172,7 +172,7 @@ class ProcessOwnershipTests(unittest.TestCase):
                 raise RuntimeError('test resume failure')
             job._resume_primary_thread = fail
             with self.assertRaisesRegex(RuntimeError,'test resume failure'):
-                job.start(['rtk','proxy',sys.executable,'-c',
+                job.start([sys.executable,'-c',
                            'import pathlib,sys; pathlib.Path(sys.argv[1]).write_text("true")',str(marker)])
         self.assertFalse(marker.exists())
 
