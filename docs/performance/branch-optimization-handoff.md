@@ -1,5 +1,16 @@
 # Laptop agent handoff — branch optimization
 
+## Hosted release preview completed — 2026-10-12 UTC
+
+[All six native PGO release previews](hosted-pgo-release-validation-20261012.md)
+pass on `f39ed49` / synthetic merge `c6625b9`. Linux x64 GNU/musl select 150;
+ARM64 GNU/musl, macOS and Windows select 300. Every selected training/evaluation
+passes; all final archive checksums and selected PGO/client hashes verify.
+macOS PGO is slower in this small sample; qualification is correctness, not a
+guaranteed speedup. No actual release/Docker publication was invoked.
+Greptile's missing-guard-tests finding is fixed by full test discovery in the
+existing lightweight Python PR job; no native inputs changed in that follow-up.
+
 ## Automatic hosted PGO releases — implementation follow-up
 
 Marcus requested PGO for every automatic server release without self-hosted

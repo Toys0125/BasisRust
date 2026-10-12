@@ -256,3 +256,24 @@ checks, pass after the matched-retention change. A focused CodeRabbit review
 could not run because the account review quota/seat policy rate-limited it; this
 follow-up is not reported as an automated review pass. Native CI remains the
 required validation of profile completeness and application behavior.
+
+## Six hosted native targets qualify
+
+The [complete hosted release preview](hosted-pgo-release-validation-20261012.md)
+on PR head `f39ed49` passes all six target builds and package uploads. Reports
+record synthetic merge `c6625b9` (main `f30b248` plus head `f39ed49`). Linux x64
+GNU/musl qualify at 150 after retained 300-client retransmit failures; ARM64
+GNU/musl, macOS ARM64 and Windows x64 qualify at 300. Each selected population
+passes 2/2 training and 4/4 evaluations per arm. All six final package checksums
+and selected PGO/shared-client binary hashes verify; no raw JSON/profiles ship.
+The native macOS retry confirms crash/record-retention corrections. Descriptive
+macOS PGO CPU/gap/work regress (+12.57% / +29.98% / −15.45%); no universal PGO
+speedup is claimed. Actual release attachment and Docker publication were not
+invoked. See the full per-target results and sample limits.
+
+Greptile's P2 coverage finding is valid: removing the old smoke job removed
+`test_server_pgo*.py` from CI. The existing lightweight Python PR job now runs
+all `test_*.py` benchmark suites, including the 23 PGO rejection guards and macOS
+sampler checks. The exact CI command passes **103 tests, four platform skips**
+locally. No native source/workload/profile/build-flag changes are made by this
+CI/report-only follow-up.
