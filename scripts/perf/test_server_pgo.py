@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from server_pgo import Pipeline, build_environment, populations, require_valid, parse_options, native_target, executable_name
+from server_pgo import Pipeline, build_environment, populations, require_valid, parse_options, native_target, executable_name, generation_flags, COMMON_FLAGS, server_flags
 
 
 class PromotionTests(unittest.TestCase):
@@ -100,6 +100,48 @@ class PromotionTests(unittest.TestCase):
                     self.assertEqual(set(archive.getnames()),
                                      {executable_name('basis-server-console', target),
                                       'Config.xml', 'PGO-VALIDATION.md', 'SHA256SUMS'})
+
+    def test_macos_retention_is_matched_across_server_stages(self):
+        for target in ['aarch64-apple-darwin', 'x86_64-unknown-linux-gnu',
+                       'x86_64-pc-windows-msvc']:
+            flags = generation_flags(target, Path('/tmp/fresh-profiles'))
+            self.assertIn('-Cprofile-generate=/tmp/fresh-profiles', flags)
+            self.assertEqual('-Clink-dead-code=yes' in flags, target == 'aarch64-apple-darwin')
+            self.assertTrue(flags.startswith(server_flags(target)))
+            self.assertEqual('-Clink-dead-code=yes' in server_flags(target), target == 'aarch64-apple-darwin')
+        self.assertNotIn('link-dead-code', COMMON_FLAGS)
+
+    def test_profile_diagnostic_inspection_never_changes_build_guard(self):
+        from types import SimpleNamespace
+        from avatar_tuning import sha256
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); profile_path = root/'current.profdata'; profile_path.write_bytes(b'current')
+            pipeline = object.__new__(Pipeline)
+            pipeline.root=root; pipeline.source=root; pipeline.profiles=root/'profiles'
+            pipeline.target=pipeline.host_target='aarch64-apple-darwin'
+            pipeline.options=SimpleNamespace(toolchain='1.99.0')
+            pipeline.manifest={'builds':{}}; pipeline.verify_source=lambda:None; pipeline.save=lambda:None
+            def compile_warning(*args, **kwargs):
+                kwargs['stdout'].write('warning: no profile data available for function _Rmissing Hash = 1 up to 0 count discarded\n')
+                return SimpleNamespace(returncode=0)
+            with patch('server_pgo.subprocess.run',side_effect=compile_warning), \
+                 patch.object(pipeline,'explain_missing_profiles') as explain:
+                with self.assertRaisesRegex(ValueError,'profile diagnostics'):
+                    pipeline.build('candidate','use',{'path':str(profile_path),'sha256':sha256(profile_path)})
+                explain.assert_called_once()
+                self.assertTrue(pipeline.manifest['builds']['candidate']['profile_diagnostics'])
+
+    def test_missing_profile_report_is_bounded_to_five_symbols(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline=object.__new__(Pipeline); pipeline.root=Path(tmp); pipeline.llvm=Path('/llvm-profdata')
+            diagnostics=[f'no profile data available for function _Rmissing{i} Hash = 1' for i in range(20)]
+            with patch('server_pgo.subprocess.run',return_value=SimpleNamespace(returncode=0)) as run:
+                pipeline.explain_missing_profiles('candidate',diagnostics,{'path':'/current.profdata'})
+                self.assertEqual(run.call_count,5)
+                for call in run.call_args_list:
+                    self.assertNotIn('--all-functions',call.args[0])
+                    self.assertEqual(call.kwargs['timeout'],15)
 
     def test_inherited_flags_and_codegen_overrides_cannot_change_stages(self):
         with patch.dict(os.environ, {'CARGO_ENCODED_RUSTFLAGS': 'bad', 'RUSTFLAGS': 'bad',

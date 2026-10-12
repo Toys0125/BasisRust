@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import statistics
 import subprocess
@@ -62,6 +63,18 @@ def require_valid(results):
     """Never promote diagnostics, missing checks, or empty/incomplete cohorts."""
     return bool(results) and all(r.get('valid') is True and r.get('checks')
                                 and all(v is True for v in r['checks'].values()) for r in results)
+
+
+def server_flags(target):
+    flags = COMMON_FLAGS
+    if target == 'aarch64-apple-darwin':
+        # Keep Mach-O function/profile roots consistent across every server stage.
+        flags += ' -Clink-dead-code=yes'
+    return flags
+
+
+def generation_flags(target, profiles):
+    return server_flags(target) + ' -Cprofile-generate=' + str(profiles)
 
 
 def build_environment(target, flags):
@@ -137,7 +150,7 @@ class Pipeline:
         self.llvm = sysroot / 'lib/rustlib' / self.host_target / 'bin' / executable_name('llvm-profdata', self.host_target)
         if not self.llvm.is_file():
             raise ValueError(f'Install matching LLVM tools: rustup component add llvm-tools-preview --toolchain {options.toolchain}')
-        self.manifest.update(compiler=self.compiler, target=self.target, client_target=self.host_target, common_flags=COMMON_FLAGS,
+        self.manifest.update(compiler=self.compiler, target=self.target, client_target=self.host_target, common_flags=server_flags(self.target), client_flags=COMMON_FLAGS,
                              llvm_profdata={'path': str(self.llvm), 'sha256': sha256(self.llvm),
                                             'version': command_output([str(self.llvm), '--version'])})
         self.profiles = self.root / 'profiles'
@@ -171,18 +184,18 @@ class Pipeline:
 
     def build(self, name, stage, profile=None):
         self.verify_source()
-        flags = COMMON_FLAGS
+        if stage == 'use' and (not profile or sha256(Path(profile['path'])) != profile['sha256']):
+            raise ValueError('Validated profile missing or changed')
+        client = stage == 'client'
+        flags = COMMON_FLAGS if client else server_flags(self.target)
         if stage == 'generate':
-            flags += ' -Cprofile-generate=' + str(self.profiles)
+            flags = generation_flags(self.target, self.profiles)
         elif stage == 'use':
-            if not profile or sha256(Path(profile['path'])) != profile['sha256']:
-                raise ValueError('Validated profile missing or changed')
             flags += ' -Cprofile-use=' + profile['path']
         target = self.root / ('build-' + name)
         if target.exists():
             raise ValueError('Build output already exists')
         env, fixed, removed = build_environment(target, flags)
-        client = stage == 'client'
         package = 'basis-rust-client' if client else 'basis-server-console'
         workspace = 'BasisRustClient' if client else 'BasisRustServer'
         build_target = self.host_target if client else self.target
@@ -202,6 +215,8 @@ class Pipeline:
                        if any(word in line.lower() for word in PROFILE_DIAGNOSTICS)]
         record['profile_diagnostics'] = diagnostics
         self.save()
+        if diagnostics and profile:
+            self.explain_missing_profiles(name, diagnostics, profile)
         if record['exit_code'] or diagnostics:
             raise ValueError('Build failed or emitted profile diagnostics; inspect ' + str(log))
         binary = target / build_target / 'release' / executable_name(package, build_target)
@@ -216,9 +231,32 @@ class Pipeline:
         ordinary = self.manifest['builds'].get('ordinary', {}).get('cargo_fingerprint')
         if not client and ordinary and (fingerprint['profile'] != ordinary['profile'] or fingerprint['features'] != ordinary['features']):
             raise ValueError('Release settings or features differ between PGO stages')
-        record.update(path=str(binary), sha256=sha256(binary), cargo_fingerprint=fingerprint)
+        record.update(path=str(binary), sha256=sha256(binary), bytes=binary.stat().st_size, cargo_fingerprint=fingerprint)
         self.save()
         return {'path': str(binary), 'sha256': record['sha256']}
+
+    def explain_missing_profiles(self, name, diagnostics, profile):
+        """Retain small text-only evidence; never reinterpret a failed build as valid."""
+        symbols = []
+        for line in diagnostics:
+            match = re.search(r'no profile data available for function (\S+) Hash', line)
+            if match and match[1] not in symbols:
+                symbols.append(match[1])
+            if len(symbols) == 5:
+                break
+        if not symbols:
+            return
+        output = self.root / ('profile-missing-' + name + '.log')
+        with output.open('w') as log:
+            for symbol in symbols:
+                log.write('Missing-function diagnostic: ' + symbol + '\n')
+                log.flush()
+                try:
+                    result = subprocess.run([str(self.llvm), 'show', '--counts', '--function=' + symbol, profile['path']],
+                                            stdout=log, stderr=subprocess.STDOUT, timeout=15)
+                    log.write(f'Inspection exit code: {result.returncode}\n\n')
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    log.write('Inspection unavailable: ' + str(error) + '\n')
 
     def cohort(self, directory, clients, binaries, training=False):
         self.verify_source()
@@ -369,6 +407,7 @@ class Pipeline:
                  f'Target: `{self.target}`. Smoke only: `{self.options.smoke}`.',
                  f'Qualified client count: `{self.manifest.get("selected_clients", "none")}`.', '',
                  'Server builds request `benchmark-validation`; Cargo feature parity is checked before workloads run.',
+                 'macOS server stages share link-dead-code=yes to preserve profile records and matched code generation; retained code can increase binary size.',
                  'Profiles and A/B results are separate at each client count. Training is excluded from evaluation.',
                  '20-ms avatar updates, Unity-policy 60 FPS poses, 128 B extra avatar, 128 B Scene at 5 Hz; CPU-only, voice off.', '',
                  '| Clients | Phase / process | Scene receipt | Scene p95 bound, ms | Avatar p95 gap, ms | CPU cores | Failed gates |',
@@ -401,10 +440,10 @@ class Pipeline:
                            'built_logical_avatar_work_per_second', 'upload_accepted_bytes_per_client_per_second')]
                 lines.append(f'| {variant} | {sum(r["valid"] for r in runs)}/{len(runs)} | ' + ' | '.join(f'{v:.3f}' for v in values) + ' |')
         lines += ['', '## Build provenance', '', f'Client target: `{self.host_target}`.',
-                  '```text', self.compiler, '```', '', '| Build | Target | Executable SHA-256 |',
-                  '| --- | --- | --- |']
+                  '```text', self.compiler, '```', '', '| Build | Target | Bytes | Executable SHA-256 |',
+                  '| --- | --- | ---: | --- |']
         for name, record in self.manifest['builds'].items():
-            lines.append(f'| {name} | {record["target"]} | `{record.get("sha256", "build incomplete")}` |')
+            lines.append(f'| {name} | {record["target"]} | {record.get("bytes", "-")} | `{record.get("sha256", "build incomplete")}` |')
         lines += ['', 'A lower-count pass does not certify higher-count capacity, 20 Hz Scene or image/photo workloads.',
                   'Loopback and one receiver observer limit conclusions; received latency excludes lost messages.',
                   'All raw measurements remain in the local output directory; no raw profiles/JSON are packaged.']

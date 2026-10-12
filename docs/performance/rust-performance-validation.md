@@ -222,3 +222,37 @@ fresh Rust profiles and reproduces output with clean exit. This verifies the
 C-builder fix locally; it does not replace native macOS application validation.
 
 The focused correction review completes with zero findings.
+
+## macOS profile-record retention follow-up
+
+The `d4511eb` macOS retry confirms the C-builder correction: both full
+300-client training processes pass every gate, with 100% Scene receipt and
+clean shutdown. Fresh profiles merge. The PGO-use build completes compilation
+but is rejected by 2,109 missing-function diagnostics; no mismatch/counter
+corruption diagnostics were observed, and no evaluation/package is promoted.
+Its recorded synthetic merge source is `b43c327`.
+
+Darwin dead stripping is a profile-retention hypothesis: LLVM's Mach-O
+live-support profile records follow function liveness, while use-stage warnings
+are evaluated before final executable stripping. The next controlled attempt
+retains code in all three macOS server stages with matched flags. A local probe
+shows training-only retention can alter code generation and itself create
+missing-record diagnostics; matching retention flags avoids those probe
+warnings. The macOS binary can grow, so build sizes are recorded. Missing-function
+and mismatch guards are retained; the change does not ignore missing-function diagnostics. If warnings remain, a bounded text report
+queries five missing symbols with matching llvm-profdata. No raw profiles/JSON
+are uploaded. Native confirmation remains pending.
+
+The local Rust probe retains a never-called function with `[0, 0]` counters,
+merges profiles, and builds matching-retention profile-use code with zero profile
+diagnostics and identical output. In this small Linux toolchain probe, retention
+increased the ordinary binary from 4,536,536 to 5,439,544 bytes; this is a size
+observation, not a macOS server estimate or performance measurement. The next
+native application run must establish the actual macOS effect. Python guard
+checks preserve fatal missing-function diagnostics and bound inspection output.
+
+Local verification: **103 Python tests, four platform skips**, including 23 PGO
+checks, pass after the matched-retention change. A focused CodeRabbit review
+could not run because the account review quota/seat policy rate-limited it; this
+follow-up is not reported as an automated review pass. Native CI remains the
+required validation of profile completeness and application behavior.

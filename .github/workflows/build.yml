@@ -133,6 +133,7 @@ jobs:
           name: pgo-failure-logs-${{ matrix.id }}
           path: |
             ${{ runner.temp }}/server-pgo-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}/build-*.log
+            ${{ runner.temp }}/server-pgo-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}/profile-*.log
             ${{ runner.temp }}/server-pgo-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}/clients-*/**/server.log
             ${{ runner.temp }}/server-pgo-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}/clients-*/**/client.log
           if-no-files-found: warn

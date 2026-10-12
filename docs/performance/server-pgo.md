@@ -15,6 +15,12 @@ Plain local Cargo commands also remain ordinary builds.
 The pipeline follows the [rustc PGO workflow](https://doc.rust-lang.org/rustc/profile-guided-optimization.html):
 build an instrumented server, exercise it, merge fresh profiles with the matching
 LLVM tool, then rebuild with profile use and evaluate against an ordinary release.
+All three macOS server stages use `-Clink-dead-code=yes` to retain zero-count
+function records and keep code generation/link roots matched. This can enlarge
+the macOS server; build sizes are included in the Markdown provenance report.
+Other targets retain their normal flags. The workload and quality gates stay
+fixed. Missing-function and mismatch diagnostics still
+abort qualification; small text-only profile inspections aid diagnosis.
 It pins Rust 1.99.0, uses locked dependencies, an explicit target, absolute profile
 paths and isolated output trees. Source, tools, fixtures, flags and executable
 hashes are recorded and checked. Generation and use share release settings.
