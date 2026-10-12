@@ -64,6 +64,17 @@ jobs:
           python -B scripts/perf/server_pgo.py \
             --output "$PGO_OUTPUT" --target "$PGO_TARGET" \
             --clients "$PGO_CLIENTS" --minimum-clients "$PGO_MINIMUM_CLIENTS"
+      - name: Retain failed-build and process logs
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: pgo-failure-logs-${{ inputs.target }}
+          path: |
+            ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}/build-*.log
+            ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}/clients-*/**/server.log
+            ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}/clients-*/**/client.log
+          if-no-files-found: warn
+
       - name: Upload qualified PGO server
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:

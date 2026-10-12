@@ -194,3 +194,31 @@ uploads build artifacts only, without release attachment or Docker publication.
 
 The final workflow-only review returns zero findings with an unverified-findings
 warning; no unqualified clean-review claim is made for that round.
+
+## macOS PGO mixed-runtime correction
+
+The first full macOS ARM64 preview on `321c2c3` built ordinary/client/instrumented
+binaries, then the instrumented server exited with SIGSEGV before the first
+training workload. Its Markdown report retains the failure; no profile was
+merged and no package uploaded. The stack was not captured, so the exact crashing
+frame is not claimed. This matches the upstream C/Rust instrumentation ABI issue:
+[cc-rs #2003](https://github.com/rust-lang/cc-rs/pull/2003) stops forwarding Rust
+PGO generation/use flags to Clang, whose profiling format can differ from Rust's
+bundled LLVM. mimalloc and zstd use this C builder.
+
+The server lockfile updates `cc` 1.2.62 -> 1.8.0 with its required `shlex` and
+`find-msvc-tools` updates. Rust profiling stays enabled; C dependencies keep
+ordinary compilation across baseline, generation and use. Failure artifacts now
+retain plain-text compiler/server/client logs, excluding JSON and raw profiles.
+The macOS retry must still complete clean training, merge/use, strict A/B and
+packaging; the upstream match is a diagnosis hypothesis until that native run.
+
+Local correction verification: all **389 server workspace tests pass, four
+manual benchmarks ignored**, with the validation feature. The locked console
+check and workspace all-targets Clippy with warnings denied pass. A real Clang
+C-constructor/Rust probe built with generation and use flags retains Rust PGO,
+records actual C compiler commands without inherited profiling flags, merges
+fresh Rust profiles and reproduces output with clean exit. This verifies the
+C-builder fix locally; it does not replace native macOS application validation.
+
+The focused correction review completes with zero findings.

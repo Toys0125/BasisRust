@@ -18,6 +18,10 @@ LLVM tool, then rebuild with profile use and evaluate against an ordinary releas
 It pins Rust 1.99.0, uses locked dependencies, an explicit target, absolute profile
 paths and isolated output trees. Source, tools, fixtures, flags and executable
 hashes are recorded and checked. Generation and use share release settings.
+The server locks `cc` 1.8.0, which prevents Rust PGO flags being forwarded to
+foreign C/C++ compilers. This avoids mixed profiling runtimes when Apple Clang's
+LLVM differs from rustc's. Rust server code is trained; native C dependencies
+retain ordinary compilation consistently across all three server builds.
 
 ## Benchmark validation feature
 
