@@ -127,8 +127,8 @@ One marker starts avatar observation and scene sends. CPU and avatar diagnostics
 keep their fixed window; scene rates use the actual duration through shutdown,
 including the observer receive grace. Scene delivery, coverage, integrity,
 cadence, and payload byte accounting are additional validity gates. The
-[1,500-client mixed PGO report](pgo-mixed-client1500-20261010.md) retains overloaded
-trials and explains why failed delivery prevents a clean speedup claim.
-
-The [750-client rerun](pgo-mixed-client750-20261010.md) reuses those same binaries
-and profile, changing only the offered client population.
+[consolidated validation report](rust-performance-validation.md#earlier-controlled-rust-measurements)
+summarizes the overloaded 1,500-client trial and the 750-client rerun, which
+reuses the same binaries/profile and changes only the offered population.
+Failed delivery prevents a clean speedup claim. Current PGO qualification uses
+separate, freshly trained profiles for each attempted population.

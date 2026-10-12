@@ -75,7 +75,9 @@ Unity-policy 60 FPS poses, 128 bytes of extra avatar data, 128-byte Scene payloa
 at 5 Hz, voice off and CPU-only server processing. Server/client workers are fixed
 at four. Scene batching is 3 ms, the peer queue quota is 1024 logical messages,
 and generic incoming upload is capped at 128 KiB/s per peer before fanout, with
-two seconds of burst credit. Images use their separate existing governor/cache.
+two seconds of burst credit. Image Scene messages are exempt from this generic
+budget; Rust advertises separate image-pacing settings but does not implement
+the C# server image governor.
 This workload sends no images, so it does not qualify photo sharing capacity.
 
 All existing quality/provenance gates remain in force, including cumulative
@@ -119,6 +121,15 @@ are retained in the Actions run, without attaching them to a published release
 or publishing Docker images. Source-only PR checks retain the existing Rust
 correctness workflows. A local `--smoke` still uses short windows/four evaluations
 and never packages; it is not used to qualify automatic release artifacts.
+The existing lightweight Python PR job runs the complete benchmark test suite,
+including PGO provenance, rejection and fallback guards:
+
+```bash
+python3 -B -m unittest discover -s scripts/perf -p 'test_*.py'
+```
+
+These guard tests require Python, with no local RTK command dependency. They
+check tool behavior separately from the native release workload qualification.
 
 `build.yml` runs automatically on pushes to main, by manual dispatch, or when
 called by `release.yml` for a published release tag. Every server matrix leg
