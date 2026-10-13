@@ -1641,6 +1641,11 @@ pub enum ContentShareType {
     Prop = 1,
     World = 2,
     Server = 3,
+    DollyTrack = 4,
+    Link = 5,
+    Text = 6,
+    Folder = 7,
+    Setting = 8,
 }
 
 impl From<u8> for ContentShareType {
@@ -1649,6 +1654,11 @@ impl From<u8> for ContentShareType {
             1 => Self::Prop,
             2 => Self::World,
             3 => Self::Server,
+            4 => Self::DollyTrack,
+            5 => Self::Link,
+            6 => Self::Text,
+            7 => Self::Folder,
+            8 => Self::Setting,
             _ => Self::Avatar,
         }
     }
@@ -1698,6 +1708,8 @@ pub struct ServerContentShareMessage {
     pub sharer_uuid: String,
     pub sharer_display_name: String,
     pub content_share_message: ContentShareMessage,
+    /// Added in protocol 56; older receivers treat its absence as false.
+    pub sharer_protected: bool,
 }
 
 impl BasisSerialize for ServerContentShareMessage {
@@ -1706,6 +1718,7 @@ impl BasisSerialize for ServerContentShareMessage {
         writer.put_string(&self.sharer_uuid)?;
         writer.put_string(&self.sharer_display_name)?;
         self.content_share_message.serialize(writer)?;
+        writer.put_bool(self.sharer_protected);
         Ok(())
     }
 }
@@ -2206,6 +2219,8 @@ pub enum AdminRequestMode {
     RenamePlayer = 93,
     GetMuteState = 94,
     MuteStateResult = 95,
+    GlobalToggleContentRemoval = 96,
+    GlobalToggleExternalLinks = 97,
     Unknown = 255,
 }
 
@@ -2327,6 +2342,8 @@ impl From<u8> for AdminRequestMode {
             93 => Self::RenamePlayer,
             94 => Self::GetMuteState,
             95 => Self::MuteStateResult,
+            96 => Self::GlobalToggleContentRemoval,
+            97 => Self::GlobalToggleExternalLinks,
             _ => Self::Unknown,
         }
     }

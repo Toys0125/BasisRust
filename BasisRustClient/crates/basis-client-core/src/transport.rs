@@ -361,14 +361,6 @@ impl ReliableReceiveState {
     }
 }
 
-pub(crate) fn read_bytes_message(data: &[u8]) -> Option<&[u8]> {
-    if data.len() < 2 {
-        return None;
-    }
-    let len = u16::from_le_bytes([data[0], data[1]]) as usize;
-    data.get(2..2 + len)
-}
-
 #[cfg(test)]
 mod fragment_tests {
     use super::*;

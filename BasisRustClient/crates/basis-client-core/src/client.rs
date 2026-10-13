@@ -27,22 +27,28 @@ use crate::net::{
     any_local_addr, bind_udp_socket, configure_load_sink_socket, resolve_addr, socket_address_bytes,
 };
 use crate::transport::{
-    parse_packet, read_bytes_message, FragmentResult, ReliableFragmentReassembler,
-    ReliableReceiveState, ReliableSend, ACK_FLUSH_INTERVAL, PING_INTERVAL_TICKS,
-    RESEND_INTERVAL_TICKS,
+    parse_packet, FragmentResult, ReliableFragmentReassembler, ReliableReceiveState, ReliableSend,
+    ACK_FLUSH_INTERVAL, PING_INTERVAL_TICKS, RESEND_INTERVAL_TICKS,
 };
 use crate::wire::build_connection_payload;
 use anyhow::{anyhow, Result};
 use basis_protocol::channels;
 use basis_protocol::io::NetReader;
 use basis_protocol::io::NetWriter;
-use basis_protocol::messages::{BasisDeserialize, ReadyMessage, ServerNetIdMessage};
+use basis_protocol::login::{connection_payload_hash, did_login_transcript};
+use basis_protocol::messages::{BasisDeserialize, BytesMessage, ReadyMessage, ServerNetIdMessage};
 use basis_protocol::version::LITENETLIB_PROTOCOL_ID;
 use basis_transport::{
     dotnet_utc_ticks, relative_sequence, DeliveryMethod, PacketProperty, DEFAULT_WINDOW_SIZE,
     LITENETLIB_CHANNELED_HEADER_SIZE, LITENETLIB_FRAGMENTED_HEADER_SIZE, LITENETLIB_INITIAL_MTU,
     MAX_SEQUENCE, RELIABLE_FRAGMENT_PAYLOAD_SIZE,
 };
+use chacha20poly1305::{
+    aead::{AeadInPlace, KeyInit},
+    ChaCha20Poly1305, Nonce,
+};
+use hkdf::Hkdf;
+use sha2::Sha256;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
@@ -52,6 +58,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify};
 use tokio::time;
 use tracing::{debug, error, info, trace, warn};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 fn read_server_net_id_assignments(payload: &[u8]) -> Option<Vec<ServerNetIdMessage>> {
     let mut reader = NetReader::new(payload);
@@ -145,6 +152,10 @@ pub(crate) struct BasisClient {
     pub(crate) avatar_diagnostics: Option<Arc<ClientAvatarDiagnostics>>,
     pub(crate) voice_diagnostics: Option<crate::voice_diagnostics::VoiceDiagnostics>,
     pub(crate) identity: Identity,
+    pub(crate) connection_secret: [u8; 32],
+    pub(crate) connection_public: [u8; 32],
+    pub(crate) connection_payload_hash: StdMutex<[u8; 32]>,
+    pub(crate) sealed_outbound: StdMutex<Option<([u8; 32], u64)>>,
 }
 
 impl BasisClient {
@@ -178,6 +189,9 @@ impl BasisClient {
         let local_peer_id = index as i32;
         let identity = Identity::random();
         ready.player_meta_data_message.player_uuid = identity.did_key();
+        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let connection_public = PublicKey::from(&secret).to_bytes();
+        let connection_secret = secret.to_bytes();
         let client = Arc::new(Self {
             index,
             socket,
@@ -217,6 +231,10 @@ impl BasisClient {
             voice_diagnostics: crate::voice_diagnostics::VoiceDiagnostics::enabled()
                 .then(|| crate::voice_diagnostics::VoiceDiagnostics::new(index)),
             identity,
+            connection_secret,
+            connection_public,
+            connection_payload_hash: StdMutex::new([0; 32]),
+            sealed_outbound: StdMutex::new(None),
         });
 
         client
@@ -231,7 +249,15 @@ impl BasisClient {
         ready: &ReadyMessage,
         shared_maintenance_enabled: bool,
     ) -> Result<()> {
-        let payload = build_connection_payload(config, ready)?;
+        let payload = build_connection_payload(config, ready, &self.connection_public)?;
+        let mut reader = NetReader::new(&payload);
+        let _version = reader.get_u16()?;
+        basis_protocol::application::NetworkApplication::try_read(&mut reader)
+            .ok_or_else(|| anyhow!("invalid connection application"))?;
+        BytesMessage::deserialize(&mut reader)?;
+        *self.connection_payload_hash.lock().unwrap() =
+            connection_payload_hash(reader.remaining_slice());
+        *self.sealed_outbound.lock().unwrap() = None;
         if self.in_use.swap(true, Ordering::SeqCst) {
             error!("Call Shutdown First!");
             return Err(anyhow!("Call Shutdown First!"));
@@ -266,7 +292,31 @@ impl BasisClient {
     }
 
     pub(crate) async fn send_connected(&self, bytes: &[u8]) -> Result<()> {
-        self.socket.send(bytes).await?;
+        let datagram = {
+            let mut guard = self.sealed_outbound.lock().unwrap();
+            if let Some((key, counter)) = guard.as_mut() {
+                *counter += 1;
+                let mut nonce = [0u8; 12];
+                nonce[..8].copy_from_slice(&counter.to_le_bytes());
+                let mut packet = bytes.to_vec();
+                let cipher = ChaCha20Poly1305::new((&*key).into());
+                let tag = cipher
+                    .encrypt_in_place_detached(
+                        Nonce::from_slice(&nonce),
+                        &bytes[..1],
+                        &mut packet[1..],
+                    )
+                    .map_err(|_| anyhow!("cannot encrypt client datagram"))?;
+                packet.extend_from_slice(&tag);
+                packet.extend_from_slice(&counter.to_le_bytes());
+                Some(packet)
+            } else {
+                None
+            }
+        };
+        self.socket
+            .send(datagram.as_deref().unwrap_or(bytes))
+            .await?;
         Ok(())
     }
 
@@ -965,11 +1015,37 @@ impl BasisClient {
                 }
             }
             channels::AUTH_IDENTITY => {
-                if let Some(challenge) = read_bytes_message(payload) {
-                    let response = self.identity.response_payload(challenge)?;
-                    self.send_reliable_ordered(channels::AUTH_IDENTITY, &response)
-                        .await?;
-                }
+                let mut reader = NetReader::new(payload);
+                let nonce = BytesMessage::deserialize(&mut reader)?.data;
+                let server_key = BytesMessage::deserialize(&mut reader)?.data;
+                let server_uuid = String::from_utf8(BytesMessage::deserialize(&mut reader)?.data)?;
+                anyhow::ensure!(
+                    nonce.len() >= 32 && server_key.len() == 32 && reader.remaining() == 0,
+                    "malformed protocol-56 DID login challenge"
+                );
+                let server_public: [u8; 32] = server_key.try_into().expect("length checked");
+                let shared = StaticSecret::from(self.connection_secret)
+                    .diffie_hellman(&PublicKey::from(server_public));
+                anyhow::ensure!(shared.as_bytes() != &[0u8; 32], "invalid server X25519 key");
+                let mut salt = [0u8; 64];
+                salt[..32].copy_from_slice(&self.connection_public);
+                salt[32..].copy_from_slice(&server_public);
+                let mut key = [0u8; 32];
+                Hkdf::<Sha256>::new(Some(&salt), shared.as_bytes())
+                    .expand(b"basis-server-link-v1-c2s", &mut key)
+                    .map_err(|_| anyhow!("cannot derive client-to-server key"))?;
+                let transcript = did_login_transcript(
+                    &self.identity.did_key(),
+                    &server_uuid,
+                    &nonce,
+                    &self.connection_public,
+                    &server_public,
+                    &self.connection_payload_hash.lock().unwrap(),
+                )?;
+                let response = self.identity.response_payload(&transcript)?;
+                *self.sealed_outbound.lock().unwrap() = Some((key, 0));
+                self.send_reliable_ordered(channels::AUTH_IDENTITY, &response)
+                    .await?;
             }
             channels::META_DATA => match parse_server_avatar_metadata(payload) {
                 Ok(metadata) => {

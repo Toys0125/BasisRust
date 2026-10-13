@@ -84,7 +84,11 @@ pub(crate) fn append_synthetic_additional_avatar_data(
     payload.extend((0..byte_count).map(|offset| sequence.wrapping_add(offset.wrapping_mul(37))));
 }
 
-pub(crate) fn build_connection_payload(config: &Config, ready: &ReadyMessage) -> Result<Vec<u8>> {
+pub(crate) fn build_connection_payload(
+    config: &Config,
+    ready: &ReadyMessage,
+    client_public: &[u8; 32],
+) -> Result<Vec<u8>> {
     let auth = config.password.as_bytes();
     let mut writer = NetWriter::with_capacity(512);
     writer.put_u16(SERVER_VERSION);
@@ -93,6 +97,7 @@ pub(crate) fn build_connection_payload(config: &Config, ready: &ReadyMessage) ->
         &config.product_name,
     )?);
     writer.put_bytes_with_length(auth)?;
+    writer.put_bytes_with_length(client_public)?;
     ready.serialize(&mut writer)?;
     Ok(writer.into_vec())
 }

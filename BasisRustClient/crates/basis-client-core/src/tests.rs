@@ -90,7 +90,7 @@ fn connection_payload_propagates_oversized_login_password() {
         ..Config::default()
     };
     let ready = ready_message(&config, [0.0; 3]).unwrap();
-    let error = build_connection_payload(&config, &ready).unwrap_err();
+    let error = build_connection_payload(&config, &ready, &[7; 32]).unwrap_err();
     assert_eq!(
         error.downcast_ref::<basis_protocol::io::NetWriteError>(),
         Some(&basis_protocol::io::NetWriteError::LengthOverflow {
@@ -105,7 +105,7 @@ fn connection_payload_propagates_oversized_avatar_buffer() {
     let config = Config::default();
     let mut ready = ready_message(&config, [0.0; 3]).unwrap();
     ready.client_avatar_change_message.byte_array = vec![0; 65536];
-    let error = build_connection_payload(&config, &ready).unwrap_err();
+    let error = build_connection_payload(&config, &ready, &[7; 32]).unwrap_err();
     assert_eq!(
         error.downcast_ref::<basis_protocol::io::NetWriteError>(),
         Some(&basis_protocol::io::NetWriteError::LengthOverflow {
@@ -544,6 +544,13 @@ async fn test_client_with_voice_diagnostics(
         voice_diagnostics: enable_voice_diagnostics
             .then(|| crate::voice_diagnostics::VoiceDiagnostics::new(index)),
         identity: Identity::random(),
+        connection_secret: [13u8; 32],
+        connection_public: x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(
+            [13u8; 32],
+        ))
+        .to_bytes(),
+        connection_payload_hash: StdMutex::new([0; 32]),
+        sealed_outbound: StdMutex::new(None),
     })
 }
 
@@ -656,16 +663,21 @@ async fn unreliable_voice_repeats_remain_counted() {
 }
 
 #[test]
-fn connection_payload_starts_with_v55_application_auth_and_ready() {
+fn connection_payload_starts_with_v56_application_auth_key_and_ready() {
     let config = Config::default();
     let ready = ready_message(&config, [0.0, 0.0, 0.0]).unwrap();
-    let payload = build_connection_payload(&config, &ready).unwrap();
-    assert_eq!(SERVER_VERSION, 55);
+    let payload = build_connection_payload(&config, &ready, &[7; 32]).unwrap();
+    assert_eq!(SERVER_VERSION, 56);
     assert_eq!(&payload[0..2], &SERVER_VERSION.to_le_bytes());
     assert_eq!(payload[2], 1);
     let auth_len = u16::from_le_bytes([payload[3], payload[4]]) as usize;
     assert_eq!(&payload[5..5 + auth_len], b"default_password");
-    assert!(payload.len() > 5 + auth_len);
+    assert_eq!(
+        u16::from_le_bytes([payload[5 + auth_len], payload[6 + auth_len]]),
+        32
+    );
+    assert_eq!(&payload[7 + auth_len..39 + auth_len], &[7; 32]);
+    assert!(payload.len() > 39 + auth_len);
 }
 
 #[test]
@@ -689,7 +701,7 @@ fn connection_payload_supports_raw_application_names() {
         ..Config::default()
     };
     let ready = ready_message(&config, [0.0, 0.0, 0.0]).unwrap();
-    let payload = build_connection_payload(&config, &ready).unwrap();
+    let payload = build_connection_payload(&config, &ready, &[7; 32]).unwrap();
 
     let mut reader = ProtocolNetReader::new(&payload);
     assert_eq!(reader.get_u16().unwrap(), SERVER_VERSION);
@@ -697,6 +709,7 @@ fn connection_payload_supports_raw_application_names() {
     assert_eq!(application.company_name, "Custom Company");
     assert_eq!(application.product_name, "Custom Product");
     assert_eq!(reader.get_bytes_with_length().unwrap(), b"default_password");
+    assert_eq!(reader.get_bytes_with_length().unwrap(), &[7; 32]);
 }
 
 #[test]
@@ -2155,7 +2168,9 @@ async fn shared_receive_hands_critical_reliable_packets_to_normal_dispatch() {
         .unwrap();
 
     let mut auth_payload = NetWriter::default();
-    auth_payload.put_bytes_with_length(b"challenge").unwrap();
+    auth_payload.put_bytes_with_length(&[7u8; 32]).unwrap();
+    auth_payload.put_bytes_with_length(&[8u8; 32]).unwrap();
+    auth_payload.put_bytes_with_length(b"server-uuid").unwrap();
     let auth = [
         vec![PacketProperty::Channeled as u8, 0, 0, auth_channel],
         auth_payload.into_vec(),

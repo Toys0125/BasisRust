@@ -43,6 +43,8 @@ pub struct ServerConfig {
     pub set_port: u16,
     pub server_name: String,
     pub server_motd: String,
+    /// Signed into the protocol-56 DID login transcript (BasisVR ServerUUID).
+    pub server_uuid: String,
     pub company_name: String,
     pub product_name: String,
     pub use_native_sockets: bool,
@@ -202,6 +204,7 @@ impl Default for ServerConfig {
             set_port: 4296,
             server_name: "Basis Server".to_string(),
             server_motd: String::new(),
+            server_uuid: String::new(),
             company_name: crate::application::DEFAULT_COMPANY_NAME.to_string(),
             product_name: crate::application::DEFAULT_PRODUCT_NAME.to_string(),
             use_native_sockets: true,
