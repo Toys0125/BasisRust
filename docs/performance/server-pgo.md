@@ -114,7 +114,11 @@ must exit zero; forced signal termination cannot qualify or train a release.
 
 ## CI and artifact workflow
 
-PGO workflow/build actions are pinned to full commit hashes. PR changes to the
+Workflow actions use upstream stable major release tags, and the Rust installer
+uses `dtolnay/rust-toolchain@stable`, rather than action commit hashes. These
+tags receive upstream updates within their release line. The PGO compiler stays
+explicitly fixed at Rust 1.99.0 with its matching LLVM tools; action updates do
+not change that matched compiler setting. PR changes to the
 PGO pipeline/build workflows/fixtures run the standard six-target build matrix
 as a release preview. It uses the full qualification and package path; artifacts
 are retained in the Actions run, without attaching them to a published release

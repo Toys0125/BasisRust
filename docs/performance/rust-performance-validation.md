@@ -243,7 +243,10 @@ reviews completed with zero findings; the matched-retention follow-up could not
 run because account quota/seat policy blocked it. GitHub automatic CodeRabbit
 review is skipped for this repository and is not approval. Greptile's historical
 harness/action-pin and missing-PGO-tests findings are fixed. No unqualified
-clean-review claim is made.
+clean-review claim is made. Workflow actions now track upstream stable major
+release tags (`@stable` for the Rust installer) instead of the earlier commit
+hash pins. This changes the workflow action policy, not the recorded benchmark
+compiler, source or results; PGO still uses matched Rust 1.99.0/LLVM tools.
 
 ### Retained failed native attempts
 

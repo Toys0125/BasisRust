@@ -38,13 +38,13 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.99.0'
           components: llvm-tools-preview
@@ -66,7 +66,7 @@ jobs:
             --clients "$PGO_CLIENTS" --minimum-clients "$PGO_MINIMUM_CLIENTS"
       - name: Retain failed-build and process logs
         if: failure()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v7
         with:
           name: pgo-failure-logs-${{ inputs.target }}
           path: |
@@ -77,7 +77,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Upload qualified PGO server
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v7
         with:
           name: basisrust-server-${{ inputs.target }}-pgo
           path: ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}/dist/*.tar.gz
@@ -85,7 +85,7 @@ jobs:
           compression-level: 0
       - name: Retain qualification summary, including failures
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v7
         with:
           name: server-pgo-qualification-summary
           path: ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}/PGO-VALIDATION.md

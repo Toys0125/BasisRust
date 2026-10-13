@@ -80,13 +80,13 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.99.0'
           targets: ${{ matrix.target }}
@@ -104,7 +104,7 @@ jobs:
           sudo apt-get install --yes musl-tools
 
       - name: Install Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -120,7 +120,7 @@ jobs:
 
       - name: Retain PGO validation summary
         if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v7
         with:
           name: pgo-validation-${{ matrix.id }}
           path: ${{ runner.temp }}/server-pgo-${{ matrix.id }}-${{ github.run_id }}-${{ github.run_attempt }}/PGO-VALIDATION.md
@@ -128,7 +128,7 @@ jobs:
 
       - name: Retain failed-build and process logs
         if: failure()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v7
         with:
           name: pgo-failure-logs-${{ matrix.id }}
           path: |
@@ -216,7 +216,7 @@ jobs:
         run: tar -C package -czf "${{ matrix.archive }}" .
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v7
         with:
           name: basisrust-${{ matrix.id }}
           path: ${{ matrix.archive }}
