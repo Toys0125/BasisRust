@@ -196,12 +196,62 @@ pub struct AvatarTimingMetrics {
 
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct SceneBatchMetrics {
+    pub peer_queue_limit: u64,
+    pub admitted_recipient_messages: u64,
+    pub rejected_recipient_messages: u64,
+    pub pending_recipient_messages: u64,
+    pub peak_peer_pending_messages: u64,
+    pub enqueued_messages: u64,
+    pub dequeued_messages: u64,
+    pub attempted_recipient_messages: u64,
+    pub stale_recipient_messages: u64,
+    pub send_errors: u64,
+    pub enqueue_errors: u64,
+    pub queue_backpressure: u64,
+    pub fanout_backpressure: u64,
+    pub sent_datagrams: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadBudgetMetrics {
+    pub bytes_per_second_per_player: u64,
+    pub burst_seconds: u64,
+    pub accepted_messages: u64,
+    pub accepted_bytes: u64,
+    pub rejected_messages: u64,
+    pub rejected_bytes: u64,
+    pub reliable_rejections: u64,
+    pub oversized_reliable_messages: u64,
+    pub image_exempt_messages: u64,
+    pub image_exempt_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageMetrics {
+    pub egress_dropped_messages: u64,
+    pub egress_dropped_bytes: u64,
+    pub cached_images: usize,
+    pub complete_images: usize,
+    pub cache_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ExtendedHealthMetrics {
     pub reliable: ReliableMetrics,
     pub app_messages: AppMessageMetrics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_budget: Option<UploadBudgetMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<ImageMetrics>,
     pub raw_udp: RawUdpMetrics,
     pub avatar_sync: AvatarSyncMetrics,
     pub avatar_timing: AvatarTimingMetrics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scene_batch: Option<SceneBatchMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -538,6 +588,53 @@ mod tests {
     }
 
     #[test]
+    fn image_metrics_are_optional_and_expose_governor_and_cache_counts() {
+        let absent = serde_json::to_value(ExtendedHealthMetrics::default()).unwrap();
+        assert!(absent.get("images").is_none());
+        let present = serde_json::to_value(ExtendedHealthMetrics {
+            images: Some(ImageMetrics {
+                egress_dropped_messages: 2,
+                egress_dropped_bytes: 300,
+                cached_images: 4,
+                complete_images: 3,
+                cache_bytes: 500,
+            }),
+            ..ExtendedHealthMetrics::default()
+        })
+        .unwrap();
+        assert_eq!(present["images"]["egressDroppedMessages"], 2);
+        assert_eq!(present["images"]["egressDroppedBytes"], 300);
+        assert_eq!(present["images"]["completeImages"], 3);
+        assert_eq!(present["images"]["cacheBytes"], 500);
+    }
+
+    #[test]
+    fn health_exposes_upload_admission_and_image_exemption() {
+        let disabled = serde_json::to_value(ExtendedHealthMetrics::default()).unwrap();
+        assert!(disabled.get("uploadBudget").is_none());
+        let metrics = ExtendedHealthMetrics {
+            upload_budget: Some(UploadBudgetMetrics {
+                bytes_per_second_per_player: 131072,
+                burst_seconds: 2,
+                accepted_messages: 4,
+                accepted_bytes: 500,
+                rejected_messages: 2,
+                rejected_bytes: 300,
+                reliable_rejections: 1,
+                oversized_reliable_messages: 0,
+                image_exempt_messages: 3,
+                image_exempt_bytes: 600000,
+            }),
+            ..ExtendedHealthMetrics::default()
+        };
+        let json = serde_json::to_value(metrics).unwrap();
+        assert_eq!(json["uploadBudget"]["bytesPerSecondPerPlayer"], 131072);
+        assert_eq!(json["uploadBudget"]["rejectedBytes"], 300);
+        assert_eq!(json["uploadBudget"]["reliableRejections"], 1);
+        assert_eq!(json["uploadBudget"]["imageExemptBytes"], 600000);
+    }
+
+    #[test]
     fn health_extended_json_exposes_avatar_input_pipeline_counts() {
         let metrics = ExtendedHealthMetrics {
             app_messages: AppMessageMetrics {
@@ -557,6 +654,29 @@ mod tests {
         assert_eq!(json["appMessages"]["avatarCoalesced"], 3);
         assert_eq!(json["appMessages"]["avatarRejected"], 2);
         assert_eq!(json["appMessages"]["avatarProcessed"], 9);
+    }
+
+    #[test]
+    fn scene_batch_health_is_optional_and_exposes_explicit_admission_loss() {
+        let disabled = serde_json::to_value(ExtendedHealthMetrics::default()).unwrap();
+        assert!(disabled.get("sceneBatch").is_none());
+        let metrics = ExtendedHealthMetrics {
+            scene_batch: Some(SceneBatchMetrics {
+                peer_queue_limit: 70,
+                admitted_recipient_messages: 100,
+                rejected_recipient_messages: 12,
+                pending_recipient_messages: 5,
+                peak_peer_pending_messages: 70,
+                ..SceneBatchMetrics::default()
+            }),
+            ..ExtendedHealthMetrics::default()
+        };
+        let enabled = serde_json::to_value(metrics).unwrap();
+        assert_eq!(enabled["sceneBatch"]["peerQueueLimit"], 70);
+        assert_eq!(enabled["sceneBatch"]["admittedRecipientMessages"], 100);
+        assert_eq!(enabled["sceneBatch"]["rejectedRecipientMessages"], 12);
+        assert_eq!(enabled["sceneBatch"]["pendingRecipientMessages"], 5);
+        assert_eq!(enabled["sceneBatch"]["peakPeerPendingMessages"], 70);
     }
 
     #[test]

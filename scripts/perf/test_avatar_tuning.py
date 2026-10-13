@@ -142,6 +142,17 @@ class ValidationTests(unittest.TestCase):
 
 
 
+class MixedRankingTests(unittest.TestCase):
+    def test_zero_scene_counters_preserve_avatar_ranking(self):
+        runs = measured_runs()
+        expected = rank(runs, [0, 6], 2)['recommended_lanes']
+        for run in runs:
+            run['metrics'].update(scene_send_errors=0, scene_latency_p50_upper_ms=0)
+        result = rank(runs, [0, 6], 2)
+        self.assertEqual(result['recommended_lanes'], expected)
+        self.assertIsNone(result['comparisons'][0]['paired_change_percent'][0]['scene_send_errors'])
+
+
 class ParsingTests(unittest.TestCase):
     def test_sectioned_observer_uses_global_metrics(self):
         with tempfile.TemporaryDirectory() as directory:

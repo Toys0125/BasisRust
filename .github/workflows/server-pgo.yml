@@ -1,0 +1,92 @@
+name: Server PGO
+
+on:
+  workflow_dispatch:
+    inputs:
+      clients:
+        description: Initial qualification population
+        type: string
+        default: '300'
+        required: true
+      minimum_clients:
+        description: Lowest fallback population (failed higher runs remain recorded)
+        type: string
+        default: '100'
+        required: true
+      target:
+        description: Native server release target
+        type: choice
+        options:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-pc-windows-msvc
+          - aarch64-apple-darwin
+        default: x86_64-unknown-linux-gnu
+
+permissions:
+  contents: read
+
+jobs:
+  qualified-build:
+    name: Qualify hosted native PGO artifact
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ inputs.target == 'x86_64-pc-windows-msvc' && 'windows-latest' || inputs.target == 'aarch64-apple-darwin' && 'macos-15' || startsWith(inputs.target, 'aarch64-unknown-linux-') && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.0'
+          components: llvm-tools-preview
+          targets: ${{ inputs.target }}
+      - name: Install musl toolchain
+        if: endsWith(inputs.target, '-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Build and qualify with lower-count fallback
+        env:
+          PGO_CLIENTS: ${{ inputs.clients }}
+          PGO_TARGET: ${{ inputs.target }}
+          PGO_MINIMUM_CLIENTS: ${{ inputs.minimum_clients }}
+          PGO_OUTPUT: ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          python -B scripts/perf/server_pgo.py \
+            --output "$PGO_OUTPUT" --target "$PGO_TARGET" \
+            --clients "$PGO_CLIENTS" --minimum-clients "$PGO_MINIMUM_CLIENTS"
+      - name: Retain failed-build and process logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pgo-failure-logs-${{ inputs.target }}
+          path: |
+            ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}/build-*.log
+            ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}/profile-*.log
+            ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}/clients-*/**/server.log
+            ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}/clients-*/**/client.log
+          if-no-files-found: warn
+
+      - name: Upload qualified PGO server
+        uses: actions/upload-artifact@v7
+        with:
+          name: basisrust-server-${{ inputs.target }}-pgo
+          path: ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}/dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+      - name: Retain qualification summary, including failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: server-pgo-qualification-summary
+          path: ${{ runner.temp }}/server-pgo-${{ github.run_id }}-${{ github.run_attempt }}/PGO-VALIDATION.md
+          if-no-files-found: warn

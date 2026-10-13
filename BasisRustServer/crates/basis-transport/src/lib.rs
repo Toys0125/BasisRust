@@ -1,5 +1,8 @@
 mod pre_auth;
 
+#[cfg(test)]
+mod bench_branches;
+
 use basis_protocol::{
     channels,
     io::NetWriter,
@@ -316,29 +319,35 @@ pub enum PacketProperty {
 }
 
 impl PacketProperty {
+    /// Lookup table for the 5-bit property field. Values above `CompactMerged` stay `None`.
+    /// The original match also compiled without an indirect jump in the Rust 1.99.0 probe;
+    /// compare optimized callers and measurements before assuming this table is faster.
+    const FROM_BYTE_TABLE: [Option<Self>; 32] = {
+        let mut table = [None; 32];
+        table[Self::Unreliable as u8 as usize] = Some(Self::Unreliable);
+        table[Self::Channeled as u8 as usize] = Some(Self::Channeled);
+        table[Self::Ack as u8 as usize] = Some(Self::Ack);
+        table[Self::Ping as u8 as usize] = Some(Self::Ping);
+        table[Self::Pong as u8 as usize] = Some(Self::Pong);
+        table[Self::ConnectRequest as u8 as usize] = Some(Self::ConnectRequest);
+        table[Self::ConnectAccept as u8 as usize] = Some(Self::ConnectAccept);
+        table[Self::Disconnect as u8 as usize] = Some(Self::Disconnect);
+        table[Self::UnconnectedMessage as u8 as usize] = Some(Self::UnconnectedMessage);
+        table[Self::MtuCheck as u8 as usize] = Some(Self::MtuCheck);
+        table[Self::MtuOk as u8 as usize] = Some(Self::MtuOk);
+        table[Self::Broadcast as u8 as usize] = Some(Self::Broadcast);
+        table[Self::Merged as u8 as usize] = Some(Self::Merged);
+        table[Self::ShutdownOk as u8 as usize] = Some(Self::ShutdownOk);
+        table[Self::PeerNotFound as u8 as usize] = Some(Self::PeerNotFound);
+        table[Self::InvalidProtocol as u8 as usize] = Some(Self::InvalidProtocol);
+        table[Self::NatMessage as u8 as usize] = Some(Self::NatMessage);
+        table[Self::Empty as u8 as usize] = Some(Self::Empty);
+        table[Self::CompactMerged as u8 as usize] = Some(Self::CompactMerged);
+        table
+    };
+
     pub fn from_byte(value: u8) -> Option<Self> {
-        Some(match value & 0x1f {
-            0 => Self::Unreliable,
-            1 => Self::Channeled,
-            2 => Self::Ack,
-            3 => Self::Ping,
-            4 => Self::Pong,
-            5 => Self::ConnectRequest,
-            6 => Self::ConnectAccept,
-            7 => Self::Disconnect,
-            8 => Self::UnconnectedMessage,
-            9 => Self::MtuCheck,
-            10 => Self::MtuOk,
-            11 => Self::Broadcast,
-            12 => Self::Merged,
-            13 => Self::ShutdownOk,
-            14 => Self::PeerNotFound,
-            15 => Self::InvalidProtocol,
-            16 => Self::NatMessage,
-            17 => Self::Empty,
-            18 => Self::CompactMerged,
-            _ => return None,
-        })
+        Self::FROM_BYTE_TABLE[(value & 0x1f) as usize]
     }
 }
 
@@ -1803,15 +1812,22 @@ impl TransportHandle {
                 Ok(true)
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                if self.statistics_enabled() {
-                    self.stats
-                        .raw_send_would_block
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(false)
+                self.cold_send_would_block()
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// Socket backpressure is the only common send refusal and it stays rare per datagram;
+    /// the WouldBlock counter keeps the per-datagram send path linear.
+    #[cold]
+    fn cold_send_would_block(&self) -> Result<bool> {
+        if self.statistics_enabled() {
+            self.stats
+                .raw_send_would_block
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(false)
     }
 
     /// These callers discard a refused datagram. Reliable/ACK/MTU callers use
@@ -1935,6 +1951,15 @@ impl TransportHandle {
             }
         }
         // Once issued, an ID can only return through the explicit cleanup/recycle path.
+        self.allocate_fresh_peer_id(&retired)
+    }
+
+    /// Fresh ID allocation runs when the recycle queue is exhausted, including initial
+    /// connections. Mark the scan and exhaustion check cold; this annotation alone does not
+    /// establish the optimized caller's layout. The caller's reuse and retire locks stay held
+    /// for the whole scan, preserving the reuse/retire/allocate order.
+    #[cold]
+    fn allocate_fresh_peer_id(&self, retired: &HashSet<PeerId>) -> Result<PeerId> {
         let mut allocated = self.allocated_peer_ids.lock();
         for _ in 0..=u16::MAX {
             let id = self.next_peer_id.fetch_add(1, Ordering::SeqCst);
@@ -2412,6 +2437,62 @@ impl TransportHandle {
         Ok(true)
     }
 
+    /// Retire a peer whose receive state rejected a fragment. Packet processing may still
+    /// hold a read lease, so this publishes lifecycle cleanup without claiming it or waiting
+    /// for readers; the event consumer owns the eventual claim and ID recycling.
+    async fn reject_fragment_session(
+        &self,
+        tx: &mpsc::Sender<ServerEvent>,
+        session: &PeerSession,
+    ) -> Result<bool> {
+        const REASON: &str = "invalid reliable fragment sequence";
+        let mut payload = NetWriter::new();
+        payload.put_string(REASON)?;
+        let lifecycle_senders = self.lifecycle_senders();
+        let disconnect_tx = lifecycle_senders
+            .as_ref()
+            .map_or(tx, |senders| &senders.disconnects);
+        // Rejected reliable fragments remain uncommitted/unACKed. Retry on the
+        // next retransmit/drain pass instead of parking a UDP worker or dispatcher.
+        let Some(permit) = try_reserve_lifecycle_event(disconnect_tx)? else {
+            return Ok(false);
+        };
+        let state = {
+            let _allocation = self.peer_allocation.lock();
+            let Some(state) = self.peers.get(&session.peer).map(|current| current.clone()) else {
+                return Ok(false);
+            };
+            if !Arc::ptr_eq(&state, &session.state)
+                || self.by_addr.get(&state.addr).map(|id| *id) != Some(session.peer)
+                || state.read_gate.is_closed()
+            {
+                return Ok(false);
+            }
+            state.read_gate.close_admission();
+            self.peers.remove(&session.peer);
+            self.by_addr.remove(&state.addr);
+            self.retire_peer_id(session.peer);
+            state
+        };
+        state.clear_ordered_reorder();
+        permit.send(ServerEvent::PeerDisconnected {
+            peer: session.peer,
+            session: session.clone(),
+            reason: DisconnectReason::Rejected(REASON.to_owned()),
+        });
+        let mut writer = NetWriter::with_capacity(payload.len() + 9);
+        writer.put_u8(PacketProperty::Disconnect as u8 | (state.connection_number << 5));
+        writer.put_i64(state.connect_time);
+        writer.put_bytes(payload.as_slice());
+        if let Err(err) = self.send_raw_to(writer.as_slice(), state.addr).await {
+            warn!(
+                peer = session.peer,
+                "failed to send disconnect packet: {err}"
+            );
+        }
+        Ok(true)
+    }
+
     pub async fn disconnect(&self, peer: PeerId, reason: &str) -> Result<()> {
         if let Some(session) = self.peer_session(peer) {
             let _ = self.disconnect_session(&session, reason).await?;
@@ -2469,17 +2550,11 @@ impl TransportHandle {
     }
 }
 
-/// Record a freshly built reliable packet as in-flight. The built bytes are moved, not cloned:
-/// the merged datagram is assembled from this copy, so cloning here doubled both the
-/// allocation count and the memcpy volume on the reliable path.
-fn record_pending_reliable(
-    state: &PeerState,
-    channel_id: u8,
-    sequence: u16,
-    bytes: Vec<u8>,
-    stats: Option<&TransportStats>,
-) {
-    let mut pending = state.pending_reliable.lock();
+/// The per-peer in-flight cap is only reached under overload or a stalled ACK stream, so the
+/// oldest-packet shedding loop stays out of the per-message reliable path. The caller holds
+/// the pending map lock for the whole shed.
+#[cold]
+fn shed_oldest_pending(state: &PeerState, pending: &mut HashMap<u8, VecDeque<PendingReliable>>) {
     while state.pending_total.load(Ordering::Relaxed) >= MAX_PENDING_RELIABLE_PER_PEER {
         // Shed exactly the single oldest in-flight packet rather than growing without bound.
         // Inspect each queue front first; popping while searching would discard one packet from
@@ -2506,6 +2581,22 @@ fn record_pending_reliable(
             pending.remove(&oldest_channel);
         }
         state.pending_total.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Record a freshly built reliable packet as in-flight. The built bytes are moved, not cloned:
+/// the merged datagram is assembled from this copy, so cloning here doubled both the
+/// allocation count and the memcpy volume on the reliable path.
+fn record_pending_reliable(
+    state: &PeerState,
+    channel_id: u8,
+    sequence: u16,
+    bytes: Vec<u8>,
+    stats: Option<&TransportStats>,
+) {
+    let mut pending = state.pending_reliable.lock();
+    if state.pending_total.load(Ordering::Relaxed) >= MAX_PENDING_RELIABLE_PER_PEER {
+        shed_oldest_pending(state, &mut pending);
     }
     pending
         .entry(channel_id)
@@ -2556,6 +2647,16 @@ fn dequeue_reliable_window(
     (0..count).filter_map(|_| outgoing.pop_front()).collect()
 }
 
+/// Payloads beyond the LiteNetLib fragment limit never occur on a healthy peer, so the drop
+/// log stays out of the reliable enqueue path.
+#[cold]
+fn cold_drop_oversized_reliable(total_fragments: usize) {
+    warn!(
+        "dropping reliable payload requiring {total_fragments} fragments; LiteNetLib limit is {}",
+        u16::MAX
+    );
+}
+
 fn enqueue_reliable_payload(
     state: &PeerState,
     channel: u8,
@@ -2582,10 +2683,7 @@ fn enqueue_reliable_payload(
 
     let total_fragments = payload.len().div_ceil(RELIABLE_FRAGMENT_PAYLOAD_SIZE);
     if total_fragments > u16::MAX as usize {
-        warn!(
-            "dropping reliable payload requiring {total_fragments} fragments; LiteNetLib limit is {}",
-            u16::MAX
-        );
+        cold_drop_oversized_reliable(total_fragments);
         return;
     }
 
@@ -3005,16 +3103,21 @@ async fn read_loop(handle: TransportHandle, tx: mpsc::Sender<ServerEvent>) {
                     warn!("transport packet processing failed: {err}");
                 }
             }
-            Err(err) => {
-                if err.kind() == std::io::ErrorKind::ConnectionReset {
-                    continue;
-                }
-                // A diagnostic must never pin every UDP receive worker behind the
-                // application event channel. Network errors are best-effort events.
-                let _ = tx.try_send(ServerEvent::NetworkError(err.to_string()));
-            }
+            Err(err) => cold_recv_error(&tx, err).await,
         }
     }
+}
+
+/// Socket receive errors are rare next to per-datagram work; ICMP-driven ConnectionReset
+/// storms still skip the network-error event, matching the historical loop behavior.
+#[cold]
+async fn cold_recv_error(tx: &mpsc::Sender<ServerEvent>, err: std::io::Error) {
+    if err.kind() == std::io::ErrorKind::ConnectionReset {
+        return;
+    }
+    // A diagnostic must never pin every UDP receive worker behind the
+    // application event channel. Network errors are best-effort events.
+    let _ = tx.try_send(ServerEvent::NetworkError(err.to_string()));
 }
 
 async fn process_packet(
@@ -3061,7 +3164,7 @@ async fn process_packet_for_peer(
     };
     let connection_number = (header & 0x60) >> 5;
     let Some(property) = PacketProperty::from_byte(header) else {
-        trace!("unknown packet property: {header}");
+        cold_unknown_property(header);
         return Ok(());
     };
     let active_peer = if matches!(
@@ -3367,6 +3470,26 @@ async fn process_packet_for_peer(
                 if let Some((channel, delivery, payload, fragment)) =
                     parse_message_packet(property, bytes)
                 {
+                    if fragment.as_ref().is_some_and(|fragment| {
+                        !matches!(
+                            delivery,
+                            DeliveryMethod::ReliableOrdered | DeliveryMethod::ReliableUnordered
+                        ) || fragment.total < 2
+                            || fragment.total as usize > MAX_INCOMING_FRAGMENT_PARTS
+                            || fragment.part >= fragment.total
+                            || payload.is_empty()
+                            || payload.len()
+                                > LITENETLIB_MTU_STEPS[LITENETLIB_MTU_STEPS.len() - 1]
+                                    - LITENETLIB_FRAGMENTED_HEADER_SIZE
+                    }) {
+                        let session = PeerSession {
+                            peer: *peer_id,
+                            state: peer.clone(),
+                        };
+                        handle.reject_fragment_session(tx, &session).await?;
+                        return Ok(());
+                    }
+
                     let reliable = matches!(
                         delivery,
                         DeliveryMethod::ReliableOrdered
@@ -3402,9 +3525,7 @@ async fn process_packet_for_peer(
                                 peer: *peer_id,
                                 state: peer.clone(),
                             };
-                            handle
-                                .disconnect_session(&session, "invalid reliable fragment sequence")
-                                .await?;
+                            handle.reject_fragment_session(tx, &session).await?;
                         } else {
                             result?;
                         }
@@ -3426,9 +3547,7 @@ async fn process_packet_for_peer(
                                 peer: *peer_id,
                                 state: peer.clone(),
                             };
-                            handle
-                                .disconnect_session(&session, "invalid reliable fragment sequence")
-                                .await?;
+                            handle.reject_fragment_session(tx, &session).await?;
                         } else {
                             result?;
                         }
@@ -3535,9 +3654,24 @@ async fn process_packet_for_peer(
                 }
             }
         }
-        _ => debug!("ignored packet property {property:?} from {remote_addr}"),
+        _ => cold_ignored_property(remote_addr, property).await,
     }
     Ok(())
+}
+
+/// Properties without an explicit receive arm — unconnected server-info probes, shutdown
+/// acknowledgements, peer-not-found, broadcast, empty — are rare on a healthy wire, so their
+/// logging stays out of the per-datagram dispatch path.
+#[cold]
+async fn cold_ignored_property(remote_addr: SocketAddr, property: PacketProperty) {
+    debug!("ignored packet property {property:?} from {remote_addr}");
+}
+
+/// Unknown property bytes come from malformed or foreign traffic; the trace stays out of the
+/// per-datagram dispatch path.
+#[cold]
+fn cold_unknown_property(header: u8) {
+    trace!("unknown packet property: {header}");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4152,7 +4286,7 @@ fn try_reserve_lifecycle_event(
     match tx.try_reserve() {
         Ok(permit) => Ok(Some(permit)),
         Err(mpsc::error::TrySendError::Full(())) => Ok(None),
-        Err(mpsc::error::TrySendError::Closed(())) => Err(TransportError::EventChannelClosed),
+        Err(mpsc::error::TrySendError::Closed(())) => cold_event_channel_closed(),
     }
 }
 
@@ -4160,8 +4294,13 @@ async fn enqueue_lossy_event(tx: &mpsc::Sender<ServerEvent>, event: ServerEvent)
     match tx.try_send(event) {
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
-        Err(mpsc::error::TrySendError::Closed(_)) => Err(TransportError::EventChannelClosed),
+        Err(mpsc::error::TrySendError::Closed(_)) => cold_event_channel_closed(),
     }
+}
+
+#[cold]
+fn cold_event_channel_closed<T>() -> Result<T> {
+    Err(TransportError::EventChannelClosed)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4257,25 +4396,21 @@ fn parse_message_packet(
     match property {
         PacketProperty::Unreliable => {
             if bytes.len() < 2 {
-                return None;
+                return cold_rejected_packet();
             }
             Some((bytes[1], DeliveryMethod::Unreliable, &bytes[2..], None))
         }
         PacketProperty::Channeled => {
             if bytes.len() < 4 {
-                return None;
+                return cold_rejected_packet();
             }
             let channel_id = bytes[3];
             let channel = channel_id / 4;
             let delivery = DeliveryMethod::from_channel_id(channel_id);
             let fragmented = bytes[0] & 0x80 != 0;
             if fragmented {
-                if !matches!(
-                    delivery,
-                    DeliveryMethod::ReliableOrdered | DeliveryMethod::ReliableUnordered
-                ) || bytes.len() < LITENETLIB_FRAGMENTED_HEADER_SIZE
-                {
-                    return None;
+                if bytes.len() < LITENETLIB_FRAGMENTED_HEADER_SIZE {
+                    return cold_rejected_packet();
                 }
                 let fragment = IncomingFragment {
                     id: u16::from_le_bytes([bytes[4], bytes[5]]),
@@ -4283,23 +4418,20 @@ fn parse_message_packet(
                     total: u16::from_le_bytes([bytes[8], bytes[9]]),
                 };
                 let payload = &bytes[LITENETLIB_FRAGMENTED_HEADER_SIZE..];
-                if fragment.total < 2
-                    || fragment.total as usize > MAX_INCOMING_FRAGMENT_PARTS
-                    || fragment.part >= fragment.total
-                    || payload.is_empty()
-                    || payload.len()
-                        > LITENETLIB_MTU_STEPS[LITENETLIB_MTU_STEPS.len() - 1]
-                            - LITENETLIB_FRAGMENTED_HEADER_SIZE
-                {
-                    return None;
-                }
                 Some((channel, delivery, payload, Some(fragment)))
             } else {
                 Some((channel, delivery, &bytes[4..], None))
             }
         }
-        _ => None,
+        _ => cold_rejected_packet(),
     }
+}
+
+/// Truncated or non-message datagrams are rare on a healthy wire, so the rejection stays out
+/// of the per-message parse path.
+#[cold]
+fn cold_rejected_packet<T>() -> Option<T> {
+    None
 }
 
 struct BuiltPacket {
@@ -4399,7 +4531,7 @@ fn next_sequenced_channel_sequence(
 /// scanning it is cheap -- and it is per channel, unlike the previous whole-peer scan.
 fn process_ack(peer: &PeerState, bytes: &[u8], stats: Option<&TransportStats>) {
     if bytes.len() < LITENETLIB_CHANNELED_HEADER_SIZE {
-        return;
+        return cold_rejected_ack();
     }
     let channel_id = bytes[3];
     let sequenced = channel_id % 4 == DeliveryMethod::ReliableSequenced as u8;
@@ -4409,22 +4541,22 @@ fn process_ack(peer: &PeerState, bytes: &[u8], stats: Option<&TransportStats>) {
         LITENETLIB_CHANNELED_HEADER_SIZE + (DEFAULT_WINDOW_SIZE - 1) / 8 + 2
     };
     if bytes.len() != expected_size {
-        return;
+        return cold_rejected_ack();
     }
     let ack_window_start = u16::from_le_bytes([bytes[1], bytes[2]]);
     if sequenced {
         if ack_window_start >= MAX_SEQUENCE {
-            return;
+            return cold_rejected_ack();
         }
         let mut pending = peer.pending_reliable.lock();
         let Some(queue) = pending.get_mut(&channel_id) else {
-            return;
+            return cold_rejected_ack();
         };
         let Some(ack_index) = queue
             .iter()
             .position(|item| item.sequence == ack_window_start)
         else {
-            return;
+            return cold_rejected_ack();
         };
         for _ in 0..=ack_index {
             queue.pop_front();
@@ -4447,12 +4579,7 @@ fn process_ack(peer: &PeerState, bytes: &[u8], stats: Option<&TransportStats>) {
     let mut pending = peer.pending_reliable.lock();
     let Some(queue) = pending.get_mut(&channel_id) else {
         drop(pending);
-        if let Some(stats) = stats.filter(|stats| stats.extended_enabled.load(Ordering::Relaxed)) {
-            stats.reliable_acks_received.fetch_add(1, Ordering::Relaxed);
-            stats
-                .reliable_acks_unknown_channel
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        cold_ack_unknown_channel(stats);
         return;
     };
     // LiteNetLib `ReliableChannel.ProcessAck` bounds check, reproduced exactly: the ACK's
@@ -4460,7 +4587,7 @@ fn process_ack(peer: &PeerState, bytes: &[u8], stats: Option<&TransportStats>) {
     // own oldest unacknowledged packet. Anything else is a stale or forged ACK and is dropped
     // whole, rather than partially believed.
     if ack_window_start >= MAX_SEQUENCE {
-        return;
+        return cold_rejected_ack();
     }
     let local_window_start = queue.front().map(|item| item.sequence).unwrap_or(0);
     let window_rel = relative_sequence(local_window_start, ack_window_start);
@@ -4496,6 +4623,23 @@ fn process_ack(peer: &PeerState, bytes: &[u8], stats: Option<&TransportStats>) {
     }
     if released > 0 {
         peer.pending_total.fetch_sub(released, Ordering::Relaxed);
+    }
+}
+
+/// Malformed, forged, or stale ACK datagrams are rare next to valid ACK traffic; the
+/// rejection stays out of the per-ACK path.
+#[cold]
+fn cold_rejected_ack() {}
+
+/// An ACK naming a channel with nothing in flight is rare once a connection is steady; the
+/// unknown-channel counters stay out of the per-ACK path.
+#[cold]
+fn cold_ack_unknown_channel(stats: Option<&TransportStats>) {
+    if let Some(stats) = stats.filter(|stats| stats.extended_enabled.load(Ordering::Relaxed)) {
+        stats.reliable_acks_received.fetch_add(1, Ordering::Relaxed);
+        stats
+            .reliable_acks_unknown_channel
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -4990,9 +5134,9 @@ async fn reliable_dispatch_loop(handle: TransportHandle, tx: mpsc::Sender<Server
                             peer: peer_id,
                             state: peer_state.clone(),
                         };
-                        let _ = handle
-                            .disconnect_session(&session, "invalid reliable fragment sequence")
-                            .await;
+                        if let Err(err) = handle.reject_fragment_session(&tx, &session).await {
+                            warn!("ordered receive drain rejection failed: {err}");
+                        }
                     }
                     Err(err) => warn!("ordered receive drain failed: {err}"),
                 }
@@ -5618,10 +5762,49 @@ mod tests {
 
     #[test]
     fn packet_property_masks_connection_number() {
-        assert_eq!(
-            PacketProperty::from_byte(PacketProperty::ConnectRequest as u8 | (2 << 5)),
-            Some(PacketProperty::ConnectRequest)
-        );
+        // Explicit LiteNetLib wire values also guard against accidentally omitting
+        // CompactMerged from the decoder. Bits 5-6 carry the connection number;
+        // bit 7 marks fragments and must not alter property decoding either.
+        let wire_properties = [
+            (0, PacketProperty::Unreliable),
+            (1, PacketProperty::Channeled),
+            (2, PacketProperty::Ack),
+            (3, PacketProperty::Ping),
+            (4, PacketProperty::Pong),
+            (5, PacketProperty::ConnectRequest),
+            (6, PacketProperty::ConnectAccept),
+            (7, PacketProperty::Disconnect),
+            (8, PacketProperty::UnconnectedMessage),
+            (9, PacketProperty::MtuCheck),
+            (10, PacketProperty::MtuOk),
+            (11, PacketProperty::Broadcast),
+            (12, PacketProperty::Merged),
+            (13, PacketProperty::ShutdownOk),
+            (14, PacketProperty::PeerNotFound),
+            (15, PacketProperty::InvalidProtocol),
+            (16, PacketProperty::NatMessage),
+            (17, PacketProperty::Empty),
+            (18, PacketProperty::CompactMerged),
+        ];
+        for connection in 0..4 {
+            for fragment in [0, 0x80] {
+                let flags = (connection << 5) | fragment;
+                for (wire, property) in wire_properties {
+                    assert_eq!(
+                        PacketProperty::from_byte(wire | flags),
+                        Some(property),
+                        "property {wire} with flags {flags:#04x}"
+                    );
+                }
+                for reserved in 19..32 {
+                    assert_eq!(
+                        PacketProperty::from_byte(reserved | flags),
+                        None,
+                        "reserved property {reserved} with flags {flags:#04x}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -7003,6 +7186,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_fragment_retires_session_and_publishes_cleanup_event() {
+        let (handle, tx, _) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 1, 1)
+                .await
+                .unwrap();
+        let mut lifecycle = handle.enable_lifecycle_event_queues(4, 1).unwrap();
+        let request_addr = loopback_addr(5001);
+        process_packet(&handle, &tx, request_addr, &admission_packet(91))
+            .await
+            .unwrap();
+        let request = match lifecycle.connections.recv().await.unwrap() {
+            ServerEvent::ConnectionRequest(request) => request,
+            _ => panic!("expected connection request"),
+        };
+        let session = handle.accept_session(&request).await.unwrap();
+        let peer = session.state.clone();
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+
+        // Retain unrelated reorder data so retirement also proves its budget is released.
+        peer.remote_ordered_sequence.lock().insert(
+            channel_id,
+            OrderedReceiveState {
+                future: HashMap::from([(
+                    7,
+                    RetainedOrderedMessage {
+                        payload: Bytes::from_static(b"retained"),
+                        fragment: None,
+                        _budgets: vec![handle
+                            .reorder_budget
+                            .try_reserve(&peer.reorder_usage, 8)
+                            .unwrap()],
+                    },
+                )]),
+                ..OrderedReceiveState::default()
+            },
+        );
+        peer.ordered_reorder_active.store(true, Ordering::Release);
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 1);
+
+        let fragment_packet = |sequence: u16, total: u16| {
+            let mut packet = vec![PacketProperty::Channeled as u8 | 0x80, 0, 0, channel_id];
+            packet[1..3].copy_from_slice(&sequence.to_le_bytes());
+            packet.extend_from_slice(&5u16.to_le_bytes());
+            packet.extend_from_slice(&0u16.to_le_bytes());
+            packet.extend_from_slice(&total.to_le_bytes());
+            packet.push(b'x');
+            packet
+        };
+        process_packet(&handle, &tx, request_addr, &fragment_packet(0, 2))
+            .await
+            .unwrap();
+        // A full lifecycle queue must delay retirement, not lose its notification.
+        handle
+            .lifecycle_senders()
+            .unwrap()
+            .disconnects
+            .try_send(ServerEvent::NetworkError("hold lifecycle".into()))
+            .unwrap();
+        let malformed = fragment_packet(1, 3);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            process_packet(&handle, &tx, request_addr, &malformed),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(handle.is_current_session(&session));
+        assert!(matches!(
+            lifecycle.disconnects.recv().await,
+            Some(ServerEvent::NetworkError(_))
+        ));
+        // Uncommitted malformed input retries rejection after capacity becomes free.
+        process_packet(&handle, &tx, request_addr, &malformed)
+            .await
+            .unwrap();
+
+        let (event_peer, captured, reason) = match lifecycle.disconnects.recv().await.unwrap() {
+            ServerEvent::PeerDisconnected {
+                peer,
+                session,
+                reason,
+            } => (peer, session, reason),
+            _ => panic!("expected fragment rejection lifecycle event"),
+        };
+        assert_eq!(event_peer, session.peer_id());
+        assert!(captured.same_connection(&session));
+        assert!(matches!(reason, DisconnectReason::Rejected(_)));
+        assert!(
+            lifecycle.disconnects.try_recv().is_err(),
+            "event must be emitted once"
+        );
+        assert!(handle.peer_session(event_peer).is_none());
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 0);
+
+        assert!(handle.close_session_admission(&captured));
+        captured.wait_for_read_leases().await;
+        handle.recycle_peer_id(event_peer);
+        let replacement_addr = loopback_addr(5002);
+        process_packet(&handle, &tx, replacement_addr, &admission_packet(92))
+            .await
+            .unwrap();
+        let replacement_request = match lifecycle.connections.recv().await.unwrap() {
+            ServerEvent::ConnectionRequest(request) => request,
+            _ => panic!("expected replacement connection request"),
+        };
+        let replacement = handle.accept_session(&replacement_request).await.unwrap();
+        assert_eq!(replacement.peer_id(), event_peer);
+        assert!(!handle
+            .reject_fragment_session(&tx, &captured)
+            .await
+            .unwrap());
+        assert!(handle.is_current_session(&replacement));
+        assert!(lifecycle.disconnects.try_recv().is_err());
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn invalid_fragment_headers_publish_rejection_instead_of_stalling() {
+        let max_payload = LITENETLIB_MTU_STEPS[LITENETLIB_MTU_STEPS.len() - 1]
+            - LITENETLIB_FRAGMENTED_HEADER_SIZE;
+        for (case, (total, part, size, delivery)) in [
+            (129u16, 0u16, 1, DeliveryMethod::ReliableOrdered),
+            (1, 0, 1, DeliveryMethod::ReliableOrdered),
+            (2, 2, 1, DeliveryMethod::ReliableUnordered),
+            (2, 0, 0, DeliveryMethod::ReliableOrdered),
+            (2, 0, max_payload + 1, DeliveryMethod::ReliableOrdered),
+            (2, 0, 1, DeliveryMethod::ReliableSequenced),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (handle, tx, _) =
+                TransportHandle::bind_with_options(loopback_addr(0), true, true, 1, 1)
+                    .await
+                    .unwrap();
+            let mut lifecycle = handle.enable_lifecycle_event_queues(4, 1).unwrap();
+            let addr = loopback_addr(5100 + case as u16);
+            process_packet(&handle, &tx, addr, &admission_packet(100 + case as i64))
+                .await
+                .unwrap();
+            let Some(ServerEvent::ConnectionRequest(request)) = lifecycle.connections.recv().await
+            else {
+                panic!("expected connection request")
+            };
+            let session = handle.accept_session(&request).await.unwrap();
+            let mut packet = vec![
+                PacketProperty::Channeled as u8 | 0x80,
+                0,
+                0,
+                DeliveryMethod::channel_id(channels::CHAT, delivery),
+            ];
+            packet.extend_from_slice(&5u16.to_le_bytes());
+            packet.extend_from_slice(&part.to_le_bytes());
+            packet.extend_from_slice(&total.to_le_bytes());
+            packet.resize(LITENETLIB_FRAGMENTED_HEADER_SIZE + size, b'x');
+            process_packet(&handle, &tx, addr, &packet).await.unwrap();
+            let Some(ServerEvent::PeerDisconnected {
+                session: retired,
+                reason,
+                ..
+            }) = tokio::time::timeout(Duration::from_secs(1), lifecycle.disconnects.recv())
+                .await
+                .unwrap()
+            else {
+                panic!("expected invalid-header rejection")
+            };
+            assert!(retired.same_connection(&session));
+            assert!(matches!(reason, DisconnectReason::Rejected(_)));
+            assert!(handle.peer_session(session.peer_id()).is_none());
+            assert_eq!(handle.reorder_budget_snapshot().retained_packets, 0);
+            assert!(handle.close_session_admission(&retired));
+            retired.wait_for_read_leases().await;
+            handle.recycle_peer_id(retired.peer_id());
+            handle.shutdown();
+        }
+    }
+
+    #[tokio::test]
     async fn pending_requests_coalesce_expire_and_recover_capacity() {
         let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
         let (tx, mut rx) = mpsc::channel(8192);
@@ -7577,7 +7939,9 @@ mod tests {
         let mut malformed = vec![PacketProperty::Channeled as u8 | 0x80, 0, 0, channel_id];
         malformed.extend_from_slice(&[1, 0, 0, 0, 1, 0]);
         malformed.extend_from_slice(b"x");
-        assert!(parse_message_packet(PacketProperty::Channeled, &malformed).is_none());
+        // Complete malformed metadata reaches the session rejection path.
+        assert!(parse_message_packet(PacketProperty::Channeled, &malformed).is_some());
+        assert!(parse_message_packet(PacketProperty::Channeled, &malformed[..9]).is_none());
 
         let budget = Arc::new(ReorderBudget::default());
         let peer = Arc::new(PeerReorderUsage::default());

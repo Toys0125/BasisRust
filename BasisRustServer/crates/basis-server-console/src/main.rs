@@ -1,3 +1,5 @@
+#[cfg(feature = "benchmark-validation")]
+use basis_server_health::{SceneBatchMetrics, UploadBudgetMetrics};
 mod shutdown;
 
 const DIAGNOSTIC_TARGET: &str = "basis_server_console::diagnostics";
@@ -12,7 +14,7 @@ use basis_server_health::{
     format_system_time, start_health_server, AppMessageMetrics, AvatarSyncMetrics,
     AvatarTimingMetrics, BsrBundleMetrics, BsrHealthMetrics, BsrLoadMetrics, BsrMsPerTickMetrics,
     BsrWindowMetrics, BsrZstdMetrics, ExtendedHealthMetrics, HealthState, HealthStatistics,
-    RawUdpMetrics, ReliableMetrics, RustTransportMetrics,
+    ImageMetrics, RawUdpMetrics, ReliableMetrics, RustTransportMetrics,
 };
 use clap::Parser;
 use crossterm::{
@@ -852,6 +854,47 @@ async fn async_main(
                 let app = server.statistics.snapshot();
                 let avatar = server.avatar_sync.stats();
                 ExtendedHealthMetrics {
+                    images: {
+                        let (egress_dropped_messages, egress_dropped_bytes) =
+                            server.image_egress_dropped();
+                        let (cached_images, complete_images, cache_bytes) =
+                            server.image_cache_stats();
+                        Some(ImageMetrics {
+                            egress_dropped_messages,
+                            egress_dropped_bytes,
+                            cached_images,
+                            complete_images,
+                            cache_bytes,
+                        })
+                    },
+                    scene_batch: {
+                        #[cfg(feature = "benchmark-validation")]
+                        {
+                            server
+                                .scene_relay_snapshot()
+                                .map(|scene| SceneBatchMetrics {
+                                    peer_queue_limit: scene.peer_queue_limit,
+                                    admitted_recipient_messages: scene.admitted_recipient_messages,
+                                    rejected_recipient_messages: scene.rejected_recipient_messages,
+                                    pending_recipient_messages: scene.pending_recipient_messages,
+                                    peak_peer_pending_messages: scene.peak_peer_pending_messages,
+                                    enqueued_messages: scene.enqueued_messages,
+                                    dequeued_messages: scene.dequeued_messages,
+                                    attempted_recipient_messages: scene
+                                        .attempted_recipient_messages,
+                                    stale_recipient_messages: scene.stale_recipient_messages,
+                                    send_errors: scene.send_errors,
+                                    enqueue_errors: scene.enqueue_errors,
+                                    queue_backpressure: scene.queue_backpressure,
+                                    fanout_backpressure: scene.fanout_backpressure,
+                                    sent_datagrams: scene.sent_datagrams,
+                                })
+                        }
+                        #[cfg(not(feature = "benchmark-validation"))]
+                        {
+                            None
+                        }
+                    },
                     reliable: ReliableMetrics {
                         pending: server.transport.pending_reliable_count(),
                         queued: server.transport.queued_reliable_count(),
@@ -863,6 +906,28 @@ async fn async_main(
                         acks_released: transport.reliable_acks_released,
                         acks_unknown_channel: transport.reliable_acks_unknown_channel,
                         window_stalls: transport.reliable_window_stalls,
+                    },
+                    upload_budget: {
+                        #[cfg(feature = "benchmark-validation")]
+                        {
+                            let upload = server.upload_budget_snapshot();
+                            Some(UploadBudgetMetrics {
+                                bytes_per_second_per_player: upload.bytes_per_second_per_player,
+                                burst_seconds: upload.burst_seconds,
+                                accepted_messages: upload.accepted_messages,
+                                accepted_bytes: upload.accepted_bytes,
+                                rejected_messages: upload.rejected_messages,
+                                rejected_bytes: upload.rejected_bytes,
+                                reliable_rejections: upload.reliable_rejections,
+                                oversized_reliable_messages: upload.oversized_reliable_messages,
+                                image_exempt_messages: upload.image_exempt_messages,
+                                image_exempt_bytes: upload.image_exempt_bytes,
+                            })
+                        }
+                        #[cfg(not(feature = "benchmark-validation"))]
+                        {
+                            None
+                        }
                     },
                     app_messages: AppMessageMetrics {
                         inbound: app.inbound_packets,
@@ -997,13 +1062,13 @@ async fn async_main(
 
     // Keep the listener across timer polls so a delivered stop signal is not
     // discarded when the periodic branch wins select.
-    let stop_signal = tokio::signal::ctrl_c();
+    let stop_signal = shutdown::stop_signal();
     tokio::pin!(stop_signal);
     loop {
         tokio::select! {
             result = &mut stop_signal => {
                 if let Err(err) = result {
-                    warn!("failed to listen for Ctrl+C: {err}");
+                    warn!("failed to listen for stop signal: {err}");
                 }
                 running.store(false, Ordering::SeqCst);
                 break;

@@ -94,9 +94,41 @@ class ServerTransmitMetricsTests(unittest.TestCase):
             commands = {'server': ['/server'], 'client': ['/client', '--x', '/client-config'],
                         'server_environment': entry['server_settings'], 'client_environment': {}}
             (capture / 'commands.json').write_text(json.dumps(commands))
-            with patch('avatar_tuning.observer_metrics', return_value=obs), \
-                 patch('avatar_tuning.sha256', return_value='same'):
+            with patch('avatar_tuning.sha256', return_value='same'):
                 result = __import__('avatar_tuning').summarize(capture, experiment, entry)
+
+            # Both observers share one marker; scene remains active through the
+            # two-second receive grace while CPU/avatar counters stay at 6s.
+            workload.update(additional_avatar_bytes=128, scene_data_bytes=128,
+                            scene_data_interval_ms=50, scene_data_reliable=False)
+            meta['workload'] = dict(workload)
+            (capture / 'run.json').write_text(json.dumps(meta))
+            commands['client'].extend(['--additional-avatar-bytes', '128', '--scene-data-bytes', '128',
+                                      '--scene-data-interval-ms', '50', '--observe-scene-csv', str(capture / 'scene.csv'),
+                                      '--scene-start-file', str(capture / 'observe-start.marker'),
+                                      '--observe-avatar-start-file', str(capture / 'observe-start.marker')])
+            (capture / 'commands.json').write_text(json.dumps(commands))
+            scene = {'window_seconds': '8', 'sent_messages': '320', 'expected_observer_messages': '160',
+                     'received_messages': '160', 'received_bytes': '20480', 'observed_senders': '1',
+                     'send_errors': '0', 'backpressure_skips': '0', 'malformed_messages': '0',
+                     'duplicate_messages': '0', 'out_of_order_messages': '0', 'latency_p50_upper_us': '0',
+                     'latency_p95_upper_us': '255', 'latency_p99_upper_us': '511'}
+            for key, value in [(None, None), ('received_messages', '150'), ('sent_messages', '280'),
+                               ('malformed_messages', '1'), ('send_errors', '1'), ('backpressure_skips', '1'),
+                               ('observed_senders', '0'), ('received_bytes', '0'), ('window_seconds', '5')]:
+                changed = dict(scene)
+                if key:
+                    changed[key] = value
+                with (capture / 'scene.csv').open('w', newline='') as stream:
+                    csv.writer(stream).writerows([['metric', 'value'], *changed.items()])
+                with self.subTest(scene_metric=key), patch('avatar_tuning.sha256', return_value='same'):
+                    mixed = __import__('avatar_tuning').summarize(capture, experiment, entry)
+                    self.assertEqual(mixed['valid'], key is None, mixed['checks'])
+                    self.assertTrue(mixed['checks']['positive_metrics'])
+                    self.assertEqual(mixed['scene']['metrics'], changed)
+                    self.assertEqual(mixed['metrics']['scene_send_errors'], int(changed['send_errors']))
+                    self.assertAlmostEqual(mixed['metrics']['server_receive_mbps'], .88)
+                    self.assertEqual(mixed['metrics']['scene_latency_p95_upper_ms'], .255)
 
         self.assertTrue(result['checks']['fixed_workload_provenance'])
         self.assertTrue(result['checks']['setting_provenance'])

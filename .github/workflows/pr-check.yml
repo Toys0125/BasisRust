@@ -15,13 +15,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Test voice analyzer and workload receive configuration
-        run: python3 -m unittest discover -s scripts/perf -p 'test_*voice*.py'
-      - name: Test avatar calibration, tuning and transmit metrics
-        run: python3 -m unittest discover -s scripts/perf -p 'test_avatar_*.py'
+      - name: Test all benchmark tools and PGO rejection guards
+        run: python3 -B -m unittest discover -s scripts/perf -p 'test_*.py'
 
   client-windows:
     name: Client check, test, clippy (Windows)
@@ -30,7 +28,7 @@ jobs:
       CARGO_BUILD_JOBS: 2
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Install Rust
@@ -53,7 +51,7 @@ jobs:
       CARGO_BUILD_JOBS: 2
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Install Rust
@@ -67,7 +65,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -103,7 +101,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 

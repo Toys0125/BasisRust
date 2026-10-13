@@ -17,6 +17,10 @@ retain their tick and flush workers. See the
 Requires Rust 1.95 or later. The Docker builder uses the exact 1.95.0 release;
 see [prerequisites](../README.md#prerequisites).
 
+Optional native Linux x64 [qualified PGO builds](../docs/performance/server-pgo.md)
+train with the Rust client and require passing matched ordinary/PGO gates.
+Ordinary builds retain their current defaults.
+
 ```powershell
 cargo run -p basis-server-console -- --base-dir . --config config/config.xml
 ```
@@ -117,6 +121,26 @@ compatibility default password for local parity tests only; configure matching
 non-empty deployment passwords on clients. `ApiEnabled=false` and
 `MaxSceneRelayMegabitsPerSecondPerPlayer=0` remain upstream defaults. Operators
 can explicitly enable/configure the API or set relay limits.
+
+`MaxUploadBytesPerSecondPerPlayer` defaults to `131072` (128 KiB/s) for each
+authenticated connection before fanout. Set the same XML/environment field to
+`0` to disable admission. The budget counts application payload bytes, including
+avatar additions and Scene envelopes, once before coalescing or relay; transport
+headers, retries and protocol/control traffic are excluded. It allows a two-second
+burst. Excess unreliable/sequenced data is dropped and counted; excess reliable
+data disconnects that connection with an explicit reason. A reliable frame larger
+than the burst can spend from a full bucket and must repay its complete byte cost
+before another such frame is admitted. Other data resumes only after that debt is fully repaid and new credit has accrued.
+
+`BasisImagePickupManager` Scene traffic remains exempt and uses the separately
+advertised image allowance. Rust enforces the separate image fanout governor and cached replay limits
+ported from C#, described above. Image chunks bypass the generic upload cap
+and are charged by that separate governor.
+`extended.uploadBudget` reports accepted/rejected bytes/messages, reliable
+rejections, oversized reliable admissions and image exemptions. This is separate
+from the optional after-fanout Scene Mbps limit and pending-message queue quota.
+`extended.images` reports image egress refusals/bytes and cache counts/bytes;
+older binaries without that optional field have unavailable image telemetry.
 
 Runtime overrides are not automatically saved. The explicit `/config save`
 command writes all current in-memory values, including environment secrets, to

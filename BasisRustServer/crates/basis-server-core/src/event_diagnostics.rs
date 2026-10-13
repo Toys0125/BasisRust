@@ -56,6 +56,7 @@ impl EventDiagnostics {
             Bytes::new(),
             false,
             false,
+            false,
         ));
         let voice_future_bytes = std::mem::size_of_val(&relay_voice_message(state, 0, &[]));
         info!("event memory diagnostics: workers={worker_limit} handle_event_future_bytes={event_future_bytes} handle_message_future_bytes={message_future_bytes} voice_relay_future_bytes={voice_future_bytes} server_state_bytes={}", std::mem::size_of::<ServerState>());

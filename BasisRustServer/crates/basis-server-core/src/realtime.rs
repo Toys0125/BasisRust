@@ -173,6 +173,24 @@ fn should_relay_voice_to_recipient(shout: bool, is_offloaded: impl FnOnce() -> b
     shout || !is_offloaded()
 }
 
+fn admit_upload(
+    peers: &DashMap<PeerId, ConnectedPeer>,
+    budget: &upload_budget::UploadBudget,
+    peer: PeerId,
+    session: &PeerSession,
+    bytes: usize,
+    delivery: DeliveryMethod,
+) -> bool {
+    let bucket = peers.get(&peer).and_then(|connected| {
+        connected
+            .session
+            .as_ref()
+            .filter(|current| current.same_connection(session))
+            .map(|_| connected.upload_bucket.clone())
+    });
+    bucket.is_some_and(|bucket| budget.admit(&bucket, bytes, delivery))
+}
+
 pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> {
     let voice = Arc::new(VoiceInbox::default());
     let avatars = Arc::new(Mutex::new(HashMap::<PeerId, AvatarPending>::new()));
@@ -250,6 +268,7 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
                                         input.payload,
                                         false,
                                         true,
+                                        true,
                                     )) {
                                         // Handled avatar rejections return Ok; only
                                         // failures escaping processing reach this path.
@@ -273,6 +292,7 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
     }
     let authenticated = state.authenticated_peers.clone();
     let statistics = state.statistics.clone();
+    let upload_budget = state.upload_budget.clone();
     let next_arrival_order = Arc::new(AtomicU64::new(0));
     let input_arrival_order = Arc::clone(&next_arrival_order);
     state
@@ -292,7 +312,9 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
                 *channel,
                 channels::VOICE | channels::VOICE_LARGE | channels::SHOUT_VOICE
             );
-            if !is_voice && !is_avatar_input(event) {
+            if (!is_voice && !is_avatar_input(event)) || !upload_budget::best_effort(*delivery) {
+                // Reliable data uses the async handler, including explicit disconnect
+                // on admission rejection. It must not be silently coalesced here.
                 return false;
             }
             if is_voice || is_avatar_input(event) {
@@ -305,6 +327,19 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
             if !authenticated.contains_key(peer)
                 || (is_voice && (payload.is_empty() || payload.len() > MAX_VOICE_PAYLOAD))
             {
+                if is_avatar_input(event) {
+                    statistics.avatar_rejected.fetch_add(1, Ordering::Relaxed);
+                }
+                return true;
+            }
+            if !admit_upload(
+                &authenticated,
+                &upload_budget,
+                *peer,
+                &session,
+                payload.len(),
+                *delivery,
+            ) {
                 if is_avatar_input(event) {
                     statistics.avatar_rejected.fetch_add(1, Ordering::Relaxed);
                 }
@@ -715,6 +750,58 @@ mod tests {
         let session = transport.peer_session(peer).unwrap();
         transport.shutdown();
         (transport, peer, session)
+    }
+
+    #[tokio::test]
+    async fn uploads_are_charged_before_realtime_coalescing_and_reset_with_connection() {
+        let (_, peer, session) = session().await;
+        let peers = DashMap::new();
+        let mut connected = crate::tests::test_connected_peer(peer);
+        connected.session = Some(session.clone());
+        let old_bucket = connected.upload_bucket.clone();
+        peers.insert(peer, connected);
+        let budget = upload_budget::UploadBudget::new(100);
+        let inbox = VoiceInbox::default();
+        let now = Instant::now();
+        for sequence in 0..10 {
+            if admit_upload(
+                &peers,
+                &budget,
+                peer,
+                &session,
+                100,
+                DeliveryMethod::Unreliable,
+            ) {
+                inbox.push(peer, input(&session, channels::VOICE, sequence, now));
+            }
+        }
+        assert_eq!(inbox.received.load(Ordering::Relaxed), 2);
+        assert_eq!(budget.snapshot().accepted_bytes, 200);
+        assert_eq!(budget.snapshot().rejected_messages, 8);
+        // A replacement ConnectedPeer owns a fresh bucket, even for a reused ID.
+        let (_, replacement_peer, replacement_session) = self::session().await;
+        assert_eq!(replacement_peer, peer);
+        let mut replacement = crate::tests::test_connected_peer(peer);
+        replacement.session = Some(replacement_session.clone());
+        assert!(!Arc::ptr_eq(&old_bucket, &replacement.upload_bucket));
+        peers.insert(peer, replacement);
+        assert!(!admit_upload(
+            &peers,
+            &budget,
+            peer,
+            &session,
+            1,
+            DeliveryMethod::Unreliable
+        ));
+        assert!(admit_upload(
+            &peers,
+            &budget,
+            peer,
+            &replacement_session,
+            200,
+            DeliveryMethod::Sequenced
+        ));
+        assert_eq!(budget.snapshot().accepted_bytes, 400);
     }
 
     fn input(session: &PeerSession, channel: u8, sequence: u8, received: Instant) -> Input {

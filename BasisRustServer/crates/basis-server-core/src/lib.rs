@@ -1,5 +1,6 @@
 mod admin_runtime;
 mod avatar_sync;
+mod benchmark_validation;
 mod event_diagnostics;
 #[cfg(feature = "gpu")]
 mod gpu_distance;
@@ -17,8 +18,14 @@ mod image_tests;
 pub mod memory_reclaim;
 mod p2p;
 mod realtime;
+mod scene_relay;
+mod upload_budget;
 
 pub use avatar_sync::BsrProfilerSnapshot;
+#[cfg(any(feature = "benchmark-validation", test))]
+pub use scene_relay::SceneRelaySnapshot;
+#[cfg(any(feature = "benchmark-validation", test))]
+pub use upload_budget::UploadBudgetSnapshot;
 
 use anyhow::{Context, Result};
 use basis_protocol::{
@@ -85,6 +92,10 @@ pub struct ConnectedPeer {
     // Present for live connections. Unit fixtures that exercise app state without a
     // transport session may leave this absent.
     pub session: Option<PeerSession>,
+    // A fresh counter per authenticated connection. Clones share admission work;
+    // old in-flight permits cannot decrement a replacement connection's quota.
+    pub(crate) scene_pending: Arc<AtomicU64>,
+    pub(crate) upload_bucket: Arc<Mutex<upload_budget::Bucket>>,
 }
 
 struct PendingIdentity {
@@ -466,6 +477,8 @@ pub struct ServerState {
     pub message_subscriptions: Arc<DashMap<PeerId, HashSet<u16>>>,
     uplink_delta_states: Arc<DashMap<PeerId, UplinkDeltaState>>,
     scene_egress: Arc<DashMap<PeerId, SceneEgressBucket>>,
+    upload_budget: Arc<upload_budget::UploadBudget>,
+    scene_relay: Option<Arc<scene_relay::SceneRelay>>,
     image_governor: Arc<image_governor::ImageBandwidthGovernor<PeerSession>>,
     image_cache: Arc<Mutex<image_cache::ImageCache>>,
     jiggle_buckets: Arc<DashMap<PeerId, JiggleTokenBucket>>,
@@ -609,7 +622,7 @@ impl ServerState {
         );
         avatar_sync.set_offloaded_pairs(p2p_broker.offloaded_pairs());
 
-        let state = Self {
+        let mut state = Self {
             config: Arc::new(RwLock::new(config.clone())),
             config_path: Arc::new(config_path.to_path_buf()),
             transport,
@@ -630,6 +643,10 @@ impl ServerState {
             message_subscriptions: Arc::new(DashMap::new()),
             uplink_delta_states: Arc::new(DashMap::new()),
             scene_egress: Arc::new(DashMap::new()),
+            upload_budget: Arc::new(upload_budget::UploadBudget::new(
+                config.max_upload_bytes_per_second_per_player,
+            )),
+            scene_relay: None,
             image_governor: Arc::new(image_governor::ImageBandwidthGovernor::default()),
             image_cache: Arc::new(Mutex::new(image_cache::ImageCache::default())),
             jiggle_buckets: Arc::new(DashMap::new()),
@@ -647,6 +664,16 @@ impl ServerState {
             disconnect_tasks: Arc::new(Mutex::new(Vec::new())),
             identity_timer_tasks: Arc::new(Mutex::new(Vec::new())),
             realtime_threads: Arc::new(Mutex::new(Vec::new())),
+        };
+        state.scene_relay = match scene_relay::SceneRelay::from_env(
+            &state.transport,
+            state.authenticated_peers.clone(),
+        ) {
+            Ok(relay) => relay.map(Arc::new),
+            Err(error) => {
+                state.shutdown().await?;
+                return Err(error.context("starting scene relay"));
+            }
         };
         let tick_thread = state
             .avatar_sync
@@ -797,6 +824,10 @@ impl ServerState {
         self.transport.set_compact_merge_send(config.compact_merged);
         self.statistics
             .set_enabled(config.health_include_extended_metrics);
+        self.upload_budget.rate.store(
+            config.max_upload_bytes_per_second_per_player,
+            Ordering::Relaxed,
+        );
 
         let previous_globals = self.global_state.read().clone();
         admin_runtime::refresh_rejoin_population(
@@ -834,6 +865,36 @@ impl ServerState {
     }
 
     pub fn status_text_with_detail(&self, verbose: bool) -> String {
+        let text = self.base_status_text_with_detail(verbose);
+        #[cfg(any(feature = "benchmark-validation", test))]
+        let text = {
+            let mut text = text;
+            let detailed = verbose && self.config.read().health_include_extended_metrics;
+            if detailed {
+                let upload = self.upload_budget_snapshot();
+                text.push_str(&format!(
+                "\nUploadBudget: rate={}B/s/peer burst={}s accepted={}/{}B rejected={}/{}B reliable-rejected={} oversized-reliable={} image-exempt={}/{}B",
+                upload.bytes_per_second_per_player,
+                upload.burst_seconds,
+                upload.accepted_messages,
+                upload.accepted_bytes,
+                upload.rejected_messages,
+                upload.rejected_bytes,
+                upload.reliable_rejections,
+                upload.oversized_reliable_messages,
+                upload.image_exempt_messages,
+                upload.image_exempt_bytes,
+            ));
+            }
+            if let Some(snapshot) = self.scene_relay_snapshot().filter(|_| detailed) {
+                text.push_str(&format!("\nSceneBatch: {snapshot:?}"));
+            }
+            text
+        };
+        text
+    }
+
+    fn base_status_text_with_detail(&self, verbose: bool) -> String {
         let players = self.player_count();
         if !self.config.read().health_include_extended_metrics {
             return if verbose {
@@ -935,6 +996,15 @@ impl ServerState {
             if let Err(err) = worker.await {
                 warn!("server worker failed to join: {err}");
                 worker_result = Err(anyhow::anyhow!("server worker failed to join: {err}"));
+            }
+        }
+        // No ingress handler can still wait on scene capacity. Drain accepted
+        // batches before retiring recipient sessions; joins run off the runtime.
+        if let Some(relay) = &self.scene_relay {
+            if let Err(error) = relay.drain().await {
+                if worker_result.is_ok() {
+                    worker_result = Err(error);
+                }
             }
         }
         // Workers can no longer create identity timers. Dropping pending entries
@@ -1039,6 +1109,16 @@ impl ServerState {
         database?;
         permissions?;
         Ok(())
+    }
+
+    #[cfg(any(feature = "benchmark-validation", test))]
+    pub fn upload_budget_snapshot(&self) -> UploadBudgetSnapshot {
+        self.upload_budget.snapshot()
+    }
+
+    #[cfg(any(feature = "benchmark-validation", test))]
+    pub fn scene_relay_snapshot(&self) -> Option<SceneRelaySnapshot> {
+        self.scene_relay.as_ref().map(|relay| relay.snapshot())
     }
 
     pub async fn broadcast(
@@ -2082,6 +2162,7 @@ async fn handle_event(state: &ServerState, event: ServerEvent) -> Result<()> {
                 payload,
                 true,
                 false,
+                false,
             )
             .await
         }
@@ -2480,6 +2561,8 @@ async fn finalize_accept(
         metadata: metadata.clone(),
         ready: ready.clone(),
         session: Some(session.clone()),
+        scene_pending: Arc::new(AtomicU64::new(0)),
+        upload_bucket: Arc::new(Mutex::new(upload_budget::Bucket::default())),
     };
     let existing_players = {
         let _commit = state.admission_commit.lock();
@@ -2993,6 +3076,7 @@ async fn handle_message(
     payload: Bytes,
     count_inbound: bool,
     count_avatar: bool,
+    upload_admitted: bool,
 ) -> Result<()> {
     if count_inbound {
         state
@@ -3020,6 +3104,33 @@ async fn handle_message(
                 .fetch_add(1, Ordering::Relaxed);
         }
         return Ok(());
+    }
+    if !upload_admitted && upload_budget::is_data(channel, &payload) {
+        let image = matches!(channel, channels::SCENE | channels::DIRECT_SCENE_SERVER)
+            && is_image_scene_upload(state, &payload);
+        if image {
+            state.upload_budget.exempt_image(payload.len());
+        } else {
+            let bucket = state.authenticated_peers.get(&peer).and_then(|connected| {
+                let matches = match (session, connected.session.as_ref()) {
+                    (Some(expected), Some(current)) => current.same_connection(expected),
+                    (None, None) => true,
+                    _ => false,
+                };
+                matches.then(|| connected.upload_bucket.clone())
+            });
+            let Some(bucket) = bucket else {
+                return Ok(());
+            };
+            if !state.upload_budget.admit(&bucket, payload.len(), delivery) {
+                if !upload_budget::best_effort(delivery) {
+                    if let Some(session) = session {
+                        request_disconnect(state, session, "Application upload rate limit exceeded (MaxUploadBytesPerSecondPerPlayer)").await?;
+                    }
+                }
+                return Ok(());
+            }
+        }
     }
     match channel {
         channels::AUTH_IDENTITY => {
@@ -3827,6 +3938,20 @@ async fn relay_avatar_generic(
     .await
 }
 
+// Match a fully valid Scene envelope before granting the image exemption. Image
+// uploads use the separate image fanout governor and cached replay allowance.
+fn is_image_scene_upload(state: &ServerState, payload: &[u8]) -> bool {
+    let Some(image_index) = state.net_ids.find("BasisImagePickupManager") else {
+        return false;
+    };
+    let mut reader = NetReader::new(payload);
+    // Scene payload is the entire remaining slice, so there are no trailing bytes.
+    reader.get_u16().is_ok_and(|index| index == image_index)
+        && reader
+            .get_u16()
+            .is_ok_and(|count| reader.remaining() >= usize::from(count) * 2)
+}
+
 async fn relay_scene_generic(
     state: &ServerState,
     peer: PeerId,
@@ -3897,6 +4022,16 @@ async fn relay_scene_generic(
     };
     let mut writer = NetWriter::new();
     message.serialize(&mut writer)?;
+    if let Some(relay) = &state.scene_relay {
+        if scene_relay::eligible(broadcast_channel, delivery, &scene.recipients) {
+            let recipients = scene_relay::snapshot_recipients(&state.authenticated_peers, peer);
+            // The recipient/session snapshot owns its tokens. No map guard
+            // crosses the bounded queue's asynchronous capacity wait.
+            return relay
+                .enqueue(Bytes::from(writer.into_vec()), recipients)
+                .await;
+        }
+    }
     send_to_recipients_or_broadcast(
         state,
         peer,
@@ -6594,12 +6729,14 @@ mod tests {
         }
     }
 
-    fn test_connected_peer(peer_id: PeerId) -> ConnectedPeer {
+    pub(super) fn test_connected_peer(peer_id: PeerId) -> ConnectedPeer {
         ConnectedPeer {
             id: peer_id,
             metadata: test_ready_message().player_meta_data_message,
             ready: test_ready_message(),
             session: None,
+            scene_pending: Arc::new(AtomicU64::new(0)),
+            upload_bucket: Arc::new(Mutex::new(upload_budget::Bucket::default())),
         }
     }
 
