@@ -1522,6 +1522,53 @@ impl TransportHandle {
             .is_some_and(|state| Arc::ptr_eq(&state, &session.state))
     }
 
+    /// Whether this incarnation has finished reliable delivery on a channel.
+    /// Closed or replaced recipients no longer need to acknowledge lifecycle barriers.
+    /// Call after enqueueing the barrier packet; a later producer may enqueue new work.
+    /// A busy send turn is conservatively non-idle because the dispatcher can temporarily
+    /// hold dequeued packets in a local batch before publishing their in-flight entries.
+    pub fn reliable_channel_idle(
+        &self,
+        session: &PeerSession,
+        channel: u8,
+        delivery: DeliveryMethod,
+    ) -> bool {
+        if session.state.read_gate.is_closed() || !self.is_current_session(session) {
+            return true;
+        }
+        let Some(_send_turn) = try_peer_send_turn(&session.state) else {
+            return false;
+        };
+        let channel_id = DeliveryMethod::channel_id(channel, delivery);
+        // Match refresh_reliable_active's lock order. Unsent datagrams can contain an ACKed
+        // retransmission or another channel; retaining any of them conservatively delays reuse.
+        let datagrams = session.state.pending_datagrams.lock();
+        let pending = session.state.pending_reliable.lock();
+        let outgoing = session.state.outgoing_reliable.lock();
+        datagrams.is_empty()
+            && pending.get(&channel_id).is_none_or(VecDeque::is_empty)
+            && outgoing.get(&channel_id).is_none_or(VecDeque::is_empty)
+    }
+
+    /// Whether all reliable delivery has completed for this captured recipient.
+    /// Lifecycle retirement must also cover ownership, resource and other reliable messages
+    /// referencing a departed ID, because their channels are independent of the leave channel.
+    /// Closed/replaced recipients resolve the barrier; a busy send turn conservatively does not.
+    pub fn reliable_idle(&self, session: &PeerSession) -> bool {
+        if session.state.read_gate.is_closed() || !self.is_current_session(session) {
+            return true;
+        }
+        let Some(_send_turn) = try_peer_send_turn(&session.state) else {
+            return false;
+        };
+        let datagrams = session.state.pending_datagrams.lock();
+        let pending = session.state.pending_reliable.lock();
+        let outgoing = session.state.outgoing_reliable.lock();
+        datagrams.is_empty()
+            && pending.values().all(VecDeque::is_empty)
+            && outgoing.values().all(VecDeque::is_empty)
+    }
+
     /// Close admission for this incarnation and claim its keyed cleanup exactly once.
     /// `true` means the caller owns cleanup, even when transport retirement closed
     /// admission before publishing `PeerDisconnected`.
@@ -5515,6 +5562,106 @@ pub fn channel_name(channel: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reliable_channel_idle_covers_queued_inflight_and_staged_packets() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        // Assemble state without races from background dispatch, as in queue-depth tests.
+        handle.shutdown();
+        let peer = test_peer_state(0);
+        handle.peers.insert(peer.id, peer.clone());
+        let session = handle.peer_session(peer.id).unwrap();
+        let channel = channels::DISCONNECTION;
+        let delivery = DeliveryMethod::ReliableOrdered;
+        let channel_id = DeliveryMethod::channel_id(channel, delivery);
+        assert!(handle.reliable_channel_idle(&session, channel, delivery));
+        assert!(handle.reliable_idle(&session));
+        enqueue_reliable_payload(&peer, channel, delivery, &[7]);
+        assert!(!handle.reliable_channel_idle(&session, channel, delivery));
+        assert!(!handle.reliable_idle(&session));
+        assert!(handle.reliable_channel_idle(&session, channels::CHAT, delivery));
+        let turn = try_peer_send_turn(&peer).unwrap();
+        let queued = peer
+            .outgoing_reliable
+            .lock()
+            .get_mut(&channel_id)
+            .unwrap()
+            .pop_front()
+            .unwrap();
+        // This is the real dispatch gap: the outgoing queue is empty but the packet is local.
+        assert!(!handle.reliable_channel_idle(&session, channel, delivery));
+        assert!(!handle.reliable_idle(&session));
+        let built = build_queued_reliable_packet(&peer, channel_id, queued);
+        let sequence = built.sequence;
+        record_pending_reliable(&peer, channel_id, sequence, built.bytes, None);
+        drop(turn);
+        assert!(!handle.reliable_channel_idle(&session, channel, delivery));
+        assert!(!handle.reliable_idle(&session));
+        let mut bits = vec![0; 17];
+        let bit = sequence as usize % DEFAULT_WINDOW_SIZE;
+        bits[bit / 8] |= 1 << (bit % 8);
+        process_ack(
+            &peer,
+            &build_ack_packet(peer.connection_number, channel_id, 0, &bits),
+            None,
+        );
+        assert!(handle.reliable_channel_idle(&session, channel, delivery));
+        assert!(handle.reliable_idle(&session));
+        let ownership_channel = channels::REMOVE_CURRENT_OWNER_REQUEST;
+        let ownership_id = DeliveryMethod::channel_id(ownership_channel, delivery);
+        enqueue_reliable_payload(&peer, ownership_channel, delivery, &[8]);
+        assert!(handle.reliable_channel_idle(&session, channel, delivery));
+        assert!(
+            !handle.reliable_idle(&session),
+            "another reliable channel is still queued"
+        );
+        let ownership = peer
+            .outgoing_reliable
+            .lock()
+            .get_mut(&ownership_id)
+            .unwrap()
+            .pop_front()
+            .unwrap();
+        let ownership = build_queued_reliable_packet(&peer, ownership_id, ownership);
+        let ownership_sequence = ownership.sequence;
+        record_pending_reliable(
+            &peer,
+            ownership_id,
+            ownership_sequence,
+            ownership.bytes,
+            None,
+        );
+        assert!(handle.reliable_channel_idle(&session, channel, delivery));
+        assert!(
+            !handle.reliable_idle(&session),
+            "another reliable channel still awaits ACK"
+        );
+        let mut ownership_bits = vec![0; 17];
+        let ownership_bit = ownership_sequence as usize % DEFAULT_WINDOW_SIZE;
+        ownership_bits[ownership_bit / 8] |= 1 << (ownership_bit % 8);
+        process_ack(
+            &peer,
+            &build_ack_packet(peer.connection_number, ownership_id, 0, &ownership_bits),
+            None,
+        );
+        assert!(handle.reliable_idle(&session));
+        peer.pending_datagrams.lock().push_back(vec![0]);
+        assert!(!handle.reliable_channel_idle(&session, channel, delivery));
+        assert!(!handle.reliable_idle(&session));
+        assert!(!handle.reliable_channel_idle(&session, channels::CHAT, delivery));
+        peer.pending_datagrams.lock().clear();
+        let replacement = test_peer_state(peer.id);
+        handle.peers.insert(peer.id, replacement.clone());
+        assert!(handle.reliable_channel_idle(&session, channel, delivery));
+        assert!(handle.reliable_idle(&session));
+        let replacement_session = handle.peer_session(peer.id).unwrap();
+        enqueue_reliable_payload(&replacement, channel, delivery, &[8]);
+        assert!(!handle.reliable_channel_idle(&replacement_session, channel, delivery));
+        replacement.read_gate.close_admission();
+        let _turn = try_peer_send_turn(&replacement).unwrap();
+        assert!(handle.reliable_channel_idle(&replacement_session, channel, delivery));
+        assert!(handle.reliable_idle(&replacement_session));
+    }
 
     #[test]
     fn blocked_peer_retains_reliable_and_ack_datagrams_without_stalling_next_peer() {

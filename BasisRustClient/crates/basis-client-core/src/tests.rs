@@ -1274,6 +1274,131 @@ fn unity_policy_emits_high_keyframe_then_decodable_delta_and_periodic_keyframe()
     assert!(later_keyframe.0 >= 0.53);
 }
 
+fn write_packed_bits_reference(
+    destination: &mut [u8],
+    bit_offset: usize,
+    value: u64,
+    bit_count: usize,
+) {
+    for bit in 0..bit_count {
+        let offset = bit_offset + bit;
+        let mask = 1u8 << (offset & 7);
+        if value & (1u64 << bit) == 0 {
+            destination[offset >> 3] &= !mask;
+        } else {
+            destination[offset >> 3] |= mask;
+        }
+    }
+}
+
+#[test]
+fn packed_pose_bits_match_reference_at_boundaries_and_preserve_neighbors() {
+    let mut state = 0x735a_0f1e_9a63_142b_u64;
+    for offset in 0usize..32 {
+        for count in 0usize..=64 {
+            for pattern in 0..8 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let value = match pattern {
+                    0 => 0,
+                    1 => u64::MAX,
+                    2 => 0xaaaa_aaaa_aaaa_aaaa,
+                    3 => 0x5555_5555_5555_5555,
+                    _ => state,
+                };
+                // Exact-end buffers catch writes beyond the requested bit span.
+                // Extra bytes and patterned contents catch damaged neighboring fields.
+                for extra in [0, 3] {
+                    let len = (offset + count).div_ceil(8) + extra;
+                    let initial = (0..len)
+                        .map(|i| (i as u8).wrapping_mul(37) ^ (pattern as u8).wrapping_mul(53))
+                        .collect::<Vec<_>>();
+                    let mut expected = initial.clone();
+                    let mut actual = initial;
+                    write_packed_bits_reference(&mut expected, offset, value, count);
+                    crate::avatar::write_packed_bits_lsb(&mut actual, offset, value, count);
+                    assert_eq!(
+                        actual, expected,
+                        "offset={offset} count={count} pattern={pattern}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Isolate the nine unaligned High-quality quaternion writes from pose trigonometry.
+/// The old bit loop and production writer receive identical precomputed pose channels.
+#[test]
+#[ignore]
+fn profile_quaternion_packing_cpu() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    type Writer = fn(&mut [u8], usize, u64, usize);
+    const PASSES: usize = 512;
+    let frames = (0..256)
+        .map(|frame| {
+            let angles = crate::avatar::unity_synthetic_angles(
+                (frame + 1) as f64 / 60.0,
+                20.0_f32.to_radians(),
+            );
+            std::array::from_fn::<_, 9, _>(|slot| {
+                let mut q = [0.0; 4];
+                q[slot % 3] = (angles[slot + 1] * 0.5).sin();
+                q[3] = (angles[slot + 1] * 0.5).cos();
+                crate::avatar::encode_high_three_dof_quaternion(q)
+            })
+        })
+        .collect::<Vec<_>>();
+    let writers: [(&str, Writer); 2] = [
+        ("production", crate::avatar::write_packed_bits_lsb),
+        ("bit_loop", write_packed_bits_reference),
+    ];
+    for frame in &frames {
+        let mut expected = vec![0xa5; BitQuality::High.payload_len()];
+        let mut actual = expected.clone();
+        for (slot, value) in frame.iter().copied().enumerate() {
+            write_packed_bits_reference(&mut expected, 72 + slot * 38, value, 38);
+            crate::avatar::write_packed_bits_lsb(&mut actual, 72 + slot * 38, value, 38);
+        }
+        assert_eq!(actual, expected);
+    }
+    let run = |writer: Writer, passes: usize| {
+        // Opaque function pointers give both writers the same call overhead.
+        let writer = black_box(writer);
+        let mut payload = vec![0xa5; BitQuality::High.payload_len()];
+        let started = Instant::now();
+        for _ in 0..passes {
+            for frame in black_box(&frames) {
+                for (slot, value) in frame.iter().copied().enumerate() {
+                    writer(&mut payload, 72 + slot * 38, value, 38);
+                }
+                black_box(payload.as_slice());
+            }
+        }
+        let elapsed_ns = started.elapsed().as_nanos();
+        let checksum = payload.iter().fold(0u64, |sum, byte| {
+            sum.wrapping_mul(257).wrapping_add(u64::from(*byte))
+        });
+        (elapsed_ns, checksum)
+    };
+    for (_, writer) in writers {
+        run(writer, 16);
+    }
+    let mut expected_checksum = None;
+    for round in 0..8 {
+        let order = if round % 2 == 0 { [0, 1] } else { [1, 0] };
+        for index in order {
+            let (label, writer) = writers[index];
+            let (elapsed_ns, checksum) = run(writer, PASSES);
+            assert_eq!(*expected_checksum.get_or_insert(checksum), checksum);
+            println!("pose_pack variant={label} round={round} poses={} elapsed_ns={elapsed_ns} checksum={checksum}", PASSES * frames.len());
+        }
+    }
+}
+
 #[test]
 fn additional_avatar_data_is_sent_on_full_and_delta_avatar_channels() {
     let byte_count = 3;

@@ -250,6 +250,11 @@ pub fn build_delta(baseline: &[u8], current: &[u8], quality: BitQuality) -> Resu
         "avatar delta current payload too small"
     );
 
+    // Equal fixed prefixes encode to the zero dirty mask; trailing data is ignored.
+    if baseline[..layout.payload_bytes] == current[..layout.payload_bytes] {
+        return Ok(vec![0u8; DIRTY_MASK_BYTES]);
+    }
+
     let mut mask = [0u8; DIRTY_MASK_BYTES];
     for field in 0..FIELD_COUNT {
         if layout.fields[field]
@@ -480,30 +485,37 @@ impl<'a> ResidualBitWriter<'a> {
         self.write_bits((value & 1) as u64, 1);
     }
 
-    fn write_bits(&mut self, value: u64, count: usize) {
-        for i in 0..count {
-            let bit = self.bit_position + i;
-            let mask = 1u8 << (bit & 7);
-            if ((value >> i) & 1) != 0 {
-                self.bytes[bit >> 3] |= mask;
-            } else {
-                self.bytes[bit >> 3] &= !mask;
-            }
+    fn write_bits(&mut self, mut value: u64, count: usize) {
+        debug_assert!(count <= u64::BITS as usize);
+        let mut byte_index = self.bit_position >> 3;
+        let mut shift = self.bit_position & 7;
+        let mut remaining = count;
+        while remaining != 0 {
+            let bits = remaining.min(8 - shift);
+            let mask = ((1u16 << bits) - 1) as u8;
+            let byte = &mut self.bytes[byte_index];
+            *byte = (*byte & !(mask << shift)) | (((value as u8) & mask) << shift);
+            value >>= bits;
+            remaining -= bits;
+            byte_index += 1;
+            shift = 0;
         }
         self.bit_position += count;
     }
 
     fn write_signed_eg(&mut self, value: i32) {
+        if value == 0 {
+            self.write_bit(1);
+            return;
+        }
         let zz = ((value << 1) ^ (value >> 31)) as u32;
         let m = zz + 1;
-        let num_bits = (32 - m.leading_zeros()) as usize;
-        if num_bits > 1 {
-            self.write_bits(0, num_bits - 1);
-        }
-        self.write_bit(1);
-        for bit in (0..num_bits.saturating_sub(1)).rev() {
-            self.write_bit((m >> bit) & 1);
-        }
+        let num_bits = 32 - m.leading_zeros();
+        // Prefix zeros followed by m in MSB-first order, packed for the LSB writer.
+        // Layout residuals are at most 24 bits; the complete code fits in u64.
+        let reversed = m.reverse_bits() >> (32 - num_bits);
+        let code = u64::from(reversed) << (num_bits - 1);
+        self.write_bits(code, (2 * num_bits - 1) as usize);
     }
 }
 
@@ -523,7 +535,15 @@ impl<'a> ResidualBitReader<'a> {
     }
 
     fn read_bit(&mut self) -> Result<u32> {
-        self.read_bits(1).map(|value| value as u32)
+        if self.bit_position.saturating_add(1) > self.end_bit {
+            bail!("truncated avatar delta bitstream");
+        }
+        let Some(byte) = self.bytes.get(self.bit_position >> 3) else {
+            bail!("truncated avatar delta bitstream");
+        };
+        let value = u32::from((*byte >> (self.bit_position & 7)) & 1);
+        self.bit_position += 1;
+        Ok(value)
     }
 
     fn read_bits(&mut self, count: usize) -> Result<u64> {
@@ -619,6 +639,103 @@ mod tests {
             }
         }
         value
+    }
+
+    fn write_bits_reference(bytes: &mut [u8], position: &mut usize, value: u64, count: usize) {
+        for index in 0..count {
+            let bit = *position + index;
+            let mask = 1u8 << (bit & 7);
+            if ((value >> index) & 1) != 0 {
+                bytes[bit >> 3] |= mask;
+            } else {
+                bytes[bit >> 3] &= !mask;
+            }
+        }
+        *position += count;
+    }
+
+    fn write_signed_eg_reference(bytes: &mut [u8], position: &mut usize, value: i32) {
+        let zz = ((value << 1) ^ (value >> 31)) as u32;
+        let m = zz + 1;
+        let num_bits = (32 - m.leading_zeros()) as usize;
+        if num_bits > 1 {
+            write_bits_reference(bytes, position, 0, num_bits - 1);
+        }
+        write_bits_reference(bytes, position, 1, 1);
+        for bit in (0..num_bits.saturating_sub(1)).rev() {
+            write_bits_reference(bytes, position, u64::from((m >> bit) & 1), 1);
+        }
+    }
+
+    #[test]
+    fn residual_writer_matches_bit_loop_at_boundaries_and_preserves_neighbors() {
+        for start in 0usize..16 {
+            for count in 0usize..=64 {
+                for value in [0, u64::MAX, 0xaaaa_5555_1234_5678, 0x735a_0f1e_9a63_142b] {
+                    for extra in [0, 3] {
+                        let mut actual =
+                            deterministic_payload((start + count).div_ceil(8) + extra, 73);
+                        let mut expected = actual.clone();
+                        let mut position = start;
+                        write_bits_reference(&mut expected, &mut position, value, count);
+                        let actual_position = {
+                            let mut writer = ResidualBitWriter::new(&mut actual, start);
+                            writer.write_bits(value, count);
+                            writer.bit_position
+                        };
+                        assert_eq!(actual_position, position);
+                        assert_eq!(
+                            actual, expected,
+                            "start={start} count={count} value={value}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exp_golomb_writer_matches_legacy_codes_and_concatenated_streams() {
+        let mut values = vec![0, -1, 1, i32::MAX, -i32::MAX];
+        for width in 1..=24 {
+            let sign = 1i32 << (width - 1);
+            values.extend([-sign, -sign + 1, sign - 1, sign / 3, -(sign / 3)]);
+        }
+        for start in 0usize..8 {
+            for &value in &values {
+                let m = (((value << 1) ^ (value >> 31)) as u32) + 1;
+                let count = 2 * (32 - m.leading_zeros()) as usize - 1;
+                let mut actual = vec![0xa5; (start + count).div_ceil(8)];
+                let mut expected = actual.clone();
+                let mut position = start;
+                write_signed_eg_reference(&mut expected, &mut position, value);
+                let actual_position = {
+                    let mut writer = ResidualBitWriter::new(&mut actual, start);
+                    writer.write_signed_eg(value);
+                    writer.bit_position
+                };
+                assert_eq!(actual_position, position);
+                assert_eq!(actual, expected, "start={start} value={value}");
+            }
+            let mut actual = vec![0xff; 1024];
+            let mut expected = actual.clone();
+            let mut position = start;
+            let actual_position = {
+                let mut writer = ResidualBitWriter::new(&mut actual, start);
+                for &value in &values {
+                    writer.write_signed_eg(value);
+                    write_signed_eg_reference(&mut expected, &mut position, value);
+                    writer.write_bits(0x735a, 13);
+                    write_bits_reference(&mut expected, &mut position, 0x735a, 13);
+                }
+                let pad = (8 - (position & 7)) & 7;
+                writer.write_bits(0, pad);
+                write_bits_reference(&mut expected, &mut position, 0, pad);
+                writer.bit_position
+            };
+            assert_eq!(actual_position, position);
+            assert_eq!(actual, expected);
+        }
     }
 
     fn replace_channel_reference(payload: &mut [u8], channel: AvatarChannel, value: u32) {
@@ -1005,6 +1122,109 @@ mod tests {
         assert_eq!(read_position(&full), Some([0.001, 0.0, 0.0]));
     }
 
+    /// Full encoder cost, including allocation, on fixed clean, sparse and dense inputs.
+    #[test]
+    #[ignore]
+    fn bench_build_delta_corpus() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const PASSES: usize = 1024;
+        for quality in [
+            BitQuality::VeryLow,
+            BitQuality::Low,
+            BitQuality::Medium,
+            BitQuality::High,
+        ] {
+            let layout = layout(quality);
+            let mut corpora = [
+                ("clean", Vec::new()),
+                ("single_axis", Vec::new()),
+                ("dense", Vec::new()),
+            ];
+            for seed in 1..=32 {
+                let baseline = deterministic_payload(layout.payload_bytes, seed * 0x13579);
+                let mut sparse = baseline.clone();
+                for (slot, field) in layout.fields.iter().enumerate().skip(1).take(9) {
+                    let delta_channels = field
+                        .iter()
+                        .filter(|c| c.kind == ChannelKind::Delta)
+                        .collect::<Vec<_>>();
+                    if let Some(channel) =
+                        delta_channels.get((seed as usize + slot) % delta_channels.len().max(1))
+                    {
+                        let value = read_channel(&baseline, **channel).wrapping_add(1 + seed % 3)
+                            & channel.mask();
+                        replace_channel_reference(&mut sparse, **channel, value);
+                    }
+                }
+                let dense = deterministic_payload(layout.payload_bytes, seed * 0x2468b + 73);
+                corpora[0].1.push((baseline.clone(), baseline.clone()));
+                corpora[1].1.push((baseline.clone(), sparse));
+                corpora[2].1.push((baseline, dense));
+            }
+            let mut identities = [0u64; 3];
+            let mut zero_channels = [0usize; 3];
+            for (index, (_, pairs)) in corpora.iter().enumerate() {
+                for (baseline, current) in pairs {
+                    let encoded = build_delta(baseline, current, quality).unwrap();
+                    assert_eq!(
+                        apply_delta(baseline, &encoded, quality).unwrap(),
+                        (current.clone(), encoded.len())
+                    );
+                    for byte in &encoded {
+                        identities[index] = identities[index]
+                            .wrapping_mul(257)
+                            .wrapping_add(u64::from(*byte));
+                    }
+                    for field in &layout.fields {
+                        if field
+                            .iter()
+                            .any(|c| read_channel(baseline, *c) != read_channel(current, *c))
+                        {
+                            zero_channels[index] += field
+                                .iter()
+                                .filter(|c| {
+                                    c.kind == ChannelKind::Delta
+                                        && read_channel(baseline, **c) == read_channel(current, **c)
+                                })
+                                .count();
+                        }
+                    }
+                }
+            }
+            let run = |index: usize, passes: usize| {
+                let pairs = &corpora[index].1;
+                let mut checksum = 0u64;
+                let started = Instant::now();
+                for _ in 0..passes {
+                    for (baseline, current) in black_box(pairs) {
+                        let encoded = black_box(
+                            build_delta(black_box(baseline), black_box(current), quality).unwrap(),
+                        );
+                        checksum = checksum
+                            .wrapping_add(encoded.len() as u64)
+                            .wrapping_add(u64::from(encoded[0]))
+                            .wrapping_add(u64::from(*encoded.last().unwrap()));
+                    }
+                }
+                (started.elapsed().as_nanos(), checksum)
+            };
+            for index in 0..3 {
+                run(index, 8);
+            }
+            let mut checksums = [None; 3];
+            for round in 0..8 {
+                let order = if round % 2 == 0 { [0, 1, 2] } else { [2, 1, 0] };
+                for index in order {
+                    let (elapsed_ns, checksum) = run(index, PASSES);
+                    assert_eq!(*checksums[index].get_or_insert(checksum), checksum);
+                    println!("delta_build quality={} case={} round={round} operations={} elapsed_ns={elapsed_ns} checksum={checksum} corpus_checksum={} zero_delta_channels={}", quality as u8, corpora[index].0, PASSES * corpora[index].1.len(), identities[index], zero_channels[index]);
+                }
+            }
+        }
+    }
+
     #[test]
     fn build_and_apply_round_trip_all_qualities() {
         for quality in [
@@ -1038,5 +1258,401 @@ mod tests {
         assert_eq!(wrap_signed(255, 8), -1);
         assert_eq!(wrap_signed(-255, 8), 1);
         assert_eq!(wrap_signed(12, 8), 12);
+    }
+
+    #[test]
+    fn build_delta_clean_prefix_returns_exact_zero_mask_all_qualities() {
+        for quality in [
+            BitQuality::VeryLow,
+            BitQuality::Low,
+            BitQuality::Medium,
+            BitQuality::High,
+        ] {
+            let payload = deterministic_payload(quality.payload_len(), 0x1234_5678);
+            assert_eq!(
+                build_delta(&payload, &payload, quality).unwrap(),
+                vec![0u8; DIRTY_MASK_BYTES]
+            );
+            // Distinct but byte-equal allocations take the same path.
+            let current = payload.clone();
+            assert_eq!(
+                build_delta(&payload, &current, quality).unwrap(),
+                vec![0u8; DIRTY_MASK_BYTES]
+            );
+            // All-zero payloads are clean at every quality.
+            let zeros = vec![0u8; quality.payload_len()];
+            assert_eq!(
+                build_delta(&zeros, &zeros, quality).unwrap(),
+                vec![0u8; DIRTY_MASK_BYTES]
+            );
+        }
+    }
+
+    #[test]
+    fn build_delta_clean_ignores_extra_tails() {
+        for quality in [
+            BitQuality::VeryLow,
+            BitQuality::Low,
+            BitQuality::Medium,
+            BitQuality::High,
+        ] {
+            let prefix_len = quality.payload_len();
+            let mut baseline = deterministic_payload(prefix_len + 4, 0x51ab_3c10);
+            let mut current = baseline.clone();
+            // Mutations past the fixed prefix stay an exact clean mask.
+            current[prefix_len] ^= 0xff;
+            current[prefix_len + 3] = current[prefix_len + 3].wrapping_add(1);
+            assert_eq!(
+                build_delta(&baseline, &current, quality).unwrap(),
+                vec![0u8; DIRTY_MASK_BYTES]
+            );
+            // Tails on the baseline side are ignored the same way.
+            baseline[prefix_len + 1] ^= 0x01;
+            assert_eq!(
+                build_delta(&baseline, &current, quality).unwrap(),
+                vec![0u8; DIRTY_MASK_BYTES]
+            );
+        }
+    }
+
+    #[test]
+    fn build_delta_clean_apply_reconstructs_prefix_and_consumes_mask_only() {
+        for quality in [
+            BitQuality::VeryLow,
+            BitQuality::Low,
+            BitQuality::Medium,
+            BitQuality::High,
+        ] {
+            let prefix_len = quality.payload_len();
+            let baseline = deterministic_payload(prefix_len, 0xdead_beef);
+            let current = baseline.clone();
+            let delta = build_delta(&baseline, &current, quality).unwrap();
+            assert_eq!(delta.len(), DIRTY_MASK_BYTES);
+            // Trailing AdditionalAvatarData after the mask-only body is left
+            // to the caller.
+            let mut with_trailing = delta.clone();
+            with_trailing.extend_from_slice(&[0xa5, 0x5a, 0xc3]);
+            let (rebuilt, consumed) = apply_delta(&baseline, &with_trailing, quality).unwrap();
+            assert_eq!(consumed, DIRTY_MASK_BYTES);
+            assert_eq!(rebuilt, baseline[..prefix_len].to_vec());
+        }
+    }
+
+    #[test]
+    fn build_delta_dirty_prefix_with_unequal_tails_falls_through() {
+        for quality in [
+            BitQuality::VeryLow,
+            BitQuality::Low,
+            BitQuality::Medium,
+            BitQuality::High,
+        ] {
+            let prefix_len = quality.payload_len();
+            let baseline = deterministic_payload(prefix_len + 2, 0x1234_5678);
+            let mut current = baseline.clone();
+            current[0] ^= 0x01;
+            current[prefix_len] ^= 0xff;
+            current[prefix_len + 1] = current[prefix_len + 1].wrapping_add(7);
+            let delta = build_delta(&baseline, &current, quality).unwrap();
+            assert_ne!(delta, vec![0u8; DIRTY_MASK_BYTES]);
+            let (rebuilt, consumed) = apply_delta(&baseline, &delta, quality).unwrap();
+            assert_eq!(consumed, delta.len());
+            assert_eq!(rebuilt, current[..prefix_len].to_vec());
+        }
+    }
+
+    #[test]
+    fn build_delta_length_errors_keep_message_and_order() {
+        for quality in [
+            BitQuality::VeryLow,
+            BitQuality::Low,
+            BitQuality::Medium,
+            BitQuality::High,
+        ] {
+            let full = deterministic_payload(quality.payload_len(), 0x1234_5678);
+            let short = &full[..full.len() - 1];
+            assert_eq!(
+                build_delta(short, &full, quality).unwrap_err().to_string(),
+                "avatar delta baseline too small"
+            );
+            assert_eq!(
+                build_delta(&full, short, quality).unwrap_err().to_string(),
+                "avatar delta current payload too small"
+            );
+            // Both truncated: the baseline guard still fires first.
+            assert_eq!(
+                build_delta(short, short, quality).unwrap_err().to_string(),
+                "avatar delta baseline too small"
+            );
+            // Empty inputs hit the baseline guard first at every quality.
+            assert_eq!(
+                build_delta(&[], &[], quality).unwrap_err().to_string(),
+                "avatar delta baseline too small"
+            );
+        }
+    }
+
+    #[test]
+    fn build_delta_single_bit_flips_cover_every_prefix_bit() {
+        // Differential for the fast path's premise: every fixed-prefix bit is
+        // semantically covered, so any byte-unequal prefix falls through to a
+        // dirty encoding that still round-trips. A bit that produced a clean
+        // mask here would be padding/dead; the fall-through keeps even that
+        // case as correct as the original path, and this test pins the
+        // current full-coverage layout.
+        for quality in [
+            BitQuality::VeryLow,
+            BitQuality::Low,
+            BitQuality::Medium,
+            BitQuality::High,
+        ] {
+            let prefix_len = quality.payload_len();
+            let baseline = deterministic_payload(prefix_len, 0x9e37_79b9);
+            for bit in 0..prefix_len * 8 {
+                let mut current = baseline.clone();
+                current[bit >> 3] ^= 1u8 << (bit & 7);
+                let delta = build_delta(&baseline, &current, quality).unwrap();
+                assert_ne!(
+                    delta,
+                    vec![0u8; DIRTY_MASK_BYTES],
+                    "quality={quality:?} bit={bit}"
+                );
+                let (rebuilt, consumed) = apply_delta(&baseline, &delta, quality).unwrap();
+                assert_eq!(consumed, delta.len());
+                assert_eq!(rebuilt, current);
+            }
+        }
+    }
+
+    #[test]
+    fn residual_read_bit_matches_checked_single_bit_semantics() {
+        // Value + advance at representative positions, including byte
+        // boundaries and the last bit before end_bit.
+        let bytes = [0b1010_0101, 0b0111_1000];
+        for start in 0..16 {
+            let mut reader = ResidualBitReader::new(&bytes, start, 16);
+            assert_eq!(
+                reader.read_bit().unwrap(),
+                read_bits_reference(&bytes, start, 1) as u32,
+                "start={start}",
+            );
+            assert_eq!(reader.bit_position, start + 1);
+        }
+
+        // Every failure keeps the exact read_bits(1) error string and leaves
+        // bit_position unadvanced.
+        let failures: Vec<(&[u8], usize, usize)> = vec![
+            (&bytes, 16, 16),                 // pos == end_bit
+            (&bytes, 15, 15),                 // pos + 1 > end_bit
+            (&bytes[..1], 8, 16),             // end_bit passes, backing byte missing
+            (&bytes, 16, usize::MAX),         // end_bit huge, slice short
+            (&bytes, usize::MAX, usize::MAX), // saturating_add must not overflow
+        ];
+        for (slice, start, end) in failures {
+            let mut reader = ResidualBitReader::new(slice, start, end);
+            assert_eq!(
+                reader.read_bit().unwrap_err().to_string(),
+                "truncated avatar delta bitstream",
+                "start={start} end={end}",
+            );
+            assert_eq!(reader.bit_position, start);
+            // Same state through the general reader fails identically.
+            let mut general = ResidualBitReader::new(slice, start, end);
+            let general_err = general.read_bits(1).unwrap_err().to_string();
+            assert_eq!(general_err, "truncated avatar delta bitstream");
+            assert_eq!(general.bit_position, start);
+        }
+
+        // read_signed_eg truncation strings are unchanged by the specialization.
+        let mut reader = ResidualBitReader::new(&[0x00], 8, 8);
+        assert_eq!(
+            reader.read_signed_eg().unwrap_err().to_string(),
+            "truncated avatar delta Exp-Golomb code",
+        );
+        let zeros = [0x00; 5];
+        let mut reader = ResidualBitReader::new(&zeros, 0, 40);
+        assert_eq!(
+            reader.read_signed_eg().unwrap_err().to_string(),
+            "invalid avatar delta Exp-Golomb prefix",
+        );
+    }
+
+    /// Full decode cost, including allocation, on a fixed prebuilt corpus.
+    ///
+    /// Ignored screen harness for the `read_bit` follow-up. The encoded corpus
+    /// is built once with the accepted encoder outside timing and validated
+    /// against the bit-loop reference (roundtrip, consumed length, truncation
+    /// errors, checksums, operation counts) before any timing. Timing covers
+    /// only `apply_delta` with `black_box` inputs/outputs and a live checksum.
+    /// Expected decoded bytes come from the validated reference decoder, never
+    /// fabricated: encoder quantization must not be assumed away.
+    #[test]
+    #[ignore]
+    fn bench_apply_delta_corpus() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const SEED_COUNT: u32 = 32;
+        const ROUNDS: usize = 8;
+        // ~20k decodes per round for clean/single-axis, ~3k for dense.
+        const PASSES_CLEAN: usize = 625;
+        const PASSES_DENSE: usize = 94;
+
+        struct Entry {
+            baseline: Vec<u8>,
+            encoded: Vec<u8>,
+            expected: Vec<u8>,
+            consumed: usize,
+        }
+        fn fold_byte(checksum: u64, byte: u8) -> u64 {
+            checksum.wrapping_mul(257).wrapping_add(u64::from(byte))
+        }
+
+        for quality in [
+            BitQuality::VeryLow,
+            BitQuality::Low,
+            BitQuality::Medium,
+            BitQuality::High,
+        ] {
+            let layout = layout(quality);
+            // Same deterministic constructors as bench_build_delta_corpus.
+            type PayloadPair = (Vec<u8>, Vec<u8>);
+            let mut corpora: [(&str, Vec<PayloadPair>); 3] = [
+                ("clean", Vec::new()),
+                ("single_axis", Vec::new()),
+                ("dense", Vec::new()),
+            ];
+            for seed in 1..=SEED_COUNT {
+                let baseline = deterministic_payload(layout.payload_bytes, seed * 0x13579);
+                let mut sparse = baseline.clone();
+                for (slot, field) in layout.fields.iter().enumerate().skip(1).take(9) {
+                    let delta_channels = field
+                        .iter()
+                        .filter(|c| c.kind == ChannelKind::Delta)
+                        .collect::<Vec<_>>();
+                    if let Some(channel) =
+                        delta_channels.get((seed as usize + slot) % delta_channels.len().max(1))
+                    {
+                        let value = read_channel(&baseline, **channel).wrapping_add(1 + seed % 3)
+                            & channel.mask();
+                        replace_channel_reference(&mut sparse, **channel, value);
+                    }
+                }
+                let dense = deterministic_payload(layout.payload_bytes, seed * 0x2468b + 73);
+                corpora[0].1.push((baseline.clone(), baseline.clone()));
+                corpora[1].1.push((baseline.clone(), sparse));
+                corpora[2].1.push((baseline, dense));
+            }
+
+            // Encode once outside timing; validate everything before timing.
+            let mut encoded_corpora: Vec<(&str, Vec<Entry>)> = Vec::new();
+            let mut corpus_checksums = Vec::new();
+            let mut dirty_fields = Vec::new();
+            let mut expected_totals = Vec::new();
+            for (case, pairs) in &corpora {
+                let mut entries = Vec::with_capacity(pairs.len());
+                let mut corpus_checksum = 0u64;
+                let mut dirty = 0usize;
+                for (baseline, current) in pairs {
+                    let encoded = build_delta(baseline, current, quality).unwrap();
+                    let (decoded, consumed) = apply_delta(baseline, &encoded, quality).unwrap();
+                    let (ref_decoded, ref_consumed) =
+                        apply_delta_reference(baseline, &encoded, quality).unwrap();
+                    assert_eq!(decoded, ref_decoded, "quality={quality:?} case={case}");
+                    assert_eq!(consumed, ref_consumed);
+                    assert_eq!(consumed, encoded.len());
+                    for byte in &encoded {
+                        corpus_checksum = fold_byte(corpus_checksum, *byte);
+                    }
+                    dirty += encoded
+                        .iter()
+                        .take(DIRTY_MASK_BYTES)
+                        .map(|b| b.count_ones() as usize)
+                        .sum::<usize>();
+                    entries.push(Entry {
+                        baseline: baseline.clone(),
+                        encoded,
+                        expected: decoded,
+                        consumed,
+                    });
+                }
+                // Truncation errors on the first entry must match the reference
+                // for every prefix; failure aborts via `?` so post-failure
+                // advance is unobservable publicly.
+                if let Some(first) = entries.first() {
+                    for end in 0..first.encoded.len() {
+                        let optimized =
+                            apply_delta(&first.baseline, &first.encoded[..end], quality)
+                                .unwrap_err()
+                                .to_string();
+                        let reference =
+                            apply_delta_reference(&first.baseline, &first.encoded[..end], quality)
+                                .unwrap_err()
+                                .to_string();
+                        assert_eq!(
+                            optimized, reference,
+                            "quality={quality:?} case={case} end={end}"
+                        );
+                    }
+                }
+                // Expected live checksum over the same fold the timed loop uses.
+                let passes = if *case == "dense" {
+                    PASSES_DENSE
+                } else {
+                    PASSES_CLEAN
+                };
+                let mut expected = 0u64;
+                for _ in 0..passes {
+                    for entry in &entries {
+                        for byte in &entry.expected {
+                            expected = fold_byte(expected, *byte);
+                        }
+                        expected = expected.wrapping_add(entry.consumed as u64);
+                    }
+                }
+                corpus_checksums.push(corpus_checksum);
+                dirty_fields.push(dirty);
+                expected_totals.push((passes, expected));
+                encoded_corpora.push((*case, entries));
+            }
+
+            let run = |index: usize, pass_count: usize| {
+                let entries = black_box(&encoded_corpora[index].1);
+                let mut checksum = 0u64;
+                let mut operations = 0usize;
+                let started = Instant::now();
+                for _ in 0..pass_count {
+                    for entry in black_box(entries) {
+                        let (decoded, consumed) = black_box(
+                            apply_delta(
+                                black_box(&entry.baseline),
+                                black_box(&entry.encoded),
+                                quality,
+                            )
+                            .unwrap(),
+                        );
+                        for byte in black_box(decoded.iter()) {
+                            checksum = fold_byte(checksum, *byte);
+                        }
+                        checksum = checksum.wrapping_add(black_box(consumed) as u64);
+                        operations += 1;
+                    }
+                }
+                (started.elapsed().as_nanos(), checksum, operations)
+            };
+            for index in 0..3 {
+                run(index, 8);
+            }
+            let mut checksums = [None; 3];
+            for round in 0..ROUNDS {
+                let order = if round % 2 == 0 { [0, 1, 2] } else { [2, 1, 0] };
+                for index in order {
+                    let (passes, expected) = expected_totals[index];
+                    let (elapsed_ns, checksum, operations) = run(index, passes);
+                    assert_eq!(checksum, expected, "live checksum drift");
+                    assert_eq!(*checksums[index].get_or_insert(checksum), checksum);
+                    println!("delta_apply quality={} case={} round={round} operations={operations} elapsed_ns={elapsed_ns} checksum={checksum} corpus_checksum={} dirty_fields={} expected_checksum={expected}", quality as u8, encoded_corpora[index].0, corpus_checksums[index], dirty_fields[index]);
+                }
+            }
+        }
     }
 }
