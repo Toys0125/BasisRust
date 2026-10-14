@@ -40,7 +40,10 @@ use crate::voice::{
     serialize_voice_recipients_large, serialize_voice_recipients_small, voice_speaker_target,
     OggOpusPackets,
 };
-use crate::wire::{avatar_change, build_connection_payload, ready_message};
+use crate::wire::{
+    avatar_change, build_connection_payload, build_connection_payload_for_version,
+    is_v55_version_rejection, ready_message,
+};
 use basis_protocol::application::NetworkApplication;
 use basis_protocol::avatar::{
     encode_avatar_bundle, encode_avatar_network_load_with_version, AvatarBundleItem, BitQuality,
@@ -55,7 +58,7 @@ use basis_protocol::messages::{
     AdditionalAvatarData, BasisDeserialize, BasisSerialize, ClientMetaDataMessage,
     ClientMetaDataMessage as ProtocolClientMetaDataMessage,
 };
-use basis_protocol::version::SERVER_VERSION;
+use basis_protocol::version::{LEGACY_SERVER_VERSION, SERVER_VERSION};
 use basis_transport::{
     DeliveryMethod, PacketProperty, DEFAULT_WINDOW_SIZE, LITENETLIB_CHANNELED_HEADER_SIZE,
     LITENETLIB_FRAGMENTED_HEADER_SIZE, LITENETLIB_FRAGMENT_HEADER_SIZE, LITENETLIB_INITIAL_MTU,
@@ -551,6 +554,8 @@ async fn test_client_with_voice_diagnostics(
         .to_bytes(),
         connection_payload_hash: StdMutex::new([0; 32]),
         sealed_outbound: StdMutex::new(None),
+        protocol_version: AtomicU16::new(SERVER_VERSION),
+        legacy_retry_payload: StdMutex::new(None),
     })
 }
 
@@ -678,6 +683,179 @@ fn connection_payload_starts_with_v56_application_auth_key_and_ready() {
     );
     assert_eq!(&payload[7 + auth_len..39 + auth_len], &[7; 32]);
     assert!(payload.len() > 39 + auth_len);
+}
+
+#[test]
+fn v55_connection_payload_omits_ephemeral_key() {
+    let config = Config::default();
+    let ready = ready_message(&config, [0.0; 3]).unwrap();
+    let payload =
+        build_connection_payload_for_version(&config, &ready, &[7; 32], LEGACY_SERVER_VERSION)
+            .unwrap();
+    let mut reader = ProtocolNetReader::new(&payload);
+    assert_eq!(reader.get_u16().unwrap(), 55);
+    let application = NetworkApplication::try_read(&mut reader).unwrap();
+    assert!(application.matches(&config.company_name, &config.product_name));
+    assert_eq!(
+        reader.get_bytes_with_length().unwrap(),
+        config.password.as_bytes()
+    );
+    let decoded =
+        <basis_protocol::messages::ReadyMessage as BasisDeserialize>::deserialize(&mut reader)
+            .unwrap();
+    assert_eq!(
+        decoded.player_meta_data_message,
+        ready.player_meta_data_message
+    );
+    assert_eq!(
+        decoded.client_avatar_change_message.byte_array,
+        ready.client_avatar_change_message.byte_array
+    );
+    assert_eq!(
+        decoded.local_avatar_sync_message,
+        ready.local_avatar_sync_message
+    );
+    assert_eq!(reader.remaining(), 0);
+}
+
+fn version_rejection(server: u16, client: u16, kind: u8, timestamp: i64) -> Vec<u8> {
+    let mut packet = ProtocolNetWriter::new();
+    packet.put_u8(PacketProperty::Disconnect as u8);
+    packet.put_i64(timestamp);
+    packet.put_u32(channels::REJECT_MAGIC);
+    packet.put_u8(kind);
+    packet.put_u16(server);
+    packet.put_u16(client);
+    packet.put_string("protocol version mismatch").unwrap();
+    packet.into_vec()
+}
+
+#[tokio::test]
+async fn v56_client_retries_v55_only_on_matching_structured_version_rejection() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(0, server.local_addr().unwrap()).await;
+    client.connected.store(false, Ordering::Release);
+    let config = Config::default();
+    let ready = ready_message(&config, [0.0; 3]).unwrap();
+    *client.legacy_retry_payload.lock().unwrap() = Some(
+        build_connection_payload_for_version(
+            &config,
+            &ready,
+            &client.connection_public,
+            LEGACY_SERVER_VERSION,
+        )
+        .unwrap(),
+    );
+    let rejection = version_rejection(
+        LEGACY_SERVER_VERSION,
+        SERVER_VERSION,
+        channels::REJECT_KIND_VERSION_MISMATCH,
+        client.connect_time,
+    );
+    assert!(is_v55_version_rejection(&rejection[9..]));
+    client.handle_packet(&rejection).await.unwrap();
+    assert_eq!(client.protocol_version.load(Ordering::Acquire), 55);
+    assert!(client.in_use.load(Ordering::Acquire));
+    assert!(client.legacy_retry_payload.lock().unwrap().is_none());
+    let mut buffer = [0; 4096];
+    let length = time::timeout(Duration::from_secs(1), server.recv(&mut buffer))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        PacketProperty::from_byte(buffer[0]),
+        Some(PacketProperty::ConnectRequest)
+    );
+    let offset = 18 + buffer[17] as usize;
+    let mut reader = ProtocolNetReader::new(&buffer[offset..length]);
+    assert_eq!(reader.get_u16().unwrap(), LEGACY_SERVER_VERSION);
+    NetworkApplication::try_read(&mut reader).unwrap();
+    assert_eq!(
+        reader.get_bytes_with_length().unwrap(),
+        config.password.as_bytes()
+    );
+    assert!(
+        <basis_protocol::messages::ReadyMessage as BasisDeserialize>::deserialize(&mut reader)
+            .is_ok()
+    );
+    assert_eq!(reader.remaining(), 0);
+    // A delayed duplicate rejection cannot send a second request or abort the retry.
+    client.handle_packet(&rejection).await.unwrap();
+    assert!(client.in_use.load(Ordering::Acquire));
+    assert!(
+        time::timeout(Duration::from_millis(30), server.recv(&mut buffer))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn v55_fallback_rejects_unrelated_or_malformed_reasons() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(0, server.local_addr().unwrap()).await;
+    client.connected.store(false, Ordering::Release);
+    let mismatches = [
+        version_rejection(
+            54,
+            SERVER_VERSION,
+            channels::REJECT_KIND_VERSION_MISMATCH,
+            0,
+        ),
+        version_rejection(55, 55, channels::REJECT_KIND_VERSION_MISMATCH, 0),
+        version_rejection(55, 56, channels::REJECT_KIND_PASSWORD_REJECTED, 0),
+        version_rejection(55, 56, channels::REJECT_KIND_VERSION_MISMATCH, 999),
+    ];
+    for packet in &mismatches {
+        assert!(
+            !is_v55_version_rejection(&packet[9..])
+                || packet[1..9] != client.connect_time.to_le_bytes()
+        );
+    }
+    assert!(!is_v55_version_rejection(&[0, 0, 0]));
+    let invalid = version_rejection(55, 56, channels::REJECT_KIND_PASSWORD_REJECTED, 0);
+    client.handle_packet(&invalid).await.unwrap();
+    assert_eq!(
+        client.protocol_version.load(Ordering::Acquire),
+        SERVER_VERSION
+    );
+    assert!(!client.in_use.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn v55_did_challenge_uses_plaintext_nonce_signature() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(0, server.local_addr().unwrap()).await;
+    client
+        .protocol_version
+        .store(LEGACY_SERVER_VERSION, Ordering::Release);
+    let challenge = [21u8; 32];
+    let mut payload = NetWriter::new();
+    payload.put_bytes_with_length(&challenge).unwrap();
+    client
+        .handle_channeled(
+            DeliveryMethod::channel_id(channels::AUTH_IDENTITY, DeliveryMethod::ReliableOrdered),
+            0,
+            payload.as_slice(),
+        )
+        .await
+        .unwrap();
+    let mut buffer = [0; 256];
+    let length = time::timeout(Duration::from_secs(1), server.recv(&mut buffer))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(buffer[0] & 0x1f, PacketProperty::Channeled as u8);
+    assert_eq!(
+        buffer[3],
+        DeliveryMethod::channel_id(channels::AUTH_IDENTITY, DeliveryMethod::ReliableOrdered)
+    );
+    let mut reader = ProtocolNetReader::new(&buffer[4..length]);
+    let response = basis_protocol::did::DidResponse::deserialize(&mut reader).unwrap();
+    assert_eq!(reader.remaining(), 0);
+    response
+        .verify(&challenge, &client.identity.verifying_key)
+        .unwrap();
+    assert!(client.sealed_outbound.lock().unwrap().is_none());
 }
 
 #[test]

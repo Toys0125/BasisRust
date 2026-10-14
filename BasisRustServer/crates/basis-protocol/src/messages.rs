@@ -2998,7 +2998,7 @@ mod admin_parity_tests {
 
     #[test]
     fn admin_mode_ids_cover_pinned_basisvr_catalog() {
-        for id in 0..=95 {
+        for id in 0..=97 {
             assert_ne!(AdminRequestMode::from(id), AdminRequestMode::Unknown);
             assert_eq!(AdminRequestMode::from(id) as u8, id);
         }
@@ -3009,7 +3009,9 @@ mod admin_parity_tests {
         assert_eq!(AdminRequestMode::EnableShoutMode as u8, 88);
         assert_eq!(AdminRequestMode::SetGlobalLocomotionPolicy as u8, 90);
         assert_eq!(AdminRequestMode::MuteStateResult as u8, 95);
-        assert_eq!(AdminRequestMode::from(96), AdminRequestMode::Unknown);
+        assert_eq!(AdminRequestMode::GlobalToggleContentRemoval as u8, 96);
+        assert_eq!(AdminRequestMode::GlobalToggleExternalLinks as u8, 97);
+        assert_eq!(AdminRequestMode::from(98), AdminRequestMode::Unknown);
         assert_eq!(
             AdminPermissionQueryKind::try_from(0),
             Ok(AdminPermissionQueryKind::Node)

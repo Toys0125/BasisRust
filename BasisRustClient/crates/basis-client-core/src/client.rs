@@ -9,6 +9,15 @@ pub(crate) const OBSERVER_CANDIDATE_COUNT: usize = 3;
 /// `Merged` and slips through; LiteNetLib frames it as `CompactMerged` and does not. Disable
 /// this when measuring all-client voice fanout against a non-Rust server so every leg measures
 /// the same population.
+fn legacy_fallback_enabled() -> bool {
+    // Version rejections are unauthenticated LiteNetLib control traffic. Hosts
+    // requiring the stronger v56 login can pin it by disabling legacy fallback.
+    match std::env::var("BASIS_CLIENT_DISABLE_V55_FALLBACK") {
+        Ok(value) => value != "1" && !value.eq_ignore_ascii_case("true"),
+        Err(_) => true,
+    }
+}
+
 fn load_sink_filter_enabled() -> bool {
     match std::env::var("BASIS_CLIENT_LOAD_SINK_FILTER") {
         Ok(value) => value != "0" && !value.eq_ignore_ascii_case("false"),
@@ -30,14 +39,16 @@ use crate::transport::{
     parse_packet, FragmentResult, ReliableFragmentReassembler, ReliableReceiveState, ReliableSend,
     ACK_FLUSH_INTERVAL, PING_INTERVAL_TICKS, RESEND_INTERVAL_TICKS,
 };
-use crate::wire::build_connection_payload;
+use crate::wire::{
+    build_connection_payload, build_connection_payload_for_version, is_v55_version_rejection,
+};
 use anyhow::{anyhow, Result};
 use basis_protocol::channels;
 use basis_protocol::io::NetReader;
 use basis_protocol::io::NetWriter;
 use basis_protocol::login::{connection_payload_hash, did_login_transcript};
 use basis_protocol::messages::{BasisDeserialize, BytesMessage, ReadyMessage, ServerNetIdMessage};
-use basis_protocol::version::LITENETLIB_PROTOCOL_ID;
+use basis_protocol::version::{LEGACY_SERVER_VERSION, LITENETLIB_PROTOCOL_ID, SERVER_VERSION};
 use basis_transport::{
     dotnet_utc_ticks, relative_sequence, DeliveryMethod, PacketProperty, DEFAULT_WINDOW_SIZE,
     LITENETLIB_CHANNELED_HEADER_SIZE, LITENETLIB_FRAGMENTED_HEADER_SIZE, LITENETLIB_INITIAL_MTU,
@@ -156,6 +167,10 @@ pub(crate) struct BasisClient {
     pub(crate) connection_public: [u8; 32],
     pub(crate) connection_payload_hash: StdMutex<[u8; 32]>,
     pub(crate) sealed_outbound: StdMutex<Option<([u8; 32], u64)>>,
+    /// Version for this exact connection; v55 is permitted only after a matching
+    /// structured rejection from the target server.
+    pub(crate) protocol_version: AtomicU16,
+    pub(crate) legacy_retry_payload: StdMutex<Option<Vec<u8>>>,
 }
 
 impl BasisClient {
@@ -235,6 +250,8 @@ impl BasisClient {
             connection_public,
             connection_payload_hash: StdMutex::new([0; 32]),
             sealed_outbound: StdMutex::new(None),
+            protocol_version: AtomicU16::new(SERVER_VERSION),
+            legacy_retry_payload: StdMutex::new(None),
         });
 
         client
@@ -250,6 +267,16 @@ impl BasisClient {
         shared_maintenance_enabled: bool,
     ) -> Result<()> {
         let payload = build_connection_payload(config, ready, &self.connection_public)?;
+        let legacy_payload = if legacy_fallback_enabled() {
+            Some(build_connection_payload_for_version(
+                config,
+                ready,
+                &self.connection_public,
+                LEGACY_SERVER_VERSION,
+            )?)
+        } else {
+            None
+        };
         let mut reader = NetReader::new(&payload);
         let _version = reader.get_u16()?;
         basis_protocol::application::NetworkApplication::try_read(&mut reader)
@@ -258,6 +285,9 @@ impl BasisClient {
         *self.connection_payload_hash.lock().unwrap() =
             connection_payload_hash(reader.remaining_slice());
         *self.sealed_outbound.lock().unwrap() = None;
+        self.protocol_version
+            .store(SERVER_VERSION, Ordering::Release);
+        *self.legacy_retry_payload.lock().unwrap() = legacy_payload;
         if self.in_use.swap(true, Ordering::SeqCst) {
             error!("Call Shutdown First!");
             return Err(anyhow!("Call Shutdown First!"));
@@ -610,6 +640,8 @@ impl BasisClient {
                     && i64::from_le_bytes(bytes[1..9].try_into().unwrap()) == self.connect_time =>
             {
                 let remote_peer = i32::from_le_bytes(bytes[11..15].try_into().unwrap());
+                // Connection established: v56 no longer needs the prebuilt v55 retry.
+                self.legacy_retry_payload.lock().unwrap().take();
                 *self.remote_peer_id.lock().await = Some(remote_peer);
                 if self.index != 0 && self.avatar_observer.is_none() && load_sink_filter_enabled() {
                     if let Err(err) = configure_load_sink_socket(&self.socket) {
@@ -626,14 +658,51 @@ impl BasisClient {
                 }
                 self.refresh_shared_receive_eligibility();
                 info!(
-                    "client {} connected as remote peer {}",
-                    self.index, remote_peer
+                    "client {} connected as remote peer {} with Basis protocol v{}",
+                    self.index,
+                    remote_peer,
+                    self.protocol_version.load(Ordering::Acquire)
                 );
             }
             PacketProperty::ConnectAccept => {}
             PacketProperty::Disconnect
             | PacketProperty::PeerNotFound
             | PacketProperty::InvalidProtocol => {
+                // Late repeats of the *old* v56 rejection must not tear down
+                // a v55 retry that is in progress or already accepted.
+                if packet.property == PacketProperty::Disconnect
+                    && packet.connection_number == self.connection_number
+                    && self.protocol_version.load(Ordering::Acquire) == LEGACY_SERVER_VERSION
+                    && bytes.get(1..9) == Some(self.connect_time.to_le_bytes().as_slice())
+                    && is_v55_version_rejection(packet.payload)
+                {
+                    return Ok(());
+                }
+                if packet.property == PacketProperty::Disconnect
+                    && packet.connection_number == self.connection_number
+                    && !self.connected.load(Ordering::Acquire)
+                    && self.in_use.load(Ordering::Acquire)
+                    && bytes.get(1..9) == Some(self.connect_time.to_le_bytes().as_slice())
+                    && is_v55_version_rejection(packet.payload)
+                    && self.legacy_retry_payload.lock().unwrap().is_some()
+                    && self
+                        .protocol_version
+                        .compare_exchange(
+                            SERVER_VERSION,
+                            LEGACY_SERVER_VERSION,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                {
+                    let retry = self.legacy_retry_payload.lock().unwrap().take();
+                    if let Some(retry) = retry {
+                        warn!("client {}: server reports protocol v55; retrying legacy unencrypted login", self.index);
+                        self.send_connected(&self.make_connect_request(&retry))
+                            .await?;
+                        return Ok(());
+                    }
+                }
                 let reason =
                     if packet.property == PacketProperty::Disconnect && packet.payload.len() >= 2 {
                         let length =
@@ -1017,6 +1086,16 @@ impl BasisClient {
             channels::AUTH_IDENTITY => {
                 let mut reader = NetReader::new(payload);
                 let nonce = BytesMessage::deserialize(&mut reader)?.data;
+                if self.protocol_version.load(Ordering::Acquire) == LEGACY_SERVER_VERSION {
+                    anyhow::ensure!(
+                        nonce.len() == 32 && reader.remaining() == 0,
+                        "malformed protocol-55 DID challenge"
+                    );
+                    let response = self.identity.response_payload(&nonce)?;
+                    self.send_reliable_ordered(channels::AUTH_IDENTITY, &response)
+                        .await?;
+                    return Ok(());
+                }
                 let server_key = BytesMessage::deserialize(&mut reader)?.data;
                 let server_uuid = String::from_utf8(BytesMessage::deserialize(&mut reader)?.data)?;
                 anyhow::ensure!(
