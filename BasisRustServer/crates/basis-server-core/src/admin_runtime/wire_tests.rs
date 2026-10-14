@@ -398,6 +398,139 @@ async fn replace_leave_worker(state: &ServerState) {
 }
 
 #[tokio::test]
+async fn leave_barriers_disconnect_non_acknowledging_peers_without_parking_ingress() {
+    // Exercise both the earlier-cleanup barrier and the leave-ACK barrier.
+    for pending_cleanup in [true, false] {
+        let (state, shutdown, _) = super::tests::test_server(false).await;
+        let worker = state.workers.lock().remove(0);
+        worker.abort();
+        let _ = worker.await;
+        let mut stalled = Client::connect(&state, "non-acking-survivor").await;
+        let mut leaver = Client::connect(&state, "barrier-leaver").await;
+        let (stalled_peer, stalled_session) = session_for_uuid(&state, "non-acking-survivor");
+        let (departed_peer, departed_session) = session_for_uuid(&state, "barrier-leaver");
+        request_disconnect(&state, &departed_session, "test leave")
+            .await
+            .unwrap();
+        leaver.receive_disconnect().await;
+        wait_for_disconnect_cleanups(&state).await;
+        // ACK all setup and cleanup traffic before selecting which phase stalls.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(200),
+            stalled.receive_inner(|_, _| false),
+        )
+        .await;
+        assert!(state.transport.reliable_idle(&stalled_session));
+        if pending_cleanup {
+            state
+                .transport
+                .send_session(
+                    &stalled_session,
+                    channels::NET_ID_ASSIGNS,
+                    DeliveryMethod::ReliableOrdered,
+                    &[0, 0],
+                )
+                .await
+                .unwrap();
+        }
+        let flush_state = state.clone();
+        let flush = tokio::spawn(async move { crate::flush_pending_leaves(&flush_state).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.join_delivery.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("leave flush must acquire the join-delivery fence");
+        assert!(state.retiring_peer_ids.contains_key(&departed_peer));
+        assert!(state.transport.is_current_session(&stalled_session));
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            crate::flush_join_batches(&state),
+        )
+        .await
+        .expect("join tick must skip a held retirement fence")
+        .unwrap();
+
+        let mut subscribe = NetWriter::new();
+        subscribe.put_u8(channels::REGISTRY_SUB_SUBSCRIBE);
+        BasisMessageSubscribe { ids: vec![42] }
+            .serialize(&mut subscribe)
+            .unwrap();
+        stalled
+            .send(channels::REGISTRY_CONTROL, subscribe.as_slice(), true)
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state.message_subscriptions.contains_key(&stalled_peer) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary ingress must progress during retirement");
+        let mut newcomer = Client::connect_pending(&state, "join-during-barrier").await;
+        // Keep refreshing liveness while deliberately withholding every ACK.
+        let socket = stalled.socket;
+        let pings = tokio::spawn(async move {
+            loop {
+                if socket
+                    .send(&[PacketProperty::Ping as u8, 0, 0])
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        tokio::time::timeout(crate::LEAVE_BARRIER_TIMEOUT + Duration::from_secs(2), flush)
+            .await
+            .expect("a pinging non-ACKing recipient must not stall retirement indefinitely")
+            .unwrap();
+        pings.abort();
+        let _ = pings.await;
+        assert!(!state.transport.is_current_session(&stalled_session));
+        assert!(state.transport.reliable_idle(&stalled_session));
+        assert!(!state.retiring_peer_ids.contains_key(&departed_peer));
+        newcomer
+            .receive(|channel, _| channel == channels::META_DATA)
+            .await;
+        wait_for_disconnect_cleanups(&state).await;
+        assert!(!state.authenticated_peers.contains_key(&stalled_peer));
+        state.shutdown().await.unwrap();
+        let _ = shutdown.send(());
+    }
+}
+
+#[tokio::test]
+async fn unchanged_voice_recipients_preserve_queued_configuration() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let _sender = Client::connect(&state, "same-config-sender").await;
+    let _recipient = Client::connect(&state, "same-config-recipient").await;
+    let (sender, _) = session_for_uuid(&state, "same-config-sender");
+    let (recipient, _) = session_for_uuid(&state, "same-config-recipient");
+    crate::install_voice_recipients(&state, sender, vec![recipient]);
+    let configured = state.voice_recipient_sessions.get(&sender).unwrap().clone();
+    crate::install_voice_recipients(&state, sender, vec![recipient]);
+    assert!(Arc::ptr_eq(
+        &configured,
+        &state.voice_recipient_sessions.get(&sender).unwrap()
+    ));
+    assert_eq!(
+        state.voice_recipients.get(&sender).unwrap().as_slice(),
+        [recipient]
+    );
+    // A real change must still invalidate old queued audio.
+    crate::install_voice_recipients(&state, sender, vec![]);
+    assert!(!Arc::ptr_eq(
+        &configured,
+        &state.voice_recipient_sessions.get(&sender).unwrap()
+    ));
+    assert!(state.voice_recipients.get(&sender).unwrap().is_empty());
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
 async fn queued_old_control_event_cannot_mutate_reused_peer_id() {
     let (state, shutdown, _) = super::tests::test_server(false).await;
     let mut old_client = Client::connect(&state, "old-control-session").await;

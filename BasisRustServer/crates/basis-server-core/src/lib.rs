@@ -1174,6 +1174,7 @@ fn is_p2p_offload_channel(channel: u8) -> bool {
 }
 
 const LEAVE_BROADCAST_INTERVAL: Duration = Duration::from_millis(50);
+const LEAVE_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn image_animation_allowed(state: &ServerState, peer: PeerId) -> bool {
     !state.global_state.read().gifs_locked
@@ -1306,6 +1307,44 @@ fn serialize_leave_batch(leaves: &[PeerId]) -> Vec<u8> {
     writer.into_vec()
 }
 
+async fn wait_reliable_barrier(state: &ServerState, recipients: &[PeerSession]) -> bool {
+    let deadline = Instant::now() + LEAVE_BARRIER_TIMEOUT;
+    loop {
+        if state.shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
+        let pending = recipients
+            .iter()
+            .filter(|session| !state.transport.reliable_idle(session))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            for session in pending {
+                warn!(
+                    peer = session.peer_id(),
+                    "disconnecting stalled reliable recipient"
+                );
+                if let Err(error) =
+                    request_disconnect(state, session, "Reliable delivery stalled").await
+                {
+                    warn!(
+                        peer = session.peer_id(),
+                        "failed to disconnect stalled recipient: {error:#}"
+                    );
+                }
+            }
+            // Never release IDs merely because the deadline elapsed. Only ACKed,
+            // closed or replaced recipient sessions satisfy the retirement barrier.
+            return recipients
+                .iter()
+                .all(|session| state.transport.reliable_idle(session));
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
 async fn flush_pending_leaves(state: &ServerState) {
     let mut leaves = {
         let mut pending = state.pending_leaves.lock();
@@ -1332,12 +1371,9 @@ async fn flush_pending_leaves(state: &ServerState) {
 
     // History and ownership cleanup use other channels. Drain their earlier
     // delivery before the leave, so a delayed join cannot recreate a ghost.
-    while !state.shutdown.load(Ordering::Relaxed)
-        && recipients
-            .iter()
-            .any(|session| !state.transport.reliable_idle(session))
-    {
-        tokio::time::sleep(Duration::from_millis(2)).await;
+    if !wait_reliable_barrier(state, &recipients).await {
+        state.pending_leaves.lock().extend(leaves);
+        return;
     }
     for session in &recipients {
         if state
@@ -1361,12 +1397,9 @@ async fn flush_pending_leaves(state: &ServerState) {
     // Newly admitted incarnations cannot have old join history: membership was
     // removed before this batch, and their initial fanout waits on join_delivery.
     // Later leave batches reference disjoint IDs; this is not a general producer fence.
-    while !state.shutdown.load(Ordering::Relaxed)
-        && recipients
-            .iter()
-            .any(|session| !state.transport.reliable_idle(session))
-    {
-        tokio::time::sleep(Duration::from_millis(2)).await;
+    if !wait_reliable_barrier(state, &recipients).await {
+        state.pending_leaves.lock().extend(leaves);
+        return;
     }
     if !state.shutdown.load(Ordering::Relaxed) {
         for peer in leaves {
@@ -1398,7 +1431,11 @@ fn frame_join_records(records: &[Arc<JoinBroadcastRecord>]) -> Result<Vec<u8>> {
 }
 
 async fn flush_join_batches(state: &ServerState) -> Result<()> {
-    let _join_delivery = state.join_delivery.lock().await;
+    // This runs inline in the ingress loop. A retirement barrier must not park
+    // that loop; leave queued join work untouched until a later flush tick.
+    let Ok(_join_delivery) = state.join_delivery.try_lock() else {
+        return Ok(());
+    };
     let targets = state.join_broadcast.lock().ready_targets();
     let mut framed_by_batch = HashMap::<Vec<(u64, u64)>, Vec<u8>>::new();
     for peer_id in targets {
@@ -4629,7 +4666,14 @@ fn install_voice_recipients(state: &ServerState, peer: PeerId, ids: Vec<PeerId>)
             }
         }
     }
-    *entry = Arc::new(sessions);
+    let unchanged = entry.len() == sessions.len()
+        && entry
+            .iter()
+            .zip(&sessions)
+            .all(|(old, new)| old.same_connection(new));
+    if !unchanged {
+        *entry = Arc::new(sessions);
+    }
     state
         .voice_recipients
         .insert(peer, entry.iter().map(PeerSession::peer_id).collect());

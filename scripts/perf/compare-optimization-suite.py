@@ -544,7 +544,7 @@ def plots(summary, prefix):
             label = f'{value:+.1f}%' if np.isfinite(value) else 'n/a'
             ax.text(j, i, label, ha='center', va='center')
     fig.colorbar(image, ax=ax, label='Normalized change (%)')
-    ax.set_xlabel('Green improves; red worsens. Mean trial quantiles, not pooled quantiles.', fontsize=9)
+    ax.set_xlabel('Green improves; red worsens. Median of per-trial values, not pooled quantiles.', fontsize=9)
     for extension in ('png', 'svg'):
         fig.savefig(str(prefix) + '-benchmarks.' + extension, dpi=160)
     plt.close(fig)

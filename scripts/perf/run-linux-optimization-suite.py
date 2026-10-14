@@ -28,6 +28,7 @@ import signal
 import sys
 import subprocess
 import time
+from optimization_suite_helpers import summarize_profile_workload
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser(description=__doc__)
@@ -50,6 +51,9 @@ if out.exists():
     parser.error(f'output already exists: {out}')
 if args.suite in ['live', 'stress'] and args.audio and not args.audio.is_dir():
     parser.error('audio folder does not exist')
+if args.suite in ['live', 'stress'] and args.audio and not any(
+        path.is_file() for path in args.audio.glob('*.opus')):
+    parser.error('audio folder contains no .opus files')
 if args.suite == 'stress' and not args.audio:
     parser.error('stress suite requires --audio')
 args.audio = args.audio.resolve() if args.audio else None
@@ -127,6 +131,8 @@ elif args.suite in ['live', 'stress']:
         else:
             failures.append(name+'-missing-workload')
 else:
+    spec=importlib.util.spec_from_file_location('summary',ROOT/'scripts/perf/summarize_windows_avatar.py')
+    module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
     capture=out/'avatar-1500'
     cmd=['python3',str(ROOT/'scripts/perf/run-windows-avatar-workload.py'),'--server',str(bins/'server'),'--client',str(args.client.resolve()),'--server-config',str(ROOT/'docs/performance/fixtures/avatar-cpu-only-server.xml'),'--clients','1500','--workers','4','--rayon-threads','16','--warmup-seconds','20','--window-seconds','60','--no-server-avatar-diagnostics','--port','64142','--health-port','64353','--output',str(capture)]
     with (out/'harness.log').open('w') as log:
@@ -165,6 +171,7 @@ else:
                 except subprocess.TimeoutExpired:
                     harness.kill()
                     harness.wait()
+    summarize_profile_workload(capture, out, module, failures)
     for label in ['server','client']:
         data = out/(label+'.data')
         if label+'-perf-record' in failures or not data.is_file() or data.stat().st_size == 0:
