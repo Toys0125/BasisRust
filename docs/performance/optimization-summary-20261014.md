@@ -58,3 +58,9 @@ Final verification passed **360 server-workspace tests and 116 client-workspace 
 Use the [Linux suite runner](../../scripts/perf/run-linux-optimization-suite.py), [comparison tool](../../scripts/perf/compare-optimization-suite.py), [week runner](../../scripts/sim/run-week-sync.py), and [heatmap exporter](../../scripts/sim/plot-week-sync.py). Individual reports contain workload commands. Corpus audio must be supplied locally.
 
 Readable reports and PNG/SVG heatmaps are versioned. New JSON exports, frozen binaries, raw CSVs, logs, and perf recordings are preserved under ignored `captures/`, including `captures/optimization-evidence-20261014/` and `captures/week-simulation/full-1000-keepalive/`. These local artifacts are not included in the commit or available in a fresh checkout; no raw JSON is added.
+
+## PR integration onto current main
+
+For the PR, the optimization commit was rebased onto `f673be1` (current main, including PRs #33–#35). The voice-admission conflict retains both upstream upload-budget enforcement and session-bound recipient configuration. The integrated revision passed 408 server-workspace tests and 138 client-workspace tests, including the 26-hour week smoke test; server/core transport and client-core all-target Clippy with warnings denied, both formatting checks, and diff checks passed.
+
+The published performance comparisons and full 168-hour run remain measurements of their recorded frozen pre-integration sources. Their hashes and raw evidence were preserved. The complete 1,000-player week and performance cohorts were not rerun on the updated main base, so these historical results are not presented as measurements of the PR head.

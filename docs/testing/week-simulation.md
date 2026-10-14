@@ -51,3 +51,9 @@ Machine evidence is preserved locally under `captures/week-simulation/full-1000-
 ![Observed hourly coverage](week-simulation-20261014.png)
 
 Final regression checks passed: server workspace **360 passed, 6 ignored**; client workspace **116 passed, 3 ignored** (476 passed, 9 ignored, 0 failed total). Server Clippy passed with `-D warnings`; `cargo fmt --check` passed in both workspaces; `git diff --check` passed. Logs are in `captures/week-simulation/`.
+
+## PR integration onto current main
+
+For the PR, the optimization commit was rebased onto `f673be1` (current main, including PRs #33–#35). The voice-admission conflict retains both upstream upload-budget enforcement and session-bound recipient configuration. The integrated revision passed 408 server-workspace tests and 138 client-workspace tests, including the 26-hour week smoke test; server/core transport and client-core all-target Clippy with warnings denied, both formatting checks, and diff checks passed.
+
+The published performance comparisons and full 168-hour run remain measurements of their recorded frozen pre-integration sources. Their hashes and raw evidence were preserved. The complete 1,000-player week and performance cohorts were not rerun on the updated main base, so these historical results are not presented as measurements of the PR head.
