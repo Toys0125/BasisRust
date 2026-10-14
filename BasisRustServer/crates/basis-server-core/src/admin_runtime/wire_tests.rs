@@ -4,6 +4,8 @@ use basis_transport::PacketProperty;
 use ed25519_dalek::{Signer, SigningKey};
 use tokio::net::UdpSocket;
 
+mod week_sim;
+
 struct Client {
     socket: UdpSocket,
     pending: Vec<(u8, Vec<u8>)>,
@@ -280,7 +282,27 @@ async fn voice_continues_while_avatar_input_is_blocked() {
     let mut recipient = Client::connect(&state, "voice-recipient").await;
     let sender_id = peer_by_uuid(&state, "voice-sender").unwrap();
     let recipient_id = peer_by_uuid(&state, "voice-recipient").unwrap();
-    state.voice_recipients.insert(sender_id, vec![recipient_id]);
+    let mut voice_recipients = NetWriter::new();
+    voice_recipients.put_u8(1);
+    voice_recipients.put_u16(recipient_id);
+    sender
+        .send(
+            channels::AUDIO_RECIPIENTS,
+            voice_recipients.as_slice(),
+            true,
+        )
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .voice_recipients
+            .get(&sender_id)
+            .is_none_or(|recipients| recipients.as_slice() != [recipient_id])
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     state
         .uplink_delta_states
         .insert(sender_id, UplinkDeltaState::empty());
@@ -344,6 +366,170 @@ async fn wait_for_disconnect_cleanups(state: &ServerState) {
     }
 }
 
+async fn receive_leave_for(client: &mut Client, peer: PeerId) {
+    client
+        .receive(|channel, payload| {
+            channel == channels::DISCONNECTION
+                && payload
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .any(|bytes| u16::from_le_bytes(*bytes) == peer)
+        })
+        .await;
+}
+
+async fn wait_for_peer_id_recycle(state: &ServerState, peer: PeerId) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while state.retiring_peer_ids.contains_key(&peer) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("peer ID retirement marker must drain");
+}
+
+async fn replace_leave_worker(state: &ServerState) {
+    let old_worker = state.workers.lock().remove(0);
+    old_worker.abort();
+    assert!(old_worker.await.unwrap_err().is_cancelled());
+    let new_worker = crate::spawn_leave_broadcast_loop(state.clone());
+    state.workers.lock().insert(0, new_worker);
+}
+
+#[tokio::test]
+async fn leave_barriers_disconnect_non_acknowledging_peers_without_parking_ingress() {
+    // Exercise both the earlier-cleanup barrier and the leave-ACK barrier.
+    for pending_cleanup in [true, false] {
+        let (state, shutdown, _) = super::tests::test_server(false).await;
+        let worker = state.workers.lock().remove(0);
+        worker.abort();
+        let _ = worker.await;
+        let mut stalled = Client::connect(&state, "non-acking-survivor").await;
+        let mut leaver = Client::connect(&state, "barrier-leaver").await;
+        let (stalled_peer, stalled_session) = session_for_uuid(&state, "non-acking-survivor");
+        let (departed_peer, departed_session) = session_for_uuid(&state, "barrier-leaver");
+        request_disconnect(&state, &departed_session, "test leave")
+            .await
+            .unwrap();
+        leaver.receive_disconnect().await;
+        wait_for_disconnect_cleanups(&state).await;
+        // ACK all setup and cleanup traffic before selecting which phase stalls.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(200),
+            stalled.receive_inner(|_, _| false),
+        )
+        .await;
+        assert!(state.transport.reliable_idle(&stalled_session));
+        if pending_cleanup {
+            state
+                .transport
+                .send_session(
+                    &stalled_session,
+                    channels::NET_ID_ASSIGNS,
+                    DeliveryMethod::ReliableOrdered,
+                    &[0, 0],
+                )
+                .await
+                .unwrap();
+        }
+        let flush_state = state.clone();
+        let flush = tokio::spawn(async move { crate::flush_pending_leaves(&flush_state).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.join_delivery.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("leave flush must acquire the join-delivery fence");
+        assert!(state.retiring_peer_ids.contains_key(&departed_peer));
+        assert!(state.transport.is_current_session(&stalled_session));
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            crate::flush_join_batches(&state),
+        )
+        .await
+        .expect("join tick must skip a held retirement fence")
+        .unwrap();
+
+        let mut subscribe = NetWriter::new();
+        subscribe.put_u8(channels::REGISTRY_SUB_SUBSCRIBE);
+        BasisMessageSubscribe { ids: vec![42] }
+            .serialize(&mut subscribe)
+            .unwrap();
+        stalled
+            .send(channels::REGISTRY_CONTROL, subscribe.as_slice(), true)
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state.message_subscriptions.contains_key(&stalled_peer) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary ingress must progress during retirement");
+        let mut newcomer = Client::connect_pending(&state, "join-during-barrier").await;
+        // Keep refreshing liveness while deliberately withholding every ACK.
+        let socket = stalled.socket;
+        let pings = tokio::spawn(async move {
+            loop {
+                if socket
+                    .send(&[PacketProperty::Ping as u8, 0, 0])
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        tokio::time::timeout(crate::LEAVE_BARRIER_TIMEOUT + Duration::from_secs(2), flush)
+            .await
+            .expect("a pinging non-ACKing recipient must not stall retirement indefinitely")
+            .unwrap();
+        pings.abort();
+        let _ = pings.await;
+        assert!(!state.transport.is_current_session(&stalled_session));
+        assert!(state.transport.reliable_idle(&stalled_session));
+        assert!(!state.retiring_peer_ids.contains_key(&departed_peer));
+        newcomer
+            .receive(|channel, _| channel == channels::META_DATA)
+            .await;
+        wait_for_disconnect_cleanups(&state).await;
+        assert!(!state.authenticated_peers.contains_key(&stalled_peer));
+        state.shutdown().await.unwrap();
+        let _ = shutdown.send(());
+    }
+}
+
+#[tokio::test]
+async fn unchanged_voice_recipients_preserve_queued_configuration() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let _sender = Client::connect(&state, "same-config-sender").await;
+    let _recipient = Client::connect(&state, "same-config-recipient").await;
+    let (sender, _) = session_for_uuid(&state, "same-config-sender");
+    let (recipient, _) = session_for_uuid(&state, "same-config-recipient");
+    crate::install_voice_recipients(&state, sender, vec![recipient]);
+    let configured = state.voice_recipient_sessions.get(&sender).unwrap().clone();
+    crate::install_voice_recipients(&state, sender, vec![recipient]);
+    assert!(Arc::ptr_eq(
+        &configured,
+        &state.voice_recipient_sessions.get(&sender).unwrap()
+    ));
+    assert_eq!(
+        state.voice_recipients.get(&sender).unwrap().as_slice(),
+        [recipient]
+    );
+    // A real change must still invalidate old queued audio.
+    crate::install_voice_recipients(&state, sender, vec![]);
+    assert!(!Arc::ptr_eq(
+        &configured,
+        &state.voice_recipient_sessions.get(&sender).unwrap()
+    ));
+    assert!(state.voice_recipients.get(&sender).unwrap().is_empty());
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
 #[tokio::test]
 async fn queued_old_control_event_cannot_mutate_reused_peer_id() {
     let (state, shutdown, _) = super::tests::test_server(false).await;
@@ -357,6 +543,7 @@ async fn queued_old_control_event_cannot_mutate_reused_peer_id() {
     old_client.receive_disconnect().await;
     wait_for_disconnect_cleanups(&state).await;
     assert!(!state.authenticated_peers.contains_key(&old_peer));
+    wait_for_peer_id_recycle(&state, old_peer).await;
 
     let _replacement = Client::connect(&state, "replacement-session").await;
     let (replacement_peer, replacement_session) = session_for_uuid(&state, "replacement-session");
@@ -421,7 +608,7 @@ async fn active_old_control_lease_delays_cleanup_and_id_reuse() {
     old_client.receive_disconnect().await;
     assert!(state.authenticated_peers.contains_key(&old_peer));
 
-    let _replacement = Client::connect(&state, "while-old-handler-paused").await;
+    let mut replacement = Client::connect(&state, "while-old-handler-paused").await;
     let (replacement_peer, _) = session_for_uuid(&state, "while-old-handler-paused");
     assert_ne!(
         replacement_peer, old_peer,
@@ -433,6 +620,8 @@ async fn active_old_control_lease_delays_cleanup_and_id_reuse() {
     wait_for_disconnect_cleanups(&state).await;
     assert!(!state.authenticated_peers.contains_key(&old_peer));
     assert!(!state.message_subscriptions.contains_key(&old_peer));
+    receive_leave_for(&mut replacement, old_peer).await;
+    wait_for_peer_id_recycle(&state, old_peer).await;
 
     let _next = Client::connect(&state, "after-old-handler-drained").await;
     let (recycled_peer, _) = session_for_uuid(&state, "after-old-handler-drained");
@@ -464,6 +653,7 @@ async fn self_disconnect_defers_drain_until_current_lease_returns() {
     client.receive_disconnect().await;
     wait_for_disconnect_cleanups(&state).await;
     assert!(!state.authenticated_peers.contains_key(&peer));
+    wait_for_peer_id_recycle(&state, peer).await;
 
     let _replacement = Client::connect(&state, "self-disconnect-replacement").await;
     let (replacement_peer, _) = session_for_uuid(&state, "self-disconnect-replacement");
@@ -1153,6 +1343,7 @@ async fn held_disconnect_leases_do_not_block_new_connections_or_reuse_peer_ids_e
         .unwrap();
     let lifecycle_events = transport.enable_lifecycle_event_queues(256, 256).unwrap();
     state.transport = transport.clone();
+    replace_leave_worker(&state).await;
 
     let (disconnect_started_tx, mut disconnect_started_rx) = mpsc::unbounded_channel();
     let (disconnect_done_tx, mut disconnect_done_rx) = mpsc::unbounded_channel();
@@ -1223,7 +1414,7 @@ async fn held_disconnect_leases_do_not_block_new_connections_or_reuse_peer_ids_e
 
     // Disconnect cleanup waits on each held lease; connection admission uses its
     // separate lifecycle workers and can authenticate another real UDP client.
-    let _third = Client::connect(&state, "held-disconnect-lease-c").await;
+    let mut third = Client::connect(&state, "held-disconnect-lease-c").await;
     let (third_peer, _) = session_for_uuid(&state, "held-disconnect-lease-c");
     assert_ne!(third_peer, first_peer);
     assert_ne!(third_peer, second_peer);
@@ -1241,8 +1432,10 @@ async fn held_disconnect_leases_do_not_block_new_connections_or_reuse_peer_ids_e
     );
     assert!(!state.authenticated_peers.contains_key(&first_peer));
     assert!(state.authenticated_peers.contains_key(&second_peer));
+    receive_leave_for(&mut third, first_peer).await;
+    wait_for_peer_id_recycle(&state, first_peer).await;
 
-    let _fourth = Client::connect(&state, "held-disconnect-lease-d").await;
+    let mut fourth = Client::connect(&state, "held-disconnect-lease-d").await;
     let (fourth_peer, fourth_session) = session_for_uuid(&state, "held-disconnect-lease-d");
     assert_eq!(
         fourth_peer, first_peer,
@@ -1261,6 +1454,11 @@ async fn held_disconnect_leases_do_not_block_new_connections_or_reuse_peer_ids_e
     );
     assert!(!state.authenticated_peers.contains_key(&second_peer));
     assert!(state.transport.is_current_session(&fourth_session));
+    tokio::join!(
+        receive_leave_for(&mut third, second_peer),
+        receive_leave_for(&mut fourth, second_peer),
+    );
+    wait_for_peer_id_recycle(&state, second_peer).await;
 
     stop.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(3), dispatcher)
@@ -1598,6 +1796,7 @@ async fn replacement_session_releases_old_ordered_admissions_before_new_lane_pro
         .unwrap();
     let mut lifecycle_events = transport.enable_lifecycle_event_queues(16, 16).unwrap();
     state.transport = transport.clone();
+    replace_leave_worker(&state).await;
 
     // Run only connection admission. Ordered envelopes below stay in the explicit
     // lane queues, modeling the dispatcher with no ordinary worker slots available.
@@ -1669,6 +1868,7 @@ async fn replacement_session_releases_old_ordered_admissions_before_new_lane_pro
     old_session.wait_for_read_leases().await;
     crate::handle_disconnect(&state, &old_session, DisconnectReason::Remote).await;
     assert!(!state.authenticated_peers.contains_key(&peer));
+    wait_for_peer_id_recycle(&state, peer).await;
 
     let mut new_client = Client::connect(&state, "ordered-admission-new").await;
     let (new_peer, new_session) = session_for_uuid(&state, "ordered-admission-new");
