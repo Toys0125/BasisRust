@@ -371,8 +371,10 @@ async fn receive_leave_for(client: &mut Client, peer: PeerId) {
         .receive(|channel, payload| {
             channel == channels::DISCONNECTION
                 && payload
-                    .chunks_exact(2)
-                    .any(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) == peer)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .any(|bytes| u16::from_le_bytes(*bytes) == peer)
         })
         .await;
 }
