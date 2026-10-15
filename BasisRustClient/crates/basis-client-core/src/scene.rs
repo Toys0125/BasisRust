@@ -157,13 +157,19 @@ pub(crate) async fn run(
     let mut ticker = time::interval(interval);
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut sequences = HashMap::<usize, u64>::new();
-    let mut first_send = true;
+    let mut first_sent = HashSet::<(usize, i64)>::new();
+    let mut pending_first_send = false;
     loop {
-        tokio::select! {
+        let regular_send = tokio::select! {
             biased;
             _ = stop.notified() => break,
-            _ = ticker.tick() => {}
-        }
+            _ = ticker.tick() => true,
+            _ = time::sleep(if pending_first_send {
+                Duration::from_millis(5)
+            } else {
+                Duration::from_millis(100)
+            }) => false,
+        };
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
@@ -177,21 +183,34 @@ pub(crate) async fn run(
             .started
             .get_or_insert_with(Instant::now);
         let snapshot = clients.lock().await.clone();
+        let active_connections = snapshot
+            .iter()
+            .filter(|client| client.in_use.load(Ordering::Acquire))
+            .map(|client| (client.index, client.connect_time))
+            .collect::<HashSet<_>>();
+        first_sent.retain(|connection| active_connections.contains(connection));
+        pending_first_send = false;
         for client in snapshot {
             if shutdown.load(Ordering::Relaxed) {
                 break;
             }
             // ConnectAccept precedes DID authentication and the v56 uplink key.
             // Metadata confirms admission, including servers with DID auth disabled.
-            if !client.connected.load(Ordering::Acquire)
-                || !client.in_use.load(Ordering::Acquire)
-                || client.metadata_state().is_none()
-            {
+            if !client.in_use.load(Ordering::Acquire) {
                 continue;
             }
-            first_send = false;
+            let connection = (client.index, client.connect_time);
+            let already_sent = first_sent.contains(&connection);
+            if already_sent && !regular_send {
+                continue;
+            }
+            if !client.connected.load(Ordering::Acquire) || client.metadata_state().is_none() {
+                pending_first_send |= !already_sent;
+                continue;
+            }
             if reliable && client.pending_reliable.lock().await.len() >= 256 {
                 session.metrics.lock().unwrap().backpressure += 1;
+                pending_first_send |= !already_sent;
                 continue;
             }
             let sequence = sequences.entry(client.index).or_default();
@@ -221,13 +240,11 @@ pub(crate) async fn run(
                 if client.index != 0 {
                     m.expected += 1;
                 }
+                first_sent.insert(connection);
             } else {
                 m.send_errors += 1;
+                pending_first_send |= !already_sent;
             }
-        }
-        if first_send {
-            // Keep the first send pending through login even with a long workload interval.
-            ticker.reset_after(Duration::from_millis(5));
         }
     }
 }

@@ -97,18 +97,32 @@ pub(crate) fn shared_receiver_mark_reliable(client: &BasisClient, bytes: &[u8]) 
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn shared_receiver_send_pong(fd: RawFd, first_byte: u8, sequence: u16) {
+pub(crate) fn shared_receiver_send_pong(
+    client: &BasisClient,
+    fd: RawFd,
+    first_byte: u8,
+    sequence: u16,
+) {
     let mut packet = [0u8; 11];
     packet[0] = PacketProperty::Pong as u8 | (first_byte & 0x60);
     packet[1..3].copy_from_slice(&sequence.to_le_bytes());
     packet[3..11].copy_from_slice(&dotnet_utc_ticks().to_le_bytes());
+    let packet = match client.seal_connected(&packet) {
+        Ok(Some(sealed)) => sealed,
+        Ok(None) => packet.to_vec(),
+        Err(error) => {
+            warn!(connection = client.index, %error, "failed to seal shared receiver pong");
+            return;
+        }
+    };
     unsafe {
         libc::send(fd, packet.as_ptr().cast(), packet.len(), libc::MSG_DONTWAIT);
     }
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn shared_receiver_send_mtu_ok(fd: RawFd, packet: &mut [u8], connection_number: u8) {
+pub(crate) fn shared_receiver_send_mtu_ok(client: &BasisClient, fd: RawFd, packet: &mut [u8]) {
+    let connection_number = client.connection_number;
     if !(LITENETLIB_INITIAL_MTU..=LITENETLIB_MAX_MTU).contains(&packet.len())
         || packet[0] != (PacketProperty::MtuCheck as u8 | (connection_number << 5))
     {
@@ -122,6 +136,14 @@ pub(crate) fn shared_receiver_send_mtu_ok(fd: RawFd, packet: &mut [u8], connecti
         return;
     }
     packet[0] = (packet[0] & 0xe0) | PacketProperty::MtuOk as u8;
+    let packet = match client.seal_connected(packet) {
+        Ok(Some(sealed)) => sealed,
+        Ok(None) => packet.to_vec(),
+        Err(error) => {
+            warn!(connection = client.index, %error, "failed to seal shared receiver MTU reply");
+            return;
+        }
+    };
     unsafe {
         libc::send(fd, packet.as_ptr().cast(), packet.len(), libc::MSG_DONTWAIT);
     }
@@ -196,7 +218,7 @@ pub(crate) fn shared_receiver_process_merged<'a>(
         }
         if property == PacketProperty::Ping as u8 && packet.len() >= 3 {
             let sequence = u16::from_le_bytes([packet[1], packet[2]]);
-            shared_receiver_send_pong(fd, packet[0], sequence);
+            shared_receiver_send_pong(client, fd, packet[0], sequence);
         }
     }
     if pos != bytes.len() {
@@ -423,18 +445,14 @@ pub(crate) fn run_shared_epoll_receiver(
                         p if p == PacketProperty::Ping as u8 => {
                             if len >= 3 {
                                 let sequence = u16::from_le_bytes([buffer[1], buffer[2]]);
-                                shared_receiver_send_pong(fd, buffer[0], sequence);
+                                shared_receiver_send_pong(&client, fd, buffer[0], sequence);
                             } else {
                                 client.record_unparsed_packet(&buffer[..len]);
                             }
                             continue;
                         }
                         p if p == PacketProperty::MtuCheck as u8 => {
-                            shared_receiver_send_mtu_ok(
-                                fd,
-                                &mut buffer[..len],
-                                client.connection_number,
-                            );
+                            shared_receiver_send_mtu_ok(&client, fd, &mut buffer[..len]);
                             continue;
                         }
                         p if p == PacketProperty::Pong as u8

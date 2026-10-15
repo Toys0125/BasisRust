@@ -30,8 +30,7 @@ use crate::avatar::{
 use crate::config::Config;
 use crate::diagnostics::ClientAvatarDiagnostics;
 use crate::identity::Identity;
-#[cfg(windows)]
-use crate::net::windows_mtu_probe_reply;
+use crate::net::mtu_probe_reply;
 use crate::net::{
     any_local_addr, bind_udp_socket, configure_load_sink_socket, resolve_addr, socket_address_bytes,
 };
@@ -321,11 +320,15 @@ impl BasisClient {
         Ok(())
     }
 
-    pub(crate) async fn send_connected(&self, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn seal_connected(&self, bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+        anyhow::ensure!(!bytes.is_empty(), "cannot seal an empty datagram");
         let datagram = {
             let mut guard = self.sealed_outbound.lock().unwrap();
             if let Some((key, counter)) = guard.as_mut() {
-                *counter += 1;
+                *counter = counter
+                    .checked_add(1)
+                    .filter(|next| *next <= i64::MAX as u64)
+                    .ok_or_else(|| anyhow!("client datagram encryption counter exhausted"))?;
                 let mut nonce = [0u8; 12];
                 nonce[..8].copy_from_slice(&counter.to_le_bytes());
                 let mut packet = bytes.to_vec();
@@ -344,6 +347,11 @@ impl BasisClient {
                 None
             }
         };
+        Ok(datagram)
+    }
+
+    pub(crate) async fn send_connected(&self, bytes: &[u8]) -> Result<()> {
+        let datagram = self.seal_connected(bytes)?;
         self.socket
             .send(datagram.as_deref().unwrap_or(bytes))
             .await?;
@@ -727,10 +735,9 @@ impl BasisClient {
                 }
             }
             PacketProperty::Pong => {}
-            #[cfg(windows)]
             PacketProperty::MtuCheck => {
-                if let Some(reply) = windows_mtu_probe_reply(bytes, self.connection_number) {
-                    self.socket.send(&reply).await?;
+                if let Some(reply) = mtu_probe_reply(bytes, self.connection_number) {
+                    self.send_connected(&reply).await?;
                 }
             }
             PacketProperty::Ack => {
@@ -1084,6 +1091,13 @@ impl BasisClient {
                 }
             }
             channels::AUTH_IDENTITY => {
+                // The server challenge is cleartext. A new reliable sequence must
+                // never restart an established key's nonce/counter stream.
+                if self.protocol_version.load(Ordering::Acquire) != LEGACY_SERVER_VERSION
+                    && self.sealed_outbound.lock().unwrap().is_some()
+                {
+                    return Ok(());
+                }
                 let mut reader = NetReader::new(payload);
                 let nonce = BytesMessage::deserialize(&mut reader)?.data;
                 if self.protocol_version.load(Ordering::Acquire) == LEGACY_SERVER_VERSION {
@@ -1122,7 +1136,15 @@ impl BasisClient {
                     &self.connection_payload_hash.lock().unwrap(),
                 )?;
                 let response = self.identity.response_payload(&transcript)?;
-                *self.sealed_outbound.lock().unwrap() = Some((key, 0));
+                {
+                    let mut outbound = self.sealed_outbound.lock().unwrap();
+                    // Concurrent receive paths may have processed another challenge
+                    // while this transcript was being built. Install the key once.
+                    if outbound.is_some() {
+                        return Ok(());
+                    }
+                    *outbound = Some((key, 0));
+                }
                 self.send_reliable_ordered(channels::AUTH_IDENTITY, &response)
                     .await?;
             }

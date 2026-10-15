@@ -8,8 +8,7 @@ use crate::config::{
     DEFAULT_VOICE_FRAME_DURATION_MS, DEFAULT_VOICE_HEARING_DISTANCE,
 };
 use crate::identity::Identity;
-#[cfg(any(windows, test))]
-use crate::net::windows_mtu_probe_reply;
+use crate::net::mtu_probe_reply;
 use crate::net::{any_local_addr, bind_udp_socket};
 use crate::observer::AvatarObserver;
 use crate::observer_session::ObserverSession;
@@ -64,6 +63,10 @@ use basis_transport::{
     LITENETLIB_FRAGMENTED_HEADER_SIZE, LITENETLIB_FRAGMENT_HEADER_SIZE, LITENETLIB_INITIAL_MTU,
     MAX_SEQUENCE, RELIABLE_FRAGMENT_PAYLOAD_SIZE,
 };
+use chacha20poly1305::{
+    aead::{AeadInPlace, KeyInit},
+    ChaCha20Poly1305, Nonce, Tag,
+};
 use ed25519_dalek::Verifier;
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(unix)]
@@ -108,9 +111,12 @@ async fn scene_waits_for_admission_without_delaying_first_send_by_workload_inter
     for reliable in [false, true] {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client = test_client(0, server.local_addr().unwrap()).await;
+        let late_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let late_client = test_client(1, late_server.local_addr().unwrap()).await;
+        let clients = Arc::new(Mutex::new(vec![client.clone(), late_client.clone()]));
         let stop = Arc::new(Notify::new());
         let task = tokio::spawn(crate::scene::run(
-            Arc::new(Mutex::new(vec![client.clone()])),
+            clients.clone(),
             Arc::new(AtomicBool::new(false)),
             stop.clone(),
             Arc::new(crate::scene::SceneSession::new(32, None)),
@@ -145,6 +151,35 @@ async fn scene_waits_for_admission_without_delaying_first_send_by_workload_inter
             assert_eq!(decoded.property, PacketProperty::Unreliable);
             assert_eq!(packet[1], channels::SCENE);
         }
+
+        assert!(
+            time::timeout(Duration::from_millis(30), late_server.recv(&mut packet))
+                .await
+                .is_err()
+        );
+        *late_client.metadata_state() = *client.metadata_state();
+        time::timeout(Duration::from_secs(1), late_server.recv(&mut packet))
+            .await
+            .expect("second admitted client waited for the workload interval")
+            .unwrap();
+
+        // A new connection at the same population index gets its own first send,
+        // even after the previously observed connections have all sent once.
+        let replacement_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut replacement = test_client(1, replacement_server.local_addr().unwrap()).await;
+        Arc::get_mut(&mut replacement).unwrap().connect_time = 1;
+        *replacement.metadata_state() = *client.metadata_state();
+        clients.lock().await[1] = replacement;
+        time::timeout(Duration::from_secs(1), replacement_server.recv(&mut packet))
+            .await
+            .expect("replacement connection waited for the workload interval")
+            .unwrap();
+        assert!(
+            time::timeout(Duration::from_millis(30), server.recv(&mut packet))
+                .await
+                .is_err(),
+            "admission polls advanced the first client's regular send cadence"
+        );
         stop.notify_one();
         time::timeout(Duration::from_secs(1), task)
             .await
@@ -906,6 +941,102 @@ async fn v55_did_challenge_uses_plaintext_nonce_signature() {
         .verify(&challenge, &client.identity.verifying_key)
         .unwrap();
     assert!(client.sealed_outbound.lock().unwrap().is_none());
+}
+
+fn open_client_datagram(key: &[u8; 32], packet: &[u8]) -> Vec<u8> {
+    let tag_start = packet.len() - 24;
+    let mut nonce = [0u8; 12];
+    nonce[..8].copy_from_slice(&packet[packet.len() - 8..]);
+    let mut plaintext = packet[..tag_start].to_vec();
+    ChaCha20Poly1305::new(key.into())
+        .decrypt_in_place_detached(
+            Nonce::from_slice(&nonce),
+            &packet[..1],
+            &mut plaintext[1..],
+            Tag::from_slice(&packet[tag_start..tag_start + 16]),
+        )
+        .unwrap();
+    plaintext
+}
+
+#[tokio::test]
+async fn repeated_v56_challenges_cannot_restart_the_encryption_counter() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(0, server.local_addr().unwrap()).await;
+    let secret = x25519_dalek::StaticSecret::from([42u8; 32]);
+    let server_public = x25519_dalek::PublicKey::from(&secret).to_bytes();
+    let challenge = |nonce: u8| {
+        let mut payload = NetWriter::new();
+        payload.put_bytes_with_length(&[nonce; 32]).unwrap();
+        payload.put_bytes_with_length(&server_public).unwrap();
+        payload.put_bytes_with_length(b"test-server").unwrap();
+        payload.into_vec()
+    };
+    let channel =
+        DeliveryMethod::channel_id(channels::AUTH_IDENTITY, DeliveryMethod::ReliableOrdered);
+    client
+        .handle_channeled(channel, 0, &challenge(21))
+        .await
+        .unwrap();
+    let mut packet = [0u8; 512];
+    let len = time::timeout(Duration::from_secs(1), server.recv(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    let (key, first_counter) = client.sealed_outbound.lock().unwrap().unwrap();
+    assert_eq!(first_counter, 1);
+    let response = open_client_datagram(&key, &packet[..len]);
+    assert_eq!(response[3], channel);
+    let pending = client.pending_reliable.lock().await.len();
+
+    // New reliable sequence, same server key, changed nonce: the reported attack.
+    client
+        .handle_channeled(channel, 1, &challenge(22))
+        .await
+        .unwrap();
+    // Malformed later challenges must also leave the established stream untouched.
+    client
+        .handle_channeled(channel, 2, b"invalid")
+        .await
+        .unwrap();
+    assert_eq!(
+        *client.sealed_outbound.lock().unwrap(),
+        Some((key, first_counter))
+    );
+    assert_eq!(client.pending_reliable.lock().await.len(), pending);
+    assert!(
+        time::timeout(Duration::from_millis(30), server.recv(&mut packet))
+            .await
+            .is_err()
+    );
+    let next = [PacketProperty::Unreliable as u8, channels::SCENE, 9];
+    client.send_connected(&next).await.unwrap();
+    let len = time::timeout(Duration::from_secs(1), server.recv(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        i64::from_le_bytes(packet[len - 8..len].try_into().unwrap()),
+        2
+    );
+    assert_eq!(open_client_datagram(&key, &packet[..len]), next);
+}
+
+#[tokio::test]
+async fn exhausted_encryption_counter_does_not_fall_back_to_plaintext() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(0, server.local_addr().unwrap()).await;
+    *client.sealed_outbound.lock().unwrap() = Some(([9; 32], i64::MAX as u64));
+    assert!(client
+        .send_connected(&[PacketProperty::Ping as u8, 0, 0])
+        .await
+        .is_err());
+    let mut packet = [0; 64];
+    assert!(
+        time::timeout(Duration::from_millis(30), server.recv(&mut packet))
+            .await
+            .is_err()
+    );
 }
 
 #[test]
@@ -2144,21 +2275,21 @@ fn windows_mtu_reply_validates_probe_and_preserves_all_bytes_except_property() {
         let probe = mtu_probe_fixture(mtu, 2);
         let mut expected = probe.clone();
         expected[0] = PacketProperty::MtuOk as u8 | (2 << 5);
-        assert_eq!(windows_mtu_probe_reply(&probe, 2), Some(expected));
+        assert_eq!(mtu_probe_reply(&probe, 2), Some(expected));
         assert_eq!(probe[0], PacketProperty::MtuCheck as u8 | (2 << 5));
     }
     let probe = mtu_probe_fixture(1164, 2);
     for offset in [1, 13, probe.len() - 1] {
         let mut invalid = probe.clone();
         invalid[offset] ^= 1;
-        assert!(windows_mtu_probe_reply(&invalid, 2).is_none());
+        assert!(mtu_probe_reply(&invalid, 2).is_none());
     }
-    assert!(windows_mtu_probe_reply(&probe, 1).is_none());
+    assert!(mtu_probe_reply(&probe, 1).is_none());
     for length in [0, 1, 13, 1023, 1433] {
-        assert!(windows_mtu_probe_reply(&vec![0; length], 2).is_none());
+        assert!(mtu_probe_reply(&vec![0; length], 2).is_none());
     }
     for mtu in [1023, 1433] {
-        assert!(windows_mtu_probe_reply(&mtu_probe_fixture(mtu, 2), 2).is_none());
+        assert!(mtu_probe_reply(&mtu_probe_fixture(mtu, 2), 2).is_none());
     }
     for property in [
         PacketProperty::MtuOk as u8,
@@ -2166,13 +2297,12 @@ fn windows_mtu_reply_validates_probe_and_preserves_all_bytes_except_property() {
     ] {
         let mut invalid = probe.clone();
         invalid[0] = property | (2 << 5);
-        assert!(windows_mtu_probe_reply(&invalid, 2).is_none());
+        assert!(mtu_probe_reply(&invalid, 2).is_none());
     }
 }
 
-#[cfg(windows)]
 #[tokio::test]
-async fn windows_receive_handler_echoes_valid_mtu_probe_to_connected_server() {
+async fn receive_handler_echoes_valid_mtu_probe_to_connected_server() {
     let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let mut client = test_client(1, server.local_addr().unwrap()).await;
     Arc::get_mut(&mut client).unwrap().connection_number = 2;
@@ -2197,10 +2327,7 @@ async fn windows_receive_handler_echoes_valid_mtu_probe_to_connected_server() {
             .unwrap()
             .unwrap();
         assert_eq!(len, mtu);
-        assert_eq!(
-            &received[..len],
-            windows_mtu_probe_reply(&probe, 2).unwrap()
-        );
+        assert_eq!(&received[..len], mtu_probe_reply(&probe, 2).unwrap());
     }
 }
 
@@ -2237,7 +2364,7 @@ async fn shared_receiver_echoes_only_valid_mtu_probe() {
         make_probe(LITENETLIB_INITIAL_MTU - 1),
         make_probe(LITENETLIB_MAX_MTU + 1),
     ] {
-        shared_receiver_send_mtu_ok(fd, &mut invalid, 2);
+        shared_receiver_send_mtu_ok(&client, fd, &mut invalid);
     }
     let mut received = [0u8; 2048];
     assert!(
@@ -2250,13 +2377,72 @@ async fn shared_receiver_echoes_only_valid_mtu_probe() {
         let mut probe = make_probe(mtu);
         let mut expected = probe.clone();
         expected[0] = PacketProperty::MtuOk as u8 | (2 << 5);
-        shared_receiver_send_mtu_ok(fd, &mut probe, 2);
+        shared_receiver_send_mtu_ok(&client, fd, &mut probe);
         let len = time::timeout(Duration::from_secs(1), server.recv(&mut received))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(len, mtu);
         assert_eq!(&received[..len], expected);
+    }
+}
+
+#[tokio::test]
+async fn post_login_control_replies_share_the_encrypted_counter_stream() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut client = test_client(1, server.local_addr().unwrap()).await;
+    Arc::get_mut(&mut client).unwrap().connection_number = 2;
+    let key = [9u8; 32];
+    *client.sealed_outbound.lock().unwrap() = Some((key, 7));
+    let probe = mtu_probe_fixture(1392, 2);
+    let expected = mtu_probe_reply(&probe, 2).unwrap();
+    let mut received = [0u8; 2048];
+
+    // The async handler used on Windows and by per-client receive loops.
+    client.handle_packet(&probe).await.unwrap();
+    let len = time::timeout(Duration::from_secs(1), server.recv(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(len, probe.len() + 24);
+    assert_eq!(
+        i64::from_le_bytes(received[len - 8..len].try_into().unwrap()),
+        8
+    );
+    assert_eq!(open_client_datagram(&key, &received[..len]), expected);
+
+    #[cfg(target_os = "linux")]
+    {
+        let fd = client.socket.as_raw_fd();
+        shared_receiver_send_mtu_ok(&client, fd, &mut probe.clone());
+        let len = time::timeout(Duration::from_secs(1), server.recv(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(len, probe.len() + 24);
+        assert_eq!(
+            i64::from_le_bytes(received[len - 8..len].try_into().unwrap()),
+            9
+        );
+        assert_eq!(open_client_datagram(&key, &received[..len]), expected);
+
+        crate::receiver::shared_receiver_send_pong(
+            &client,
+            fd,
+            PacketProperty::Ping as u8 | (2 << 5),
+            3,
+        );
+        let len = time::timeout(Duration::from_secs(1), server.recv(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            i64::from_le_bytes(received[len - 8..len].try_into().unwrap()),
+            10
+        );
+        let pong = open_client_datagram(&key, &received[..len]);
+        assert_eq!(pong.len(), 11);
+        assert_eq!(&pong[..3], &[PacketProperty::Pong as u8 | (2 << 5), 3, 0]);
     }
 }
 

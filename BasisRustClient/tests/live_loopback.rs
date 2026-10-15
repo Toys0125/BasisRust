@@ -18,6 +18,44 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::{timeout, Instant};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_client_completes_post_login_mtu_discovery() {
+    Live::start("default_password", 1, false, Fault::None)
+        .await
+        .run(|live| {
+            Box::pin(async move {
+                live.until(|p| p.from_server && p.channeled(channels::META_DATA))
+                    .await;
+                let probe = live
+                    .until(|p| {
+                        p.from_server
+                            && p.property() == PacketProperty::MtuCheck
+                            && p.bytes.len() >= 1392
+                    })
+                    .await;
+                let response = live
+                    .until(|p| {
+                        !p.from_server
+                            && p.property() == PacketProperty::MtuOk
+                            && p.bytes.len() == probe.bytes.len()
+                    })
+                    .await;
+                assert_eq!(&response.bytes[1..], &probe.bytes[1..]);
+                let peer = live.server.transport.peer_snapshots()[0].id;
+                timeout(LIMIT, async {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_millis(5));
+                    while live.server.transport.peer_mtu(peer) < 1392 {
+                        tick.tick().await;
+                    }
+                })
+                .await
+                .expect("server rejected the post-login MTU reply");
+                live.finish().await;
+            })
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_password_rejects_actual_client_before_identity_or_player_admission() {
     Live::start("loopback-wrong-password", 1, false, Fault::None)
         .await
