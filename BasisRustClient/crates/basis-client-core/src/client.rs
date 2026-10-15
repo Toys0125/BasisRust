@@ -902,11 +902,13 @@ impl BasisClient {
     }
 
     pub(crate) async fn observe_avatar_channel(&self, channel: u8, payload: &[u8]) {
-        if channel == channels::SCENE {
+        if matches!(channel, channels::SCENE | channels::DIRECT_SCENE_SERVER) {
             let image_network_id = self.image_network_id.load(Ordering::Acquire);
             if let (Some(session), true) = (&self.image_benchmark, image_network_id != u16::MAX) {
                 session.observe(self.index, image_network_id, payload);
             }
+        }
+        if channel == channels::SCENE {
             if let Some(session) = &self.scene_session {
                 session.observe(payload);
             }
@@ -1063,7 +1065,7 @@ impl BasisClient {
             diagnostics.receive(channel, payload);
         }
 
-        if channel == channels::SCENE {
+        if matches!(channel, channels::SCENE | channels::DIRECT_SCENE_SERVER) {
             if let (Some(session), Some(network_id)) = (
                 &self.image_benchmark,
                 (self.image_network_id.load(Ordering::Acquire) != u16::MAX)
@@ -1071,6 +1073,8 @@ impl BasisClient {
             ) {
                 session.observe(self.index, network_id, payload);
             }
+        }
+        if channel == channels::SCENE {
             if let Some(session) = &self.scene_session {
                 session.observe(payload);
             }

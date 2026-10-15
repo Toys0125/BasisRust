@@ -2761,6 +2761,233 @@ async fn shared_receive_hands_critical_reliable_packets_to_normal_dispatch() {
     assert!(client.force_avatar_keyframe.load(Ordering::Acquire));
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shared_receive_dispatches_single_and_batched_net_id_assignments() {
+    use basis_protocol::messages::{
+        NetIdMessage, ServerNetIdMessage, ServerUniqueIdMessages, UshortUniqueIdMessage,
+    };
+
+    fn channel_packet(channel_id: u8, sequence: u16, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![PacketProperty::Channeled as u8];
+        packet.extend_from_slice(&sequence.to_le_bytes());
+        packet.push(channel_id);
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(1, server.local_addr().unwrap()).await;
+    let manager_id = |id| ServerNetIdMessage {
+        net_id_message: NetIdMessage {
+            player_id: crate::image_benchmark::IMAGE_MANAGER_IDENTIFIER.to_owned(),
+        },
+        ushort_unique_id_message: UshortUniqueIdMessage {
+            unique_id_ushort: id,
+        },
+    };
+
+    let mut single_payload = ProtocolNetWriter::new();
+    manager_id(42).serialize(&mut single_payload).unwrap();
+    let single_channel =
+        DeliveryMethod::channel_id(channels::NET_ID_ASSIGN, DeliveryMethod::ReliableOrdered);
+    let single = channel_packet(single_channel, 1, single_payload.as_slice());
+    let mut merged = vec![PacketProperty::Merged as u8];
+    merged.extend_from_slice(&(single.len() as u16).to_le_bytes());
+    merged.extend_from_slice(&single);
+    let handoff = shared_receiver_process_merged(&client, client.socket.as_raw_fd(), &merged);
+    assert_eq!(handoff, vec![&single[..]]);
+    assert!(!client.reliable_receive_state().unwrap().started[single_channel as usize]);
+    client.handle_packet(handoff[0]).await.unwrap();
+    assert_eq!(client.image_network_id.load(Ordering::Acquire), 42);
+    assert!(client.reliable_receive_state().unwrap().started[single_channel as usize]);
+
+    let mut batch_payload = ProtocolNetWriter::new();
+    ServerUniqueIdMessages {
+        messages: vec![
+            manager_id(43),
+            ServerNetIdMessage {
+                net_id_message: NetIdMessage {
+                    player_id: "another-manager".into(),
+                },
+                ushort_unique_id_message: UshortUniqueIdMessage {
+                    unique_id_ushort: 99,
+                },
+            },
+        ],
+    }
+    .serialize(&mut batch_payload)
+    .unwrap();
+    let batch_channel =
+        DeliveryMethod::channel_id(channels::NET_ID_ASSIGNS, DeliveryMethod::ReliableOrdered);
+    let batch = channel_packet(batch_channel, 1, batch_payload.as_slice());
+    let mut compact = vec![PacketProperty::CompactMerged as u8, 0x40, batch.len() as u8];
+    compact.extend_from_slice(&batch);
+    let handoff = shared_receiver_process_compact(&client, &compact);
+    assert_eq!(handoff, vec![&batch[..]]);
+    assert!(!client.reliable_receive_state().unwrap().started[batch_channel as usize]);
+    client.handle_packet(handoff[0]).await.unwrap();
+    assert_eq!(client.image_network_id.load(Ordering::Acquire), 43);
+    assert!(client.reliable_receive_state().unwrap().started[batch_channel as usize]);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shared_receive_keeps_scene_reliable_only_for_scene_observers() {
+    fn scene_packet(sequence: u16) -> Vec<u8> {
+        let channel_id =
+            DeliveryMethod::channel_id(channels::SCENE, DeliveryMethod::ReliableOrdered);
+        let timestamp = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+        let mut packet = vec![PacketProperty::Channeled as u8];
+        packet.extend_from_slice(&sequence.to_le_bytes());
+        packet.push(channel_id);
+        packet.extend_from_slice(&7u16.to_le_bytes());
+        packet.extend_from_slice(&60000u16.to_le_bytes());
+        packet.extend_from_slice(b"BSCR");
+        packet.extend_from_slice(&1u32.to_le_bytes());
+        packet.extend_from_slice(&1u64.to_le_bytes());
+        packet.extend_from_slice(&timestamp.to_le_bytes());
+        packet
+    }
+
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut observer = test_client(1, server.local_addr().unwrap()).await;
+    let session = Arc::new(crate::scene::SceneSession::new(24, None));
+    Arc::get_mut(&mut observer).unwrap().scene_session = Some(session.clone());
+    let wire = scene_packet(1);
+    let mut compact = vec![PacketProperty::CompactMerged as u8, 0x40, wire.len() as u8];
+    compact.extend_from_slice(&wire);
+    let handoff = shared_receiver_process_compact(&observer, &compact);
+    assert_eq!(handoff, vec![&wire[..]]);
+    let scene_channel =
+        DeliveryMethod::channel_id(channels::SCENE, DeliveryMethod::ReliableOrdered);
+    assert!(!observer.reliable_receive_state().unwrap().started[scene_channel as usize]);
+    observer.handle_packet(handoff[0]).await.unwrap();
+
+    let csv = std::env::temp_dir().join(format!("basis-shared-scene-{}.csv", Uuid::new_v4()));
+    session.write_csv(&csv).unwrap();
+    let report = std::fs::read_to_string(&csv).unwrap();
+    let _ = std::fs::remove_file(csv);
+    assert!(
+        report.lines().any(|line| line == "received_messages,1"),
+        "{report}"
+    );
+
+    let cache_channel = DeliveryMethod::channel_id(
+        channels::DIRECT_SCENE_SERVER,
+        DeliveryMethod::ReliableOrdered,
+    );
+    let mut cache_wire = scene_packet(1);
+    cache_wire[3] = cache_channel;
+    let mut cache_container = vec![
+        PacketProperty::CompactMerged as u8,
+        0x40,
+        cache_wire.len() as u8,
+    ];
+    cache_container.extend_from_slice(&cache_wire);
+    assert!(shared_receiver_process_compact(&observer, &cache_container).is_empty());
+    assert!(observer.reliable_receive_state().unwrap().started[cache_channel as usize]);
+
+    // Ordinary load sinks still ACK the reliable scene packet without handing its body
+    // to the async scene parser.
+    let sink = test_client(2, server.local_addr().unwrap()).await;
+    let wire = scene_packet(2);
+    let mut merged = vec![PacketProperty::Merged as u8];
+    merged.extend_from_slice(&(wire.len() as u16).to_le_bytes());
+    merged.extend_from_slice(&wire);
+    assert!(shared_receiver_process_merged(&sink, sink.socket.as_raw_fd(), &merged).is_empty());
+    assert!(sink.reliable_receive_state().unwrap().started[scene_channel as usize]);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shared_receive_hands_fragmented_scene_and_cache_to_image_benchmark_client() {
+    fn merged(packet: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![PacketProperty::Merged as u8];
+        bytes.extend_from_slice(&(packet.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(packet);
+        bytes
+    }
+
+    let dir = std::env::temp_dir().join(format!("basis-shared-image-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image_path = dir.join("fixture.jpg");
+    let mut image = vec![0x55; 5 * 1024 * 1024];
+    image[..2].copy_from_slice(&[0xff, 0xd8]);
+    image[2..21].copy_from_slice(&[
+        0xff, 0xc0, 0x00, 0x11, 0x08, 0x08, 0x00, 0x08, 0x00, 0x08, 0x03, 0x01, 0x11, 0x00, 0x02,
+        0x11, 0x00, 0x03, 0x11,
+    ]);
+    let last = image.len();
+    image[last - 2..].copy_from_slice(&[0xff, 0xd9]);
+    std::fs::write(&image_path, image).unwrap();
+    let session = crate::image_benchmark::ImageBenchmarkSession::new(
+        crate::image_benchmark::ImageBenchmarkOptions {
+            config_path: std::path::PathBuf::new(),
+            ip: "127.0.0.1".into(),
+            port: 4296,
+            image_path,
+            output_path: dir.join("image.jsonl"),
+            live_start_file: dir.join("live.marker"),
+            cache_start_file: dir.join("cache.marker"),
+            clients: 4,
+            sharers: 3,
+            cache_recipients: 1,
+            egress_megabits_per_second: 200,
+        },
+    )
+    .unwrap();
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut client = test_client(3, server.local_addr().unwrap()).await;
+    Arc::get_mut(&mut client).unwrap().image_benchmark = Some(session);
+    client.image_network_id.store(42, Ordering::Release);
+
+    for channel in [channels::SCENE, channels::DIRECT_SCENE_SERVER] {
+        let channel_id = DeliveryMethod::channel_id(channel, DeliveryMethod::ReliableOrdered);
+        let mut scene = Vec::with_capacity(3000);
+        scene.extend_from_slice(&100u16.to_le_bytes());
+        scene.extend_from_slice(&42u16.to_le_bytes());
+        scene.push(2); // image chunk operation; unknown image id is ignored by the observer.
+        scene.extend_from_slice(&[0x5a; 2995]);
+        client.send_reliable_ordered(channel, &scene).await.unwrap();
+
+        let fragment_count = scene.len().div_ceil(RELIABLE_FRAGMENT_PAYLOAD_SIZE);
+        let mut received = vec![0u8; LITENETLIB_INITIAL_MTU];
+        for index in 0..fragment_count {
+            let length = time::timeout(Duration::from_secs(1), server.recv(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+            let packet = received[..length].to_vec();
+            assert_eq!(parse_packet(&packet).unwrap().channel_id, Some(channel_id));
+            let container = if index % 2 == 0 {
+                merged(&packet)
+            } else {
+                let mut compact = vec![PacketProperty::CompactMerged as u8, 0xc0];
+                compact.extend_from_slice(&(packet.len() as u16).to_le_bytes());
+                compact.extend_from_slice(&packet);
+                compact
+            };
+            let handoff = if index % 2 == 0 {
+                shared_receiver_process_merged(&client, client.socket.as_raw_fd(), &container)
+            } else {
+                shared_receiver_process_compact(&client, &container)
+            };
+            assert_eq!(
+                handoff.len(),
+                1,
+                "fragment {index} must reach normal dispatch"
+            );
+            client.handle_packet(handoff[0]).await.unwrap();
+        }
+    }
+    assert!(client.in_use.load(Ordering::Acquire));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[tokio::test]
 async fn fragmented_reliable_matches_litenetlib_wire_and_ack_lifecycle() {
     let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();

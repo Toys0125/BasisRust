@@ -174,9 +174,19 @@ fn shared_receiver_process_raw(client: &BasisClient, bytes: &[u8]) -> bool {
                 channel,
                 basis_protocol::channels::AUTH_IDENTITY
                     | basis_protocol::channels::META_DATA
+                    | basis_protocol::channels::NET_ID_ASSIGN
+                    | basis_protocol::channels::NET_ID_ASSIGNS
                     | basis_protocol::channels::DELTA_AVATAR
-            ) {
+            ) || (channel == basis_protocol::channels::SCENE && client.scene_session.is_some())
+                || (matches!(
+                    channel,
+                    basis_protocol::channels::SCENE | basis_protocol::channels::DIRECT_SCENE_SERVER
+                ) && client.image_benchmark.is_some())
+            {
                 // Do not mark this here: handle_channeled must see a new packet to apply it.
+                // Assignment replies update per-client state, and reliable scene/cache payloads
+                // feed only the explicitly enabled scene/image observers. All other reliable
+                // load-sink traffic needs the receive window and ACK bookkeeping only.
                 true
             } else {
                 shared_receiver_mark_reliable(client, bytes);
