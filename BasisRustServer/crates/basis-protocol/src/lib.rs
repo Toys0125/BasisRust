@@ -6,6 +6,7 @@ pub mod channels;
 pub mod config;
 pub mod did;
 pub mod io;
+pub mod login;
 pub mod messages;
 pub mod permissions;
 pub mod server_info;

@@ -105,6 +105,7 @@ fn test_peer_state() -> PeerState {
         connect_time: 1,
         last_seen: parking_lot::Mutex::new(Instant::now()),
         read_gate: SessionReadGate::default(),
+        inbound_seal: parking_lot::Mutex::new(sealed_inbound::InboundSeal::Plain),
         last_ping_sent: parking_lot::Mutex::new(Instant::now()),
         next_ping_sequence: AtomicU16::new(0),
         next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),

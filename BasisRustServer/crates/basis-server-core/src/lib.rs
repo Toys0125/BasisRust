@@ -36,6 +36,7 @@ use basis_protocol::{
     config::{BasisUserRestrictionMode, ServerConfig},
     did::{did_key_verifying_key, DidResponse},
     io::{NetReader, NetWriter},
+    login::{connection_payload_hash, did_login_transcript},
     messages::{
         core_message_supply, decompress_permission_extras, AdminRequest, AdminRequestMode,
         AvatarDataMessage, BasisDeserialize, BasisMessageSubscribe, BasisSerialize, BytesMessage,
@@ -65,7 +66,9 @@ use basis_transport::{
 };
 use bytes::Bytes;
 use dashmap::DashMap;
+use hkdf::Hkdf;
 use parking_lot::{Mutex, RwLock};
+use sha2::Sha256;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::{self, OpenOptions},
@@ -81,6 +84,7 @@ use std::{
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info, warn};
+use x25519_dalek::{EphemeralSecret, PublicKey};
 
 pub use avatar_sync::{AvatarSyncConfig, AvatarSyncSystem};
 
@@ -102,6 +106,8 @@ struct PendingIdentity {
     session: PeerSession,
     ready: ReadyMessage,
     challenge: Vec<u8>,
+    /// Connection-bound protocol-56 DID signature payload, not just the nonce.
+    transcript: Vec<u8>,
     expires_at: Instant,
     _timeout_cancel: oneshot::Sender<()>,
     _admission_slot: AdmissionSlot,
@@ -2408,13 +2414,33 @@ async fn handle_connection_request(
         }
     };
     if config.use_auth && !password_matches(&config.password, &auth.data) {
-        state
-            .transport
-            .reject(&request, "Authentication failed, Auth rejected")
-            .await?;
+        reject_structured(
+            state,
+            &request,
+            channels::REJECT_KIND_PASSWORD_REJECTED,
+            0,
+            0,
+            "Authentication failed, Auth rejected",
+        )
+        .await?;
         return Ok(());
     }
 
+    // In v56 the BytesMessage containing the client's ephemeral X25519 key
+    // precedes ReadyMessage. Its complete serialized bytes and ReadyMessage are
+    // hashed for the signed connection transcript.
+    let payload_hash = connection_payload_hash(reader.remaining_slice());
+    let client_public_key = match BytesMessage::deserialize(&mut reader) {
+        Ok(key) if key.data.len() == 32 => <[u8; 32]>::try_from(key.data.as_slice()).ok(),
+        _ => None,
+    };
+    let Some(client_public_key) = client_public_key else {
+        state
+            .transport
+            .reject(&request, "Invalid connection key.")
+            .await?;
+        return Ok(());
+    };
     let ready = match ReadyMessage::deserialize(&mut reader) {
         Ok(ready) => ready,
         Err(_) => {
@@ -2475,7 +2501,38 @@ async fn handle_connection_request(
     if !state.transport.is_pending_request(&request) {
         return Ok(());
     }
-    let session = match state.transport.accept_session(&request).await {
+    // Prepare the server's ephemeral key before accepting, so low-order client
+    // points can be rejected without creating a live transport session.
+    let login_key = if config.use_auth_identity {
+        let secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+        let server_public_key = PublicKey::from(&secret).to_bytes();
+        let shared = secret
+            .diffie_hellman(&PublicKey::from(client_public_key))
+            .to_bytes();
+        if shared == [0u8; 32] {
+            state
+                .transport
+                .reject(&request, "Invalid connection key.")
+                .await?;
+            return Ok(());
+        }
+        let mut salt = [0u8; 64];
+        salt[..32].copy_from_slice(&client_public_key);
+        salt[32..].copy_from_slice(&server_public_key);
+        let mut key = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(&salt), &shared)
+            .expand(b"basis-server-link-v1-c2s", &mut key)
+            .map_err(|_| anyhow::anyhow!("cannot derive sealed client uplink key"))?;
+        Some((server_public_key, key))
+    } else {
+        None
+    };
+
+    let session = match if config.use_auth_identity {
+        state.transport.accept_session_awaiting_seal(&request).await
+    } else {
+        state.transport.accept_session(&request).await
+    } {
         Ok(session) => session,
         Err(basis_transport::TransportError::PeerIdExhausted) => {
             reject_structured(
@@ -2500,12 +2557,28 @@ async fn handle_connection_request(
         return Ok(());
     }
     if config.use_auth_identity {
+        let (server_public_key, uplink_key) = login_key.expect("key derived for DID login");
+        if !state
+            .transport
+            .activate_sealed_inbound(&session, &uplink_key)
+        {
+            disconnect_admission(state, &session, "Transport cannot protect the login.").await;
+            return Ok(());
+        }
         let challenge_ttl = identity_challenge_ttl(
             state.player_count(),
             config.auth_validation_time_out_miliseconds,
         );
         let mut challenge = vec![0; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut challenge);
+        let transcript = did_login_transcript(
+            &ready.player_meta_data_message.player_uuid,
+            &config.server_uuid,
+            &challenge,
+            &client_public_key,
+            &server_public_key,
+            &payload_hash,
+        )?;
         let expires_at = Instant::now() + challenge_ttl;
         let (timeout_cancel, mut timeout_cancelled) = oneshot::channel();
         state.pending_identity.insert(
@@ -2514,6 +2587,7 @@ async fn handle_connection_request(
                 session: session.clone(),
                 ready,
                 challenge: challenge.clone(),
+                transcript,
                 expires_at,
                 _timeout_cancel: timeout_cancel,
                 _admission_slot: admission_slot,
@@ -2553,6 +2627,14 @@ async fn handle_connection_request(
         let mut writer = NetWriter::new();
         BytesMessage {
             data: challenge.clone(),
+        }
+        .serialize(&mut writer)?;
+        BytesMessage {
+            data: server_public_key.to_vec(),
+        }
+        .serialize(&mut writer)?;
+        BytesMessage {
+            data: config.server_uuid.as_bytes().to_vec(),
         }
         .serialize(&mut writer)?;
         state
@@ -3265,7 +3347,7 @@ async fn handle_message(
                     );
                     let verifying_key =
                         did_key_verifying_key(&pending.ready.player_meta_data_message.player_uuid)?;
-                    response.verify(&pending.challenge, &verifying_key)
+                    response.verify(&pending.transcript, &verifying_key)
                 })();
                 if let Err(error) = identity_check {
                     disconnect_admission(
@@ -3818,12 +3900,14 @@ async fn handle_message(
                             configured.min(4096) as usize
                         }
                     };
-                    let Some(server_message) = state.content_share.add_with_limit(
+                    let sharer_protected = has_protection_permission(state, peer);
+                    let Some(server_message) = state.content_share.add_with_limit_and_protection(
                         peer,
                         peer_state.metadata.player_uuid.clone(),
                         peer_state.metadata.player_display_name.clone(),
                         request,
                         max_spheres,
+                        sharer_protected,
                     ) else {
                         return Ok(());
                     };
@@ -4772,6 +4856,14 @@ fn content_locked(state: &ServerState, content_type: ContentShareType, peer: Pee
                     basis_server_permissions::nodes::RESOURCE_LOCK_BYPASS_SERVER,
                 )
         }
+        // Reject unimplemented inline share types until their BasisVR v56
+        // content validations and policy toggles are ported. In particular,
+        // links must never bypass the upstream anti-spoofing URL checks.
+        ContentShareType::DollyTrack
+        | ContentShareType::Link
+        | ContentShareType::Text
+        | ContentShareType::Folder
+        | ContentShareType::Setting => true,
     }
 }
 

@@ -1,4 +1,5 @@
 mod pre_auth;
+mod sealed_inbound;
 
 #[cfg(test)]
 mod bench_branches;
@@ -590,6 +591,7 @@ struct PeerState {
     connect_time: i64,
     last_seen: parking_lot::Mutex<Instant>,
     read_gate: SessionReadGate,
+    inbound_seal: parking_lot::Mutex<sealed_inbound::InboundSeal>,
     last_ping_sent: parking_lot::Mutex<Instant>,
     next_ping_sequence: AtomicU16,
     next_reliable_sequence: parking_lot::Mutex<HashMap<u8, u16>>,
@@ -1907,6 +1909,43 @@ impl TransportHandle {
     /// Callers that cross an `await` while handling admission must retain this handle instead
     /// of looking the numeric peer ID up again, since that ID may have been recycled.
     pub async fn accept_session(&self, request: &ConnectionRequest) -> Result<PeerSession> {
+        self.accept_session_with_seal(request, false).await
+    }
+
+    /// Protocol 56: no unsealed client user data is admitted while the challenge key is installed.
+    pub async fn accept_session_awaiting_seal(
+        &self,
+        request: &ConnectionRequest,
+    ) -> Result<PeerSession> {
+        self.accept_session_with_seal(request, true).await
+    }
+
+    pub fn activate_sealed_inbound(&self, session: &PeerSession, key: &[u8; 32]) -> bool {
+        self.is_current_session(session) && session.state.inbound_seal.lock().activate(key)
+    }
+
+    /// Gives an in-process test proxy a cipher for inspecting and faulting real
+    /// encrypted datagrams without changing the live session's replay window.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_inbound_cipher(
+        &self,
+        remote_addr: SocketAddr,
+    ) -> Option<chacha20poly1305::ChaCha20Poly1305> {
+        let peer_id = *self.by_addr.get(&remote_addr)?;
+        let peer = self.peers.get(&peer_id)?;
+        let seal = peer.inbound_seal.lock();
+        match &*seal {
+            sealed_inbound::InboundSeal::Active { cipher, .. } => Some(cipher.clone()),
+            _ => None,
+        }
+    }
+
+    async fn accept_session_with_seal(
+        &self,
+        request: &ConnectionRequest,
+        sealed: bool,
+    ) -> Result<PeerSession> {
         let (id, session) = {
             // Reserve and publish under one lock: concurrent accepts cannot choose the same ID.
             let _allocation = self.peer_allocation.lock();
@@ -1923,6 +1962,11 @@ impl TransportHandle {
                 connect_time: request.connect_time,
                 last_seen: parking_lot::Mutex::new(Instant::now()),
                 read_gate: SessionReadGate::default(),
+                inbound_seal: parking_lot::Mutex::new(if sealed {
+                    sealed_inbound::InboundSeal::AwaitingKey
+                } else {
+                    sealed_inbound::InboundSeal::Plain
+                }),
                 last_ping_sent: parking_lot::Mutex::new(Instant::now()),
                 next_ping_sequence: AtomicU16::new(0),
                 next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),
@@ -3251,6 +3295,21 @@ async fn process_packet_for_peer(
     } else {
         None
     };
+
+    // The per-peer packet layer applies to the whole UDP datagram, not the
+    // logical packets recursively unpacked from Merged / CompactMerged.
+    let opened = if expected_peer.is_none() {
+        match active_peer.as_ref() {
+            Some((_, peer)) => peer.inbound_seal.lock().open(bytes),
+            None => Some(std::borrow::Cow::Borrowed(bytes)),
+        }
+    } else {
+        Some(std::borrow::Cow::Borrowed(bytes))
+    };
+    let Some(opened) = opened else {
+        return Ok(());
+    };
+    let bytes = opened.as_ref();
 
     match property {
         PacketProperty::ConnectRequest => {
@@ -7957,6 +8016,7 @@ mod tests {
             connect_time: 1,
             last_seen: parking_lot::Mutex::new(Instant::now()),
             read_gate: SessionReadGate::default(),
+            inbound_seal: parking_lot::Mutex::new(sealed_inbound::InboundSeal::Plain),
             last_ping_sent: parking_lot::Mutex::new(Instant::now()),
             next_ping_sequence: AtomicU16::new(0),
             next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),
@@ -10741,6 +10801,7 @@ mod tests {
             connect_time: 123,
             last_seen: parking_lot::Mutex::new(Instant::now()),
             read_gate: SessionReadGate::default(),
+            inbound_seal: parking_lot::Mutex::new(sealed_inbound::InboundSeal::Plain),
             last_ping_sent: parking_lot::Mutex::new(Instant::now()),
             next_ping_sequence: AtomicU16::new(0),
             next_reliable_sequence: parking_lot::Mutex::new(HashMap::new()),

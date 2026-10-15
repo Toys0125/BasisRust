@@ -423,11 +423,31 @@ impl ContentShareState {
         message: ContentShareMessage,
         max_per_player: usize,
     ) -> Option<ServerContentShareMessage> {
+        self.add_with_limit_and_protection(
+            player_id,
+            sharer_uuid,
+            sharer_display_name,
+            message,
+            max_per_player,
+            false,
+        )
+    }
+
+    pub fn add_with_limit_and_protection(
+        &self,
+        player_id: u16,
+        sharer_uuid: String,
+        sharer_display_name: String,
+        message: ContentShareMessage,
+        max_per_player: usize,
+        sharer_protected: bool,
+    ) -> Option<ServerContentShareMessage> {
         let server = ServerContentShareMessage {
             player_id,
             sharer_uuid,
             sharer_display_name,
             content_share_message: message,
+            sharer_protected,
         };
         let mut spheres = self.spheres.write();
         if spheres.contains_key(&server.content_share_message.sphere_net_id)

@@ -1,8 +1,13 @@
 //! Loopback checks exercise the dispatcher and actual outbound client packets.
 use super::*;
 use basis_transport::PacketProperty;
+use chacha20poly1305::{
+    aead::{AeadInPlace, KeyInit},
+    ChaCha20Poly1305, Nonce,
+};
 use ed25519_dalek::{Signer, SigningKey};
 use tokio::net::UdpSocket;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 mod week_sim;
 
@@ -12,6 +17,12 @@ struct Client {
     received: HashSet<(u8, u16)>,
     sequences: HashMap<u8, u16>,
     fragments: HashMap<(u8, u16), Vec<Option<Vec<u8>>>>,
+    uuid: String,
+    secret: StaticSecret,
+    public: [u8; 32],
+    payload_hash: [u8; 32],
+    seal_key: Option<[u8; 32]>,
+    seal_counter: i64,
 }
 
 impl Client {
@@ -60,12 +71,28 @@ impl Client {
         }
         .serialize(&mut writer)
         .unwrap();
+        let payload_start = writer.len();
+        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let public = PublicKey::from(&secret).to_bytes();
+        BytesMessage {
+            data: public.to_vec(),
+        }
+        .serialize(&mut writer)
+        .unwrap();
         super::tests::ready_message(uuid)
             .serialize(&mut writer)
             .unwrap();
+        let payload_hash =
+            basis_protocol::login::connection_payload_hash(&writer.as_slice()[payload_start..]);
         socket.send(writer.as_slice()).await.unwrap();
         Self {
             socket,
+            uuid: uuid.to_string(),
+            secret,
+            public,
+            payload_hash,
+            seal_key: None,
+            seal_counter: 0,
             pending: Vec::new(),
             received: HashSet::new(),
             sequences: HashMap::new(),
@@ -85,9 +112,30 @@ impl Client {
         let payload = self
             .receive(|channel, _| channel == channels::AUTH_IDENTITY)
             .await;
-        BytesMessage::deserialize(&mut NetReader::new(&payload))
-            .unwrap()
-            .data
+        let mut reader = NetReader::new(&payload);
+        let nonce = BytesMessage::deserialize(&mut reader).unwrap().data;
+        let server_key = BytesMessage::deserialize(&mut reader).unwrap().data;
+        let server_uuid =
+            String::from_utf8(BytesMessage::deserialize(&mut reader).unwrap().data).unwrap();
+        let server_public: [u8; 32] = server_key.try_into().unwrap();
+        let shared = self.secret.diffie_hellman(&PublicKey::from(server_public));
+        let mut salt = [0u8; 64];
+        salt[..32].copy_from_slice(&self.public);
+        salt[32..].copy_from_slice(&server_public);
+        let mut key = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(&salt), shared.as_bytes())
+            .expand(b"basis-server-link-v1-c2s", &mut key)
+            .unwrap();
+        self.seal_key = Some(key);
+        basis_protocol::login::did_login_transcript(
+            &self.uuid,
+            &server_uuid,
+            &nonce,
+            &self.public,
+            &server_public,
+            &self.payload_hash,
+        )
+        .unwrap()
     }
 
     async fn send_identity_response(&mut self, signature: Vec<u8>) {
@@ -127,7 +175,27 @@ impl Client {
         let mut writer = NetWriter::new();
         writer.put_u8(PacketProperty::Disconnect as u8);
         writer.put_i64(1); // connect_time from connect_pending_with_contract
-        self.socket.send(writer.as_slice()).await.unwrap();
+        self.send_datagram(writer.as_slice()).await;
+    }
+
+    async fn send_datagram(&mut self, packet: &[u8]) {
+        let mut datagram = packet.to_vec();
+        if let Some(key) = self.seal_key {
+            self.seal_counter += 1;
+            let mut nonce = [0u8; 12];
+            nonce[..8].copy_from_slice(&self.seal_counter.to_le_bytes());
+            let cipher = ChaCha20Poly1305::new((&key).into());
+            let tag = cipher
+                .encrypt_in_place_detached(
+                    Nonce::from_slice(&nonce),
+                    &[packet[0]],
+                    &mut datagram[1..],
+                )
+                .unwrap();
+            datagram.extend_from_slice(&tag);
+            datagram.extend_from_slice(&self.seal_counter.to_le_bytes());
+        }
+        self.socket.send(&datagram).await.unwrap();
     }
 
     async fn send(&mut self, channel: u8, payload: &[u8], reliable: bool) {
@@ -146,7 +214,7 @@ impl Client {
             writer.put_u8(channel);
         }
         writer.put_bytes(payload);
-        self.socket.send(writer.as_slice()).await.unwrap();
+        self.send_datagram(writer.as_slice()).await;
     }
 
     async fn admin(&mut self, mode: AdminRequestMode, payload: impl FnOnce(&mut NetWriter)) {
@@ -182,7 +250,7 @@ impl Client {
                     // the 128 sequence bits; the transport tests use the same 17-byte form.
                     ack.extend_from_slice(&[0; 17]);
                     ack[4 + (sequence as usize % 128) / 8] |= 1 << (sequence % 8);
-                    self.socket.send(&ack).await.unwrap();
+                    self.send_datagram(&ack).await;
                     if !self.received.insert((channel_id, sequence)) {
                         continue;
                     }
@@ -841,7 +909,7 @@ async fn password_rejection_creates_no_challenge_and_valid_identity_keeps_wire_f
     }
     let mut valid = Client::connect_pending_with_auth(&state, &did, b"default_password").await;
     let challenge = valid.answer_identity(&key).await;
-    assert_eq!(challenge.len(), 32);
+    assert!(challenge.len() > 32);
     valid
         .receive(|channel, _| channel == channels::META_DATA)
         .await;

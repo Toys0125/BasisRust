@@ -355,7 +355,9 @@ async fn run_internal(
             }
             .serialize(&mut writer)?;
             for client in &snapshot {
-                if client.image_network_id.load(Ordering::Acquire) == u16::MAX {
+                if client.image_network_id.load(Ordering::Acquire) == u16::MAX
+                    && client.metadata_state().is_some()
+                {
                     client
                         .send_reliable_ordered(channels::NET_ID_ASSIGN, writer.as_slice())
                         .await?;

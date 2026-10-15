@@ -15,8 +15,9 @@ discovers them automatically.
 - Wrong-password rejection before transport/player admission.
 - Corrupted Ed25519 identity response rejection after transport acceptance, without
   admitting a player or sending post-auth metadata.
-- Correct DID authentication after dropping the first client response; verify its
-  signature against the server challenge and advertised public key.
+- Correct v56 DID authentication after dropping the first client response; verify
+  its signature against the captured nonce, server ID, ephemeral keys, and
+  connection payload hash.
 - Reliable server-to-client traffic through 160 sequence numbers. Withhold sequence
   zero until an actual gap ACK arrives, then check retransmission, absolute bitmap
   coverage, window refill, and server pending/queued drain.
@@ -41,7 +42,7 @@ device, Unity installation, fixed ports, or external server is required.
 
 ## Pinned evidence and limits
 
-Wire assertions use BasisVR commit
+Legacy payload assertions use BasisVR commit
 `81f190b217c11c2b39231e0bc9db330fd4a2803c`, specifically:
 
 - `Basis Server/BasisNetworkClient/BasisDIDAuthIdentityClient.cs`: length-prefixed
@@ -62,6 +63,15 @@ Wire assertions use BasisVR commit
   and `LocalAvatarSyncMessage.cs`: channel-derived pose quality and fixed payload.
   The live fixture checks the current small-ID high-quality fanout envelope and
   exact pose preservation; existing protocol vectors cover packing/repacking.
+
+The v56 login transcript and sealed packet format are checked against the Rust
+implementations; the legacy source pin above does not establish v56 parity. The
+proxy uses the server transport's nondefault `test-support` feature to clone the
+in-process session cipher. It authenticates and decrypts captured client packets
+for payload assertions while forwarding the original encrypted datagrams. The
+invalid-signature scenario deliberately mutates and reseals the DID response so
+that it reaches identity verification. Production dependencies do not enable
+this test API, and session ciphers are never written to disk or sent over IPC.
 
 This is Rust executable-to-Rust server coverage, **not proof of live Unity
 interoperability**. The client is a synthetic load client: it ACKs reliable CHAT

@@ -3,12 +3,13 @@ use crate::config::Config;
 use anyhow::Result;
 use basis_protocol::application::NetworkApplication;
 use basis_protocol::avatar::{encode_avatar_network_load_with_version, BitQuality};
+use basis_protocol::channels;
 use basis_protocol::io::NetWriter;
 use basis_protocol::messages::{
     AdditionalAvatarData, BasisSerialize, ClientAvatarChangeMessage, ClientMetaDataMessage,
     LocalAvatarSyncMessage, ReadyMessage,
 };
-use basis_protocol::version::SERVER_VERSION;
+use basis_protocol::version::{LEGACY_SERVER_VERSION, SERVER_VERSION};
 use rand::Rng;
 use uuid::Uuid;
 
@@ -84,17 +85,52 @@ pub(crate) fn append_synthetic_additional_avatar_data(
     payload.extend((0..byte_count).map(|offset| sequence.wrapping_add(offset.wrapping_mul(37))));
 }
 
-pub(crate) fn build_connection_payload(config: &Config, ready: &ReadyMessage) -> Result<Vec<u8>> {
+pub(crate) fn build_connection_payload(
+    config: &Config,
+    ready: &ReadyMessage,
+    client_public: &[u8; 32],
+) -> Result<Vec<u8>> {
+    build_connection_payload_for_version(config, ready, client_public, SERVER_VERSION)
+}
+
+pub(crate) fn build_connection_payload_for_version(
+    config: &Config,
+    ready: &ReadyMessage,
+    client_public: &[u8; 32],
+    version: u16,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        version == SERVER_VERSION || version == LEGACY_SERVER_VERSION,
+        "unsupported Basis protocol v{version}"
+    );
     let auth = config.password.as_bytes();
     let mut writer = NetWriter::with_capacity(512);
-    writer.put_u16(SERVER_VERSION);
+    writer.put_u16(version);
     writer.put_bytes(&NetworkApplication::encode(
         &config.company_name,
         &config.product_name,
     )?);
     writer.put_bytes_with_length(auth)?;
+    if version == SERVER_VERSION {
+        writer.put_bytes_with_length(client_public)?;
+    }
     ready.serialize(&mut writer)?;
     Ok(writer.into_vec())
+}
+
+/// A v55 server sends the structured version-mismatch payload *before* it
+/// accepts the connection. Never retry because of a password/auth failure, a
+/// generic disconnect, or a server advertising anything other than v55.
+pub(crate) fn is_v55_version_rejection(payload: &[u8]) -> bool {
+    let mut reader = basis_protocol::io::NetReader::new(payload);
+    matches!(
+        (reader.get_u32(), reader.get_u8(), reader.get_u16(), reader.get_u16()),
+        (Ok(magic), Ok(kind), Ok(server), Ok(client))
+            if magic == channels::REJECT_MAGIC
+                && kind == channels::REJECT_KIND_VERSION_MISMATCH
+                && server == LEGACY_SERVER_VERSION
+                && client == SERVER_VERSION
+    )
 }
 
 pub(crate) fn random_display_name() -> String {

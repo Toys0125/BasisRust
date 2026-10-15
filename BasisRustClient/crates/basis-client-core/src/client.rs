@@ -9,6 +9,15 @@ pub(crate) const OBSERVER_CANDIDATE_COUNT: usize = 3;
 /// `Merged` and slips through; LiteNetLib frames it as `CompactMerged` and does not. Disable
 /// this when measuring all-client voice fanout against a non-Rust server so every leg measures
 /// the same population.
+fn legacy_fallback_enabled() -> bool {
+    // Version rejections are unauthenticated LiteNetLib control traffic. Hosts
+    // requiring the stronger v56 login can pin it by disabling legacy fallback.
+    match std::env::var("BASIS_CLIENT_DISABLE_V55_FALLBACK") {
+        Ok(value) => value != "1" && !value.eq_ignore_ascii_case("true"),
+        Err(_) => true,
+    }
+}
+
 fn load_sink_filter_enabled() -> bool {
     match std::env::var("BASIS_CLIENT_LOAD_SINK_FILTER") {
         Ok(value) => value != "0" && !value.eq_ignore_ascii_case("false"),
@@ -21,28 +30,35 @@ use crate::avatar::{
 use crate::config::Config;
 use crate::diagnostics::ClientAvatarDiagnostics;
 use crate::identity::Identity;
-#[cfg(windows)]
-use crate::net::windows_mtu_probe_reply;
+use crate::net::mtu_probe_reply;
 use crate::net::{
     any_local_addr, bind_udp_socket, configure_load_sink_socket, resolve_addr, socket_address_bytes,
 };
 use crate::transport::{
-    parse_packet, read_bytes_message, FragmentResult, ReliableFragmentReassembler,
-    ReliableReceiveState, ReliableSend, ACK_FLUSH_INTERVAL, PING_INTERVAL_TICKS,
-    RESEND_INTERVAL_TICKS,
+    parse_packet, FragmentResult, ReliableFragmentReassembler, ReliableReceiveState, ReliableSend,
+    ACK_FLUSH_INTERVAL, PING_INTERVAL_TICKS, RESEND_INTERVAL_TICKS,
 };
-use crate::wire::build_connection_payload;
+use crate::wire::{
+    build_connection_payload, build_connection_payload_for_version, is_v55_version_rejection,
+};
 use anyhow::{anyhow, Result};
 use basis_protocol::channels;
 use basis_protocol::io::NetReader;
 use basis_protocol::io::NetWriter;
-use basis_protocol::messages::{BasisDeserialize, ReadyMessage, ServerNetIdMessage};
-use basis_protocol::version::LITENETLIB_PROTOCOL_ID;
+use basis_protocol::login::{connection_payload_hash, did_login_transcript};
+use basis_protocol::messages::{BasisDeserialize, BytesMessage, ReadyMessage, ServerNetIdMessage};
+use basis_protocol::version::{LEGACY_SERVER_VERSION, LITENETLIB_PROTOCOL_ID, SERVER_VERSION};
 use basis_transport::{
     dotnet_utc_ticks, relative_sequence, DeliveryMethod, PacketProperty, DEFAULT_WINDOW_SIZE,
     LITENETLIB_CHANNELED_HEADER_SIZE, LITENETLIB_FRAGMENTED_HEADER_SIZE, LITENETLIB_INITIAL_MTU,
     MAX_SEQUENCE, RELIABLE_FRAGMENT_PAYLOAD_SIZE,
 };
+use chacha20poly1305::{
+    aead::{AeadInPlace, KeyInit},
+    ChaCha20Poly1305, Nonce,
+};
+use hkdf::Hkdf;
+use sha2::Sha256;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
@@ -52,6 +68,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify};
 use tokio::time;
 use tracing::{debug, error, info, trace, warn};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 fn read_server_net_id_assignments(payload: &[u8]) -> Option<Vec<ServerNetIdMessage>> {
     let mut reader = NetReader::new(payload);
@@ -63,51 +80,6 @@ fn read_server_net_id_assignments(payload: &[u8]) -> Option<Vec<ServerNetIdMessa
     Some(messages)
 }
 
-#[cfg(test)]
-mod net_id_batch_tests {
-    use super::*;
-    use basis_protocol::messages::{
-        BasisSerialize, NetIdMessage, ServerUniqueIdMessages, UshortUniqueIdMessage,
-    };
-
-    #[test]
-    fn parses_batched_network_id_assignments() {
-        let expected = vec![
-            ServerNetIdMessage {
-                net_id_message: NetIdMessage {
-                    player_id: "BasisImagePickupManager".into(),
-                },
-                ushort_unique_id_message: UshortUniqueIdMessage {
-                    unique_id_ushort: 23,
-                },
-            },
-            ServerNetIdMessage {
-                net_id_message: NetIdMessage {
-                    player_id: "another-manager".into(),
-                },
-                ushort_unique_id_message: UshortUniqueIdMessage {
-                    unique_id_ushort: 42,
-                },
-            },
-        ];
-        let mut writer = NetWriter::new();
-        ServerUniqueIdMessages {
-            messages: expected.clone(),
-        }
-        .serialize(&mut writer)
-        .unwrap();
-        assert_eq!(
-            read_server_net_id_assignments(writer.as_slice()).unwrap(),
-            expected
-        );
-        assert!(
-            read_server_net_id_assignments(&writer.as_slice()[..writer.as_slice().len() - 1])
-                .is_none()
-        );
-    }
-}
-
-#[derive(Debug)]
 pub(crate) struct BasisClient {
     pub(crate) index: usize,
     pub(crate) socket: Arc<UdpSocket>,
@@ -145,6 +117,62 @@ pub(crate) struct BasisClient {
     pub(crate) avatar_diagnostics: Option<Arc<ClientAvatarDiagnostics>>,
     pub(crate) voice_diagnostics: Option<crate::voice_diagnostics::VoiceDiagnostics>,
     pub(crate) identity: Identity,
+    pub(crate) connection_secret: [u8; 32],
+    pub(crate) connection_public: [u8; 32],
+    pub(crate) connection_payload_hash: StdMutex<[u8; 32]>,
+    pub(crate) sealed_outbound: StdMutex<Option<([u8; 32], u64)>>,
+    /// Version for this exact connection; v55 is permitted only after a matching
+    /// structured rejection from the target server.
+    pub(crate) protocol_version: AtomicU16,
+    pub(crate) legacy_retry_payload: StdMutex<Option<Vec<u8>>>,
+}
+
+// Keep connection keys and the password-bearing legacy payload out of diagnostics.
+impl std::fmt::Debug for BasisClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BasisClient")
+            .field("index", &self.index)
+            .field("socket", &self.socket)
+            .field("server_addr", &self.server_addr)
+            .field("connect_time", &self.connect_time)
+            .field("connection_number", &self.connection_number)
+            .field("local_peer_id", &self.local_peer_id)
+            .field("remote_peer_id", &self.remote_peer_id)
+            .field("connected", &self.connected)
+            .field("in_use", &self.in_use)
+            .field("intentional_reconnect", &self.intentional_reconnect)
+            .field("movement_sequence", &self.movement_sequence)
+            .field("voice_sequence", &self.voice_sequence)
+            .field("reliable_sequences", &self.reliable_sequences)
+            .field("fragment_id", &self.fragment_id)
+            .field("ping_sequence", &self.ping_sequence)
+            .field("pending_reliable", &self.pending_reliable)
+            .field("pending_reliable_active", &self.pending_reliable_active)
+            .field("ack_pending", &self.ack_pending)
+            .field("shared_receive", &self.shared_receive)
+            .field("shared_receive_eligible", &self.shared_receive_eligible)
+            .field("receive_shutdown", &self.receive_shutdown)
+            .field("received_reliable", &self.received_reliable)
+            .field("fragment_reassembler", &self.fragment_reassembler)
+            .field("server_avatar_metadata", &self.server_avatar_metadata)
+            .field("force_avatar_keyframe", &self.force_avatar_keyframe)
+            .field("pose", &self.pose)
+            .field("avatar_observer", &self.avatar_observer)
+            .field("scene_session", &self.scene_session)
+            .field("image_benchmark", &self.image_benchmark)
+            .field("image_network_id", &self.image_network_id)
+            .field("packet_diagnostics", &self.packet_diagnostics)
+            .field("avatar_diagnostics", &self.avatar_diagnostics)
+            .field("voice_diagnostics", &self.voice_diagnostics)
+            .field("identity", &self.identity)
+            .field("connection_secret", &"<redacted>")
+            .field("connection_public", &self.connection_public)
+            .field("connection_payload_hash", &self.connection_payload_hash)
+            .field("sealed_outbound", &"<redacted>")
+            .field("protocol_version", &self.protocol_version)
+            .field("legacy_retry_payload", &"<redacted>")
+            .finish()
+    }
 }
 
 impl BasisClient {
@@ -178,6 +206,9 @@ impl BasisClient {
         let local_peer_id = index as i32;
         let identity = Identity::random();
         ready.player_meta_data_message.player_uuid = identity.did_key();
+        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let connection_public = PublicKey::from(&secret).to_bytes();
+        let connection_secret = secret.to_bytes();
         let client = Arc::new(Self {
             index,
             socket,
@@ -217,6 +248,12 @@ impl BasisClient {
             voice_diagnostics: crate::voice_diagnostics::VoiceDiagnostics::enabled()
                 .then(|| crate::voice_diagnostics::VoiceDiagnostics::new(index)),
             identity,
+            connection_secret,
+            connection_public,
+            connection_payload_hash: StdMutex::new([0; 32]),
+            sealed_outbound: StdMutex::new(None),
+            protocol_version: AtomicU16::new(SERVER_VERSION),
+            legacy_retry_payload: StdMutex::new(None),
         });
 
         client
@@ -231,11 +268,32 @@ impl BasisClient {
         ready: &ReadyMessage,
         shared_maintenance_enabled: bool,
     ) -> Result<()> {
-        let payload = build_connection_payload(config, ready)?;
+        let payload = build_connection_payload(config, ready, &self.connection_public)?;
+        let legacy_payload = if legacy_fallback_enabled() {
+            Some(build_connection_payload_for_version(
+                config,
+                ready,
+                &self.connection_public,
+                LEGACY_SERVER_VERSION,
+            )?)
+        } else {
+            None
+        };
+        let mut reader = NetReader::new(&payload);
+        let _version = reader.get_u16()?;
+        basis_protocol::application::NetworkApplication::try_read(&mut reader)
+            .ok_or_else(|| anyhow!("invalid connection application"))?;
+        BytesMessage::deserialize(&mut reader)?;
+        let payload_hash = connection_payload_hash(reader.remaining_slice());
         if self.in_use.swap(true, Ordering::SeqCst) {
             error!("Call Shutdown First!");
             return Err(anyhow!("Call Shutdown First!"));
         }
+        *self.connection_payload_hash.lock().unwrap() = payload_hash;
+        *self.sealed_outbound.lock().unwrap() = None;
+        self.protocol_version
+            .store(SERVER_VERSION, Ordering::Release);
+        *self.legacy_retry_payload.lock().unwrap() = legacy_payload;
         let request = self.make_connect_request(&payload);
         self.send_connected(&request).await?;
         debug!(
@@ -265,8 +323,41 @@ impl BasisClient {
         Ok(())
     }
 
+    pub(crate) fn seal_connected(&self, bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+        anyhow::ensure!(!bytes.is_empty(), "cannot seal an empty datagram");
+        let datagram = {
+            let mut guard = self.sealed_outbound.lock().unwrap();
+            if let Some((key, counter)) = guard.as_mut() {
+                *counter = counter
+                    .checked_add(1)
+                    .filter(|next| *next <= i64::MAX as u64)
+                    .ok_or_else(|| anyhow!("client datagram encryption counter exhausted"))?;
+                let mut nonce = [0u8; 12];
+                nonce[..8].copy_from_slice(&counter.to_le_bytes());
+                let mut packet = bytes.to_vec();
+                let cipher = ChaCha20Poly1305::new((&*key).into());
+                let tag = cipher
+                    .encrypt_in_place_detached(
+                        Nonce::from_slice(&nonce),
+                        &bytes[..1],
+                        &mut packet[1..],
+                    )
+                    .map_err(|_| anyhow!("cannot encrypt client datagram"))?;
+                packet.extend_from_slice(&tag);
+                packet.extend_from_slice(&counter.to_le_bytes());
+                Some(packet)
+            } else {
+                None
+            }
+        };
+        Ok(datagram)
+    }
+
     pub(crate) async fn send_connected(&self, bytes: &[u8]) -> Result<()> {
-        self.socket.send(bytes).await?;
+        let datagram = self.seal_connected(bytes)?;
+        self.socket
+            .send(datagram.as_deref().unwrap_or(bytes))
+            .await?;
         Ok(())
     }
 
@@ -560,6 +651,8 @@ impl BasisClient {
                     && i64::from_le_bytes(bytes[1..9].try_into().unwrap()) == self.connect_time =>
             {
                 let remote_peer = i32::from_le_bytes(bytes[11..15].try_into().unwrap());
+                // Connection established: v56 no longer needs the prebuilt v55 retry.
+                self.legacy_retry_payload.lock().unwrap().take();
                 *self.remote_peer_id.lock().await = Some(remote_peer);
                 if self.index != 0 && self.avatar_observer.is_none() && load_sink_filter_enabled() {
                     if let Err(err) = configure_load_sink_socket(&self.socket) {
@@ -576,14 +669,51 @@ impl BasisClient {
                 }
                 self.refresh_shared_receive_eligibility();
                 info!(
-                    "client {} connected as remote peer {}",
-                    self.index, remote_peer
+                    "client {} connected as remote peer {} with Basis protocol v{}",
+                    self.index,
+                    remote_peer,
+                    self.protocol_version.load(Ordering::Acquire)
                 );
             }
             PacketProperty::ConnectAccept => {}
             PacketProperty::Disconnect
             | PacketProperty::PeerNotFound
             | PacketProperty::InvalidProtocol => {
+                // Late repeats of the *old* v56 rejection must not tear down
+                // a v55 retry that is in progress or already accepted.
+                if packet.property == PacketProperty::Disconnect
+                    && packet.connection_number == self.connection_number
+                    && self.protocol_version.load(Ordering::Acquire) == LEGACY_SERVER_VERSION
+                    && bytes.get(1..9) == Some(self.connect_time.to_le_bytes().as_slice())
+                    && is_v55_version_rejection(packet.payload)
+                {
+                    return Ok(());
+                }
+                if packet.property == PacketProperty::Disconnect
+                    && packet.connection_number == self.connection_number
+                    && !self.connected.load(Ordering::Acquire)
+                    && self.in_use.load(Ordering::Acquire)
+                    && bytes.get(1..9) == Some(self.connect_time.to_le_bytes().as_slice())
+                    && is_v55_version_rejection(packet.payload)
+                    && self.legacy_retry_payload.lock().unwrap().is_some()
+                    && self
+                        .protocol_version
+                        .compare_exchange(
+                            SERVER_VERSION,
+                            LEGACY_SERVER_VERSION,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                {
+                    let retry = self.legacy_retry_payload.lock().unwrap().take();
+                    if let Some(retry) = retry {
+                        warn!("client {}: server reports protocol v55; retrying legacy unencrypted login", self.index);
+                        self.send_connected(&self.make_connect_request(&retry))
+                            .await?;
+                        return Ok(());
+                    }
+                }
                 let reason =
                     if packet.property == PacketProperty::Disconnect && packet.payload.len() >= 2 {
                         let length =
@@ -608,10 +738,9 @@ impl BasisClient {
                 }
             }
             PacketProperty::Pong => {}
-            #[cfg(windows)]
             PacketProperty::MtuCheck => {
-                if let Some(reply) = windows_mtu_probe_reply(bytes, self.connection_number) {
-                    self.socket.send(&reply).await?;
+                if let Some(reply) = mtu_probe_reply(bytes, self.connection_number) {
+                    self.send_connected(&reply).await?;
                 }
             }
             PacketProperty::Ack => {
@@ -776,11 +905,13 @@ impl BasisClient {
     }
 
     pub(crate) async fn observe_avatar_channel(&self, channel: u8, payload: &[u8]) {
-        if channel == channels::SCENE {
+        if matches!(channel, channels::SCENE | channels::DIRECT_SCENE_SERVER) {
             let image_network_id = self.image_network_id.load(Ordering::Acquire);
             if let (Some(session), true) = (&self.image_benchmark, image_network_id != u16::MAX) {
                 session.observe(self.index, image_network_id, payload);
             }
+        }
+        if channel == channels::SCENE {
             if let Some(session) = &self.scene_session {
                 session.observe(payload);
             }
@@ -937,7 +1068,7 @@ impl BasisClient {
             diagnostics.receive(channel, payload);
         }
 
-        if channel == channels::SCENE {
+        if matches!(channel, channels::SCENE | channels::DIRECT_SCENE_SERVER) {
             if let (Some(session), Some(network_id)) = (
                 &self.image_benchmark,
                 (self.image_network_id.load(Ordering::Acquire) != u16::MAX)
@@ -945,6 +1076,8 @@ impl BasisClient {
             ) {
                 session.observe(self.index, network_id, payload);
             }
+        }
+        if channel == channels::SCENE {
             if let Some(session) = &self.scene_session {
                 session.observe(payload);
             }
@@ -965,11 +1098,62 @@ impl BasisClient {
                 }
             }
             channels::AUTH_IDENTITY => {
-                if let Some(challenge) = read_bytes_message(payload) {
-                    let response = self.identity.response_payload(challenge)?;
+                // The server challenge is cleartext. A new reliable sequence must
+                // never restart an established key's nonce/counter stream.
+                if self.protocol_version.load(Ordering::Acquire) != LEGACY_SERVER_VERSION
+                    && self.sealed_outbound.lock().unwrap().is_some()
+                {
+                    return Ok(());
+                }
+                let mut reader = NetReader::new(payload);
+                let nonce = BytesMessage::deserialize(&mut reader)?.data;
+                if self.protocol_version.load(Ordering::Acquire) == LEGACY_SERVER_VERSION {
+                    anyhow::ensure!(
+                        nonce.len() == 32 && reader.remaining() == 0,
+                        "malformed protocol-55 DID challenge"
+                    );
+                    let response = self.identity.response_payload(&nonce)?;
                     self.send_reliable_ordered(channels::AUTH_IDENTITY, &response)
                         .await?;
+                    return Ok(());
                 }
+                let server_key = BytesMessage::deserialize(&mut reader)?.data;
+                let server_uuid = String::from_utf8(BytesMessage::deserialize(&mut reader)?.data)?;
+                anyhow::ensure!(
+                    nonce.len() >= 32 && server_key.len() == 32 && reader.remaining() == 0,
+                    "malformed protocol-56 DID login challenge"
+                );
+                let server_public: [u8; 32] = server_key.try_into().expect("length checked");
+                let shared = StaticSecret::from(self.connection_secret)
+                    .diffie_hellman(&PublicKey::from(server_public));
+                anyhow::ensure!(shared.as_bytes() != &[0u8; 32], "invalid server X25519 key");
+                let mut salt = [0u8; 64];
+                salt[..32].copy_from_slice(&self.connection_public);
+                salt[32..].copy_from_slice(&server_public);
+                let mut key = [0u8; 32];
+                Hkdf::<Sha256>::new(Some(&salt), shared.as_bytes())
+                    .expand(b"basis-server-link-v1-c2s", &mut key)
+                    .map_err(|_| anyhow!("cannot derive client-to-server key"))?;
+                let transcript = did_login_transcript(
+                    &self.identity.did_key(),
+                    &server_uuid,
+                    &nonce,
+                    &self.connection_public,
+                    &server_public,
+                    &self.connection_payload_hash.lock().unwrap(),
+                )?;
+                let response = self.identity.response_payload(&transcript)?;
+                {
+                    let mut outbound = self.sealed_outbound.lock().unwrap();
+                    // Concurrent receive paths may have processed another challenge
+                    // while this transcript was being built. Install the key once.
+                    if outbound.is_some() {
+                        return Ok(());
+                    }
+                    *outbound = Some((key, 0));
+                }
+                self.send_reliable_ordered(channels::AUTH_IDENTITY, &response)
+                    .await?;
             }
             channels::META_DATA => match parse_server_avatar_metadata(payload) {
                 Ok(metadata) => {
@@ -1220,5 +1404,49 @@ impl BasisClient {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod net_id_batch_tests {
+    use super::*;
+    use basis_protocol::messages::{
+        BasisSerialize, NetIdMessage, ServerUniqueIdMessages, UshortUniqueIdMessage,
+    };
+
+    #[test]
+    fn parses_batched_network_id_assignments() {
+        let expected = vec![
+            ServerNetIdMessage {
+                net_id_message: NetIdMessage {
+                    player_id: "BasisImagePickupManager".into(),
+                },
+                ushort_unique_id_message: UshortUniqueIdMessage {
+                    unique_id_ushort: 23,
+                },
+            },
+            ServerNetIdMessage {
+                net_id_message: NetIdMessage {
+                    player_id: "another-manager".into(),
+                },
+                ushort_unique_id_message: UshortUniqueIdMessage {
+                    unique_id_ushort: 42,
+                },
+            },
+        ];
+        let mut writer = NetWriter::new();
+        ServerUniqueIdMessages {
+            messages: expected.clone(),
+        }
+        .serialize(&mut writer)
+        .unwrap();
+        assert_eq!(
+            read_server_net_id_assignments(writer.as_slice()).unwrap(),
+            expected
+        );
+        assert!(
+            read_server_net_id_assignments(&writer.as_slice()[..writer.as_slice().len() - 1])
+                .is_none()
+        );
     }
 }

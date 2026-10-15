@@ -21,6 +21,9 @@ basis-transport = { path = "../basis-transport" }
 bytes.workspace = true
 bytemuck = { workspace = true, optional = true }
 dashmap.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+x25519-dalek.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 pollster = { workspace = true, optional = true }
@@ -37,5 +40,6 @@ subtle = "2.6"
 wgpu = { workspace = true, optional = true }
 
 [dev-dependencies]
+chacha20poly1305.workspace = true
 bs58 = "0.5"
 ed25519-dalek.workspace = true
