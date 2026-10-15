@@ -103,6 +103,56 @@ fn connection_payload_propagates_oversized_login_password() {
     );
 }
 
+#[tokio::test]
+async fn scene_waits_for_admission_without_delaying_first_send_by_workload_interval() {
+    for reliable in [false, true] {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = test_client(0, server.local_addr().unwrap()).await;
+        let stop = Arc::new(Notify::new());
+        let task = tokio::spawn(crate::scene::run(
+            Arc::new(Mutex::new(vec![client.clone()])),
+            Arc::new(AtomicBool::new(false)),
+            stop.clone(),
+            Arc::new(crate::scene::SceneSession::new(32, None)),
+            Duration::from_secs(60),
+            reliable,
+        ));
+        let mut packet = [0u8; 512];
+        assert!(
+            time::timeout(Duration::from_millis(30), server.recv(&mut packet))
+                .await
+                .is_err()
+        );
+
+        // Admission without a DID challenge is valid too: metadata is the ready signal,
+        // rather than requiring a sealing key from an optional identity exchange.
+        *client.metadata_state() = Some(ServerAvatarMetadata {
+            sync_interval_ms: 20,
+            base_multiplier: 1.0,
+            increase_rate: 0.0,
+            slowest_send_rate_secs: 2.5,
+            uplink_delta_enabled: false,
+        });
+        let len = time::timeout(Duration::from_secs(1), server.recv(&mut packet))
+            .await
+            .expect("first scene send waited for the 60-second interval")
+            .unwrap();
+        let decoded = parse_packet(&packet[..len]).unwrap();
+        if reliable {
+            assert_eq!(decoded.property, PacketProperty::Channeled);
+            assert_eq!(decoded.channel_id, Some(channels::SCENE * 4 + 2));
+        } else {
+            assert_eq!(decoded.property, PacketProperty::Unreliable);
+            assert_eq!(packet[1], channels::SCENE);
+        }
+        stop.notify_one();
+        time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
 #[test]
 fn connection_payload_propagates_oversized_avatar_buffer() {
     let config = Config::default();

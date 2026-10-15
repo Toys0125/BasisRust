@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# In-process integration fixtures only; never enabled by production dependencies.
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
 basis-protocol = { path = "../basis-protocol" }

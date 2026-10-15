@@ -1877,6 +1877,23 @@ impl TransportHandle {
         self.is_current_session(session) && session.state.inbound_seal.lock().activate(key)
     }
 
+    /// Gives an in-process test proxy a cipher for inspecting and faulting real
+    /// encrypted datagrams without changing the live session's replay window.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_inbound_cipher(
+        &self,
+        remote_addr: SocketAddr,
+    ) -> Option<chacha20poly1305::ChaCha20Poly1305> {
+        let peer_id = *self.by_addr.get(&remote_addr)?;
+        let peer = self.peers.get(&peer_id)?;
+        let seal = peer.inbound_seal.lock();
+        match &*seal {
+            sealed_inbound::InboundSeal::Active { cipher, .. } => Some(cipher.clone()),
+            _ => None,
+        }
+    }
+
     async fn accept_session_with_seal(
         &self,
         request: &ConnectionRequest,

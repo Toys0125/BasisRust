@@ -157,6 +157,7 @@ pub(crate) async fn run(
     let mut ticker = time::interval(interval);
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut sequences = HashMap::<usize, u64>::new();
+    let mut first_send = true;
     loop {
         tokio::select! {
             biased;
@@ -180,9 +181,15 @@ pub(crate) async fn run(
             if shutdown.load(Ordering::Relaxed) {
                 break;
             }
-            if !client.connected.load(Ordering::Acquire) || !client.in_use.load(Ordering::Acquire) {
+            // ConnectAccept precedes DID authentication and the v56 uplink key.
+            // Metadata confirms admission, including servers with DID auth disabled.
+            if !client.connected.load(Ordering::Acquire)
+                || !client.in_use.load(Ordering::Acquire)
+                || client.metadata_state().is_none()
+            {
                 continue;
             }
+            first_send = false;
             if reliable && client.pending_reliable.lock().await.len() >= 256 {
                 session.metrics.lock().unwrap().backpressure += 1;
                 continue;
@@ -217,6 +224,10 @@ pub(crate) async fn run(
             } else {
                 m.send_errors += 1;
             }
+        }
+        if first_send {
+            // Keep the first send pending through login even with a long workload interval.
+            ticker.reset_after(Duration::from_millis(5));
         }
     }
 }

@@ -13,7 +13,8 @@ use std::{
 
 use basis_protocol::{channels, config::ServerConfig};
 use basis_server_core::ServerState;
-use basis_transport::PacketProperty;
+use basis_transport::{PacketProperty, TransportHandle};
+use chacha20poly1305::{aead::AeadInPlace, ChaCha20Poly1305, Nonce, Tag};
 use tempfile::TempDir;
 use tokio::{
     io::AsyncWriteExt,
@@ -105,6 +106,7 @@ impl Live {
         let proxy = tokio::spawn(proxy(
             front,
             server.transport.local_addr().unwrap(),
+            server.transport.clone(),
             tx,
             fault,
             stop,
@@ -338,14 +340,21 @@ impl Drop for Live {
     }
 }
 
+struct Upstream {
+    socket: Arc<UdpSocket>,
+    gap_ack: Arc<AtomicBool>,
+    cipher: Option<ChaCha20Poly1305>,
+}
+
 async fn proxy(
     front: Arc<UdpSocket>,
     server: SocketAddr,
+    transport: TransportHandle,
     tx: mpsc::UnboundedSender<Capture>,
     fault: Fault,
     mut stop: oneshot::Receiver<()>,
 ) {
-    let mut upstreams = HashMap::new();
+    let mut upstreams: HashMap<SocketAddr, Upstream> = HashMap::new();
     let mut receivers = JoinSet::new();
     let mut dropped_auth = false;
     let loss = fault == Fault::ReliableLoss;
@@ -363,39 +372,114 @@ async fn proxy(
                     Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => continue,
                     result => result.unwrap(),
                 };
-                if fault == Fault::InvalidSignature && buffer[0] & 31 == 1 && buffer[3] == 2 {
-                    // Change one signature byte in the actual client's response. Retain
-                    // its framing, channel, sequence, and all remaining bytes.
-                    assert_eq!(len, 75);
-                    assert_eq!(&buffer[4..6], &[64, 0]);
-                    buffer[6] ^= 1;
-                }
                 if let std::collections::hash_map::Entry::Vacant(entry) = upstreams.entry(client) {
                     let upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
                     upstream.connect(server).await.unwrap();
                     let gap_ack = Arc::new(AtomicBool::new(false));
-                    entry.insert((upstream.clone(), gap_ack.clone()));
+                    entry.insert(Upstream { socket: upstream.clone(), gap_ack: gap_ack.clone(), cipher: None });
                     receivers.spawn(receive_server(upstream, front.clone(), client, tx.clone(), loss, gap_ack));
                 }
-                let frames = frames(&buffer[..len]);
+                let upstream = &upstreams[&client].socket;
+                let server_addr = upstream.local_addr().unwrap();
+                if upstreams[&client].cipher.is_none() {
+                    upstreams.get_mut(&client).unwrap().cipher = transport.test_inbound_cipher(server_addr);
+                }
+                let cipher = upstreams[&client].cipher.as_ref();
+                let (mut plaintext, mut frames) = decode_client_datagram(&buffer[..len], cipher);
+                let mut wire = buffer[..len].to_vec();
+                if fault == Fault::InvalidSignature {
+                    if let Some(frame) = frames.iter_mut().find(|p| p[0] & 31 == 1 && p.get(3) == Some(&(channels::AUTH_IDENTITY * 4 + 2))) {
+                        // The v56 DID response is sealed. Change the signature in the
+                        // decoded reliable packet, then authenticate it again with the
+                        // same packet counter so the server reaches signature validation.
+                        assert!(cipher.is_some(), "identity response was not sealed");
+                        assert_eq!(frame.len(), 75);
+                        assert_eq!(&frame[4..6], &[64, 0]);
+                        frame[6] ^= 1;
+                        assert_eq!(plaintext[0] & 31, 1, "identity response unexpectedly packed");
+                        plaintext[6] ^= 1;
+                        wire = seal_datagram(cipher.unwrap(), &plaintext, counter(&buffer[..len]));
+                    }
+                }
                 // Release sequence zero only after the client has ACKed the real gap.
                 // This makes loss recovery deterministic even on a slow CI runner.
                 if frames.iter().any(|p| p[0] & 31 == 2 && p[3] == channels::CHAT * 4 + 2
                     && p[1..3] == [0, 0] && p[4] & 1 == 0 && p[4..20].iter().any(|b| *b != 0)) {
-                    upstreams[&client].1.store(true, Ordering::Relaxed);
+                    upstreams[&client].gap_ack.store(true, Ordering::Relaxed);
                 }
                 let drop = loss && !dropped_auth && frames.iter().any(|p| {
                     p[0] & 31 == 1 && p[3] == channels::AUTH_IDENTITY * 4 + 2
                 });
                 dropped_auth |= drop;
                 capture(&tx, client, false, drop, frames);
-                if !drop { upstreams[&client].0.send(&buffer[..len]).await.unwrap(); }
+                if !drop { upstreams[&client].socket.send(&wire).await.unwrap(); }
             }
             result = receivers.join_next(), if !receivers.is_empty() => {
                 panic!("proxy forwarder stopped: {result:?}");
             }
         }
     }
+}
+
+/// Decode one real client datagram for assertions. v56 leaves the first property
+/// byte visible and appends a 16-byte tag and 8-byte counter after sealing bytes[1..].
+/// Non-user control traffic can remain cleartext while the login key is installed.
+fn decode_client_datagram(
+    packet: &[u8],
+    cipher: Option<&ChaCha20Poly1305>,
+) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let mut plaintext = packet.to_vec();
+    let mut opened = false;
+    if let Some(cipher) = cipher {
+        if packet.len() > 24 {
+            let tag_start = packet.len() - 24;
+            let counter_bytes: [u8; 8] = packet[packet.len() - 8..].try_into().unwrap();
+            let count = i64::from_le_bytes(counter_bytes);
+            if count > 0 {
+                let mut nonce = [0u8; 12];
+                nonce[..8].copy_from_slice(&counter_bytes);
+                let tag = Tag::from_slice(&packet[tag_start..tag_start + 16]);
+                if cipher
+                    .decrypt_in_place_detached(
+                        Nonce::from_slice(&nonce),
+                        &packet[..1],
+                        &mut plaintext[1..tag_start],
+                        tag,
+                    )
+                    .is_ok()
+                {
+                    plaintext.truncate(tag_start);
+                    opened = true;
+                }
+            }
+        }
+        let property = packet[0] & 31;
+        if matches!(property, 0 | 1 | 12 | 18) {
+            assert!(
+                opened,
+                "v56 client user datagram failed authenticated decryption: property={property}, len={}", packet.len()
+            );
+        }
+    }
+    let children = frames(&plaintext);
+    (plaintext, children)
+}
+
+fn counter(packet: &[u8]) -> i64 {
+    i64::from_le_bytes(packet[packet.len() - 8..].try_into().unwrap())
+}
+
+fn seal_datagram(cipher: &ChaCha20Poly1305, plaintext: &[u8], count: i64) -> Vec<u8> {
+    let mut packet = plaintext.to_vec();
+    let mut nonce = [0u8; 12];
+    nonce[..8].copy_from_slice(&count.to_le_bytes());
+    let header = [packet[0]];
+    let tag = cipher
+        .encrypt_in_place_detached(Nonce::from_slice(&nonce), &header, &mut packet[1..])
+        .expect("reseal mutated client datagram");
+    packet.extend_from_slice(&tag);
+    packet.extend_from_slice(&count.to_le_bytes());
+    packet
 }
 
 async fn receive_server(

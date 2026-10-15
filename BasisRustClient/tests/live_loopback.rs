@@ -1,10 +1,17 @@
-//! Executable-to-server regressions. Wire expectations are pinned to BasisVR
-//! 81f190b217c11c2b39231e0bc9db330fd4a2803c; see README.md for source paths/limits.
+//! Executable-to-server regressions. Legacy payload expectations are pinned to
+//! BasisVR 81f190b217c11c2b39231e0bc9db330fd4a2803c; v56 login/sealing is covered
+//! against the Rust implementations. See README.md for source paths/limits.
 mod support;
 
 use std::collections::{HashMap, HashSet};
 
-use basis_protocol::channels;
+use basis_protocol::{
+    application::NetworkApplication,
+    channels,
+    io::NetReader,
+    login::{connection_payload_hash, did_login_transcript},
+    version::SERVER_VERSION,
+};
 use basis_transport::{DeliveryMethod, PacketProperty};
 use support::{Fault, Live, LIMIT, SILENCE};
 use tokio::io::AsyncWriteExt;
@@ -19,13 +26,20 @@ async fn wrong_password_rejects_actual_client_before_identity_or_player_admissio
                 let rejected = live
                     .until(|p| p.from_server && p.property() == PacketProperty::Disconnect)
                     .await;
-                // LiteNetLib Disconnect: property + timestamp + string. The encoded string
-                // length includes one; the wire carries no terminating NUL.
-                let len = u16::from_le_bytes(rejected.bytes[9..11].try_into().unwrap()) as usize;
+                // LiteNetLib Disconnect: property + timestamp + structured rejection.
+                let mut rejection = NetReader::new(&rejected.bytes[9..]);
+                assert_eq!(rejection.get_u32().unwrap(), channels::REJECT_MAGIC);
                 assert_eq!(
-                    &rejected.bytes[11..11 + len - 1],
-                    b"Authentication failed, Auth rejected"
+                    rejection.get_u8().unwrap(),
+                    channels::REJECT_KIND_PASSWORD_REJECTED
                 );
+                assert_eq!(rejection.get_u16().unwrap(), 0);
+                assert_eq!(rejection.get_u16().unwrap(), 0);
+                assert_eq!(
+                    rejection.get_string().unwrap(),
+                    "Authentication failed, Auth rejected"
+                );
+                assert_eq!(rejection.remaining(), 0);
                 assert_eq!(live.server.player_count(), 0);
                 assert_eq!(live.server.transport.connected_peers_count(), 0);
                 live.await_client_rejection().await;
@@ -79,6 +93,7 @@ async fn identity_auth_and_reliable_ack_recover_loss_across_a_full_window() {
         .run(|live| {
             Box::pin(async move {
                 let deadline = Instant::now() + LIMIT;
+                let mut connection = None;
                 let mut challenge = None;
                 let mut response = None;
                 let mut dropped_response = None;
@@ -86,13 +101,29 @@ async fn identity_auth_and_reliable_ack_recover_loss_across_a_full_window() {
                 let mut challenge_ack = false;
                 while !(metadata && response.is_some() && challenge_ack) {
                     let packet = live.next(deadline).await;
-                    if packet.channeled(channels::AUTH_IDENTITY) {
+                    if !packet.from_server && packet.property() == PacketProperty::ConnectRequest {
+                        let mut reader =
+                            NetReader::new(&packet.bytes[18 + packet.bytes[17] as usize..]);
+                        assert_eq!(reader.get_u16().unwrap(), SERVER_VERSION);
+                        NetworkApplication::try_read(&mut reader).unwrap();
+                        reader.get_bytes_with_length().unwrap(); // password
+                        let hash = connection_payload_hash(reader.remaining_slice());
+                        let public: [u8; 32] =
+                            reader.get_bytes_with_length().unwrap().try_into().unwrap();
+                        connection = Some((public, hash));
+                    } else if packet.channeled(channels::AUTH_IDENTITY) {
                         if packet.from_server {
-                            // BytesMessage = u16 length + challenge bytes.
-                            let len =
-                                u16::from_le_bytes(packet.bytes[4..6].try_into().unwrap()) as usize;
-                            assert_eq!(len, 32);
-                            challenge = Some(packet.bytes[6..6 + len].to_vec());
+                            let mut reader = NetReader::new(&packet.bytes[4..]);
+                            let nonce = reader.get_bytes_with_length().unwrap().to_vec();
+                            assert_eq!(nonce.len(), 32);
+                            let public: [u8; 32] =
+                                reader.get_bytes_with_length().unwrap().try_into().unwrap();
+                            let server_id =
+                                std::str::from_utf8(reader.get_bytes_with_length().unwrap())
+                                    .unwrap()
+                                    .to_owned();
+                            assert_eq!(reader.remaining(), 0);
+                            challenge = Some((nonce, public, server_id));
                         } else if packet.dropped {
                             dropped_response = Some(packet.bytes);
                         } else {
@@ -132,8 +163,19 @@ async fn identity_auth_and_reliable_ack_recover_loss_across_a_full_window() {
                 let response = response.unwrap();
                 assert_eq!(&response[4..6], &[64, 0]);
                 assert_eq!(&response[70..], &[3, 0, b'N', b'/', b'A']);
+                let (client_public, payload_hash) = connection.unwrap();
+                let (nonce, server_public, server_id) = challenge.unwrap();
+                let transcript = did_login_transcript(
+                    did,
+                    &server_id,
+                    &nonce,
+                    &client_public,
+                    &server_public,
+                    &payload_hash,
+                )
+                .unwrap();
                 key.verify_strict(
-                    &challenge.unwrap(),
+                    &transcript,
                     &ed25519_dalek::Signature::from_slice(&response[6..70]).unwrap(),
                 )
                 .unwrap();

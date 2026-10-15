@@ -583,7 +583,9 @@ pub(crate) async fn voice_workers(
         let snapshot = clients.lock().await.clone();
         let connected = snapshot
             .iter()
-            .filter(|client| client.connected.load(Ordering::Relaxed))
+            .filter(|client| {
+                client.connected.load(Ordering::Relaxed) && client.metadata_state().is_some()
+            })
             .map(|client| client.index)
             .collect::<Vec<_>>();
         let connected_set = connected.iter().copied().collect::<HashSet<_>>();
