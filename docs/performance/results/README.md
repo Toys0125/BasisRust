@@ -1,5 +1,23 @@
 # Performance results
 
+The [2026-10-14 consolidated summary](../optimization-summary-20261014.md) covers every retained/rejected optimization, benchmark and profiling scope, and the full 1,000-player week simulation. New machine exports remain local under ignored `captures/`; readable reports and heatmaps are versioned.
+
+The [2026-10-13 payload ownership comparison](../optimization-20261013.md) covers all available benchmark families, native Linux perf captures, heatmaps and retained overload results.
+
+The [follow-up membership snapshot comparison](../optimization-20261013-membership.md) adds matched latency, delivery, voice CPU, and native cycle evidence against that accepted revision.
+
+The [client quaternion packing comparison](../optimization-20261013-packing.md) records byte-equivalence, targeted packing costs, and whole-client CPU results with an unchanged server.
+
+The [bulk residual encoding comparison](../optimization-20261013-delta.md) records all-quality encoder costs, matched live results, and native client heatmaps; whole-process gains remain workload-dependent.
+
+The [voice overload diagnosis](../optimization-20261013-voice.md) identifies source-inbox replacement and client cadence limits while preserving failed capacity gates.
+
+The [second-pass tooling review](../optimization-20261013-round2-tooling.md) strengthens sample-count and audio-identity guards. The [receiver-index experiment](../optimization-20261013-index.md) was rejected after worse delivery at 1,500 clients.
+
+The [voice-buffer experiment](../optimization-20261013-voice-send.md) was rejected after the overloaded workload delivered fewer avatar updates, despite modest client user-CPU savings.
+
+The [exact-clean delta shortcut](../optimization-20261013-clean.md) reduces clean encoder cost 87–90%; repeated live validation supports a targeted encoder claim, without a general capacity claim.
+
 The [PR #31 machine-readable benchmark summary](../benchmark-summary.json) retains reliable-receive samples, historical voice aggregates, and the peer-snapshot enumeration microbenchmark without adding raw captures.
 
 This directory summarizes the measured outcomes and their limits. The Windows
@@ -176,3 +194,13 @@ The [2026-10-04 tuning CLI smoke](../hardware-tuning-validation-20261004.md)
 retains four Linux quick runs and reports an inconclusive result; its
 [JSON](hardware-tuning-smoke-20261004.json) includes all measured runs and gates.
 This is tool validation, not a new universal performance recommendation.
+
+- [Zstd destination experiment (rejected)](../optimization-20261013-zstd.md): compressor screen improved, but lower live CPU came with fewer delivered updates.
+
+- [Initial channel-bitset experiment](../optimization-20261013-bundle.md): full encoder improves, but live delivery trades between 1,000 and 1,500 avatars; the confirmation below rejects it.
+
+- [Direct single-bit decoder (retained)](../optimization-20261014-read-bit.md): full dense decoding 5.5–8.9% faster; all matched delivery/coverage/error gates pass.
+
+- [Channel-bitset confirmation (rejected)](../optimization-20261014-channel-confirm.md): repeated 1,000-avatar delivery loss on the accepted decoder base.
+
+- [Client payload borrow (rejected)](../optimization-20261014-client-borrow.md): serializer −2.79%, but 1,500-avatar delivery −2.08% and p95 +3.50%; restored the measured control and stopped further experiments.
