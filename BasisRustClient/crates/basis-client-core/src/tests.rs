@@ -645,6 +645,62 @@ async fn test_client_with_voice_diagnostics(
 }
 
 #[tokio::test]
+async fn client_debug_redacts_connection_secrets() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(7, server.local_addr().unwrap()).await;
+    *client.sealed_outbound.lock().unwrap() = Some(([237; 32], 19));
+    *client.legacy_retry_payload.lock().unwrap() = Some(vec![251; 40]);
+    for debug in [format!("{client:?}"), format!("{client:#?}")] {
+        assert!(debug.contains("index: 7"));
+        assert!(debug.contains("connection_secret: \"<redacted>\""));
+        assert!(debug.contains("sealed_outbound: \"<redacted>\""));
+        assert!(debug.contains("legacy_retry_payload: \"<redacted>\""));
+        assert!(!debug.contains("13, 13, 13"));
+        assert!(!debug.contains("237, 237, 237"));
+        assert!(!debug.contains("251, 251, 251"));
+    }
+}
+
+#[tokio::test]
+async fn duplicate_start_preserves_active_connection_state() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let config = Config::default();
+    let ready = ready_message(&config, [0.0; 3]).unwrap();
+    for version in [SERVER_VERSION, LEGACY_SERVER_VERSION] {
+        let client = test_client(0, server.local_addr().unwrap()).await;
+        let key = [9; 32];
+        *client.connection_payload_hash.lock().unwrap() = [71; 32];
+        *client.sealed_outbound.lock().unwrap() = Some((key, 19));
+        client.protocol_version.store(version, Ordering::Release);
+        *client.legacy_retry_payload.lock().unwrap() = Some(vec![42]);
+        let error = client
+            .start_client(&config, &ready, true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Call Shutdown First!"));
+        assert_eq!(*client.connection_payload_hash.lock().unwrap(), [71; 32]);
+        assert_eq!(*client.sealed_outbound.lock().unwrap(), Some((key, 19)));
+        assert_eq!(client.protocol_version.load(Ordering::Acquire), version);
+        assert_eq!(*client.legacy_retry_payload.lock().unwrap(), Some(vec![42]));
+        assert!(client.connected.load(Ordering::Acquire));
+        assert!(client.in_use.load(Ordering::Acquire));
+        let packet = [PacketProperty::Ping as u8, 0, 0];
+        let sealed = client.seal_connected(&packet).unwrap().unwrap();
+        assert_eq!(
+            u64::from_le_bytes(sealed[sealed.len() - 8..].try_into().unwrap()),
+            20
+        );
+        assert_eq!(open_client_datagram(&key, &sealed), packet);
+        let mut buffer = [0; 32];
+        assert!(
+            time::timeout(Duration::from_millis(20), server.recv(&mut buffer))
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
 async fn reliable_voice_diagnostics_skip_duplicates_on_direct_merged_and_compact_merged() {
     use crate::voice_diagnostics::WindowActiveTestGuard;
 
