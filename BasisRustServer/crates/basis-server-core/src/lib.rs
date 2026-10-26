@@ -3818,23 +3818,18 @@ async fn handle_message(
                 .get(&peer)
                 .map(|p| p.metadata.player_uuid.clone())
                 .unwrap_or_default();
-            let Some(existing) = state
+            let removal_locked = state.global_state.read().content_removal_locked;
+            if state
                 .resources
-                .all_resources()
-                .into_iter()
-                .find(|r| r.loaded_net_id == request.loaded_net_id)
-            else {
-                return Ok(());
-            };
-            if (existing.is_admin_locked && !is_moderator)
-                || (state.global_state.read().content_removal_locked
-                    && !is_moderator
-                    && (requester_uuid.is_empty() || requester_uuid != existing.uuid_of_creator))
+                .unload_resource_if(&request.loaded_net_id, |resource| {
+                    is_moderator
+                        || (!resource.is_admin_locked
+                            && (!removal_locked
+                                || (!requester_uuid.is_empty()
+                                    && requester_uuid == resource.uuid_of_creator)))
+                })
+                .is_some()
             {
-                return Ok(());
-            }
-            if let Some(resource) = state.resources.unload_resource(&request.loaded_net_id) {
-                let _ = resource;
                 let mut writer = NetWriter::new();
                 request.serialize(&mut writer)?;
                 state

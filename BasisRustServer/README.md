@@ -45,6 +45,23 @@ Useful flags:
 
 ### Cilbox SQL player storage (optional)
 
+`StorageEnabled`, `StorageBackend`, `StorageConnectionString`, and `StorageSqlTable`
+are startup settings. Edit them in the server XML configuration and restart the
+server; `/config set` rejects live changes to these fields without changing the
+running configuration. `BASIS_STORAGE_URL` is also read only at startup.
+Storage quota limits can be changed live.
+
+Persistent storage reconciles aggregate usage at startup, then updates accounting
+with each mutation instead of rescanning every account. File storage uses an OS
+directory lock and a recovery ledger; SQL storage maintains totals with database
+triggers. Deleting the last key or clearing the last scope removes the account's
+file or SQL row. Legacy empty accounts are removed during startup reconciliation.
+Stop the server before manually editing player files.
+
+SQL table names are ASCII identifiers of at most 63 bytes. The PostgreSQL user
+must own the storage table and its accounting objects, and have permission to
+create tables, functions, and triggers in the configured schema.
+
 Build or run with the `sql-storage` feature to add PostgreSQL and embedded
 SQLite support. The feature is **off by default**; the existing `file` and
 `memory` storage backends continue working without it.
@@ -72,7 +89,7 @@ in the server XML. `BASIS_STORAGE_URL` overrides the XML value. TLS is
 available via SQLx/rustls; use `sslmode=require` for remote connections.
 
 **SQLite fallback:** With no remote URL, or if PostgreSQL cannot be connected
-to and initialized at startup, the server automatically opens
+to at startup, the server automatically opens
 `<base-dir>/storage/players.sqlite3` (creates it if missing). SQLite is
 embedded; there is no local database service to install. If
 `HasFileSupport=false`, the fallback SQLite database is in-memory instead.
@@ -83,6 +100,8 @@ falling back does not migrate existing PostgreSQL data, and when PostgreSQL
 becomes reachable on the next server restart, it is used again. A live
 PostgreSQL outage returns a storage-unavailable response rather than silently
 switching stores in the middle of a session (avoids split-brain writes).
+If PostgreSQL connects but its schema/accounting initialization fails, storage
+is disabled with an explicit error instead of selecting a different database.
 Back up the SQLite file and remote database independently. Changes to
 `StorageBackend` likewise do not migrate old `file` storage records.
 

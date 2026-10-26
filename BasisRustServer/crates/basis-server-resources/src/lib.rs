@@ -32,12 +32,20 @@ impl ResourceState {
         message: ResourceManagementMessage,
         max_per_creator: usize,
     ) -> bool {
+        self.insert_resource(&mut self.resources.write(), message, max_per_creator)
+    }
+
+    fn insert_resource(
+        &self,
+        resources: &mut HashMap<String, ResourceManagementMessage>,
+        message: ResourceManagementMessage,
+        max_per_creator: usize,
+    ) -> bool {
         let id = message.loaded_net_id.clone();
         if id.is_empty() {
             return false;
         }
         let creator = message.uuid_of_creator.clone();
-        let mut resources = self.resources.write();
         if resources.contains_key(&id) {
             return false;
         }
@@ -54,12 +62,25 @@ impl ResourceState {
     }
 
     pub fn unload_resource(&self, id: &str) -> Option<ResourceManagementMessage> {
-        self.preload_sessions.write().remove(id);
-        let removed = self.resources.write().remove(id);
-        if let Some(resource) = removed.as_ref() {
-            self.note_resource_removed(&resource.uuid_of_creator);
+        self.unload_resource_if(id, |_| true)
+    }
+
+    /// Authorize the actual resource under the same lock as removal.
+    pub fn unload_resource_if(
+        &self,
+        id: &str,
+        allowed: impl FnOnce(&ResourceManagementMessage) -> bool,
+    ) -> Option<ResourceManagementMessage> {
+        let mut resources = self.resources.write();
+        if !allowed(resources.get(id)?) {
+            return None;
         }
-        removed
+        let removed = resources.remove(id)?;
+        // Keep the resource lock until cleanup completes so a replacement with
+        // the same ID cannot lose its preload session or creator accounting.
+        self.preload_sessions.write().remove(id);
+        self.note_resource_removed(&removed.uuid_of_creator);
+        Some(removed)
     }
 
     fn note_resource_removed(&self, creator: &str) {
@@ -177,7 +198,8 @@ impl ResourceState {
         peers: &[u16],
         max_per_creator: usize,
     ) -> bool {
-        if !self.load_resource_with_limit(resource.clone(), max_per_creator) {
+        let mut resources = self.resources.write();
+        if !self.insert_resource(&mut resources, resource.clone(), max_per_creator) {
             return false;
         }
         self.preload_sessions.write().insert(
@@ -687,6 +709,57 @@ impl PipState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resource(id: &str, creator: &str) -> ResourceManagementMessage {
+        ResourceManagementMessage {
+            mode: 0,
+            loaded_net_id: id.into(),
+            unlock_password: String::new(),
+            combined_url: "https://example.com/resource".into(),
+            uuid_of_creator: creator.into(),
+            is_admin_locked: true,
+            position_x: 0.0,
+            position_y: 0.0,
+            position_z: 0.0,
+            quaternion_x: 0.0,
+            quaternion_y: 0.0,
+            quaternion_z: 0.0,
+            quaternion_w: 1.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            scale_z: 1.0,
+            persist: false,
+            static_resource: false,
+            static_admin_locked: false,
+            modify_scale: false,
+            load_strategy: 0,
+        }
+    }
+
+    #[test]
+    fn authorized_unload_preserves_denied_preloads_and_cleans_up_once() {
+        let state = ResourceState::default();
+        assert!(state.start_preload(resource("one", "alice"), &[1], 1));
+        assert!(state
+            .unload_resource_if("missing", |_| panic!("missing ID must not scan resources"))
+            .is_none());
+        assert!(state
+            .unload_resource_if("one", |resource| !resource.is_admin_locked)
+            .is_none());
+        assert!(state.preload_sessions.read().contains_key("one"));
+        assert!(!state.load_resource_with_limit(resource("two", "alice"), 1));
+        assert!(state
+            .unload_resource_if("one", |resource| resource.uuid_of_creator == "alice")
+            .is_some());
+        assert!(!state.preload_sessions.read().contains_key("one"));
+        assert!(state.unload_resource("one").is_none());
+        assert!(state.load_resource_with_limit(resource("one", "bob"), 1));
+        assert!(state
+            .unload_resource_if("one", |resource| resource.uuid_of_creator == "alice")
+            .is_none());
+        assert!(state.load_resource_with_limit(resource("two", "alice"), 1));
+        assert_eq!(state.creator_counts.read().get("bob"), Some(&1));
+    }
 
     #[test]
     fn net_id_namespace_exhausts_gracefully_and_preserves_live_names_until_reset() {

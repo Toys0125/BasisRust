@@ -769,6 +769,23 @@ impl ServerConfig {
         })
     }
 
+    /// Storage handles are bound at startup; a live edit must not pretend to
+    /// switch databases or enable a backend that was never initialized.
+    pub fn set_live_field(&mut self, name: &str, value: &str) -> Result<()> {
+        anyhow::ensure!(
+            ![
+                "StorageEnabled",
+                "StorageBackend",
+                "StorageConnectionString",
+                "StorageSqlTable"
+            ]
+            .iter()
+            .any(|field| field.eq_ignore_ascii_case(name)),
+            "{name} requires a server restart; edit the server XML configuration and restart"
+        );
+        self.set_field(name, value)
+    }
+
     pub fn set_field(&mut self, name: &str, value: &str) -> Result<()> {
         let mut serialized = serde_json::to_value(&*self)?;
         let object = serialized
@@ -816,6 +833,35 @@ impl ServerConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn storage_initialization_fields_reject_live_edits_without_mutating_config() {
+        let mut config = super::ServerConfig::default();
+        let before = serde_json::to_value(&config).unwrap();
+        for (field, value) in [
+            ("StorageEnabled", "false"),
+            ("storagebackend", "sql"),
+            ("StorageConnectionString", "postgres://test"),
+            ("StorageSqlTable", "other"),
+        ] {
+            let error = config.set_live_field(field, value).unwrap_err();
+            assert!(error.to_string().contains("restart"));
+            assert_eq!(serde_json::to_value(&config).unwrap(), before);
+        }
+        config
+            .set_live_field("StorageMaxBytesPerPlayer", "4096")
+            .unwrap();
+        assert_eq!(config.storage_max_bytes_per_player, 4096);
+        config
+            .set_live_field("StorageMaxTotalMegabytes", "32")
+            .unwrap();
+        assert_eq!(config.storage_max_total_megabytes, 32);
+        config.set_field("StorageBackend", "sql").unwrap();
+        assert_eq!(
+            config.storage_backend, "sql",
+            "offline/startup edits remain supported"
+        );
+    }
+
     #[test]
     fn basisvr_restriction_modes_and_new_policy_fields_roundtrip() {
         use super::*;

@@ -150,7 +150,22 @@ struct State {
 #[derive(Debug, Clone)]
 pub struct PlayerStorage {
     root: Option<PathBuf>,
+    file_lock: Option<Arc<fs::File>>,
     state: Arc<Mutex<State>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FileUsage {
+    used: usize,
+    dirty: bool,
+}
+
+struct PlayerFileGuard<'a>(&'a fs::File);
+
+impl Drop for PlayerFileGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 impl PlayerStorage {
@@ -159,10 +174,97 @@ impl PlayerStorage {
             fs::create_dir_all(root)
                 .with_context(|| format!("creating player storage {}", root.display()))?;
         }
-        Ok(Self {
+        let file_lock = root
+            .as_ref()
+            .map(|root| {
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(root.join(".lock"))
+                    .map(Arc::new)
+            })
+            .transpose()?;
+        let storage = Self {
             root,
+            file_lock,
             state: Arc::new(Mutex::new(State::default())),
-        })
+        };
+        if storage.root.is_some() {
+            let _guard = storage.lock_files()?;
+            storage.reconcile_files()?;
+        }
+        Ok(storage)
+    }
+
+    fn lock_files(&self) -> Result<Option<PlayerFileGuard<'_>>> {
+        self.file_lock
+            .as_ref()
+            .map(|file| {
+                file.lock().context("locking player storage directory")?;
+                Ok(PlayerFileGuard(file))
+            })
+            .transpose()
+    }
+
+    fn write_file_usage(&self, used: usize, dirty: bool) -> Result<()> {
+        let path = self
+            .root
+            .as_ref()
+            .expect("file storage root")
+            .join(".usage");
+        let bytes = serde_json::to_vec(&FileUsage { used, dirty })?;
+        super::atomic_write_with(
+            &path,
+            |file| std::io::Write::write_all(file, &bytes),
+            super::sync_directory,
+        )
+    }
+
+    /// Reconcile once at startup, or recover an interrupted record/ledger update.
+    /// Callers hold the directory's OS lock throughout reconciliation and writes.
+    fn reconcile_files(&self) -> Result<usize> {
+        let root = self.root.as_ref().expect("file storage root");
+        let mut used = 0usize;
+        for entry in fs::read_dir(root)? {
+            let path = entry?.path();
+            if !path.extension().is_some_and(|ext| ext == "json") {
+                continue;
+            }
+            let bytes = fs::read(&path)?;
+            if let Ok(record) = serde_json::from_slice::<PlayerRecord>(&bytes) {
+                if record.scopes.is_empty() && self.file_for(&record.owner).as_ref() == Some(&path)
+                {
+                    fs::remove_file(&path)?;
+                    continue;
+                }
+            }
+            used = used
+                .checked_add(bytes.len())
+                .context("player storage size overflow")?;
+        }
+        super::sync_directory(root)?;
+        self.write_file_usage(used, false)?;
+        Ok(used)
+    }
+
+    fn file_usage(&self) -> Result<usize> {
+        let path = self
+            .root
+            .as_ref()
+            .expect("file storage root")
+            .join(".usage");
+        match fs::read(path) {
+            Ok(bytes) => {
+                if let Ok(FileUsage { used, dirty: false }) = serde_json::from_slice(&bytes) {
+                    return Ok(used);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.reconcile_files()
     }
 
     fn file_for(&self, owner: &str) -> Option<PathBuf> {
@@ -204,30 +306,43 @@ impl PlayerStorage {
         let Some(path) = self.file_for(owner) else {
             return Ok(());
         };
-        let bytes = serde_json::to_vec(record)?;
-        if max_total_bytes > 0 {
-            let old = fs::metadata(&path).map(|m| m.len() as usize).unwrap_or(0);
-            let mut used = 0usize;
-            for entry in fs::read_dir(self.root.as_ref().expect("file storage root"))? {
-                let entry = entry?;
-                if entry.path().extension().is_some_and(|ext| ext == "json") {
-                    used = used.saturating_add(entry.metadata()?.len() as usize);
-                }
+        let bytes = if record.scopes.is_empty() {
+            Vec::new()
+        } else {
+            serde_json::to_vec(record)?
+        };
+        let used = self.file_usage()?;
+        let old = match fs::metadata(&path) {
+            Ok(metadata) => usize::try_from(metadata.len())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        };
+        let next = used
+            .checked_sub(old)
+            .context("player storage accounting mismatch")?
+            .checked_add(bytes.len())
+            .context("player storage size overflow")?;
+        anyhow::ensure!(
+            quota_allows(used, next, max_total_bytes),
+            "global player storage quota exceeded"
+        );
+        // Persist the recovery marker before changing data. If any step fails or
+        // the process exits, the next operation rebuilds the ledger from files.
+        self.write_file_usage(used, true)?;
+        if bytes.is_empty() {
+            match fs::remove_file(&path) {
+                Ok(()) => super::sync_directory(self.root.as_ref().expect("file storage root"))?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
-            anyhow::ensure!(
-                quota_allows(
-                    used,
-                    used.saturating_sub(old).saturating_add(bytes.len()),
-                    max_total_bytes,
-                ),
-                "global player storage quota exceeded"
-            );
+        } else {
+            super::atomic_write_with(
+                &path,
+                |file| std::io::Write::write_all(file, &bytes),
+                super::sync_directory,
+            )?;
         }
-        super::atomic_write_with(
-            &path,
-            |file| std::io::Write::write_all(file, &bytes),
-            super::sync_directory,
-        )
+        self.write_file_usage(next, false)
     }
 
     pub fn execute(
@@ -260,6 +375,13 @@ impl PlayerStorage {
             reply.status = StorageStatus::RateLimited;
             return reply;
         }
+        let _file_guard = match self.lock_files() {
+            Ok(guard) => guard,
+            Err(_) => {
+                reply.status = StorageStatus::Unavailable;
+                return reply;
+            }
+        };
         let record = match state.records.get(owner) {
             Some(record) => record.clone(),
             None => match self.read_account(owner) {
@@ -399,6 +521,100 @@ pub(crate) fn apply_request(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn disk_bytes(storage: &PlayerStorage) -> usize {
+        fs::read_dir(storage.root.as_ref().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .map(|path| fs::metadata(path).unwrap().len() as usize)
+            .sum()
+    }
+
+    #[test]
+    fn file_accounting_serializes_independent_instances_and_removes_empty_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = PlayerStorage::new(Some(dir.path().to_path_buf())).unwrap();
+        assert_eq!(
+            first
+                .execute("alice", request(StorageOp::Set, "one", 64), 1024, 0)
+                .status,
+            StorageStatus::Ok
+        );
+        let size = disk_bytes(&first);
+        assert_eq!(
+            first
+                .execute("alice", request(StorageOp::Clear, "one", 0), 1024, 0)
+                .status,
+            StorageStatus::Ok
+        );
+        assert!(!first.file_for("alice").unwrap().exists());
+        assert_eq!(first.file_usage().unwrap(), 0);
+        let second = PlayerStorage::new(Some(dir.path().to_path_buf())).unwrap();
+        let a = first.clone();
+        let b = second.clone();
+        let one = std::thread::spawn(move || {
+            a.execute("alice", request(StorageOp::Set, "one", 64), 1024, size)
+        });
+        let two = std::thread::spawn(move || {
+            b.execute("bobby", request(StorageOp::Set, "one", 64), 1024, size)
+        });
+        let statuses = [one.join().unwrap().status, two.join().unwrap().status];
+        assert_eq!(
+            statuses.iter().filter(|s| **s == StorageStatus::Ok).count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|s| **s == StorageStatus::Full)
+                .count(),
+            1
+        );
+        assert_eq!(first.file_usage().unwrap(), size);
+        assert_eq!(disk_bytes(&first), size);
+        for owner in ["alice", "bobby"] {
+            first.execute(owner, request(StorageOp::Clear, "one", 0), 1024, 0);
+        }
+        assert_eq!(disk_bytes(&first), 0);
+        assert_eq!(second.file_usage().unwrap(), 0);
+    }
+
+    #[test]
+    fn file_ledger_recovers_interrupted_updates_and_cleans_legacy_empty_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = PlayerStorage::new(Some(dir.path().to_path_buf())).unwrap();
+        storage.execute("alice", request(StorageOp::Set, "one", 64), 1024, 0);
+        storage
+            .write_file_usage(storage.file_usage().unwrap(), true)
+            .unwrap();
+        fs::remove_file(storage.file_for("alice").unwrap()).unwrap();
+        assert_eq!(
+            storage
+                .execute("bobby", request(StorageOp::Set, "one", 16), 1024, 1000)
+                .status,
+            StorageStatus::Ok
+        );
+        assert_eq!(storage.file_usage().unwrap(), disk_bytes(&storage));
+        let empty = PlayerRecord {
+            owner: "legacy".into(),
+            ..Default::default()
+        };
+        fs::write(
+            storage.file_for("legacy").unwrap(),
+            serde_json::to_vec(&empty).unwrap(),
+        )
+        .unwrap();
+        let restarted = PlayerStorage::new(Some(dir.path().to_path_buf())).unwrap();
+        assert!(!restarted.file_for("legacy").unwrap().exists());
+        assert_eq!(restarted.file_usage().unwrap(), disk_bytes(&restarted));
+        assert_eq!(
+            restarted
+                .execute("bobby", request(StorageOp::Get, "one", 0), 1024, 1000)
+                .value,
+            vec![1; 16]
+        );
+    }
 
     #[test]
     fn full_budget_bookkeeping_admits_new_owners_without_resetting_active_limits() {

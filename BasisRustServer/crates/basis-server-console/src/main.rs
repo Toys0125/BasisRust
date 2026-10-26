@@ -1538,7 +1538,7 @@ fn set_config_field_live(
 ) {
     {
         let mut config = server.config.write();
-        if let Err(err) = config.set_field(field, value) {
+        if let Err(err) = config.set_live_field(field, value) {
             println!("Failed to set {field}: {err}");
             return;
         }

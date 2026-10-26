@@ -1,6 +1,8 @@
 //! Optional SQL player storage: PostgreSQL remote, persistent SQLite fallback.
 //! A remote connection is attempted only at startup; an in-flight outage returns
 //! Unavailable rather than silently switching databases and losing read-your-writes.
+mod accounting;
+
 use crate::player::{apply_request, quota_allows, PlayerRecord, RateLimiter};
 use anyhow::{Context, Result};
 use basis_protocol::storage::{
@@ -30,6 +32,7 @@ enum Pool {
 pub struct SqlPlayerStorage {
     pool: Pool,
     table: String,
+    usage_table: String,
     limits: Arc<Mutex<RateLimiter>>,
 }
 
@@ -42,7 +45,7 @@ impl SqlPlayerStorage {
         table: &str,
     ) -> Result<(Self, SqlBackend)> {
         anyhow::ensure!(
-            !table.is_empty() && table.len() <= 64 &&
+            !table.is_empty() && table.len() <= 63 &&
             table.as_bytes().first().is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_') &&
             table.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
             "StorageSqlTable must be a SQL identifier containing only letters, numbers and underscores"
@@ -57,19 +60,18 @@ impl SqlPlayerStorage {
                 .connect(connection_string)
                 .await
             {
-                let create = format!(
-                        "CREATE TABLE IF NOT EXISTS {table} (owner TEXT PRIMARY KEY, payload BYTEA NOT NULL)"
-                    );
-                if sqlx::query(&create).execute(&pool).await.is_ok() {
-                    return Ok((
-                        Self {
-                            pool: Pool::Postgres(pool),
-                            table: table.to_owned(),
-                            limits: Arc::new(Mutex::new(RateLimiter::default())),
-                        },
-                        SqlBackend::PostgreSql,
-                    ));
-                }
+                accounting::init_postgres(&pool, table).await.context(
+                    "PostgreSQL connected, but player-storage accounting initialization failed; verify table, function, and trigger permissions"
+                )?;
+                return Ok((
+                    Self {
+                        pool: Pool::Postgres(pool),
+                        table: table.to_owned(),
+                        usage_table: accounting::usage_table(table),
+                        limits: Arc::new(Mutex::new(RateLimiter::default())),
+                    },
+                    SqlBackend::PostgreSql,
+                ));
             }
         }
 
@@ -98,14 +100,12 @@ impl SqlPlayerStorage {
                 .max_lifetime(None);
         }
         let pool = pool_options.connect_with(options).await?;
-        let create = format!(
-            "CREATE TABLE IF NOT EXISTS {table} (owner TEXT PRIMARY KEY, payload BLOB NOT NULL)"
-        );
-        sqlx::query(&create).execute(&pool).await?;
+        accounting::init_sqlite(&pool, table).await?;
         Ok((
             Self {
                 pool: Pool::Sqlite(pool),
                 table: table.to_owned(),
+                usage_table: accounting::usage_table(table),
                 limits: Arc::new(Mutex::new(RateLimiter::default())),
             },
             SqlBackend::Sqlite,
@@ -192,19 +192,23 @@ impl SqlPlayerStorage {
             .await?
             .map(|row| row.try_get("payload"))
             .transpose()?;
+        let existing_size = data.as_ref().map_or(0, Vec::len);
         let record = decode_record(data, owner)?;
         let (mut reply, updated) = apply_request(&record, request, limit);
         if let Some(updated) = updated {
-            let payload = serde_json::to_vec(&updated)?;
+            let payload = if updated.scopes.is_empty() {
+                Vec::new()
+            } else {
+                serde_json::to_vec(&updated)?
+            };
             let query_total = format!(
-                "SELECT COALESCE(SUM(octet_length(payload)), 0) AS used FROM {}",
-                self.table
+                "SELECT used FROM {} WHERE id=1 FOR UPDATE",
+                self.usage_table
             );
             let global_used: i64 = sqlx::query(&query_total)
                 .fetch_one(&mut *tx)
                 .await?
                 .try_get("used")?;
-            let existing_size = self.postgres_previous_bytes(&mut tx, owner).await?;
             if !quota_allows(
                 global_used as usize,
                 (global_used as usize)
@@ -216,33 +220,22 @@ impl SqlPlayerStorage {
                 reply.used = record.used() as i32;
                 return Ok(reply);
             }
-            let upsert = format!("INSERT INTO {} (owner, payload) VALUES ($1, $2) ON CONFLICT(owner) DO UPDATE SET payload = EXCLUDED.payload", self.table);
-            sqlx::query(&upsert)
-                .bind(owner)
-                .bind(payload)
-                .execute(&mut *tx)
-                .await?;
+            if payload.is_empty() {
+                sqlx::query(&format!("DELETE FROM {} WHERE owner=$1", self.table))
+                    .bind(owner)
+                    .execute(&mut *tx)
+                    .await?;
+            } else {
+                let upsert = format!("INSERT INTO {} (owner, payload) VALUES ($1, $2) ON CONFLICT(owner) DO UPDATE SET payload = EXCLUDED.payload", self.table);
+                sqlx::query(&upsert)
+                    .bind(owner)
+                    .bind(payload)
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         tx.commit().await?;
         Ok(reply)
-    }
-
-    async fn postgres_previous_bytes(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        owner: &str,
-    ) -> Result<usize> {
-        let query = format!(
-            "SELECT octet_length(payload) AS n FROM {} WHERE owner=$1",
-            self.table
-        );
-        Ok(sqlx::query(&query)
-            .bind(owner)
-            .fetch_optional(&mut **tx)
-            .await?
-            .map(|r| r.try_get::<i32, _>("n").map(|n| n.max(0) as usize))
-            .transpose()?
-            .unwrap_or(0))
     }
 
     async fn sqlite_operation(
@@ -253,7 +246,15 @@ impl SqlPlayerStorage {
         limit: usize,
         total_limit: usize,
     ) -> Result<StorageReply> {
-        let mut tx = pool.begin().await?;
+        let writing = matches!(
+            request.op,
+            StorageOp::Set | StorageOp::Delete | StorageOp::Clear
+        );
+        let mut tx = if writing {
+            pool.begin_with("BEGIN IMMEDIATE").await?
+        } else {
+            pool.begin().await?
+        };
         let select = format!("SELECT payload FROM {} WHERE owner = ?1", self.table);
         let data: Option<Vec<u8>> = sqlx::query(&select)
             .bind(owner)
@@ -261,29 +262,20 @@ impl SqlPlayerStorage {
             .await?
             .map(|row| row.try_get("payload"))
             .transpose()?;
+        let previous_size = data.as_ref().map_or(0, Vec::len);
         let record = decode_record(data, owner)?;
         let (mut reply, updated) = apply_request(&record, request, limit);
         if let Some(updated) = updated {
-            let payload = serde_json::to_vec(&updated)?;
-            let query_total = format!(
-                "SELECT COALESCE(SUM(length(payload)), 0) AS used FROM {}",
-                self.table
-            );
+            let payload = if updated.scopes.is_empty() {
+                Vec::new()
+            } else {
+                serde_json::to_vec(&updated)?
+            };
+            let query_total = format!("SELECT used FROM {} WHERE id=1", self.usage_table);
             let global_used: i64 = sqlx::query(&query_total)
                 .fetch_one(&mut *tx)
                 .await?
                 .try_get("used")?;
-            let previous = format!(
-                "SELECT length(payload) AS n FROM {} WHERE owner = ?1",
-                self.table
-            );
-            let previous_size: usize = sqlx::query(&previous)
-                .bind(owner)
-                .fetch_optional(&mut *tx)
-                .await?
-                .map(|r| r.try_get::<i64, _>("n").map(|n| n.max(0) as usize))
-                .transpose()?
-                .unwrap_or(0);
             if !quota_allows(
                 global_used as usize,
                 (global_used as usize)
@@ -295,12 +287,19 @@ impl SqlPlayerStorage {
                 reply.used = record.used() as i32;
                 return Ok(reply);
             }
-            let upsert = format!("INSERT INTO {} (owner, payload) VALUES (?1, ?2) ON CONFLICT(owner) DO UPDATE SET payload=excluded.payload", self.table);
-            sqlx::query(&upsert)
-                .bind(owner)
-                .bind(payload)
-                .execute(&mut *tx)
-                .await?;
+            if payload.is_empty() {
+                sqlx::query(&format!("DELETE FROM {} WHERE owner=?1", self.table))
+                    .bind(owner)
+                    .execute(&mut *tx)
+                    .await?;
+            } else {
+                let upsert = format!("INSERT INTO {} (owner, payload) VALUES (?1, ?2) ON CONFLICT(owner) DO UPDATE SET payload=excluded.payload", self.table);
+                sqlx::query(&upsert)
+                    .bind(owner)
+                    .bind(payload)
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         tx.commit().await?;
         Ok(reply)
@@ -330,6 +329,266 @@ fn decode_record(data: Option<Vec<u8>>, owner: &str) -> Result<PlayerRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn sqlite_usage(storage: &SqlPlayerStorage) -> (i64, i64, i64) {
+        let Pool::Sqlite(pool) = &storage.pool else {
+            unreachable!()
+        };
+        let used: i64 = sqlx::query_scalar(&format!(
+            "SELECT used FROM {} WHERE id=1",
+            storage.usage_table
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let sum: i64 = sqlx::query_scalar(&format!(
+            "SELECT COALESCE(SUM(length(payload)),0) FROM {}",
+            storage.table
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {}", storage.table))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        (used, sum, count)
+    }
+
+    #[tokio::test]
+    async fn sqlite_counters_cover_concurrent_pools_deletion_and_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.db");
+        let (first, _) = SqlPlayerStorage::connect("", Some(&path), "basis_storage")
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .execute("alice", req(StorageOp::Set, vec![1; 64]), 1024, 0)
+                .await
+                .status,
+            StorageStatus::Ok
+        );
+        let size = sqlite_usage(&first).await.0;
+        assert_eq!(
+            first
+                .execute("alice", req(StorageOp::Delete, vec![]), 1024, 0)
+                .await
+                .status,
+            StorageStatus::Ok
+        );
+        assert_eq!(sqlite_usage(&first).await, (0, 0, 0));
+        let (second, _) = SqlPlayerStorage::connect("", Some(&path), "basis_storage")
+            .await
+            .unwrap();
+        let (a, b) = tokio::join!(
+            first.execute(
+                "alice",
+                req(StorageOp::Set, vec![1; 64]),
+                1024,
+                size as usize
+            ),
+            second.execute(
+                "bobby",
+                req(StorageOp::Set, vec![1; 64]),
+                1024,
+                size as usize
+            )
+        );
+        assert_eq!(
+            [a.status, b.status]
+                .iter()
+                .filter(|s| **s == StorageStatus::Ok)
+                .count(),
+            1
+        );
+        assert_eq!(
+            [a.status, b.status]
+                .iter()
+                .filter(|s| **s == StorageStatus::Full)
+                .count(),
+            1
+        );
+        assert_eq!(sqlite_usage(&first).await, (size, size, 1));
+        let Pool::Sqlite(pool) = &first.pool else {
+            unreachable!()
+        };
+        let empty = serde_json::to_vec(&PlayerRecord {
+            owner: "legacy".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        sqlx::query("INSERT INTO basis_storage VALUES ('legacy',?1)")
+            .bind(&empty)
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlite_usage(&first).await,
+            (size + empty.len() as i64, size + empty.len() as i64, 2)
+        );
+        sqlx::query(&format!(
+            "UPDATE {} SET used=999999 WHERE id=1",
+            first.usage_table
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+        let (restarted, _) = SqlPlayerStorage::connect("", Some(&path), "basis_storage")
+            .await
+            .unwrap();
+        assert_eq!(sqlite_usage(&restarted).await, (size, size, 1));
+        for owner in ["alice", "bobby"] {
+            restarted
+                .execute(owner, req(StorageOp::Clear, vec![]), 1024, 0)
+                .await;
+        }
+        assert_eq!(sqlite_usage(&restarted).await, (0, 0, 0));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BASIS_TEST_POSTGRES_URL; run by SQL CI job"]
+    async fn postgres_integration_accounting_concurrency_and_empty_cleanup() {
+        let url =
+            std::env::var("BASIS_TEST_POSTGRES_URL").expect("BASIS_TEST_POSTGRES_URL required");
+        let table = format!(
+            "storage_test_{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let (first, backend) = SqlPlayerStorage::connect(&url, None, &table).await.unwrap();
+        assert_eq!(
+            backend,
+            SqlBackend::PostgreSql,
+            "integration test must not silently use fallback"
+        );
+        let Pool::Postgres(pool) = &first.pool else {
+            unreachable!()
+        };
+        assert_eq!(
+            first
+                .execute("alice", req(StorageOp::Set, vec![1; 64]), 1024, 0)
+                .await
+                .status,
+            StorageStatus::Ok
+        );
+        let size: i64 = sqlx::query_scalar(&format!(
+            "SELECT used FROM {} WHERE id=1",
+            first.usage_table
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        first
+            .execute("alice", req(StorageOp::Clear, vec![]), 1024, 0)
+            .await;
+        let (second, backend) = SqlPlayerStorage::connect(&url, None, &table).await.unwrap();
+        assert_eq!(backend, SqlBackend::PostgreSql);
+        let (a, b) = tokio::join!(
+            first.execute(
+                "alice",
+                req(StorageOp::Set, vec![1; 64]),
+                1024,
+                size as usize
+            ),
+            second.execute(
+                "bobby",
+                req(StorageOp::Set, vec![1; 64]),
+                1024,
+                size as usize
+            )
+        );
+        assert_eq!(
+            [a.status, b.status]
+                .iter()
+                .filter(|s| **s == StorageStatus::Ok)
+                .count(),
+            1
+        );
+        assert_eq!(
+            [a.status, b.status]
+                .iter()
+                .filter(|s| **s == StorageStatus::Full)
+                .count(),
+            1
+        );
+        let empty = serde_json::to_vec(&PlayerRecord {
+            owner: "legacy".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        sqlx::query(&format!("INSERT INTO {table} VALUES ('legacy',$1)"))
+            .bind(&empty)
+            .execute(pool)
+            .await
+            .unwrap();
+        let (restarted, backend) = SqlPlayerStorage::connect(&url, None, &table).await.unwrap();
+        assert_eq!(backend, SqlBackend::PostgreSql);
+        let used: i64 = sqlx::query_scalar(&format!(
+            "SELECT used FROM {} WHERE id=1",
+            first.usage_table
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let sum: i64 = sqlx::query_scalar(&format!(
+            "SELECT COALESCE(SUM(octet_length(payload)),0)::BIGINT FROM {table}"
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!((used, sum), (size, size));
+        for owner in ["alice", "bobby"] {
+            restarted
+                .execute(owner, req(StorageOp::Delete, vec![]), 1024, 0)
+                .await;
+        }
+        let used: i64 = sqlx::query_scalar(&format!(
+            "SELECT used FROM {} WHERE id=1",
+            first.usage_table
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!((used, count), (0, 0));
+        // A connected database with an unusable schema must not silently select
+        // SQLite and expose an unrelated empty dataset.
+        let view = format!("{table}_view");
+        sqlx::query(&format!(
+            "CREATE VIEW {view} AS SELECT owner,payload FROM {table}"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+        let error = SqlPlayerStorage::connect(&url, None, &view)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("accounting initialization failed"));
+        sqlx::query(&format!("DROP VIEW {view}"))
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(&format!("DROP TABLE {table} CASCADE"))
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(&format!("DROP FUNCTION {}_fn()", first.usage_table))
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(&format!("DROP TABLE {}", first.usage_table))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
     fn req(op: StorageOp, value: Vec<u8>) -> StorageRequest {
         StorageRequest {
             op,

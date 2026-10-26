@@ -8,6 +8,10 @@ license.workspace = true
 default = []
 sql-storage = ["dep:sqlx", "dep:tokio"]
 
+[[example]]
+name = "player-storage-quota-benchmark"
+required-features = ["sql-storage"]
+
 [dependencies]
 anyhow.workspace = true
 basis-protocol = { path = "../basis-protocol" }
