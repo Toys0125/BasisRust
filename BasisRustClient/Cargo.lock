@@ -138,6 +138,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "unicode-general-category",
  "uuid",
  "zstd-safe",
 ]
@@ -152,6 +153,7 @@ dependencies = [
  "basis-server-core",
  "basis-transport",
  "bs58",
+ "chacha20poly1305",
  "clap",
  "ed25519-dalek",
  "mimalloc",
@@ -233,9 +235,11 @@ name = "basis-server-storage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "basis-protocol",
  "parking_lot",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "windows-sys 0.59.0",
  "xattr",

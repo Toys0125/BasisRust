@@ -1,9 +1,7 @@
-#[cfg(any(windows, test))]
 use crate::transport::LITENETLIB_MAX_MTU;
 use crate::transport::{SOCKET_BUFFER_SIZE, SOCKET_TTL};
 use anyhow::{anyhow, Result};
 use basis_transport::PacketProperty;
-#[cfg(any(windows, test))]
 use basis_transport::LITENETLIB_INITIAL_MTU;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -25,8 +23,7 @@ pub(crate) fn any_local_addr(remote: SocketAddr) -> SocketAddr {
     }
 }
 
-#[cfg(any(windows, test))]
-pub(crate) fn windows_mtu_probe_reply(packet: &[u8], connection_number: u8) -> Option<Vec<u8>> {
+pub(crate) fn mtu_probe_reply(packet: &[u8], connection_number: u8) -> Option<Vec<u8>> {
     // Match Linux's shared receiver: only echo a complete LiteNetLib probe so
     // the server can safely increase its per-peer datagram packing limit.
     if !(LITENETLIB_INITIAL_MTU..=LITENETLIB_MAX_MTU).contains(&packet.len())

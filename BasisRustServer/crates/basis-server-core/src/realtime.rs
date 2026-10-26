@@ -14,6 +14,7 @@ const VOICE_SEND_QUANTUM: usize = 32;
 
 struct Input {
     session: PeerSession,
+    voice_recipients: Option<Arc<Vec<PeerSession>>>,
     channel: u8,
     delivery: DeliveryMethod,
     payload: Bytes,
@@ -124,6 +125,7 @@ struct VoiceGroup {
     peer: PeerId,
     session: PeerSession,
     shout: bool,
+    voice_recipients: Option<Arc<Vec<PeerSession>>>,
     targets: Vec<Vec<PeerId>>,
     frames: Vec<(u8, Bytes, Instant)>,
 }
@@ -291,6 +293,7 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
         return Err(error);
     }
     let authenticated = state.authenticated_peers.clone();
+    let configured_voice = state.voice_recipient_sessions.clone();
     let statistics = state.statistics.clone();
     let upload_budget = state.upload_budget.clone();
     let next_arrival_order = Arc::new(AtomicU64::new(0));
@@ -327,6 +330,9 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
             if !authenticated.contains_key(peer)
                 || (is_voice && (payload.is_empty() || payload.len() > MAX_VOICE_PAYLOAD))
             {
+                if is_voice {
+                    statistics.voice_rejected.fetch_add(1, Ordering::Relaxed);
+                }
                 if is_avatar_input(event) {
                     statistics.avatar_rejected.fetch_add(1, Ordering::Relaxed);
                 }
@@ -345,8 +351,20 @@ pub(super) fn start(state: &ServerState) -> Result<Vec<thread::JoinHandle<()>>> 
                 }
                 return true;
             }
+            let voice_recipients = if is_voice && *channel != channels::SHOUT_VOICE {
+                let Some(configured) = configured_voice.get(peer).map(|p| p.clone()) else {
+                    return true;
+                };
+                if configured.is_empty() {
+                    return true;
+                }
+                Some(configured)
+            } else {
+                None
+            };
             let input = Input {
                 session,
+                voice_recipients,
                 channel: *channel,
                 delivery: *delivery,
                 payload: payload.clone(),
@@ -416,17 +434,23 @@ fn voice_loop(state: &ServerState, inbox: &VoiceInbox, lanes: &[Arc<SendLane>]) 
                 if !voice_allowed(state, peer, shout) {
                     continue;
                 }
+                let configured = state.voice_recipient_sessions.get(&peer).map(|p| p.clone());
                 let selected = inputs
                     .iter()
                     .filter(|i| {
                         (i.channel == channels::SHOUT_VOICE) == shout
                             && state.transport.is_current_session(&i.session)
+                            && (shout
+                                || i.voice_recipients
+                                    .as_ref()
+                                    .zip(configured.as_ref())
+                                    .is_some_and(|(input, current)| Arc::ptr_eq(input, current)))
                     })
                     .collect::<Vec<_>>();
                 let Some(first) = selected.first() else {
                     continue;
                 };
-                let recipients = if shout {
+                let recipients: Vec<PeerId> = if shout {
                     state
                         .authenticated_peers
                         .iter()
@@ -435,9 +459,20 @@ fn voice_loop(state: &ServerState, inbox: &VoiceInbox, lanes: &[Arc<SendLane>]) 
                         .collect()
                 } else {
                     state
-                        .voice_recipients
+                        .voice_recipient_sessions
                         .get(&peer)
-                        .map(|p| p.clone())
+                        .map(|configured| {
+                            configured
+                                .iter()
+                                .filter_map(|recipient| {
+                                    let id = recipient.peer_id();
+                                    sessions
+                                        .get(&id)
+                                        .filter(|current| recipient.same_connection(current))
+                                        .map(|_| id)
+                                })
+                                .collect()
+                        })
                         .unwrap_or_default()
                 };
                 let mut targets = vec![Vec::new(); lanes.len()];
@@ -479,6 +514,7 @@ fn voice_loop(state: &ServerState, inbox: &VoiceInbox, lanes: &[Arc<SendLane>]) 
                     peer,
                     session: first.session.clone(),
                     shout,
+                    voice_recipients: first.voice_recipients.clone(),
                     targets,
                     frames,
                 });
@@ -587,6 +623,14 @@ fn send_loop(state: &ServerState, transport: &TransportHandle, lane: &SendLane, 
                 }
                 if !state.transport.is_current_session(&group.session)
                     || !voice_allowed(state, group.peer, group.shout)
+                    || (!group.shout
+                        && !state.voice_recipient_sessions.get(&group.peer).is_some_and(
+                            |current| {
+                                group.voice_recipients.as_ref().is_some_and(|configured| {
+                                    Arc::ptr_eq(configured, current.value())
+                                })
+                            },
+                        ))
                 {
                     continue;
                 }
@@ -807,6 +851,7 @@ mod tests {
     fn input(session: &PeerSession, channel: u8, sequence: u8, received: Instant) -> Input {
         Input {
             session: session.clone(),
+            voice_recipients: None,
             channel,
             delivery: DeliveryMethod::Unreliable,
             payload: Bytes::from(vec![sequence, 0, 0]),

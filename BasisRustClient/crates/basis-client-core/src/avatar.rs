@@ -54,17 +54,22 @@ pub(crate) fn unity_interval_tick_due(
 pub(crate) fn write_packed_bits_lsb(
     destination: &mut [u8],
     bit_offset: usize,
-    value: u64,
+    mut value: u64,
     bit_count: usize,
 ) {
-    for bit in 0..bit_count {
-        let destination_bit = bit_offset + bit;
-        let mask = 1u8 << (destination_bit & 7);
-        if value & (1u64 << bit) == 0 {
-            destination[destination_bit >> 3] &= !mask;
-        } else {
-            destination[destination_bit >> 3] |= mask;
-        }
+    debug_assert!(bit_count <= u64::BITS as usize);
+    let mut byte_index = bit_offset >> 3;
+    let mut shift = bit_offset & 7;
+    let mut remaining = bit_count;
+    while remaining != 0 {
+        let count = remaining.min(8 - shift);
+        let mask = ((1u16 << count) - 1) as u8;
+        let byte = &mut destination[byte_index];
+        *byte = (*byte & !(mask << shift)) | (((value as u8) & mask) << shift);
+        value >>= count;
+        remaining -= count;
+        byte_index += 1;
+        shift = 0;
     }
 }
 

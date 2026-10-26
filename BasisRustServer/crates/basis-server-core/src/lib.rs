@@ -364,6 +364,8 @@ pub struct StatisticsSnapshot {
     pub protocol_errors: u64,
     /// Avatar input packets intercepted by the realtime handler.
     pub avatar_received: u64,
+    /// Voice rejected at admission for authentication, empty, or oversize payload.
+    pub voice_rejected: u64,
     /// Received avatar packets superseded by per-peer coalescing.
     pub avatar_coalesced: u64,
     /// Avatar packets discarded for authentication, session, registration, or protocol reasons.
@@ -414,6 +416,7 @@ pub struct Statistics {
     outbound_packets: Arc<GatedCounter>,
     protocol_errors: Arc<GatedCounter>,
     avatar_received: Arc<GatedCounter>,
+    voice_rejected: Arc<GatedCounter>,
     avatar_coalesced: Arc<GatedCounter>,
     avatar_rejected: Arc<GatedCounter>,
     avatar_processed: Arc<GatedCounter>,
@@ -428,6 +431,7 @@ impl Statistics {
             outbound_packets: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
             protocol_errors: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
             avatar_received: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
+            voice_rejected: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
             avatar_coalesced: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
             avatar_rejected: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
             avatar_processed: Arc::new(GatedCounter::new(Arc::clone(&enabled))),
@@ -445,6 +449,7 @@ impl Statistics {
             self.outbound_packets.store(0, Ordering::Relaxed);
             self.protocol_errors.store(0, Ordering::Relaxed);
             self.avatar_received.store(0, Ordering::Relaxed);
+            self.voice_rejected.store(0, Ordering::Relaxed);
             self.avatar_coalesced.store(0, Ordering::Relaxed);
             self.avatar_rejected.store(0, Ordering::Relaxed);
             self.avatar_processed.store(0, Ordering::Relaxed);
@@ -458,6 +463,7 @@ impl Statistics {
             outbound_packets: self.outbound_packets.load(Ordering::Relaxed),
             protocol_errors: self.protocol_errors.load(Ordering::Relaxed),
             avatar_received: self.avatar_received.load(Ordering::Relaxed),
+            voice_rejected: self.voice_rejected.load(Ordering::Relaxed),
             avatar_coalesced: self.avatar_coalesced.load(Ordering::Relaxed),
             avatar_rejected: self.avatar_rejected.load(Ordering::Relaxed),
             avatar_processed: self.avatar_processed.load(Ordering::Relaxed),
@@ -472,6 +478,7 @@ pub struct ServerState {
     pub transport: TransportHandle,
     pub authenticated_peers: Arc<DashMap<PeerId, ConnectedPeer>>,
     join_broadcast: Arc<Mutex<JoinBroadcastState>>,
+    join_delivery: Arc<tokio::sync::Mutex<()>>,
     pending_identity: Arc<DashMap<PeerId, PendingIdentity>>,
     admission_slots: Arc<Semaphore>,
     admission_commit: Arc<Mutex<()>>,
@@ -487,6 +494,9 @@ pub struct ServerState {
     pub content_share: ContentShareState,
     pub pip: PipState,
     pub voice_recipients: Arc<DashMap<PeerId, Vec<PeerId>>>,
+    // Routing captures connection incarnations when recipients are configured.
+    // The public ID map remains a derived diagnostic view.
+    voice_recipient_sessions: Arc<DashMap<PeerId, Arc<Vec<PeerSession>>>>,
     pub message_subscriptions: Arc<DashMap<PeerId, HashSet<u16>>>,
     uplink_delta_states: Arc<DashMap<PeerId, UplinkDeltaState>>,
     scene_egress: Arc<DashMap<PeerId, SceneEgressBucket>>,
@@ -503,6 +513,7 @@ pub struct ServerState {
     admin_runtime: Arc<admin_runtime::AdminRuntime>,
     pub statistics: Statistics,
     pending_leaves: Arc<Mutex<Vec<PeerId>>>,
+    retiring_peer_ids: Arc<DashMap<PeerId, ()>>,
     shutdown: Arc<AtomicBool>,
     tick_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     workers: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -704,6 +715,7 @@ impl ServerState {
             transport,
             authenticated_peers: Arc::new(DashMap::new()),
             join_broadcast: Arc::new(Mutex::new(JoinBroadcastState::default())),
+            join_delivery: Arc::new(tokio::sync::Mutex::new(())),
             pending_identity: Arc::new(DashMap::new()),
             admission_slots: Arc::new(Semaphore::new(MAX_PENDING_ADMISSIONS)),
             admission_commit: Arc::new(Mutex::new(())),
@@ -719,6 +731,7 @@ impl ServerState {
             content_share: ContentShareState::default(),
             pip: PipState::default(),
             voice_recipients: Arc::new(DashMap::new()),
+            voice_recipient_sessions: Arc::new(DashMap::new()),
             message_subscriptions: Arc::new(DashMap::new()),
             uplink_delta_states: Arc::new(DashMap::new()),
             scene_egress: Arc::new(DashMap::new()),
@@ -737,6 +750,7 @@ impl ServerState {
             admin_runtime: Arc::new(admin_runtime),
             statistics: Statistics::new(config.health_include_extended_metrics),
             pending_leaves: Arc::new(Mutex::new(Vec::new())),
+            retiring_peer_ids: Arc::new(DashMap::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
             tick_thread: Arc::new(Mutex::new(None)),
             workers: Arc::new(Mutex::new(Vec::new())),
@@ -1240,6 +1254,7 @@ fn is_p2p_offload_channel(channel: u8) -> bool {
 }
 
 const LEAVE_BROADCAST_INTERVAL: Duration = Duration::from_millis(50);
+const LEAVE_BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn image_animation_allowed(state: &ServerState, peer: PeerId) -> bool {
     !state.global_state.read().gifs_locked
@@ -1372,6 +1387,44 @@ fn serialize_leave_batch(leaves: &[PeerId]) -> Vec<u8> {
     writer.into_vec()
 }
 
+async fn wait_reliable_barrier(state: &ServerState, recipients: &[PeerSession]) -> bool {
+    let deadline = Instant::now() + LEAVE_BARRIER_TIMEOUT;
+    loop {
+        if state.shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
+        let pending = recipients
+            .iter()
+            .filter(|session| !state.transport.reliable_idle(session))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            for session in pending {
+                warn!(
+                    peer = session.peer_id(),
+                    "disconnecting stalled reliable recipient"
+                );
+                if let Err(error) =
+                    request_disconnect(state, session, "Reliable delivery stalled").await
+                {
+                    warn!(
+                        peer = session.peer_id(),
+                        "failed to disconnect stalled recipient: {error:#}"
+                    );
+                }
+            }
+            // Never release IDs merely because the deadline elapsed. Only ACKed,
+            // closed or replaced recipient sessions satisfy the retirement barrier.
+            return recipients
+                .iter()
+                .all(|session| state.transport.reliable_idle(session));
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
 async fn flush_pending_leaves(state: &ServerState) {
     let mut leaves = {
         let mut pending = state.pending_leaves.lock();
@@ -1383,20 +1436,30 @@ async fn flush_pending_leaves(state: &ServerState) {
     leaves.sort_unstable();
     leaves.dedup();
 
+    // Serialize join producers with retirement: no locally captured old join
+    // record may be enqueued after its leave has been acknowledged.
+    let _join_delivery = state.join_delivery.lock().await;
     let payload = serialize_leave_batch(&leaves);
     let leavers = leaves.iter().copied().collect::<HashSet<_>>();
     let recipients = state
         .authenticated_peers
         .iter()
-        .map(|entry| *entry.key())
-        .filter(|peer| !leavers.contains(peer))
+        .filter(|entry| !leavers.contains(entry.key()))
+        .filter_map(|entry| entry.session.clone())
+        .filter(|session| state.transport.is_current_session(session))
         .collect::<Vec<_>>();
 
-    for peer in recipients {
+    // History and ownership cleanup use other channels. Drain their earlier
+    // delivery before the leave, so a delayed join cannot recreate a ghost.
+    if !wait_reliable_barrier(state, &recipients).await {
+        state.pending_leaves.lock().extend(leaves);
+        return;
+    }
+    for session in &recipients {
         if state
             .transport
-            .send(
-                peer,
+            .send_session(
+                session,
                 channels::DISCONNECTION,
                 DeliveryMethod::ReliableOrdered,
                 &payload,
@@ -1408,6 +1471,20 @@ async fn flush_pending_leaves(state: &ServerState) {
                 .statistics
                 .outbound_packets
                 .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    // Keep IDs reserved until all earlier cleanup and leave packets are ACKed.
+    // Newly admitted incarnations cannot have old join history: membership was
+    // removed before this batch, and their initial fanout waits on join_delivery.
+    // Later leave batches reference disjoint IDs; this is not a general producer fence.
+    if !wait_reliable_barrier(state, &recipients).await {
+        state.pending_leaves.lock().extend(leaves);
+        return;
+    }
+    if !state.shutdown.load(Ordering::Relaxed) {
+        for peer in leaves {
+            state.transport.recycle_peer_id(peer);
+            state.retiring_peer_ids.remove(&peer);
         }
     }
 }
@@ -1434,6 +1511,11 @@ fn frame_join_records(records: &[Arc<JoinBroadcastRecord>]) -> Result<Vec<u8>> {
 }
 
 async fn flush_join_batches(state: &ServerState) -> Result<()> {
+    // This runs inline in the ingress loop. A retirement barrier must not park
+    // that loop; leave queued join work untouched until a later flush tick.
+    let Ok(_join_delivery) = state.join_delivery.try_lock() else {
+        return Ok(());
+    };
     let targets = state.join_broadcast.lock().ready_targets();
     let mut framed_by_batch = HashMap::<Vec<(u64, u64)>, Vec<u8>>::new();
     for peer_id in targets {
@@ -2818,10 +2900,15 @@ async fn send_accept_fanout(
     peer_id: PeerId,
     existing_players: &[ConnectedPeer],
 ) -> Result<()> {
+    let _join_delivery = state.join_delivery.lock().await;
     let mut existing_player_packets = Vec::new();
     let mut batch_payload = Vec::new();
     let mut batch_count = 0u16;
     for existing in existing_players {
+        // A disconnect can remove membership after admission captured history.
+        if !state.join_broadcast.lock().peers.contains_key(&existing.id) {
+            continue;
+        }
         let ready = state
             .authenticated_peers
             .get(&existing.id)
@@ -3004,6 +3091,7 @@ async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: D
         .unwrap_or_default();
     state.pending_identity.remove(&peer);
     state.voice_recipients.remove(&peer);
+    state.voice_recipient_sessions.remove(&peer);
     state.message_subscriptions.remove(&peer);
     state.uplink_delta_states.remove(&peer);
     state.scene_egress.remove(&peer);
@@ -3081,7 +3169,24 @@ async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: D
                 .await;
         }
     }
-    if state.authenticated_peers.remove(&peer).is_some() {
+    let was_authenticated = state.authenticated_peers.remove(&peer).is_some();
+    if was_authenticated {
+        state.retiring_peer_ids.insert(peer, ());
+        // Admission is closed and authentication removed. Installers hold target
+        // leases through publication; cleanup drained those leases before pruning.
+        for mut recipients in state.voice_recipient_sessions.iter_mut() {
+            if recipients.iter().any(|session| session.peer_id() == peer) {
+                *recipients = Arc::new(
+                    recipients
+                        .iter()
+                        .filter(|session| session.peer_id() != peer)
+                        .cloned()
+                        .collect(),
+                );
+                let ids = recipients.iter().map(PeerSession::peer_id).collect();
+                state.voice_recipients.insert(*recipients.key(), ids);
+            }
+        }
         info!("peer removed: {peer} ({reason:?})");
         for spawn in state.resources.remove_preload_peer(peer) {
             broadcast_spawn_preloaded(state, spawn).await;
@@ -3109,7 +3214,9 @@ async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: D
             state.pip.reset();
         }
     }
-    state.transport.recycle_peer_id(peer);
+    if !was_authenticated {
+        state.transport.recycle_peer_id(peer);
+    }
 }
 
 fn capture_uplink_delta_baseline(state: &ServerState, peer: PeerId, payload: &[u8]) {
@@ -4785,14 +4892,14 @@ async fn update_voice_recipients(
                 (id != peer && !excluded.contains(&id)).then_some(id)
             })
             .collect::<Vec<_>>();
-        state.voice_recipients.insert(peer, recipients);
+        install_voice_recipients(state, peer, recipients);
     } else {
         let recipients = message
             .users
             .into_iter()
             .filter(|id| *id != peer && state.authenticated_peers.contains_key(id))
             .collect::<Vec<_>>();
-        state.voice_recipients.insert(peer, recipients);
+        install_voice_recipients(state, peer, recipients);
     }
     Ok(())
 }
@@ -4821,11 +4928,51 @@ fn update_voice_recipients_bitfield(state: &ServerState, peer: PeerId, payload: 
             }
         }
     }
-    state.voice_recipients.insert(peer, recipients);
+    install_voice_recipients(state, peer, recipients);
+}
+
+fn install_voice_recipients(state: &ServerState, peer: PeerId, ids: Vec<PeerId>) {
+    let mut entry = state.voice_recipient_sessions.entry(peer).or_default();
+    let mut leases = Vec::with_capacity(ids.len());
+    let mut sessions = Vec::with_capacity(ids.len());
+    for id in ids {
+        if id == peer {
+            continue;
+        }
+        let session = state
+            .authenticated_peers
+            .get(&id)
+            .and_then(|p| p.session.clone());
+        if let Some(session) = session {
+            if let Some(lease) = session.try_read_lease() {
+                if state.transport.is_current_session(&session) {
+                    leases.push(lease);
+                    sessions.push(session);
+                }
+            }
+        }
+    }
+    let unchanged = entry.len() == sessions.len()
+        && entry
+            .iter()
+            .zip(&sessions)
+            .all(|(old, new)| old.same_connection(new));
+    if !unchanged {
+        *entry = Arc::new(sessions);
+    }
+    state
+        .voice_recipients
+        .insert(peer, entry.iter().map(PeerSession::peer_id).collect());
+    // No map guard or recipient read lease crosses an asynchronous send.
+    drop(leases);
 }
 
 async fn relay_voice_message(state: &ServerState, peer: PeerId, payload: &[u8]) {
-    let Some(recipients) = state.voice_recipients.get(&peer).map(|entry| entry.clone()) else {
+    let Some(recipients) = state
+        .voice_recipient_sessions
+        .get(&peer)
+        .map(|entry| entry.clone())
+    else {
         return;
     };
     let large_id = peer > u8::MAX as u16;
@@ -4840,13 +4987,13 @@ async fn relay_voice_message(state: &ServerState, peer: PeerId, payload: &[u8]) 
     };
     let mut writer = NetWriter::new();
     message.serialize_with_id_size(&mut writer, large_id);
-    for recipient in recipients {
-        if state.p2p_broker.is_offloaded(peer, recipient) {
+    for recipient in recipients.iter() {
+        if state.p2p_broker.is_offloaded(peer, recipient.peer_id()) {
             continue;
         }
         let _ = state
             .transport
-            .send(
+            .send_session(
                 recipient,
                 channel,
                 DeliveryMethod::Unreliable,

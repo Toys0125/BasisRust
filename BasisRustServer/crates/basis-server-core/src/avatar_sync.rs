@@ -572,18 +572,24 @@ struct OutboundAvatarBatch<'a> {
 }
 
 #[derive(Debug, Clone)]
-struct BundleAvatarSend {
+struct BundleAvatarSend<'a> {
     original_channel: u8,
-    payload: Bytes,
+    payload: &'a Bytes,
     interval_offset: usize,
     interval_byte: u8,
 }
 
 #[derive(Default)]
-struct ReceiverBuildScratch {
+struct ReceiverBuildScratch<'a> {
     live_senders: Vec<bool>,
     sent_senders: Vec<(PeerId, u64)>,
-    bundle: Vec<BundleAvatarSend>,
+    bundle: Vec<BundleAvatarSend<'a>>,
+}
+
+struct LiveSenderSnapshot<'a> {
+    peer_states: &'a [(PeerId, Arc<PlayerAvatarState>)],
+    live_senders: Vec<bool>,
+    membership_generation: u64,
 }
 
 const MAX_BUNDLE_CACHE_ENTRIES_PER_TICK: usize = 4096;
@@ -643,7 +649,7 @@ impl PartialEq for BundleCacheKey {
 impl Eq for BundleCacheKey {}
 
 impl BundleCacheLookup {
-    fn new(items: &[BundleAvatarSend], compression: AvatarBundleCompression) -> Self {
+    fn new(items: &[BundleAvatarSend<'_>], compression: AvatarBundleCompression) -> Self {
         let mut channel_counts = [0u8; 256];
         let mut raw_len = 0usize;
         let mut identities = Vec::with_capacity(items.len());
@@ -765,7 +771,7 @@ impl Default for AvatarBundleCache {
 impl AvatarBundleCache {
     fn cell_for(
         &self,
-        items: &[BundleAvatarSend],
+        items: &[BundleAvatarSend<'_>],
         compression: AvatarBundleCompression,
     ) -> Option<Arc<BundleCacheCell>> {
         let lookup = BundleCacheLookup::new(items, compression);
@@ -791,7 +797,10 @@ impl AvatarBundleCache {
         }
         let key = BundleCacheKey {
             lookup,
-            _owners: items.iter().map(|item| item.payload.clone()).collect(),
+            _owners: items
+                .iter()
+                .map(|item| Bytes::clone(item.payload))
+                .collect(),
         };
         match self.entries.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
@@ -1848,6 +1857,9 @@ impl AvatarSyncSystem {
         };
 
         let build_start = Instant::now();
+        // Share the census only within this immutable tick roster. Receiver builds
+        // validate its epoch under the admission gate and refresh after a join/leave.
+        let live_sender_snapshot = self.live_sender_snapshot(&peer_states);
         // A tick owns one immutable sender snapshot, so identical bundle chunks can
         // share their encoded bytes across all receiver builds in this tick.
         let bundle_cache = AvatarBundleCache::default();
@@ -1891,6 +1903,7 @@ impl AvatarSyncSystem {
                         bypass_empty,
                         &bundle_cache,
                         scratch,
+                        Some(&live_sender_snapshot),
                     )
                 },
             )
@@ -2079,6 +2092,21 @@ impl AvatarSyncSystem {
         }
     }
 
+    fn live_sender_snapshot<'a>(
+        &self,
+        peer_states: &'a [(PeerId, Arc<PlayerAvatarState>)],
+    ) -> LiveSenderSnapshot<'a> {
+        let live = self.live_players.read();
+        LiveSenderSnapshot {
+            peer_states,
+            live_senders: peer_states
+                .iter()
+                .map(|(id, state)| live.get(id) == Some(&state.incarnation))
+                .collect(),
+            membership_generation: self.membership_generation.load(Ordering::Relaxed),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_sends_for_receiver<'a>(
         &self,
@@ -2095,7 +2123,8 @@ impl AvatarSyncSystem {
         offloaded_empty: bool,
         bypass_empty: bool,
         bundle_cache: &AvatarBundleCache,
-        scratch: &mut ReceiverBuildScratch,
+        scratch: &mut ReceiverBuildScratch<'a>,
+        live_sender_snapshot: Option<&LiveSenderSnapshot<'_>>,
     ) -> Option<OutboundAvatarBatch<'a>> {
         let receiver_incarnation = peer_states
             .iter()
@@ -2111,18 +2140,26 @@ impl AvatarSyncSystem {
         };
         // Never hold the admission lock while waiting on a receiver or encoding.
         let mut receiver_tracking = row.lock();
-        let membership_generation = {
+        let (membership_generation, live_senders) = {
             let live = self.live_players.read();
             if live.get(&receiver_id) != Some(&receiver_incarnation) {
                 return None;
             }
-            scratch.live_senders.clear();
-            scratch.live_senders.extend(
-                peer_states
-                    .iter()
-                    .map(|(id, state)| live.get(id) == Some(&state.incarnation)),
-            );
-            self.membership_generation.load(Ordering::Relaxed)
+            let generation = self.membership_generation.load(Ordering::Relaxed);
+            if let Some(snapshot) = live_sender_snapshot.filter(|snapshot| {
+                snapshot.membership_generation == generation
+                    && std::ptr::eq(snapshot.peer_states, peer_states)
+            }) {
+                (generation, snapshot.live_senders.as_slice())
+            } else {
+                scratch.live_senders.clear();
+                scratch.live_senders.extend(
+                    peer_states
+                        .iter()
+                        .map(|(id, state)| live.get(id) == Some(&state.incarnation)),
+                );
+                (generation, scratch.live_senders.as_slice())
+            }
         };
         // Sender teardown waits on this row outside the admission lock. Its
         // incarnation check preserves replacements admitted during old teardown.
@@ -2185,7 +2222,7 @@ impl AvatarSyncSystem {
             };
             let (sender_id, sender_state) = &peer_states[peer_index];
             let sender_id = *sender_id;
-            if sender_id == receiver_id || !scratch.live_senders[peer_index] {
+            if sender_id == receiver_id || !live_senders[peer_index] {
                 continue;
             }
             if !offloaded_empty
@@ -2364,7 +2401,9 @@ impl AvatarSyncSystem {
             if config.enable_bundle_compression {
                 bundle.push(BundleAvatarSend {
                     original_channel: channel,
-                    payload: packet_bytes.clone(),
+                    // The tick's immutable peer snapshot owns these bytes through
+                    // encoding and flush. Only admitted cache keys need a clone.
+                    payload: packet_bytes,
                     interval_offset,
                     interval_byte,
                 });
@@ -2423,8 +2462,7 @@ impl AvatarSyncSystem {
                 .outbound_logical_avatar_sends
                 .fetch_add(logical_sends, Ordering::Relaxed);
         }
-        // Only the independently owned `direct` sends escape this receiver build. In
-        // particular, release every Bytes clone held by scratch before it is reused.
+        // Only direct sends escape; scratch holds no bundle items between builds.
         bundle.clear();
         (!direct.is_empty()).then_some(OutboundAvatarBatch {
             receiver: receiver_id,
@@ -2664,7 +2702,7 @@ fn try_for_each_receiver_flush<T: Sync>(
 
 fn emit_greedy_avatar_bundles<'a>(
     direct: &mut Vec<OutboundAvatarSend<'a>>,
-    bundle: &mut Vec<BundleAvatarSend>,
+    bundle: &mut Vec<BundleAvatarSend<'a>>,
     bundle_ratio: &mut f32,
     profiler: &BsrProfiler,
     config: &AvatarSyncConfig,
@@ -2762,14 +2800,10 @@ fn emit_greedy_avatar_bundles<'a>(
     direct.extend(
         bundle
             .drain(cursor..)
-            .map(|item| OutboundAvatarSend::Owned {
+            .map(|item| OutboundAvatarSend::Borrowed {
                 channel: item.original_channel,
-                payload: patch_interval_bytes(
-                    &item.payload,
-                    item.interval_offset,
-                    item.interval_byte,
-                ),
-                patch: None,
+                payload: item.payload,
+                patch: Some((item.interval_offset, item.interval_byte)),
             }),
     );
     bundle.clear();
@@ -2788,7 +2822,7 @@ enum BundleEmit {
 
 fn try_emit_bundle_range<'a>(
     direct: &mut Vec<OutboundAvatarSend<'a>>,
-    bundle: &[BundleAvatarSend],
+    bundle: &[BundleAvatarSend<'_>],
     range: Range<usize>,
     profiler: &BsrProfiler,
     config: &AvatarSyncConfig,
@@ -2814,7 +2848,7 @@ fn try_emit_bundle_range<'a>(
             .iter()
             .map(|item| AvatarBundleSlice {
                 original_channel: item.original_channel,
-                payload: &item.payload,
+                payload: item.payload,
                 interval_patch: Some((item.interval_offset, item.interval_byte)),
             })
             .collect::<Vec<_>>();
@@ -2856,7 +2890,7 @@ fn try_emit_bundle_range<'a>(
 }
 
 fn pick_bundle_chunk_end(
-    bundle: &[BundleAvatarSend],
+    bundle: &[BundleAvatarSend<'_>],
     cursor: usize,
     hard_end: usize,
     target_raw: usize,
@@ -2874,7 +2908,7 @@ fn pick_bundle_chunk_end(
     chunk_end
 }
 
-fn bundle_range_raw_len(bundle: &[BundleAvatarSend], start: usize, end: usize) -> usize {
+fn bundle_range_raw_len(bundle: &[BundleAvatarSend<'_>], start: usize, end: usize) -> usize {
     bundle[start..end]
         .iter()
         .map(|item| 3 + item.payload.len())
@@ -3414,21 +3448,6 @@ fn pre_serialize(
     }
 }
 
-fn patch_interval_bytes(payload: &Bytes, interval_offset: usize, interval: u8) -> Bytes {
-    if payload
-        .get(interval_offset)
-        .is_some_and(|current| *current == interval)
-    {
-        return payload.clone();
-    }
-    let mut bytes = Vec::with_capacity(payload.len());
-    bytes.extend_from_slice(payload);
-    if interval_offset < bytes.len() {
-        bytes[interval_offset] = interval;
-    }
-    Bytes::from(bytes)
-}
-
 #[cfg(windows)]
 fn set_avatar_thread_priority() {
     use windows_sys::Win32::System::Threading::{
@@ -3587,17 +3606,58 @@ mod tests {
     }
 
     #[test]
+    fn bundle_cache_retains_borrowed_payload_backing_until_cache_drop() {
+        struct Owner {
+            dropped: Arc<AtomicBool>,
+        }
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                &[1, 2, 3, 4]
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::Relaxed);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let cache = AvatarBundleCache::default();
+        {
+            let payload = Bytes::from_owner(Owner {
+                dropped: Arc::clone(&dropped),
+            });
+            cache
+                .cell_for(
+                    &[BundleAvatarSend {
+                        original_channel: channels::DELTA_AVATAR,
+                        payload: &payload,
+                        interval_offset: 1,
+                        interval_byte: 20,
+                    }],
+                    AvatarBundleCompression::Lz4,
+                )
+                .unwrap();
+        }
+        assert!(!dropped.load(Ordering::Relaxed));
+        drop(cache);
+        assert!(dropped.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn bundle_cache_fingerprint_collisions_preserve_full_identity() {
+        let first = Bytes::from_static(&[1, 2, 3, 4]);
+        let second = Bytes::from_static(&[5, 6, 7, 8]);
+        let different_backing = Bytes::from(vec![1, 2, 3, 4]);
         let base = vec![
             BundleAvatarSend {
                 original_channel: channels::DELTA_AVATAR,
-                payload: Bytes::from_static(&[1, 2, 3, 4]),
+                payload: &first,
                 interval_offset: 1,
                 interval_byte: 20,
             },
             BundleAvatarSend {
                 original_channel: channels::DELTA_AVATAR,
-                payload: Bytes::from_static(&[5, 6, 7, 8]),
+                payload: &second,
                 interval_offset: 1,
                 interval_byte: 20,
             },
@@ -3616,14 +3676,14 @@ mod tests {
         reversed.reverse();
         variants.push((reversed, AvatarBundleCompression::Lz4));
         let mut backing = base.clone();
-        backing[0].payload = Bytes::from(vec![1, 2, 3, 4]);
+        backing[0].payload = &different_backing;
         variants.push((backing, AvatarBundleCompression::Lz4));
         variants.push((
             base.clone(),
             AvatarBundleCompression::ZstdDictionary { level: -2 },
         ));
         variants.push((base, AvatarBundleCompression::ZstdDictionary { level: 1 }));
-        let collide = |items: &[BundleAvatarSend], compression| {
+        let collide = |items: &[BundleAvatarSend<'_>], compression| {
             let mut lookup = BundleCacheLookup::new(items, compression);
             lookup.fingerprint = 7;
             lookup
@@ -3633,7 +3693,10 @@ mod tests {
             entries.insert(
                 BundleCacheKey {
                     lookup: collide(items, *compression),
-                    _owners: items.iter().map(|item| item.payload.clone()).collect(),
+                    _owners: items
+                        .iter()
+                        .map(|item| Bytes::clone(item.payload))
+                        .collect(),
                 },
                 index,
             );
@@ -3649,24 +3712,30 @@ mod tests {
         let config = receiver_build_test_config();
         let profiler = BsrProfiler::new(false);
         let cache = AvatarBundleCache::default();
-        let mut bundle = (0..6)
-            .map(|index| BundleAvatarSend {
-                original_channel: channels::DELTA_AVATAR,
-                payload: Bytes::from(
+        let payloads = (0..6)
+            .map(|index| {
+                Bytes::from(
                     (0..80)
                         .map(|offset| ((index * 37 + offset * 13) % 256) as u8)
                         .collect::<Vec<_>>(),
-                ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut bundle = payloads
+            .iter()
+            .map(|payload| BundleAvatarSend {
+                original_channel: channels::DELTA_AVATAR,
+                payload,
                 interval_offset: 2,
                 interval_byte: 20,
             })
             .collect::<Vec<_>>();
-        let expected = |items: &[BundleAvatarSend]| {
+        let expected = |items: &[BundleAvatarSend<'_>]| {
             let slices = items
                 .iter()
                 .map(|item| AvatarBundleSlice {
                     original_channel: item.original_channel,
-                    payload: &item.payload,
+                    payload: item.payload,
                     interval_patch: Some((item.interval_offset, item.interval_byte)),
                 })
                 .collect::<Vec<_>>();
@@ -3752,9 +3821,10 @@ mod tests {
                 random as u8
             })
             .collect::<Vec<_>>();
+        let payload = Bytes::from(payload);
         let bundle = vec![BundleAvatarSend {
             original_channel: channels::DELTA_AVATAR,
-            payload: Bytes::from(payload),
+            payload: &payload,
             interval_offset: 2,
             interval_byte: 17,
         }];
@@ -3792,7 +3862,7 @@ mod tests {
         let expected = try_encode_avatar_bundle_slices_with_compression(
             &[AvatarBundleSlice {
                 original_channel: bundle[0].original_channel,
-                payload: &bundle[0].payload,
+                payload: bundle[0].payload,
                 interval_patch: Some((2, 17)),
             }],
             AvatarBundleCompression::Lz4,
@@ -3813,9 +3883,10 @@ mod tests {
                 random as u8
             })
             .collect::<Vec<_>>();
+        let payload = Bytes::from(payload);
         let mut bundle = vec![BundleAvatarSend {
             original_channel: channels::DELTA_AVATAR,
-            payload: Bytes::from(payload),
+            payload: &payload,
             interval_offset: 2,
             interval_byte: 20,
         }];
@@ -3833,7 +3904,7 @@ mod tests {
             let expected = try_encode_avatar_bundle_slices_with_compression(
                 &[AvatarBundleSlice {
                     original_channel: bundle[0].original_channel,
-                    payload: &bundle[0].payload,
+                    payload: bundle[0].payload,
                     interval_patch: Some((bundle[0].interval_offset, patch_byte)),
                 }],
                 AvatarBundleCompression::Lz4,
@@ -3907,6 +3978,78 @@ mod tests {
         }
     }
 
+    fn membership_test_batch(
+        system: &AvatarSyncSystem,
+        peers: &[(PeerId, Arc<PlayerAvatarState>)],
+        live_snapshot: Option<&LiveSenderSnapshot<'_>>,
+    ) -> Option<AvatarBatchSnapshot> {
+        let batch = system.build_sends_for_receiver(
+            1,
+            [0.0; 3],
+            AVATAR_BUNDLE_WIRE_BUDGET_BYTES,
+            peers,
+            None,
+            None,
+            &receiver_build_test_config(),
+            1_000,
+            1,
+            AVATAR_TICK_INTERVAL_MS,
+            true,
+            true,
+            &AvatarBundleCache::default(),
+            &mut ReceiverBuildScratch::default(),
+            live_snapshot,
+        );
+        snapshot_avatar_batch(batch.as_ref())
+    }
+
+    #[test]
+    fn shared_membership_snapshot_refreshes_after_departure_and_id_reuse() {
+        for reuse in [false, true] {
+            let config = receiver_build_test_config();
+            let checked = AvatarSyncSystem::new(config.clone());
+            let shared = AvatarSyncSystem::new(config);
+            let peers = receiver_build_test_peers_from_ids([1, 2, 3], &[]);
+            register_test_peers(&checked, &peers);
+            register_test_peers(&shared, &peers);
+            let snapshot = shared.live_sender_snapshot(&peers);
+            for system in [&checked, &shared] {
+                system.remove_player(2);
+                if reuse {
+                    system.register_player(2);
+                }
+            }
+            let actual = membership_test_batch(&shared, &peers, Some(&snapshot));
+            assert_eq!(actual, membership_test_batch(&checked, &peers, None));
+            let batch = actual.unwrap();
+            assert_eq!(batch.1.len(), 1);
+            assert_eq!(batch.1[0].1[0], 3); // No frame from departed incarnation 2.
+
+            shared.remove_player(1);
+            shared.register_player(1);
+            assert!(membership_test_batch(&shared, &peers, Some(&snapshot)).is_none());
+            assert!(!shared.tracking.contains_key(&1));
+        }
+    }
+
+    #[test]
+    fn shared_membership_snapshot_cannot_apply_to_a_different_roster_order() {
+        let config = receiver_build_test_config();
+        let checked = AvatarSyncSystem::new(config.clone());
+        let shared = AvatarSyncSystem::new(config);
+        let peers = receiver_build_test_peers_from_ids([1, 2, 3], &[]);
+        let live_peers = vec![peers[0].clone(), peers[2].clone()];
+        register_test_peers(&checked, &live_peers);
+        register_test_peers(&shared, &live_peers);
+        let snapshot = shared.live_sender_snapshot(&peers);
+        let reordered = vec![peers[2].clone(), peers[0].clone(), peers[1].clone()];
+        let actual = membership_test_batch(&shared, &reordered, Some(&snapshot));
+        assert_eq!(actual, membership_test_batch(&checked, &reordered, None));
+        let batch = actual.unwrap();
+        assert_eq!(batch.1.len(), 1);
+        assert_eq!(batch.1[0].1[0], 3); // The old mask's true bit must not admit peer 2.
+    }
+
     #[test]
     fn drained_update_cannot_recreate_disconnected_or_reused_peer() {
         let config = receiver_build_test_config();
@@ -3965,6 +4108,7 @@ mod tests {
                     true,
                     &cache,
                     &mut scratch,
+                    None,
                 )
                 .is_some()
         };
@@ -4043,6 +4187,7 @@ mod tests {
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let builder_system = system.clone();
         let builder = std::thread::spawn(move || {
+            let live_sender_snapshot = builder_system.live_sender_snapshot(&peers);
             let sent = builder_system
                 .build_sends_for_receiver(
                     1,
@@ -4059,6 +4204,7 @@ mod tests {
                     true,
                     &AvatarBundleCache::default(),
                     &mut ReceiverBuildScratch::default(),
+                    Some(&live_sender_snapshot),
                 )
                 .is_some();
             (sent, peers, config)
@@ -4136,7 +4282,8 @@ mod tests {
                     true,
                     true,
                     &AvatarBundleCache::default(),
-                    &mut ReceiverBuildScratch::default()
+                    &mut ReceiverBuildScratch::default(),
+                    None,
                 )
                 .is_some());
         }
@@ -4174,6 +4321,7 @@ mod tests {
             true,
             &AvatarBundleCache::default(),
             &mut ReceiverBuildScratch::default(),
+            None,
         );
         let row = Arc::clone(system.tracking.get(&1).unwrap().value());
         let mut held = row.lock();
@@ -4243,6 +4391,7 @@ mod tests {
             true,
             &cache,
             &mut scratch,
+            None,
         );
         system.remove_player(2);
         let frame = Arc::clone(system.states.get(&3).unwrap().value());
@@ -4318,6 +4467,7 @@ mod tests {
                 true,
                 &cache,
                 &mut scratch,
+                None,
             );
         };
         let assert_cached = |receiver, distance: f32, quality| {
@@ -4417,6 +4567,7 @@ mod tests {
                             true,
                             &cache,
                             &mut scratch,
+                            None,
                         )
                         .unwrap();
                     assert_eq!(batch.sends.len(), peers.len() - 1);
@@ -4512,6 +4663,7 @@ mod tests {
                 true,
                 &AvatarBundleCache::default(),
                 &mut scratch,
+                None,
             );
         };
         build(Some(&first), &peers, &roster, 0);
@@ -4669,6 +4821,7 @@ mod tests {
                 true,
                 &AvatarBundleCache::default(),
                 &mut ReceiverBuildScratch::default(),
+                None,
             );
             assert_eq!(
                 system.tracking.get(&1).unwrap().lock().senders[&2].cached_quality_index,
@@ -4931,7 +5084,7 @@ mod tests {
     fn build_fresh_and_reused<'a>(
         fresh_system: &AvatarSyncSystem,
         reused_system: &AvatarSyncSystem,
-        scratch: &mut ReceiverBuildScratch,
+        scratch: &mut ReceiverBuildScratch<'a>,
         config: &AvatarSyncConfig,
         peers: &'a [(PeerId, Arc<PlayerAvatarState>)],
         receiver: PeerId,
@@ -4944,7 +5097,9 @@ mod tests {
             .1
             .position;
         let bundle_cache = AvatarBundleCache::default();
-        let build = |system: &AvatarSyncSystem, scratch: &mut ReceiverBuildScratch| {
+        let build = |system: &AvatarSyncSystem,
+                     scratch: &mut ReceiverBuildScratch<'a>,
+                     live_snapshot: Option<&LiveSenderSnapshot<'a>>| {
             system.build_sends_for_receiver(
                 receiver,
                 receiver_position,
@@ -4960,11 +5115,13 @@ mod tests {
                 true,
                 &bundle_cache,
                 scratch,
+                live_snapshot,
             )
         };
         let mut fresh_scratch = ReceiverBuildScratch::default();
-        let fresh = build(fresh_system, &mut fresh_scratch);
-        let reused = build(reused_system, scratch);
+        let fresh = build(fresh_system, &mut fresh_scratch, None);
+        let live_snapshot = reused_system.live_sender_snapshot(peers);
+        let reused = build(reused_system, scratch, Some(&live_snapshot));
         let expected = snapshot_avatar_batch(fresh.as_ref());
         assert_eq!(expected, snapshot_avatar_batch(reused.as_ref()));
         assert!(fresh_scratch.bundle.is_empty());

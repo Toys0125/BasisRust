@@ -30,8 +30,7 @@ use crate::avatar::{
 use crate::config::Config;
 use crate::diagnostics::ClientAvatarDiagnostics;
 use crate::identity::Identity;
-#[cfg(windows)]
-use crate::net::windows_mtu_probe_reply;
+use crate::net::mtu_probe_reply;
 use crate::net::{
     any_local_addr, bind_udp_socket, configure_load_sink_socket, resolve_addr, socket_address_bytes,
 };
@@ -81,51 +80,6 @@ fn read_server_net_id_assignments(payload: &[u8]) -> Option<Vec<ServerNetIdMessa
     Some(messages)
 }
 
-#[cfg(test)]
-mod net_id_batch_tests {
-    use super::*;
-    use basis_protocol::messages::{
-        BasisSerialize, NetIdMessage, ServerUniqueIdMessages, UshortUniqueIdMessage,
-    };
-
-    #[test]
-    fn parses_batched_network_id_assignments() {
-        let expected = vec![
-            ServerNetIdMessage {
-                net_id_message: NetIdMessage {
-                    player_id: "BasisImagePickupManager".into(),
-                },
-                ushort_unique_id_message: UshortUniqueIdMessage {
-                    unique_id_ushort: 23,
-                },
-            },
-            ServerNetIdMessage {
-                net_id_message: NetIdMessage {
-                    player_id: "another-manager".into(),
-                },
-                ushort_unique_id_message: UshortUniqueIdMessage {
-                    unique_id_ushort: 42,
-                },
-            },
-        ];
-        let mut writer = NetWriter::new();
-        ServerUniqueIdMessages {
-            messages: expected.clone(),
-        }
-        .serialize(&mut writer)
-        .unwrap();
-        assert_eq!(
-            read_server_net_id_assignments(writer.as_slice()).unwrap(),
-            expected
-        );
-        assert!(
-            read_server_net_id_assignments(&writer.as_slice()[..writer.as_slice().len() - 1])
-                .is_none()
-        );
-    }
-}
-
-#[derive(Debug)]
 pub(crate) struct BasisClient {
     pub(crate) index: usize,
     pub(crate) socket: Arc<UdpSocket>,
@@ -171,6 +125,54 @@ pub(crate) struct BasisClient {
     /// structured rejection from the target server.
     pub(crate) protocol_version: AtomicU16,
     pub(crate) legacy_retry_payload: StdMutex<Option<Vec<u8>>>,
+}
+
+// Keep connection keys and the password-bearing legacy payload out of diagnostics.
+impl std::fmt::Debug for BasisClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BasisClient")
+            .field("index", &self.index)
+            .field("socket", &self.socket)
+            .field("server_addr", &self.server_addr)
+            .field("connect_time", &self.connect_time)
+            .field("connection_number", &self.connection_number)
+            .field("local_peer_id", &self.local_peer_id)
+            .field("remote_peer_id", &self.remote_peer_id)
+            .field("connected", &self.connected)
+            .field("in_use", &self.in_use)
+            .field("intentional_reconnect", &self.intentional_reconnect)
+            .field("movement_sequence", &self.movement_sequence)
+            .field("voice_sequence", &self.voice_sequence)
+            .field("reliable_sequences", &self.reliable_sequences)
+            .field("fragment_id", &self.fragment_id)
+            .field("ping_sequence", &self.ping_sequence)
+            .field("pending_reliable", &self.pending_reliable)
+            .field("pending_reliable_active", &self.pending_reliable_active)
+            .field("ack_pending", &self.ack_pending)
+            .field("shared_receive", &self.shared_receive)
+            .field("shared_receive_eligible", &self.shared_receive_eligible)
+            .field("receive_shutdown", &self.receive_shutdown)
+            .field("received_reliable", &self.received_reliable)
+            .field("fragment_reassembler", &self.fragment_reassembler)
+            .field("server_avatar_metadata", &self.server_avatar_metadata)
+            .field("force_avatar_keyframe", &self.force_avatar_keyframe)
+            .field("pose", &self.pose)
+            .field("avatar_observer", &self.avatar_observer)
+            .field("scene_session", &self.scene_session)
+            .field("image_benchmark", &self.image_benchmark)
+            .field("image_network_id", &self.image_network_id)
+            .field("packet_diagnostics", &self.packet_diagnostics)
+            .field("avatar_diagnostics", &self.avatar_diagnostics)
+            .field("voice_diagnostics", &self.voice_diagnostics)
+            .field("identity", &self.identity)
+            .field("connection_secret", &"<redacted>")
+            .field("connection_public", &self.connection_public)
+            .field("connection_payload_hash", &self.connection_payload_hash)
+            .field("sealed_outbound", &"<redacted>")
+            .field("protocol_version", &self.protocol_version)
+            .field("legacy_retry_payload", &"<redacted>")
+            .finish()
+    }
 }
 
 impl BasisClient {
@@ -282,16 +284,16 @@ impl BasisClient {
         basis_protocol::application::NetworkApplication::try_read(&mut reader)
             .ok_or_else(|| anyhow!("invalid connection application"))?;
         BytesMessage::deserialize(&mut reader)?;
-        *self.connection_payload_hash.lock().unwrap() =
-            connection_payload_hash(reader.remaining_slice());
-        *self.sealed_outbound.lock().unwrap() = None;
-        self.protocol_version
-            .store(SERVER_VERSION, Ordering::Release);
-        *self.legacy_retry_payload.lock().unwrap() = legacy_payload;
+        let payload_hash = connection_payload_hash(reader.remaining_slice());
         if self.in_use.swap(true, Ordering::SeqCst) {
             error!("Call Shutdown First!");
             return Err(anyhow!("Call Shutdown First!"));
         }
+        *self.connection_payload_hash.lock().unwrap() = payload_hash;
+        *self.sealed_outbound.lock().unwrap() = None;
+        self.protocol_version
+            .store(SERVER_VERSION, Ordering::Release);
+        *self.legacy_retry_payload.lock().unwrap() = legacy_payload;
         let request = self.make_connect_request(&payload);
         self.send_connected(&request).await?;
         debug!(
@@ -321,11 +323,15 @@ impl BasisClient {
         Ok(())
     }
 
-    pub(crate) async fn send_connected(&self, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn seal_connected(&self, bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+        anyhow::ensure!(!bytes.is_empty(), "cannot seal an empty datagram");
         let datagram = {
             let mut guard = self.sealed_outbound.lock().unwrap();
             if let Some((key, counter)) = guard.as_mut() {
-                *counter += 1;
+                *counter = counter
+                    .checked_add(1)
+                    .filter(|next| *next <= i64::MAX as u64)
+                    .ok_or_else(|| anyhow!("client datagram encryption counter exhausted"))?;
                 let mut nonce = [0u8; 12];
                 nonce[..8].copy_from_slice(&counter.to_le_bytes());
                 let mut packet = bytes.to_vec();
@@ -344,6 +350,11 @@ impl BasisClient {
                 None
             }
         };
+        Ok(datagram)
+    }
+
+    pub(crate) async fn send_connected(&self, bytes: &[u8]) -> Result<()> {
+        let datagram = self.seal_connected(bytes)?;
         self.socket
             .send(datagram.as_deref().unwrap_or(bytes))
             .await?;
@@ -727,10 +738,9 @@ impl BasisClient {
                 }
             }
             PacketProperty::Pong => {}
-            #[cfg(windows)]
             PacketProperty::MtuCheck => {
-                if let Some(reply) = windows_mtu_probe_reply(bytes, self.connection_number) {
-                    self.socket.send(&reply).await?;
+                if let Some(reply) = mtu_probe_reply(bytes, self.connection_number) {
+                    self.send_connected(&reply).await?;
                 }
             }
             PacketProperty::Ack => {
@@ -895,11 +905,13 @@ impl BasisClient {
     }
 
     pub(crate) async fn observe_avatar_channel(&self, channel: u8, payload: &[u8]) {
-        if channel == channels::SCENE {
+        if matches!(channel, channels::SCENE | channels::DIRECT_SCENE_SERVER) {
             let image_network_id = self.image_network_id.load(Ordering::Acquire);
             if let (Some(session), true) = (&self.image_benchmark, image_network_id != u16::MAX) {
                 session.observe(self.index, image_network_id, payload);
             }
+        }
+        if channel == channels::SCENE {
             if let Some(session) = &self.scene_session {
                 session.observe(payload);
             }
@@ -1056,7 +1068,7 @@ impl BasisClient {
             diagnostics.receive(channel, payload);
         }
 
-        if channel == channels::SCENE {
+        if matches!(channel, channels::SCENE | channels::DIRECT_SCENE_SERVER) {
             if let (Some(session), Some(network_id)) = (
                 &self.image_benchmark,
                 (self.image_network_id.load(Ordering::Acquire) != u16::MAX)
@@ -1064,6 +1076,8 @@ impl BasisClient {
             ) {
                 session.observe(self.index, network_id, payload);
             }
+        }
+        if channel == channels::SCENE {
             if let Some(session) = &self.scene_session {
                 session.observe(payload);
             }
@@ -1084,6 +1098,13 @@ impl BasisClient {
                 }
             }
             channels::AUTH_IDENTITY => {
+                // The server challenge is cleartext. A new reliable sequence must
+                // never restart an established key's nonce/counter stream.
+                if self.protocol_version.load(Ordering::Acquire) != LEGACY_SERVER_VERSION
+                    && self.sealed_outbound.lock().unwrap().is_some()
+                {
+                    return Ok(());
+                }
                 let mut reader = NetReader::new(payload);
                 let nonce = BytesMessage::deserialize(&mut reader)?.data;
                 if self.protocol_version.load(Ordering::Acquire) == LEGACY_SERVER_VERSION {
@@ -1122,7 +1143,15 @@ impl BasisClient {
                     &self.connection_payload_hash.lock().unwrap(),
                 )?;
                 let response = self.identity.response_payload(&transcript)?;
-                *self.sealed_outbound.lock().unwrap() = Some((key, 0));
+                {
+                    let mut outbound = self.sealed_outbound.lock().unwrap();
+                    // Concurrent receive paths may have processed another challenge
+                    // while this transcript was being built. Install the key once.
+                    if outbound.is_some() {
+                        return Ok(());
+                    }
+                    *outbound = Some((key, 0));
+                }
                 self.send_reliable_ordered(channels::AUTH_IDENTITY, &response)
                     .await?;
             }
@@ -1375,5 +1404,49 @@ impl BasisClient {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod net_id_batch_tests {
+    use super::*;
+    use basis_protocol::messages::{
+        BasisSerialize, NetIdMessage, ServerUniqueIdMessages, UshortUniqueIdMessage,
+    };
+
+    #[test]
+    fn parses_batched_network_id_assignments() {
+        let expected = vec![
+            ServerNetIdMessage {
+                net_id_message: NetIdMessage {
+                    player_id: "BasisImagePickupManager".into(),
+                },
+                ushort_unique_id_message: UshortUniqueIdMessage {
+                    unique_id_ushort: 23,
+                },
+            },
+            ServerNetIdMessage {
+                net_id_message: NetIdMessage {
+                    player_id: "another-manager".into(),
+                },
+                ushort_unique_id_message: UshortUniqueIdMessage {
+                    unique_id_ushort: 42,
+                },
+            },
+        ];
+        let mut writer = NetWriter::new();
+        ServerUniqueIdMessages {
+            messages: expected.clone(),
+        }
+        .serialize(&mut writer)
+        .unwrap();
+        assert_eq!(
+            read_server_net_id_assignments(writer.as_slice()).unwrap(),
+            expected
+        );
+        assert!(
+            read_server_net_id_assignments(&writer.as_slice()[..writer.as_slice().len() - 1])
+                .is_none()
+        );
     }
 }

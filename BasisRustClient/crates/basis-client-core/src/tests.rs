@@ -8,8 +8,7 @@ use crate::config::{
     DEFAULT_VOICE_FRAME_DURATION_MS, DEFAULT_VOICE_HEARING_DISTANCE,
 };
 use crate::identity::Identity;
-#[cfg(any(windows, test))]
-use crate::net::windows_mtu_probe_reply;
+use crate::net::mtu_probe_reply;
 use crate::net::{any_local_addr, bind_udp_socket};
 use crate::observer::AvatarObserver;
 use crate::observer_session::ObserverSession;
@@ -64,6 +63,10 @@ use basis_transport::{
     LITENETLIB_FRAGMENTED_HEADER_SIZE, LITENETLIB_FRAGMENT_HEADER_SIZE, LITENETLIB_INITIAL_MTU,
     MAX_SEQUENCE, RELIABLE_FRAGMENT_PAYLOAD_SIZE,
 };
+use chacha20poly1305::{
+    aead::{AeadInPlace, KeyInit},
+    ChaCha20Poly1305, Nonce, Tag,
+};
 use ed25519_dalek::Verifier;
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(unix)]
@@ -101,6 +104,88 @@ fn connection_payload_propagates_oversized_login_password() {
             max: 65535
         })
     );
+}
+
+#[tokio::test]
+async fn scene_waits_for_admission_without_delaying_first_send_by_workload_interval() {
+    for reliable in [false, true] {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = test_client(0, server.local_addr().unwrap()).await;
+        let late_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let late_client = test_client(1, late_server.local_addr().unwrap()).await;
+        let clients = Arc::new(Mutex::new(vec![client.clone(), late_client.clone()]));
+        let stop = Arc::new(Notify::new());
+        let task = tokio::spawn(crate::scene::run(
+            clients.clone(),
+            Arc::new(AtomicBool::new(false)),
+            stop.clone(),
+            Arc::new(crate::scene::SceneSession::new(32, None)),
+            Duration::from_secs(60),
+            reliable,
+        ));
+        let mut packet = [0u8; 512];
+        assert!(
+            time::timeout(Duration::from_millis(30), server.recv(&mut packet))
+                .await
+                .is_err()
+        );
+
+        // Admission without a DID challenge is valid too: metadata is the ready signal,
+        // rather than requiring a sealing key from an optional identity exchange.
+        *client.metadata_state() = Some(ServerAvatarMetadata {
+            sync_interval_ms: 20,
+            base_multiplier: 1.0,
+            increase_rate: 0.0,
+            slowest_send_rate_secs: 2.5,
+            uplink_delta_enabled: false,
+        });
+        let len = time::timeout(Duration::from_secs(1), server.recv(&mut packet))
+            .await
+            .expect("first scene send waited for the 60-second interval")
+            .unwrap();
+        let decoded = parse_packet(&packet[..len]).unwrap();
+        if reliable {
+            assert_eq!(decoded.property, PacketProperty::Channeled);
+            assert_eq!(decoded.channel_id, Some(channels::SCENE * 4 + 2));
+        } else {
+            assert_eq!(decoded.property, PacketProperty::Unreliable);
+            assert_eq!(packet[1], channels::SCENE);
+        }
+
+        assert!(
+            time::timeout(Duration::from_millis(30), late_server.recv(&mut packet))
+                .await
+                .is_err()
+        );
+        *late_client.metadata_state() = *client.metadata_state();
+        time::timeout(Duration::from_secs(1), late_server.recv(&mut packet))
+            .await
+            .expect("second admitted client waited for the workload interval")
+            .unwrap();
+
+        // A new connection at the same population index gets its own first send,
+        // even after the previously observed connections have all sent once.
+        let replacement_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut replacement = test_client(1, replacement_server.local_addr().unwrap()).await;
+        Arc::get_mut(&mut replacement).unwrap().connect_time = 1;
+        *replacement.metadata_state() = *client.metadata_state();
+        clients.lock().await[1] = replacement;
+        time::timeout(Duration::from_secs(1), replacement_server.recv(&mut packet))
+            .await
+            .expect("replacement connection waited for the workload interval")
+            .unwrap();
+        assert!(
+            time::timeout(Duration::from_millis(30), server.recv(&mut packet))
+                .await
+                .is_err(),
+            "admission polls advanced the first client's regular send cadence"
+        );
+        stop.notify_one();
+        time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }
 
 #[test]
@@ -560,6 +645,62 @@ async fn test_client_with_voice_diagnostics(
 }
 
 #[tokio::test]
+async fn client_debug_redacts_connection_secrets() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(7, server.local_addr().unwrap()).await;
+    *client.sealed_outbound.lock().unwrap() = Some(([237; 32], 19));
+    *client.legacy_retry_payload.lock().unwrap() = Some(vec![251; 40]);
+    for debug in [format!("{client:?}"), format!("{client:#?}")] {
+        assert!(debug.contains("index: 7"));
+        assert!(debug.contains("connection_secret: \"<redacted>\""));
+        assert!(debug.contains("sealed_outbound: \"<redacted>\""));
+        assert!(debug.contains("legacy_retry_payload: \"<redacted>\""));
+        assert!(!debug.contains("13, 13, 13"));
+        assert!(!debug.contains("237, 237, 237"));
+        assert!(!debug.contains("251, 251, 251"));
+    }
+}
+
+#[tokio::test]
+async fn duplicate_start_preserves_active_connection_state() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let config = Config::default();
+    let ready = ready_message(&config, [0.0; 3]).unwrap();
+    for version in [SERVER_VERSION, LEGACY_SERVER_VERSION] {
+        let client = test_client(0, server.local_addr().unwrap()).await;
+        let key = [9; 32];
+        *client.connection_payload_hash.lock().unwrap() = [71; 32];
+        *client.sealed_outbound.lock().unwrap() = Some((key, 19));
+        client.protocol_version.store(version, Ordering::Release);
+        *client.legacy_retry_payload.lock().unwrap() = Some(vec![42]);
+        let error = client
+            .start_client(&config, &ready, true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Call Shutdown First!"));
+        assert_eq!(*client.connection_payload_hash.lock().unwrap(), [71; 32]);
+        assert_eq!(*client.sealed_outbound.lock().unwrap(), Some((key, 19)));
+        assert_eq!(client.protocol_version.load(Ordering::Acquire), version);
+        assert_eq!(*client.legacy_retry_payload.lock().unwrap(), Some(vec![42]));
+        assert!(client.connected.load(Ordering::Acquire));
+        assert!(client.in_use.load(Ordering::Acquire));
+        let packet = [PacketProperty::Ping as u8, 0, 0];
+        let sealed = client.seal_connected(&packet).unwrap().unwrap();
+        assert_eq!(
+            u64::from_le_bytes(sealed[sealed.len() - 8..].try_into().unwrap()),
+            20
+        );
+        assert_eq!(open_client_datagram(&key, &sealed), packet);
+        let mut buffer = [0; 32];
+        assert!(
+            time::timeout(Duration::from_millis(20), server.recv(&mut buffer))
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
 async fn reliable_voice_diagnostics_skip_duplicates_on_direct_merged_and_compact_merged() {
     use crate::voice_diagnostics::WindowActiveTestGuard;
 
@@ -856,6 +997,102 @@ async fn v55_did_challenge_uses_plaintext_nonce_signature() {
         .verify(&challenge, &client.identity.verifying_key)
         .unwrap();
     assert!(client.sealed_outbound.lock().unwrap().is_none());
+}
+
+fn open_client_datagram(key: &[u8; 32], packet: &[u8]) -> Vec<u8> {
+    let tag_start = packet.len() - 24;
+    let mut nonce = [0u8; 12];
+    nonce[..8].copy_from_slice(&packet[packet.len() - 8..]);
+    let mut plaintext = packet[..tag_start].to_vec();
+    ChaCha20Poly1305::new(key.into())
+        .decrypt_in_place_detached(
+            Nonce::from_slice(&nonce),
+            &packet[..1],
+            &mut plaintext[1..],
+            Tag::from_slice(&packet[tag_start..tag_start + 16]),
+        )
+        .unwrap();
+    plaintext
+}
+
+#[tokio::test]
+async fn repeated_v56_challenges_cannot_restart_the_encryption_counter() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(0, server.local_addr().unwrap()).await;
+    let secret = x25519_dalek::StaticSecret::from([42u8; 32]);
+    let server_public = x25519_dalek::PublicKey::from(&secret).to_bytes();
+    let challenge = |nonce: u8| {
+        let mut payload = NetWriter::new();
+        payload.put_bytes_with_length(&[nonce; 32]).unwrap();
+        payload.put_bytes_with_length(&server_public).unwrap();
+        payload.put_bytes_with_length(b"test-server").unwrap();
+        payload.into_vec()
+    };
+    let channel =
+        DeliveryMethod::channel_id(channels::AUTH_IDENTITY, DeliveryMethod::ReliableOrdered);
+    client
+        .handle_channeled(channel, 0, &challenge(21))
+        .await
+        .unwrap();
+    let mut packet = [0u8; 512];
+    let len = time::timeout(Duration::from_secs(1), server.recv(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    let (key, first_counter) = client.sealed_outbound.lock().unwrap().unwrap();
+    assert_eq!(first_counter, 1);
+    let response = open_client_datagram(&key, &packet[..len]);
+    assert_eq!(response[3], channel);
+    let pending = client.pending_reliable.lock().await.len();
+
+    // New reliable sequence, same server key, changed nonce: the reported attack.
+    client
+        .handle_channeled(channel, 1, &challenge(22))
+        .await
+        .unwrap();
+    // Malformed later challenges must also leave the established stream untouched.
+    client
+        .handle_channeled(channel, 2, b"invalid")
+        .await
+        .unwrap();
+    assert_eq!(
+        *client.sealed_outbound.lock().unwrap(),
+        Some((key, first_counter))
+    );
+    assert_eq!(client.pending_reliable.lock().await.len(), pending);
+    assert!(
+        time::timeout(Duration::from_millis(30), server.recv(&mut packet))
+            .await
+            .is_err()
+    );
+    let next = [PacketProperty::Unreliable as u8, channels::SCENE, 9];
+    client.send_connected(&next).await.unwrap();
+    let len = time::timeout(Duration::from_secs(1), server.recv(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        i64::from_le_bytes(packet[len - 8..len].try_into().unwrap()),
+        2
+    );
+    assert_eq!(open_client_datagram(&key, &packet[..len]), next);
+}
+
+#[tokio::test]
+async fn exhausted_encryption_counter_does_not_fall_back_to_plaintext() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(0, server.local_addr().unwrap()).await;
+    *client.sealed_outbound.lock().unwrap() = Some(([9; 32], i64::MAX as u64));
+    assert!(client
+        .send_connected(&[PacketProperty::Ping as u8, 0, 0])
+        .await
+        .is_err());
+    let mut packet = [0; 64];
+    assert!(
+        time::timeout(Duration::from_millis(30), server.recv(&mut packet))
+            .await
+            .is_err()
+    );
 }
 
 #[test]
@@ -1463,6 +1700,131 @@ fn unity_policy_emits_high_keyframe_then_decodable_delta_and_periodic_keyframe()
         .find(|(elapsed, packet, _)| packet[1] == channels::PLAYER_AVATAR_HIGH && *elapsed >= 0.53)
         .expect("500ms keyframe deadline should emit a new keyframe");
     assert!(later_keyframe.0 >= 0.53);
+}
+
+fn write_packed_bits_reference(
+    destination: &mut [u8],
+    bit_offset: usize,
+    value: u64,
+    bit_count: usize,
+) {
+    for bit in 0..bit_count {
+        let offset = bit_offset + bit;
+        let mask = 1u8 << (offset & 7);
+        if value & (1u64 << bit) == 0 {
+            destination[offset >> 3] &= !mask;
+        } else {
+            destination[offset >> 3] |= mask;
+        }
+    }
+}
+
+#[test]
+fn packed_pose_bits_match_reference_at_boundaries_and_preserve_neighbors() {
+    let mut state = 0x735a_0f1e_9a63_142b_u64;
+    for offset in 0usize..32 {
+        for count in 0usize..=64 {
+            for pattern in 0..8 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let value = match pattern {
+                    0 => 0,
+                    1 => u64::MAX,
+                    2 => 0xaaaa_aaaa_aaaa_aaaa,
+                    3 => 0x5555_5555_5555_5555,
+                    _ => state,
+                };
+                // Exact-end buffers catch writes beyond the requested bit span.
+                // Extra bytes and patterned contents catch damaged neighboring fields.
+                for extra in [0, 3] {
+                    let len = (offset + count).div_ceil(8) + extra;
+                    let initial = (0..len)
+                        .map(|i| (i as u8).wrapping_mul(37) ^ (pattern as u8).wrapping_mul(53))
+                        .collect::<Vec<_>>();
+                    let mut expected = initial.clone();
+                    let mut actual = initial;
+                    write_packed_bits_reference(&mut expected, offset, value, count);
+                    crate::avatar::write_packed_bits_lsb(&mut actual, offset, value, count);
+                    assert_eq!(
+                        actual, expected,
+                        "offset={offset} count={count} pattern={pattern}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Isolate the nine unaligned High-quality quaternion writes from pose trigonometry.
+/// The old bit loop and production writer receive identical precomputed pose channels.
+#[test]
+#[ignore]
+fn profile_quaternion_packing_cpu() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    type Writer = fn(&mut [u8], usize, u64, usize);
+    const PASSES: usize = 512;
+    let frames = (0..256)
+        .map(|frame| {
+            let angles = crate::avatar::unity_synthetic_angles(
+                (frame + 1) as f64 / 60.0,
+                20.0_f32.to_radians(),
+            );
+            std::array::from_fn::<_, 9, _>(|slot| {
+                let mut q = [0.0; 4];
+                q[slot % 3] = (angles[slot + 1] * 0.5).sin();
+                q[3] = (angles[slot + 1] * 0.5).cos();
+                crate::avatar::encode_high_three_dof_quaternion(q)
+            })
+        })
+        .collect::<Vec<_>>();
+    let writers: [(&str, Writer); 2] = [
+        ("production", crate::avatar::write_packed_bits_lsb),
+        ("bit_loop", write_packed_bits_reference),
+    ];
+    for frame in &frames {
+        let mut expected = vec![0xa5; BitQuality::High.payload_len()];
+        let mut actual = expected.clone();
+        for (slot, value) in frame.iter().copied().enumerate() {
+            write_packed_bits_reference(&mut expected, 72 + slot * 38, value, 38);
+            crate::avatar::write_packed_bits_lsb(&mut actual, 72 + slot * 38, value, 38);
+        }
+        assert_eq!(actual, expected);
+    }
+    let run = |writer: Writer, passes: usize| {
+        // Opaque function pointers give both writers the same call overhead.
+        let writer = black_box(writer);
+        let mut payload = vec![0xa5; BitQuality::High.payload_len()];
+        let started = Instant::now();
+        for _ in 0..passes {
+            for frame in black_box(&frames) {
+                for (slot, value) in frame.iter().copied().enumerate() {
+                    writer(&mut payload, 72 + slot * 38, value, 38);
+                }
+                black_box(payload.as_slice());
+            }
+        }
+        let elapsed_ns = started.elapsed().as_nanos();
+        let checksum = payload.iter().fold(0u64, |sum, byte| {
+            sum.wrapping_mul(257).wrapping_add(u64::from(*byte))
+        });
+        (elapsed_ns, checksum)
+    };
+    for (_, writer) in writers {
+        run(writer, 16);
+    }
+    let mut expected_checksum = None;
+    for round in 0..8 {
+        let order = if round % 2 == 0 { [0, 1] } else { [1, 0] };
+        for index in order {
+            let (label, writer) = writers[index];
+            let (elapsed_ns, checksum) = run(writer, PASSES);
+            assert_eq!(*expected_checksum.get_or_insert(checksum), checksum);
+            println!("pose_pack variant={label} round={round} poses={} elapsed_ns={elapsed_ns} checksum={checksum}", PASSES * frames.len());
+        }
+    }
 }
 
 #[test]
@@ -2094,21 +2456,21 @@ fn windows_mtu_reply_validates_probe_and_preserves_all_bytes_except_property() {
         let probe = mtu_probe_fixture(mtu, 2);
         let mut expected = probe.clone();
         expected[0] = PacketProperty::MtuOk as u8 | (2 << 5);
-        assert_eq!(windows_mtu_probe_reply(&probe, 2), Some(expected));
+        assert_eq!(mtu_probe_reply(&probe, 2), Some(expected));
         assert_eq!(probe[0], PacketProperty::MtuCheck as u8 | (2 << 5));
     }
     let probe = mtu_probe_fixture(1164, 2);
     for offset in [1, 13, probe.len() - 1] {
         let mut invalid = probe.clone();
         invalid[offset] ^= 1;
-        assert!(windows_mtu_probe_reply(&invalid, 2).is_none());
+        assert!(mtu_probe_reply(&invalid, 2).is_none());
     }
-    assert!(windows_mtu_probe_reply(&probe, 1).is_none());
+    assert!(mtu_probe_reply(&probe, 1).is_none());
     for length in [0, 1, 13, 1023, 1433] {
-        assert!(windows_mtu_probe_reply(&vec![0; length], 2).is_none());
+        assert!(mtu_probe_reply(&vec![0; length], 2).is_none());
     }
     for mtu in [1023, 1433] {
-        assert!(windows_mtu_probe_reply(&mtu_probe_fixture(mtu, 2), 2).is_none());
+        assert!(mtu_probe_reply(&mtu_probe_fixture(mtu, 2), 2).is_none());
     }
     for property in [
         PacketProperty::MtuOk as u8,
@@ -2116,13 +2478,12 @@ fn windows_mtu_reply_validates_probe_and_preserves_all_bytes_except_property() {
     ] {
         let mut invalid = probe.clone();
         invalid[0] = property | (2 << 5);
-        assert!(windows_mtu_probe_reply(&invalid, 2).is_none());
+        assert!(mtu_probe_reply(&invalid, 2).is_none());
     }
 }
 
-#[cfg(windows)]
 #[tokio::test]
-async fn windows_receive_handler_echoes_valid_mtu_probe_to_connected_server() {
+async fn receive_handler_echoes_valid_mtu_probe_to_connected_server() {
     let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let mut client = test_client(1, server.local_addr().unwrap()).await;
     Arc::get_mut(&mut client).unwrap().connection_number = 2;
@@ -2147,10 +2508,7 @@ async fn windows_receive_handler_echoes_valid_mtu_probe_to_connected_server() {
             .unwrap()
             .unwrap();
         assert_eq!(len, mtu);
-        assert_eq!(
-            &received[..len],
-            windows_mtu_probe_reply(&probe, 2).unwrap()
-        );
+        assert_eq!(&received[..len], mtu_probe_reply(&probe, 2).unwrap());
     }
 }
 
@@ -2187,7 +2545,7 @@ async fn shared_receiver_echoes_only_valid_mtu_probe() {
         make_probe(LITENETLIB_INITIAL_MTU - 1),
         make_probe(LITENETLIB_MAX_MTU + 1),
     ] {
-        shared_receiver_send_mtu_ok(fd, &mut invalid, 2);
+        shared_receiver_send_mtu_ok(&client, fd, &mut invalid);
     }
     let mut received = [0u8; 2048];
     assert!(
@@ -2200,13 +2558,72 @@ async fn shared_receiver_echoes_only_valid_mtu_probe() {
         let mut probe = make_probe(mtu);
         let mut expected = probe.clone();
         expected[0] = PacketProperty::MtuOk as u8 | (2 << 5);
-        shared_receiver_send_mtu_ok(fd, &mut probe, 2);
+        shared_receiver_send_mtu_ok(&client, fd, &mut probe);
         let len = time::timeout(Duration::from_secs(1), server.recv(&mut received))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(len, mtu);
         assert_eq!(&received[..len], expected);
+    }
+}
+
+#[tokio::test]
+async fn post_login_control_replies_share_the_encrypted_counter_stream() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut client = test_client(1, server.local_addr().unwrap()).await;
+    Arc::get_mut(&mut client).unwrap().connection_number = 2;
+    let key = [9u8; 32];
+    *client.sealed_outbound.lock().unwrap() = Some((key, 7));
+    let probe = mtu_probe_fixture(1392, 2);
+    let expected = mtu_probe_reply(&probe, 2).unwrap();
+    let mut received = [0u8; 2048];
+
+    // The async handler used on Windows and by per-client receive loops.
+    client.handle_packet(&probe).await.unwrap();
+    let len = time::timeout(Duration::from_secs(1), server.recv(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(len, probe.len() + 24);
+    assert_eq!(
+        i64::from_le_bytes(received[len - 8..len].try_into().unwrap()),
+        8
+    );
+    assert_eq!(open_client_datagram(&key, &received[..len]), expected);
+
+    #[cfg(target_os = "linux")]
+    {
+        let fd = client.socket.as_raw_fd();
+        shared_receiver_send_mtu_ok(&client, fd, &mut probe.clone());
+        let len = time::timeout(Duration::from_secs(1), server.recv(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(len, probe.len() + 24);
+        assert_eq!(
+            i64::from_le_bytes(received[len - 8..len].try_into().unwrap()),
+            9
+        );
+        assert_eq!(open_client_datagram(&key, &received[..len]), expected);
+
+        crate::receiver::shared_receiver_send_pong(
+            &client,
+            fd,
+            PacketProperty::Ping as u8 | (2 << 5),
+            3,
+        );
+        let len = time::timeout(Duration::from_secs(1), server.recv(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            i64::from_le_bytes(received[len - 8..len].try_into().unwrap()),
+            10
+        );
+        let pong = open_client_datagram(&key, &received[..len]);
+        assert_eq!(pong.len(), 11);
+        assert_eq!(&pong[..3], &[PacketProperty::Pong as u8 | (2 << 5), 3, 0]);
     }
 }
 
@@ -2398,6 +2815,233 @@ async fn shared_receive_hands_critical_reliable_packets_to_normal_dispatch() {
     assert!(!client.reliable_receive_state().unwrap().started[delta_channel as usize]);
     client.handle_packet(handoff[0]).await.unwrap();
     assert!(client.force_avatar_keyframe.load(Ordering::Acquire));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shared_receive_dispatches_single_and_batched_net_id_assignments() {
+    use basis_protocol::messages::{
+        NetIdMessage, ServerNetIdMessage, ServerUniqueIdMessages, UshortUniqueIdMessage,
+    };
+
+    fn channel_packet(channel_id: u8, sequence: u16, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![PacketProperty::Channeled as u8];
+        packet.extend_from_slice(&sequence.to_le_bytes());
+        packet.push(channel_id);
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(1, server.local_addr().unwrap()).await;
+    let manager_id = |id| ServerNetIdMessage {
+        net_id_message: NetIdMessage {
+            player_id: crate::image_benchmark::IMAGE_MANAGER_IDENTIFIER.to_owned(),
+        },
+        ushort_unique_id_message: UshortUniqueIdMessage {
+            unique_id_ushort: id,
+        },
+    };
+
+    let mut single_payload = ProtocolNetWriter::new();
+    manager_id(42).serialize(&mut single_payload).unwrap();
+    let single_channel =
+        DeliveryMethod::channel_id(channels::NET_ID_ASSIGN, DeliveryMethod::ReliableOrdered);
+    let single = channel_packet(single_channel, 1, single_payload.as_slice());
+    let mut merged = vec![PacketProperty::Merged as u8];
+    merged.extend_from_slice(&(single.len() as u16).to_le_bytes());
+    merged.extend_from_slice(&single);
+    let handoff = shared_receiver_process_merged(&client, client.socket.as_raw_fd(), &merged);
+    assert_eq!(handoff, vec![&single[..]]);
+    assert!(!client.reliable_receive_state().unwrap().started[single_channel as usize]);
+    client.handle_packet(handoff[0]).await.unwrap();
+    assert_eq!(client.image_network_id.load(Ordering::Acquire), 42);
+    assert!(client.reliable_receive_state().unwrap().started[single_channel as usize]);
+
+    let mut batch_payload = ProtocolNetWriter::new();
+    ServerUniqueIdMessages {
+        messages: vec![
+            manager_id(43),
+            ServerNetIdMessage {
+                net_id_message: NetIdMessage {
+                    player_id: "another-manager".into(),
+                },
+                ushort_unique_id_message: UshortUniqueIdMessage {
+                    unique_id_ushort: 99,
+                },
+            },
+        ],
+    }
+    .serialize(&mut batch_payload)
+    .unwrap();
+    let batch_channel =
+        DeliveryMethod::channel_id(channels::NET_ID_ASSIGNS, DeliveryMethod::ReliableOrdered);
+    let batch = channel_packet(batch_channel, 1, batch_payload.as_slice());
+    let mut compact = vec![PacketProperty::CompactMerged as u8, 0x40, batch.len() as u8];
+    compact.extend_from_slice(&batch);
+    let handoff = shared_receiver_process_compact(&client, &compact);
+    assert_eq!(handoff, vec![&batch[..]]);
+    assert!(!client.reliable_receive_state().unwrap().started[batch_channel as usize]);
+    client.handle_packet(handoff[0]).await.unwrap();
+    assert_eq!(client.image_network_id.load(Ordering::Acquire), 43);
+    assert!(client.reliable_receive_state().unwrap().started[batch_channel as usize]);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shared_receive_keeps_scene_reliable_only_for_scene_observers() {
+    fn scene_packet(sequence: u16) -> Vec<u8> {
+        let channel_id =
+            DeliveryMethod::channel_id(channels::SCENE, DeliveryMethod::ReliableOrdered);
+        let timestamp = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+        let mut packet = vec![PacketProperty::Channeled as u8];
+        packet.extend_from_slice(&sequence.to_le_bytes());
+        packet.push(channel_id);
+        packet.extend_from_slice(&7u16.to_le_bytes());
+        packet.extend_from_slice(&60000u16.to_le_bytes());
+        packet.extend_from_slice(b"BSCR");
+        packet.extend_from_slice(&1u32.to_le_bytes());
+        packet.extend_from_slice(&1u64.to_le_bytes());
+        packet.extend_from_slice(&timestamp.to_le_bytes());
+        packet
+    }
+
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut observer = test_client(1, server.local_addr().unwrap()).await;
+    let session = Arc::new(crate::scene::SceneSession::new(24, None));
+    Arc::get_mut(&mut observer).unwrap().scene_session = Some(session.clone());
+    let wire = scene_packet(1);
+    let mut compact = vec![PacketProperty::CompactMerged as u8, 0x40, wire.len() as u8];
+    compact.extend_from_slice(&wire);
+    let handoff = shared_receiver_process_compact(&observer, &compact);
+    assert_eq!(handoff, vec![&wire[..]]);
+    let scene_channel =
+        DeliveryMethod::channel_id(channels::SCENE, DeliveryMethod::ReliableOrdered);
+    assert!(!observer.reliable_receive_state().unwrap().started[scene_channel as usize]);
+    observer.handle_packet(handoff[0]).await.unwrap();
+
+    let csv = std::env::temp_dir().join(format!("basis-shared-scene-{}.csv", Uuid::new_v4()));
+    session.write_csv(&csv).unwrap();
+    let report = std::fs::read_to_string(&csv).unwrap();
+    let _ = std::fs::remove_file(csv);
+    assert!(
+        report.lines().any(|line| line == "received_messages,1"),
+        "{report}"
+    );
+
+    let cache_channel = DeliveryMethod::channel_id(
+        channels::DIRECT_SCENE_SERVER,
+        DeliveryMethod::ReliableOrdered,
+    );
+    let mut cache_wire = scene_packet(1);
+    cache_wire[3] = cache_channel;
+    let mut cache_container = vec![
+        PacketProperty::CompactMerged as u8,
+        0x40,
+        cache_wire.len() as u8,
+    ];
+    cache_container.extend_from_slice(&cache_wire);
+    assert!(shared_receiver_process_compact(&observer, &cache_container).is_empty());
+    assert!(observer.reliable_receive_state().unwrap().started[cache_channel as usize]);
+
+    // Ordinary load sinks still ACK the reliable scene packet without handing its body
+    // to the async scene parser.
+    let sink = test_client(2, server.local_addr().unwrap()).await;
+    let wire = scene_packet(2);
+    let mut merged = vec![PacketProperty::Merged as u8];
+    merged.extend_from_slice(&(wire.len() as u16).to_le_bytes());
+    merged.extend_from_slice(&wire);
+    assert!(shared_receiver_process_merged(&sink, sink.socket.as_raw_fd(), &merged).is_empty());
+    assert!(sink.reliable_receive_state().unwrap().started[scene_channel as usize]);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shared_receive_hands_fragmented_scene_and_cache_to_image_benchmark_client() {
+    fn merged(packet: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![PacketProperty::Merged as u8];
+        bytes.extend_from_slice(&(packet.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(packet);
+        bytes
+    }
+
+    let dir = std::env::temp_dir().join(format!("basis-shared-image-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image_path = dir.join("fixture.jpg");
+    let mut image = vec![0x55; 5 * 1024 * 1024];
+    image[..2].copy_from_slice(&[0xff, 0xd8]);
+    image[2..21].copy_from_slice(&[
+        0xff, 0xc0, 0x00, 0x11, 0x08, 0x08, 0x00, 0x08, 0x00, 0x08, 0x03, 0x01, 0x11, 0x00, 0x02,
+        0x11, 0x00, 0x03, 0x11,
+    ]);
+    let last = image.len();
+    image[last - 2..].copy_from_slice(&[0xff, 0xd9]);
+    std::fs::write(&image_path, image).unwrap();
+    let session = crate::image_benchmark::ImageBenchmarkSession::new(
+        crate::image_benchmark::ImageBenchmarkOptions {
+            config_path: std::path::PathBuf::new(),
+            ip: "127.0.0.1".into(),
+            port: 4296,
+            image_path,
+            output_path: dir.join("image.jsonl"),
+            live_start_file: dir.join("live.marker"),
+            cache_start_file: dir.join("cache.marker"),
+            clients: 4,
+            sharers: 3,
+            cache_recipients: 1,
+            egress_megabits_per_second: 200,
+        },
+    )
+    .unwrap();
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut client = test_client(3, server.local_addr().unwrap()).await;
+    Arc::get_mut(&mut client).unwrap().image_benchmark = Some(session);
+    client.image_network_id.store(42, Ordering::Release);
+
+    for channel in [channels::SCENE, channels::DIRECT_SCENE_SERVER] {
+        let channel_id = DeliveryMethod::channel_id(channel, DeliveryMethod::ReliableOrdered);
+        let mut scene = Vec::with_capacity(3000);
+        scene.extend_from_slice(&100u16.to_le_bytes());
+        scene.extend_from_slice(&42u16.to_le_bytes());
+        scene.push(2); // image chunk operation; unknown image id is ignored by the observer.
+        scene.extend_from_slice(&[0x5a; 2995]);
+        client.send_reliable_ordered(channel, &scene).await.unwrap();
+
+        let fragment_count = scene.len().div_ceil(RELIABLE_FRAGMENT_PAYLOAD_SIZE);
+        let mut received = vec![0u8; LITENETLIB_INITIAL_MTU];
+        for index in 0..fragment_count {
+            let length = time::timeout(Duration::from_secs(1), server.recv(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+            let packet = received[..length].to_vec();
+            assert_eq!(parse_packet(&packet).unwrap().channel_id, Some(channel_id));
+            let container = if index % 2 == 0 {
+                merged(&packet)
+            } else {
+                let mut compact = vec![PacketProperty::CompactMerged as u8, 0xc0];
+                compact.extend_from_slice(&(packet.len() as u16).to_le_bytes());
+                compact.extend_from_slice(&packet);
+                compact
+            };
+            let handoff = if index % 2 == 0 {
+                shared_receiver_process_merged(&client, client.socket.as_raw_fd(), &container)
+            } else {
+                shared_receiver_process_compact(&client, &container)
+            };
+            assert_eq!(
+                handoff.len(),
+                1,
+                "fragment {index} must reach normal dispatch"
+            );
+            client.handle_packet(handoff[0]).await.unwrap();
+        }
+    }
+    assert!(client.in_use.load(Ordering::Acquire));
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
