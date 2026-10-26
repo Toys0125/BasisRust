@@ -100,6 +100,8 @@ pub struct ConnectedPeer {
     // Present for live connections. Unit fixtures that exercise app state without a
     // transport session may leave this absent.
     pub session: Option<PeerSession>,
+    /// Whether this connection completed the connection-bound DID proof.
+    pub identity_verified: bool,
     // A fresh counter per authenticated connection. Clones share admission work;
     // old in-flight permits cannot decrement a replacement connection's quota.
     pub(crate) scene_pending: Arc<AtomicU64>,
@@ -2799,6 +2801,7 @@ async fn finalize_accept(
         metadata: metadata.clone(),
         ready: ready.clone(),
         session: Some(session.clone()),
+        identity_verified,
         scene_pending: Arc::new(AtomicU64::new(0)),
         upload_bucket: Arc::new(Mutex::new(upload_budget::Bucket::default())),
     };
@@ -3986,6 +3989,7 @@ async fn handle_message(
             };
             let uuid = peer_info.metadata.player_uuid.clone();
             let session = peer_info.session.clone();
+            let identity_verified = peer_info.identity_verified;
             drop(peer_info);
             let (enabled, per_player, max_total, verified) = {
                 let config = state.config.read();
@@ -4001,7 +4005,7 @@ async fn handle_message(
                     } else {
                         256 * 1024 * 1024
                     },
-                    config.use_auth_identity,
+                    config.use_auth_identity && identity_verified,
                 )
             };
             let status = if !verified
@@ -7285,6 +7289,7 @@ mod tests {
             metadata: test_ready_message().player_meta_data_message,
             ready: test_ready_message(),
             session: None,
+            identity_verified: false,
             scene_pending: Arc::new(AtomicU64::new(0)),
             upload_bucket: Arc::new(Mutex::new(upload_budget::Bucket::default())),
         }

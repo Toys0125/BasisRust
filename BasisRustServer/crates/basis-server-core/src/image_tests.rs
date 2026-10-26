@@ -45,6 +45,7 @@ fn add_peer(state: &ServerState, id: PeerId) {
                     basis_protocol::messages::LocalAvatarSyncMessage::empty_high(),
             },
             session: None,
+            identity_verified: false,
             scene_pending: Arc::new(AtomicU64::new(0)),
             upload_bucket: Arc::new(Mutex::new(upload_budget::Bucket::default())),
         },

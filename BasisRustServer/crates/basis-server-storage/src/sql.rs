@@ -1,7 +1,7 @@
 //! Optional SQL player storage: PostgreSQL remote, persistent SQLite fallback.
 //! A remote connection is attempted only at startup; an in-flight outage returns
 //! Unavailable rather than silently switching databases and losing read-your-writes.
-use crate::player::{apply_request, PlayerRecord, RateBudget};
+use crate::player::{apply_request, consume_budget, quota_allows, PlayerRecord, RateBudget};
 use anyhow::{Context, Result};
 use basis_protocol::storage::{
     StorageOp, StorageReply, StorageRequest, StorageStatus, MAX_BYTES_PER_PLAYER,
@@ -89,10 +89,15 @@ impl SqlPlayerStorage {
         .busy_timeout(Duration::from_secs(5));
         // One connection serializes writes (and prevents SQLite in-memory DB
         // inconsistency); SQLite's file locks cover multi-process access.
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await?;
+        let mut pool_options = SqlitePoolOptions::new().max_connections(1);
+        if sqlite_path.is_none() {
+            // Closing the last connection destroys an in-memory SQLite database.
+            pool_options = pool_options
+                .min_connections(1)
+                .idle_timeout(None)
+                .max_lifetime(None);
+        }
+        let pool = pool_options.connect_with(options).await?;
         let create = format!(
             "CREATE TABLE IF NOT EXISTS {table} (owner TEXT PRIMARY KEY, payload BLOB NOT NULL)"
         );
@@ -129,18 +134,11 @@ impl SqlPlayerStorage {
         }
         {
             let mut limits = self.limits.lock();
-            if limits.len() >= 8192 {
-                limits.retain(|_, budget| !budget.inactive_for(Duration::from_secs(60)));
-            }
             let write = matches!(
                 request.op,
                 StorageOp::Set | StorageOp::Delete | StorageOp::Clear
             );
-            if !limits
-                .entry(owner.to_owned())
-                .or_insert_with(RateBudget::new)
-                .consume(write)
-            {
+            if !consume_budget(&mut limits, owner, write) {
                 return fail(StorageStatus::RateLimited);
             }
         }
@@ -207,12 +205,13 @@ impl SqlPlayerStorage {
                 .await?
                 .try_get("used")?;
             let existing_size = self.postgres_previous_bytes(&mut tx, owner).await?;
-            if total_limit != 0
-                && (global_used as usize)
+            if !quota_allows(
+                global_used as usize,
+                (global_used as usize)
                     .saturating_sub(existing_size)
-                    .saturating_add(payload.len())
-                    > total_limit
-            {
+                    .saturating_add(payload.len()),
+                total_limit,
+            ) {
                 reply.status = StorageStatus::Full;
                 reply.used = record.used() as i32;
                 return Ok(reply);
@@ -285,12 +284,13 @@ impl SqlPlayerStorage {
                 .map(|r| r.try_get::<i64, _>("n").map(|n| n.max(0) as usize))
                 .transpose()?
                 .unwrap_or(0);
-            if total_limit != 0
-                && (global_used as usize)
+            if !quota_allows(
+                global_used as usize,
+                (global_used as usize)
                     .saturating_sub(previous_size)
-                    .saturating_add(payload.len())
-                    > total_limit
-            {
+                    .saturating_add(payload.len()),
+                total_limit,
+            ) {
                 reply.status = StorageStatus::Full;
                 reply.used = record.used() as i32;
                 return Ok(reply);
@@ -337,6 +337,87 @@ mod tests {
             scope: "level".into(),
             key: "score".into(),
             value,
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_sqlite_keeps_its_only_connection_alive() {
+        let (storage, _) = SqlPlayerStorage::connect("", None, "basis_storage")
+            .await
+            .unwrap();
+        let Pool::Sqlite(pool) = &storage.pool else {
+            unreachable!()
+        };
+        assert_eq!(pool.options().get_min_connections(), 1);
+        assert_eq!(pool.options().get_idle_timeout(), None);
+        assert_eq!(pool.options().get_max_lifetime(), None);
+        assert_eq!(
+            storage
+                .execute("alice", req(StorageOp::Set, vec![7]), 1024, 0)
+                .await
+                .status,
+            StorageStatus::Ok
+        );
+        assert_eq!(
+            storage
+                .execute("alice", req(StorageOp::Get, vec![]), 1024, 0)
+                .await
+                .value,
+            vec![7]
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (disk, _) =
+            SqlPlayerStorage::connect("", Some(&dir.path().join("store.db")), "basis_storage")
+                .await
+                .unwrap();
+        let Pool::Sqlite(pool) = &disk.pool else {
+            unreachable!()
+        };
+        assert!(pool.options().get_idle_timeout().is_some());
+        assert!(pool.options().get_max_lifetime().is_some());
+    }
+
+    #[tokio::test]
+    async fn lower_quotas_allow_sqlite_cleanup_without_allowing_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in [None, Some(dir.path().join("quota.db"))] {
+            let (storage, _) = SqlPlayerStorage::connect("", path.as_deref(), "basis_storage")
+                .await
+                .unwrap();
+            for global in [false, true] {
+                let (per_player, total) = if global { (1024, 1) } else { (8, 0) };
+                for op in [StorageOp::Delete, StorageOp::Clear, StorageOp::Set] {
+                    let owner = format!("{global}-{op:?}");
+                    for scope in ["one", "two"] {
+                        let mut request = req(StorageOp::Set, vec![1; 64]);
+                        request.scope = scope.into();
+                        assert_eq!(
+                            storage.execute(&owner, request, 1024, 0).await.status,
+                            StorageStatus::Ok
+                        );
+                    }
+                    let mut request = req(op, vec![1; 16]);
+                    request.scope = "one".into();
+                    let reduced = storage.execute(&owner, request, per_player, total).await;
+                    assert_eq!(reduced.status, StorageStatus::Ok);
+                    assert!(reduced.used > 8);
+                    let mut request = req(StorageOp::Set, vec![1; 128]);
+                    request.scope = "two".into();
+                    let denied = storage.execute(&owner, request, per_player, total).await;
+                    assert_eq!(denied.status, StorageStatus::Full);
+                    assert_eq!(denied.used, reduced.used);
+                    let mut request = req(StorageOp::Get, vec![]);
+                    request.scope = "two".into();
+                    assert_eq!(
+                        storage
+                            .execute(&owner, request, per_player, total)
+                            .await
+                            .value,
+                        vec![1; 64]
+                    );
+                }
+            }
         }
     }
 
