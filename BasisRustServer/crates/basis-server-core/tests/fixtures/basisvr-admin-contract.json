@@ -45,6 +45,7 @@
     "basis.resource.unload.prop",
     "basis.resource.unload.world",
     "basis.server.stats",
+    "basis.storage.use",
     "basis.voice.lockbypass"
   ],
   "default_nodes": [
@@ -59,7 +60,8 @@
     "basis.resource.load.world",
     "basis.resource.unload.avatar",
     "basis.resource.unload.prop",
-    "basis.resource.unload.world"
+    "basis.resource.unload.world",
+    "basis.storage.use"
   ],
   "moderator_nodes": [
     "basis.chat.lockbypass",

@@ -43,6 +43,58 @@ Useful flags:
 
 ## Configuration
 
+### Cilbox SQL player storage (optional)
+
+Build or run with the `sql-storage` feature to add PostgreSQL and embedded
+SQLite support. The feature is **off by default**; the existing `file` and
+`memory` storage backends continue working without it.
+
+```sh
+cargo run -p basis-server-console --features sql-storage -- --base-dir .
+# Or: cargo build --release -p basis-server-console --features sql-storage
+```
+
+Set these fields in `config/config.xml` (inside the `<Configuration>` element):
+
+```xml
+<StorageEnabled>true</StorageEnabled>
+<StorageBackend>sql</StorageBackend>
+<StorageSqlTable>basis_storage</StorageSqlTable>
+<StorageMaxBytesPerPlayer>16384</StorageMaxBytesPerPlayer>
+<StorageMaxTotalMegabytes>256</StorageMaxTotalMegabytes>
+```
+
+For **remote PostgreSQL**, supply its connection URL as
+`BASIS_STORAGE_URL` (recommended, to keep credentials out of XML),
+for example `postgresql://user:password@db.example.net:5432/basis?sslmode=require`.
+Alternatively, set `<StorageConnectionString>postgresql://...</StorageConnectionString>`
+in the server XML. `BASIS_STORAGE_URL` overrides the XML value. TLS is
+available via SQLx/rustls; use `sslmode=require` for remote connections.
+
+**SQLite fallback:** With no remote URL, or if PostgreSQL cannot be connected
+to and initialized at startup, the server automatically opens
+`<base-dir>/storage/players.sqlite3` (creates it if missing). SQLite is
+embedded; there is no local database service to install. If
+`HasFileSupport=false`, the fallback SQLite database is in-memory instead.
+
+The chosen backend is logged on startup without printing connection
+credentials. Remote and fallback SQLite databases are **separate datasets**:
+falling back does not migrate existing PostgreSQL data, and when PostgreSQL
+becomes reachable on the next server restart, it is used again. A live
+PostgreSQL outage returns a storage-unavailable response rather than silently
+switching stores in the middle of a session (avoids split-brain writes).
+Back up the SQLite file and remote database independently. Changes to
+`StorageBackend` likewise do not migrate old `file` storage records.
+
+The server checks verified DID identity and the `basis.storage.use`
+permission before allowing Get/Set/Delete/Keys/Usage/Clear. SQL writes use
+transactions; PostgreSQL updates are serialized for cross-instance quota
+correctness. Storage byte limits and per-player operation throttles apply to
+both SQL variants. Non-SQL builds do not link SQLite or PostgreSQL libraries.
+The SQL table name must be a safe SQL identifier (letters, digits,
+underscores; cannot start with a digit). Only PostgreSQL remote URLs are
+supported; a MySQL URL is not a PostgreSQL connection.
+
 Image sharing uses the C# server's bandwidth governor and bounded image cache.
 `ImageShareEgressMegabitsPerSecond` (default 200) sets each sharer's relayed
 payload budget, counting recipient fan-out. Enforcement applies

@@ -10,6 +10,9 @@ use std::{
     sync::Arc,
 };
 
+pub mod player;
+#[cfg(feature = "sql-storage")]
+pub mod sql;
 #[cfg(windows)]
 mod windows_metadata;
 

@@ -393,9 +393,16 @@ impl OwnershipState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SharedSphere {
+    message: ServerContentShareMessage,
+    dropped_at: Instant,
+    left_at: Option<Instant>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ContentShareState {
-    spheres: Arc<RwLock<HashMap<String, ServerContentShareMessage>>>,
+    spheres: Arc<RwLock<HashMap<String, SharedSphere>>>,
 }
 
 impl ContentShareState {
@@ -453,7 +460,7 @@ impl ContentShareState {
         if spheres.contains_key(&server.content_share_message.sphere_net_id)
             || spheres
                 .values()
-                .filter(|sphere| sphere.player_id == player_id)
+                .filter(|sphere| sphere.message.player_id == player_id && sphere.left_at.is_none())
                 .count()
                 >= max_per_player
         {
@@ -461,50 +468,117 @@ impl ContentShareState {
         }
         spheres.insert(
             server.content_share_message.sphere_net_id.clone(),
-            server.clone(),
+            SharedSphere {
+                message: server.clone(),
+                dropped_at: Instant::now(),
+                left_at: None,
+            },
         );
         Some(server)
     }
 
-    pub fn remove(
+    /// Check ownership and protection under the same lock as removal, so concurrent
+    /// requests cannot bypass the content-removal policy.
+    pub fn remove_authorized(
         &self,
         player_id: u16,
         message: ContentShareCleanupMessage,
+        is_moderator: bool,
+        content_removal_locked: bool,
     ) -> Option<ServerContentShareCleanupMessage> {
-        if self
-            .spheres
-            .write()
-            .remove(&message.sphere_net_id)
-            .is_some()
+        let mut spheres = self.spheres.write();
+        let existing = spheres.get(&message.sphere_net_id)?;
+        let is_owner = existing.left_at.is_none() && existing.message.player_id == player_id;
+        if !is_owner
+            && !is_moderator
+            && (existing.message.sharer_protected || content_removal_locked)
         {
-            Some(ServerContentShareCleanupMessage {
-                player_id,
-                content_share_cleanup_message: message,
-            })
-        } else {
-            None
+            return None;
         }
+        spheres.remove(&message.sphere_net_id)?;
+        Some(ServerContentShareCleanupMessage {
+            player_id,
+            content_share_cleanup_message: message,
+        })
     }
 
     pub fn remove_player(&self, player_id: u16) -> Vec<ServerContentShareCleanupMessage> {
+        self.remove_player_with_timeout(player_id, 0)
+    }
+
+    pub fn remove_player_with_timeout(
+        &self,
+        player_id: u16,
+        leave_timeout_seconds: i32,
+    ) -> Vec<ServerContentShareCleanupMessage> {
         let mut spheres = self.spheres.write();
+        let now = Instant::now();
         let keys: Vec<_> = spheres
             .iter()
-            .filter_map(|(key, value)| (value.player_id == player_id).then_some(key.clone()))
+            .filter_map(|(key, value)| {
+                (value.message.player_id == player_id && value.left_at.is_none())
+                    .then_some(key.clone())
+            })
             .collect();
-        let mut removed = Vec::with_capacity(keys.len());
+        let mut removed = Vec::new();
         for key in keys {
-            spheres.remove(&key);
-            removed.push(ServerContentShareCleanupMessage {
-                player_id,
-                content_share_cleanup_message: ContentShareCleanupMessage { sphere_net_id: key },
-            });
+            if leave_timeout_seconds > 0 {
+                if let Some(sphere) = spheres.get_mut(&key) {
+                    sphere.left_at = Some(now);
+                }
+            } else {
+                spheres.remove(&key);
+                removed.push(ServerContentShareCleanupMessage {
+                    player_id,
+                    content_share_cleanup_message: ContentShareCleanupMessage {
+                        sphere_net_id: key,
+                    },
+                });
+            }
         }
         removed
     }
 
+    pub fn expire_due(
+        &self,
+        now: Instant,
+        leave_timeout_seconds: i32,
+        deletion_timer_seconds: i32,
+    ) -> Vec<ServerContentShareCleanupMessage> {
+        let mut spheres = self.spheres.write();
+        let leave_after = Duration::from_secs(leave_timeout_seconds.max(0) as u64);
+        let delete_after = Duration::from_secs(deletion_timer_seconds.max(0) as u64);
+        let due: Vec<_> = spheres
+            .iter()
+            .filter_map(|(key, sphere)| {
+                let left_expired = sphere
+                    .left_at
+                    .is_some_and(|left| now.saturating_duration_since(left) >= leave_after);
+                let lifetime_expired = deletion_timer_seconds > 0
+                    && now.saturating_duration_since(sphere.dropped_at) >= delete_after;
+                (left_expired || lifetime_expired)
+                    .then_some((key.clone(), sphere.message.player_id))
+            })
+            .collect();
+        due.into_iter()
+            .map(|(key, player_id)| {
+                spheres.remove(&key);
+                ServerContentShareCleanupMessage {
+                    player_id,
+                    content_share_cleanup_message: ContentShareCleanupMessage {
+                        sphere_net_id: key,
+                    },
+                }
+            })
+            .collect()
+    }
+
     pub fn all(&self) -> Vec<ServerContentShareMessage> {
-        self.spheres.read().values().cloned().collect()
+        self.spheres
+            .read()
+            .values()
+            .map(|s| s.message.clone())
+            .collect()
     }
 
     pub fn reset(&self) {
@@ -648,6 +722,75 @@ mod tests {
         let removed = state.remove_player(7);
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].ownership_id, "a");
+    }
+
+    #[test]
+    fn protected_content_cleanup_requires_owner_or_moderator() {
+        let state = ContentShareState::default();
+        let msg = ContentShareMessage {
+            sphere_net_id: "protected".into(),
+            content_url: "u".into(),
+            unlock_password: String::new(),
+            content_type: basis_protocol::messages::ContentShareType::Avatar,
+            position_x: 0.0,
+            position_y: 0.0,
+            position_z: 0.0,
+        };
+        state.add_with_limit_and_protection(1, "owner".into(), "name".into(), msg, 10, true);
+        let cleanup = || ContentShareCleanupMessage {
+            sphere_net_id: "protected".into(),
+        };
+        assert!(state
+            .remove_authorized(2, cleanup(), false, false)
+            .is_none());
+        assert_eq!(state.all().len(), 1);
+        assert!(state.remove_authorized(1, cleanup(), false, true).is_some());
+        assert!(state.all().is_empty());
+    }
+
+    #[test]
+    fn locked_content_cleanup_requires_owner_or_moderator() {
+        let state = ContentShareState::default();
+        let msg = ContentShareMessage {
+            sphere_net_id: "locked".into(),
+            content_url: "u".into(),
+            unlock_password: String::new(),
+            content_type: basis_protocol::messages::ContentShareType::Avatar,
+            position_x: 0.0,
+            position_y: 0.0,
+            position_z: 0.0,
+        };
+        state.add(1, "owner".into(), "name".into(), msg);
+        let cleanup = || ContentShareCleanupMessage {
+            sphere_net_id: "locked".into(),
+        };
+        assert!(state.remove_authorized(2, cleanup(), false, true).is_none());
+        assert!(state.remove_authorized(2, cleanup(), true, true).is_some());
+    }
+
+    #[test]
+    fn spheres_expire_after_disconnect_or_configured_lifetime() {
+        let state = ContentShareState::default();
+        let msg = ContentShareMessage {
+            sphere_net_id: "later".into(),
+            content_url: "u".into(),
+            unlock_password: String::new(),
+            content_type: basis_protocol::messages::ContentShareType::Avatar,
+            position_x: 0.0,
+            position_y: 0.0,
+            position_z: 0.0,
+        };
+        state.add(8, "owner".into(), "name".into(), msg);
+        assert!(state.remove_player_with_timeout(8, 60).is_empty());
+        assert_eq!(state.all().len(), 1);
+        assert!(state.expire_due(Instant::now(), 60, 0).is_empty());
+        assert_eq!(
+            state
+                .expire_due(Instant::now() + Duration::from_secs(61), 60, 0)
+                .len(),
+            1
+        );
+        assert!(state.all().is_empty());
     }
 
     #[test]

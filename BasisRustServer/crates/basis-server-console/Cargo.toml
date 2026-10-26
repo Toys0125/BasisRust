@@ -7,6 +7,7 @@ license.workspace = true
 [features]
 default = []
 benchmark-validation = ["basis-server-core/benchmark-validation"]
+sql-storage = ["basis-server-core/sql-storage"]
 gpu = ["basis-server-core/gpu"]
 
 [[bin]]

@@ -8,6 +8,7 @@ license.workspace = true
 [features]
 default = []
 benchmark-validation = []
+sql-storage = ["basis-server-storage/sql-storage"]
 gpu = ["dep:bytemuck", "dep:pollster", "dep:wgpu"]
 
 [dependencies]

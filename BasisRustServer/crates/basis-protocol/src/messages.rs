@@ -756,7 +756,7 @@ pub fn core_message_supply() -> BasisMessageSupply {
         (1, "basis.core.metadata"),
         (2, "basis.core.disconnection"),
         (3, "basis.core.voice"),
-        (4, "basis.core.voice.shout"),
+        (4, "basis.core.voice.announce"),
         (5, "basis.core.voice.recipients"),
         (6, "basis.core.avatar.verylow"),
         (7, "basis.core.avatar.verylow.additional"),
@@ -784,6 +784,7 @@ pub fn core_message_supply() -> BasisMessageSupply {
         (29, "basis.core.contentshare"),
         (30, "basis.core.avatar.delta"),
         (31, "basis.core.serverbound"),
+        (32, "basis.core.storage"),
         (34, "basis.core.admin"),
         (35, "basis.core.statistics"),
         (36, "basis.core.camera.pip.state"),
@@ -2739,7 +2740,15 @@ mod tests {
             .descriptors
             .iter()
             .any(|d| d.id == 60 && d.name == "basis.core.registry.control"));
-        assert!(!supply.descriptors.iter().any(|d| d.id == 32 || d.id == 33));
+        assert!(supply
+            .descriptors
+            .iter()
+            .any(|d| d.id == 32 && d.name == "basis.core.storage"));
+        assert!(supply
+            .descriptors
+            .iter()
+            .any(|d| d.id == 4 && d.name == "basis.core.voice.announce"));
+        assert!(!supply.descriptors.iter().any(|d| d.id == 33));
         assert!(supply
             .descriptors
             .iter()
