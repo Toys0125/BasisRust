@@ -1,7 +1,7 @@
 //! Optional SQL player storage: PostgreSQL remote, persistent SQLite fallback.
 //! A remote connection is attempted only at startup; an in-flight outage returns
 //! Unavailable rather than silently switching databases and losing read-your-writes.
-use crate::player::{apply_request, consume_budget, quota_allows, PlayerRecord, RateBudget};
+use crate::player::{apply_request, quota_allows, PlayerRecord, RateLimiter};
 use anyhow::{Context, Result};
 use basis_protocol::storage::{
     StorageOp, StorageReply, StorageRequest, StorageStatus, MAX_BYTES_PER_PLAYER,
@@ -12,7 +12,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions},
     Row,
 };
-use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc, time::Duration};
+use std::{path::Path, str::FromStr, sync::Arc, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SqlBackend {
@@ -30,7 +30,7 @@ enum Pool {
 pub struct SqlPlayerStorage {
     pool: Pool,
     table: String,
-    limits: Arc<Mutex<HashMap<String, RateBudget>>>,
+    limits: Arc<Mutex<RateLimiter>>,
 }
 
 impl SqlPlayerStorage {
@@ -65,7 +65,7 @@ impl SqlPlayerStorage {
                         Self {
                             pool: Pool::Postgres(pool),
                             table: table.to_owned(),
-                            limits: Arc::new(Mutex::new(HashMap::new())),
+                            limits: Arc::new(Mutex::new(RateLimiter::default())),
                         },
                         SqlBackend::PostgreSql,
                     ));
@@ -106,7 +106,7 @@ impl SqlPlayerStorage {
             Self {
                 pool: Pool::Sqlite(pool),
                 table: table.to_owned(),
-                limits: Arc::new(Mutex::new(HashMap::new())),
+                limits: Arc::new(Mutex::new(RateLimiter::default())),
             },
             SqlBackend::Sqlite,
         ))
@@ -138,7 +138,7 @@ impl SqlPlayerStorage {
                 request.op,
                 StorageOp::Set | StorageOp::Delete | StorageOp::Clear
             );
-            if !consume_budget(&mut limits, owner, write) {
+            if !limits.consume(owner, write) {
                 return fail(StorageStatus::RateLimited);
             }
         }

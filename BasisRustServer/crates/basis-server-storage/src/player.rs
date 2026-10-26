@@ -14,7 +14,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -72,6 +72,11 @@ impl RateBudget {
             writes: 10.0,
         }
     }
+    fn fully_refilled(&self, now: Instant) -> bool {
+        let delta = now.saturating_duration_since(self.last).as_secs_f64();
+        self.reads + delta * 20.0 >= 60.0 && self.writes + delta * 2.0 >= 10.0
+    }
+
     pub(crate) fn consume(&mut self, write: bool) -> bool {
         let now = Instant::now();
         let delta = now.saturating_duration_since(self.last).as_secs_f64();
@@ -91,29 +96,47 @@ impl RateBudget {
     }
 }
 
-pub(crate) fn consume_budget(
-    budgets: &mut HashMap<String, RateBudget>,
-    owner: &str,
-    write: bool,
-) -> bool {
-    const MAX_OWNERS: usize = 8192;
-    if budgets.len() >= MAX_OWNERS && !budgets.contains_key(owner) {
-        budgets.retain(|_, budget| budget.last.elapsed() < Duration::from_secs(60));
-        if budgets.len() >= MAX_OWNERS {
-            // Keep bookkeeping bounded without locking new owners out of storage.
-            let oldest = budgets
-                .iter()
-                .min_by_key(|(_, budget)| budget.last)
-                .map(|(owner, _)| owner.clone());
-            if let Some(oldest) = oldest {
-                budgets.remove(&oldest);
-            }
+#[derive(Debug)]
+pub(crate) struct RateLimiter {
+    owners: HashMap<String, RateBudget>,
+    overflow: RateBudget,
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self {
+            owners: HashMap::new(),
+            overflow: RateBudget::new(),
         }
     }
-    budgets
-        .entry(owner.to_owned())
-        .or_insert_with(RateBudget::new)
-        .consume(write)
+}
+
+impl RateLimiter {
+    const MAX_OWNERS: usize = 8192;
+
+    pub(crate) fn consume(&mut self, owner: &str, write: bool) -> bool {
+        if let Some(budget) = self.owners.get_mut(owner) {
+            return budget.consume(write);
+        }
+        let now = Instant::now();
+        // An untracked owner may already owe tokens to the shared allowance.
+        // Do not promote it to a fresh bucket until that debt has refilled.
+        if self.overflow.fully_refilled(now) {
+            if self.owners.len() >= Self::MAX_OWNERS {
+                self.owners.retain(|_, budget| !budget.fully_refilled(now));
+            }
+            if self.owners.len() < Self::MAX_OWNERS {
+                return self
+                    .owners
+                    .entry(owner.to_owned())
+                    .or_insert_with(RateBudget::new)
+                    .consume(write);
+            }
+        }
+        // Keep memory bounded without permanently excluding new owners when
+        // all tracked buckets are busy. Sharing can only tighten their limits.
+        self.overflow.consume(write)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -121,7 +144,7 @@ struct State {
     // Only the memory backend retains records; files are read on demand.
     records: HashMap<String, PlayerRecord>,
     memory_bytes: usize,
-    budgets: HashMap<String, RateBudget>,
+    budgets: RateLimiter,
 }
 
 #[derive(Debug, Clone)]
@@ -233,7 +256,7 @@ impl PlayerStorage {
             request.op,
             StorageOp::Set | StorageOp::Delete | StorageOp::Clear
         );
-        if !consume_budget(&mut state.budgets, owner, write) {
+        if !state.budgets.consume(owner, write) {
             reply.status = StorageStatus::RateLimited;
             return reply;
         }
@@ -375,22 +398,72 @@ pub(crate) fn apply_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn full_budget_bookkeeping_admits_new_owners_without_resetting_active_limits() {
-        let mut budgets = HashMap::new();
+        let mut budgets = RateLimiter::default();
         for owner in 0..8192 {
-            budgets.insert(owner.to_string(), RateBudget::new());
+            budgets.owners.insert(owner.to_string(), RateBudget::new());
         }
-        budgets.get_mut("0").unwrap().last = Instant::now() - Duration::from_secs(1);
-        assert!(consume_budget(&mut budgets, "new", false));
-        assert_eq!(budgets.len(), 8192);
-        assert!(!budgets.contains_key("0"));
+        assert!(budgets.consume("new", false));
+        assert!(budgets.owners.len() <= RateLimiter::MAX_OWNERS);
         for _ in 0..59 {
-            assert!(consume_budget(&mut budgets, "new", false));
+            assert!(budgets.consume("new", false));
         }
-        assert!(!consume_budget(&mut budgets, "new", false));
-        assert_eq!(budgets.len(), 8192);
+        assert!(!budgets.consume("new", false));
+    }
+
+    #[test]
+    fn owner_churn_preserves_depleted_budgets_and_shared_overflow_debt() {
+        let mut limiter = RateLimiter::default();
+        for owner in 0..RateLimiter::MAX_OWNERS {
+            limiter.owners.insert(
+                owner.to_string(),
+                RateBudget {
+                    last: Instant::now(),
+                    reads: 0.0,
+                    writes: 0.0,
+                },
+            );
+        }
+        assert!(!limiter.consume("0", true));
+        for owner in RateLimiter::MAX_OWNERS..RateLimiter::MAX_OWNERS + 10 {
+            assert!(limiter.consume(&owner.to_string(), true));
+        }
+        assert!(!limiter.consume("another", true));
+        assert!(!limiter.consume("0", true), "churn reset a depleted owner");
+        assert_eq!(limiter.owners.len(), RateLimiter::MAX_OWNERS);
+
+        // A free slot must not give an overflow owner a fresh write allowance.
+        limiter.owners.remove("1");
+        let overflow_owner = RateLimiter::MAX_OWNERS.to_string();
+        assert!(!limiter.consume(&overflow_owner, true));
+        assert!(!limiter.owners.contains_key(&overflow_owner));
+        limiter.overflow.last = Instant::now() - Duration::from_secs(6);
+        assert!(limiter.consume(&overflow_owner, true));
+        assert!(limiter.owners.contains_key(&overflow_owner));
+    }
+
+    #[test]
+    fn evicts_only_budgets_whose_read_and_write_tokens_have_refilled() {
+        let mut limiter = RateLimiter::default();
+        for owner in 0..RateLimiter::MAX_OWNERS {
+            limiter.owners.insert(
+                owner.to_string(),
+                RateBudget {
+                    last: Instant::now(),
+                    reads: 0.0,
+                    writes: 0.0,
+                },
+            );
+        }
+        let refill_time = Instant::now() - Duration::from_secs(6);
+        limiter.owners.get_mut("0").unwrap().last = refill_time;
+        assert!(limiter.consume("new", true));
+        assert!(!limiter.owners.contains_key("0"));
+        assert!(limiter.owners.contains_key("1"));
+        assert_eq!(limiter.owners.len(), RateLimiter::MAX_OWNERS);
     }
 
     fn request(op: StorageOp, scope: &str, bytes: usize) -> StorageRequest {
