@@ -107,6 +107,68 @@ fn connection_payload_propagates_oversized_login_password() {
 }
 
 #[tokio::test]
+async fn movement_waits_for_post_login_metadata_in_both_scheduling_modes() {
+    for sync_batching in [false, true] {
+        for authenticated in [false, true] {
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let client = test_client(0, server.local_addr().unwrap()).await;
+            let shutdown = Arc::new(AtomicBool::new(false));
+            crate::simulation::movement_workers(
+                Arc::new(Mutex::new(vec![client.clone()])),
+                shutdown.clone(),
+                crate::simulation::CadenceOptions {
+                    sync_batching,
+                    unity_avatar_policy: false,
+                    unity_frame_rate: 60,
+                    unity_pose_amplitude_radians: 0.0,
+                    movement_interval: Duration::from_millis(5),
+                    movement_jitter_percent: 0,
+                    voice_jitter_percent: 0,
+                    allow_position_drift: false,
+                    additional_avatar_bytes: 0,
+                },
+            )
+            .await;
+            let mut packet = [0u8; 2048];
+            assert!(
+                time::timeout(Duration::from_millis(50), server.recv(&mut packet))
+                    .await
+                    .is_err(),
+                "movement started before admission: sync_batching={sync_batching}"
+            );
+            assert_eq!(client.movement_sequence.load(Ordering::Relaxed), 0);
+
+            // Identity authentication is optional; metadata admits both kinds of server.
+            let key = [9u8; 32];
+            if authenticated {
+                *client.sealed_outbound.lock().unwrap() = Some((key, 0));
+            }
+            *client.metadata_state() = Some(ServerAvatarMetadata {
+                sync_interval_ms: 20,
+                base_multiplier: 1.0,
+                increase_rate: 0.0,
+                slowest_send_rate_secs: 2.5,
+                uplink_delta_enabled: false,
+            });
+            let received = time::timeout(Duration::from_secs(1), server.recv(&mut packet)).await;
+            shutdown.store(true, Ordering::Relaxed);
+            let len = received.expect("admitted movement did not start").unwrap();
+            let plaintext = if authenticated {
+                open_client_datagram(&key, &packet[..len])
+            } else {
+                packet[..len].to_vec()
+            };
+            assert_eq!(plaintext[0] & 31, PacketProperty::Unreliable as u8);
+            assert_eq!(plaintext[1], channels::PLAYER_AVATAR_HIGH);
+            assert_eq!(
+                plaintext[2], 0,
+                "pre-admission ticks consumed sequence numbers"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn scene_waits_for_admission_without_delaying_first_send_by_workload_interval() {
     for reliable in [false, true] {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
