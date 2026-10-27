@@ -1040,11 +1040,12 @@ impl BasisClient {
 
         let mut assembled = None;
         if fragmented {
-            match self.fragment_reassembler.lock().unwrap().push(
+            let fragment_result = self.fragment_reassembler.lock().unwrap().push(
                 channel_id,
                 packet_payload,
                 std::time::Instant::now(),
-            ) {
+            );
+            match fragment_result {
                 FragmentResult::Complete(bytes) => assembled = Some(bytes),
                 FragmentResult::Pending => return Ok(()),
                 FragmentResult::Duplicate => {
@@ -1054,6 +1055,7 @@ impl BasisClient {
                     return Ok(());
                 }
                 FragmentResult::Invalid => {
+                    warn!(client=self.index, channel_id, sequence, reason=?self.fragment_reassembler.lock().unwrap().last_error(), header=?packet_payload.get(..6), "invalid reliable fragment assembly; deactivating connection");
                     if let Some(session) = &self.image_benchmark {
                         session.note_fragment_error();
                     }

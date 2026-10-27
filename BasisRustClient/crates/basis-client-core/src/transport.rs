@@ -112,6 +112,7 @@ struct FragmentAssembly {
 pub(crate) struct ReliableFragmentReassembler {
     entries: HashMap<(u8, u16), FragmentAssembly>,
     bytes: usize,
+    last_error: Option<&'static str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -123,6 +124,14 @@ pub(crate) enum FragmentResult {
 }
 
 impl ReliableFragmentReassembler {
+    fn invalid(&mut self, reason: &'static str) -> FragmentResult {
+        self.last_error = Some(reason);
+        FragmentResult::Invalid
+    }
+    pub(crate) fn last_error(&self) -> Option<&'static str> {
+        self.last_error
+    }
+
     pub(crate) fn push(&mut self, channel_id: u8, payload: &[u8], now: Instant) -> FragmentResult {
         let expired = self
             .entries
@@ -137,10 +146,10 @@ impl ReliableFragmentReassembler {
             }
             // These packet sequences have already been ACKed. Continuing would leave a
             // permanently incomplete message with no way to request its missing pieces.
-            return FragmentResult::Invalid;
+            return self.invalid("expired assembly");
         }
         if payload.len() <= 6 {
-            return FragmentResult::Invalid;
+            return self.invalid("short header");
         }
         let id = u16::from_le_bytes([payload[0], payload[1]]);
         let part = u16::from_le_bytes([payload[2], payload[3]]) as usize;
@@ -154,18 +163,18 @@ impl ReliableFragmentReassembler {
             || data.is_empty()
             || data.len() > max_fragment_size
         {
-            return FragmentResult::Invalid;
+            return self.invalid("invalid part bounds");
         }
         let key = (channel_id, id);
         if let Some(entry) = self.entries.get(&key) {
             if entry.total != total {
                 self.remove(key);
-                return FragmentResult::Invalid;
+                return self.invalid("conflicting total");
             }
             if part + 1 < total {
                 if entry.fragment_size.is_some_and(|size| size != data.len()) {
                     self.remove(key);
-                    return FragmentResult::Invalid;
+                    return self.invalid("conflicting fragment sizes");
                 }
                 if entry.fragment_size.is_none()
                     && entry.parts[total - 1]
@@ -173,22 +182,22 @@ impl ReliableFragmentReassembler {
                         .is_some_and(|last| last.len() > data.len())
                 {
                     self.remove(key);
-                    return FragmentResult::Invalid;
+                    return self.invalid("last fragment exceeds full size");
                 }
             } else if entry.fragment_size.is_some_and(|size| data.len() > size) {
                 self.remove(key);
-                return FragmentResult::Invalid;
+                return self.invalid("last fragment exceeds full size");
             }
             if let Some(existing) = &entry.parts[part] {
                 if existing == data {
                     return FragmentResult::Duplicate;
                 }
                 self.remove(key);
-                return FragmentResult::Invalid;
+                return self.invalid("conflicting duplicate");
             }
         } else {
             if self.entries.len() >= MAX_REASSEMBLIES {
-                return FragmentResult::Invalid;
+                return self.invalid("assembly count limit");
             }
             self.entries.insert(
                 key,
@@ -204,7 +213,7 @@ impl ReliableFragmentReassembler {
         }
         if self.bytes.saturating_add(data.len()) > MAX_REASSEMBLY_BYTES {
             self.remove(key);
-            return FragmentResult::Invalid;
+            return self.invalid("assembly byte limit");
         }
         let entry = self
             .entries
@@ -224,7 +233,7 @@ impl ReliableFragmentReassembler {
         let mut assembled = Vec::with_capacity(entry.bytes);
         for bytes in &entry.parts {
             let Some(bytes) = bytes else {
-                return FragmentResult::Invalid;
+                return self.invalid("missing completed part");
             };
             assembled.extend_from_slice(bytes);
         }
@@ -513,5 +522,61 @@ mod fragment_tests {
         }
         assert_eq!(receiver.bytes, 0);
         assert!(receiver.entries.is_empty());
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shared_handoff_finishes_ignored_channel_fragments_before_later_storage() {
+        use basis_protocol::channels;
+        use basis_transport::DeliveryMethod;
+        use std::sync::atomic::Ordering;
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = crate::tests::test_client(0, socket.local_addr().unwrap()).await;
+        let channel = DeliveryMethod::channel_id(
+            channels::CREATE_REMOTE_PLAYERS_FOR_NEW_PEER,
+            DeliveryMethod::ReliableOrdered,
+        );
+        let packet = |part: u16| {
+            let mut bytes = vec![PacketProperty::Channeled as u8 | 0x80];
+            bytes.extend(part.to_le_bytes());
+            bytes.push(channel);
+            bytes.extend(11u16.to_le_bytes());
+            bytes.extend(part.to_le_bytes());
+            bytes.extend(2u16.to_le_bytes());
+            bytes.extend([7; 20]);
+            bytes
+        };
+        client.handle_packet(&packet(0)).await.unwrap();
+        assert_eq!(client.fragment_reassembler.lock().unwrap().entries.len(), 1);
+        client.shared_receive.store(true, Ordering::Release);
+        let last = packet(1);
+        let mut compact = vec![PacketProperty::CompactMerged as u8, 0x40, last.len() as u8];
+        compact.extend(&last);
+        let forwarded = crate::receiver::shared_receiver_process_compact(&client, &compact);
+        assert_eq!(
+            forwarded.len(),
+            1,
+            "a fragmented message must retain its reassembly path across handoff"
+        );
+        client.handle_packet(forwarded[0]).await.unwrap();
+        let mut receiver = client.fragment_reassembler.lock().unwrap();
+        assert!(receiver.entries.is_empty());
+        let future = Instant::now() + FRAGMENT_EXPIRY + Duration::from_secs(1);
+        let mut fragment = Vec::new();
+        fragment.extend(12u16.to_le_bytes());
+        fragment.extend(0u16.to_le_bytes());
+        fragment.extend(2u16.to_le_bytes());
+        fragment.extend([9; 20]);
+        let storage =
+            DeliveryMethod::channel_id(channels::STORAGE, DeliveryMethod::ReliableOrdered);
+        assert_eq!(
+            receiver.push(storage, &fragment, future),
+            FragmentResult::Pending
+        );
+        fragment[2..4].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(
+            receiver.push(storage, &fragment, future),
+            FragmentResult::Complete(vec![9; 40])
+        );
+        assert!(client.in_use.load(Ordering::Acquire));
     }
 }

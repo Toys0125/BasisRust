@@ -44,4 +44,20 @@ class PersistenceBenchmarkTests(unittest.TestCase):
         self.assertFalse(bench.summarize(samples,row,avatar,100,True,60,[0,0])['valid'])
 
 
+class PublicationValidationTests(unittest.TestCase):
+    def test_duplicate_repeats_missing_and_nonfinite_metrics_are_rejected(self):
+        spec=importlib.util.spec_from_file_location('persistence_summary',Path(__file__).with_name('summarize-persistence-benchmark.py'))
+        report=importlib.util.module_from_spec(spec);spec.loader.exec_module(report)
+        def fixture():
+            return [dict({key:1 for key in report.METRICS},clients=count,backend=backend,uploads_enabled=enabled,repeat=repeat,valid=True,postgres_cpu_cores=1)
+                    for count in [100,1000] for backend in report.BACKENDS for enabled in [False,True] for repeat in [1,2,3]]
+        self.assertEqual(len(report.validate_results(fixture())),16)
+        rows=fixture();rows[1]['repeat']=1
+        with self.assertRaises(ValueError):report.validate_results(rows)
+        rows=fixture();del rows[0]['server_cpu_cores']
+        with self.assertRaises(ValueError):report.validate_results(rows)
+        rows=fixture();rows[0]['cycle_p95_ms']=float('nan')
+        with self.assertRaises(ValueError):report.validate_results(rows)
+
+
 if __name__=='__main__': unittest.main()
