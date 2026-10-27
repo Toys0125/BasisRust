@@ -96,6 +96,15 @@ fn read_name(reader: &mut NetReader<'_>) -> Option<String> {
     valid_name(&name).then_some(name)
 }
 
+/// Recover a correlation header even when the request body is malformed.
+/// Unknown operations, truncated headers and zero IDs cannot be answered.
+pub fn read_request_header(data: &[u8]) -> Option<(StorageOp, u16)> {
+    let mut reader = NetReader::new(data);
+    let op = StorageOp::try_from(reader.get_u8().ok()?).ok()?;
+    let id = reader.get_u16().ok()?;
+    (id != 0).then_some((op, id))
+}
+
 pub fn read_request(data: &[u8]) -> Option<StorageRequest> {
     let mut reader = NetReader::new(data);
     let op = StorageOp::try_from(reader.get_u8().ok()?).ok()?;
@@ -184,6 +193,27 @@ mod tests {
         corrupt.push(0);
         assert!(read_request(&corrupt).is_none());
     }
+    #[test]
+    fn malformed_bodies_preserve_only_answerable_headers() {
+        for payload in [
+            &[1, 7, 0][..],
+            &[1, 7, 0, 0, 0][..],
+            &[4, 7, 0, 1, 0, 255][..],
+        ] {
+            assert!(read_request(payload).is_none());
+            assert_eq!(read_request_header(payload).unwrap().1, 7);
+        }
+        for payload in [
+            &[][..],
+            &[1][..],
+            &[1, 7][..],
+            &[99, 7, 0][..],
+            &[1, 0, 0][..],
+        ] {
+            assert!(read_request_header(payload).is_none());
+        }
+    }
+
     #[test]
     fn replies_have_basisvr_header_and_get_value() {
         let bytes = write_reply(&StorageReply {

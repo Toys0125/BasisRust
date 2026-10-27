@@ -61,6 +61,7 @@ use basis_server_permissions::PermissionManager;
 use basis_server_resources::{
     ContentShareState, NetIdState, OwnershipState, PipState, ResourceState,
 };
+pub use basis_server_storage::admin::{StorageAdminAction, StorageAdminReply};
 #[cfg(feature = "sql-storage")]
 use basis_server_storage::sql::{SqlBackend, SqlPlayerStorage};
 use basis_server_storage::{player::PlayerStorage, PersistentDatabase};
@@ -943,6 +944,20 @@ impl ServerState {
         self.refresh_runtime_config();
         broadcast_lock_state(self).await;
         admin_runtime::broadcast_locomotion_policy(self).await;
+    }
+
+    /// Console-only storage administration. No client protocol exposes these operations.
+    pub async fn storage_admin(&self, action: StorageAdminAction) -> Result<StorageAdminReply> {
+        #[cfg(feature = "sql-storage")]
+        if let Some(sql) = &self.sql_player_storage {
+            return sql.admin(action).await;
+        }
+        let db = self
+            .player_storage
+            .as_ref()
+            .context("Player storage is off or unavailable")?
+            .clone();
+        tokio::task::spawn_blocking(move || db.admin(action)).await?
     }
 
     pub fn players_text(&self) -> String {
@@ -3976,8 +3991,23 @@ async fn handle_message(
             }
         }
         channels::STORAGE => {
-            let Some(request) = storage::read_request(&payload) else {
-                return Ok(());
+            let (request, malformed) = match storage::read_request(&payload) {
+                Some(request) => (request, false),
+                None => {
+                    let Some((op, id)) = storage::read_request_header(&payload) else {
+                        return Ok(());
+                    };
+                    (
+                        storage::StorageRequest {
+                            op,
+                            id,
+                            scope: String::new(),
+                            key: String::new(),
+                            value: Vec::new(),
+                        },
+                        true,
+                    )
+                }
             };
             let Some(peer_info) = state.authenticated_peers.get(&peer) else {
                 return Ok(());
@@ -4022,6 +4052,8 @@ async fn handle_message(
                 })
             {
                 Some(StorageStatus::Unavailable)
+            } else if malformed {
+                Some(StorageStatus::Invalid)
             } else {
                 None
             };

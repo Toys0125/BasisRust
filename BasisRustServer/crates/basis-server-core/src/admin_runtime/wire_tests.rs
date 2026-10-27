@@ -888,6 +888,43 @@ async fn storage_authorization_is_bound_to_identity_proof_at_admission() {
         .await;
     assert_eq!(storage_set(&mut verified, 3).await, StorageStatus::Ok);
 
+    // Recoverable headers get a correlated error rather than timing out. The
+    // same malformed body must not bypass proof checks on the unverified peer.
+    for (client, expected) in [
+        (&mut claimed, StorageStatus::Denied),
+        (&mut verified, StorageStatus::Invalid),
+    ] {
+        let mut valid_body = NetWriter::new();
+        valid_body.put_bytes_with_length(b"wire-test").unwrap();
+        valid_body.put_bytes_with_length(b"proof").unwrap();
+        valid_body.put_bytes_with_length(b"value").unwrap();
+        let mut trailing = valid_body.into_vec();
+        trailing.push(0);
+        for (index, body) in [vec![], vec![0, 0], trailing].into_iter().enumerate() {
+            let id = 20 + index as u16;
+            let mut request = vec![storage::StorageOp::Set as u8];
+            request.extend(id.to_le_bytes());
+            request.extend(body);
+            client.send(channels::STORAGE, &request, true).await;
+            let payload = client
+                .receive(|channel, _| channel == channels::STORAGE)
+                .await;
+            let mut reader = NetReader::new(&payload);
+            assert_eq!(reader.get_u8().unwrap(), storage::StorageOp::Set as u8);
+            assert_eq!(reader.get_u16().unwrap(), id);
+            assert_eq!(reader.get_u8().unwrap(), expected as u8);
+        }
+    }
+    let StorageAdminReply::Inspection { record, .. } = state
+        .storage_admin(StorageAdminAction::Inspect(verified_did))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(record.scopes.len(), 1);
+    assert_eq!(record.scopes["wire-test"]["proof"], 5);
+
     state.shutdown().await.unwrap();
     let _ = shutdown.send(());
 }

@@ -112,6 +112,91 @@ impl SqlPlayerStorage {
         ))
     }
 
+    /// Local operator access; mutations use the same locks and accounting as writes.
+    pub async fn admin(
+        &self,
+        action: crate::admin::StorageAdminAction,
+    ) -> Result<crate::admin::StorageAdminReply> {
+        use crate::admin::{StorageAdminAction, StorageAdminReply};
+        action.validate()?;
+        match action {
+            StorageAdminAction::Statistics => {
+                // One statement gives the count and counter a consistent snapshot.
+                let query = format!(
+                    "SELECT COUNT(*) AS records, (SELECT used FROM {} WHERE id=1) AS bytes FROM {}",
+                    self.usage_table, self.table
+                );
+                let (backend, records, bytes): (&'static str, i64, i64) = match &self.pool {
+                    Pool::Postgres(pool) => {
+                        let row = sqlx::query(&query).fetch_one(pool).await?;
+                        ("postgresql", row.try_get("records")?, row.try_get("bytes")?)
+                    }
+                    Pool::Sqlite(pool) => {
+                        let row = sqlx::query(&query).fetch_one(pool).await?;
+                        ("sqlite", row.try_get("records")?, row.try_get("bytes")?)
+                    }
+                };
+                Ok(StorageAdminReply::Statistics {
+                    backend,
+                    records: records.try_into()?,
+                    bytes: bytes.try_into()?,
+                })
+            }
+            StorageAdminAction::Inspect(owner) => {
+                let data: Option<Vec<u8>> = match &self.pool {
+                    Pool::Postgres(pool) => {
+                        sqlx::query_scalar(&format!(
+                            "SELECT payload FROM {} WHERE owner=$1",
+                            self.table
+                        ))
+                        .bind(&owner)
+                        .fetch_optional(pool)
+                        .await?
+                    }
+                    Pool::Sqlite(pool) => {
+                        sqlx::query_scalar(&format!(
+                            "SELECT payload FROM {} WHERE owner=?1",
+                            self.table
+                        ))
+                        .bind(&owner)
+                        .fetch_optional(pool)
+                        .await?
+                    }
+                };
+                let record = decode_record(data, &owner)?;
+                Ok(StorageAdminReply::Inspection {
+                    owner,
+                    record: record.into(),
+                })
+            }
+            StorageAdminAction::Wipe(owner) => {
+                // Delete without decoding, so corrupt data can also be removed.
+                match &self.pool {
+                    Pool::Postgres(pool) => {
+                        let mut tx = pool.begin().await?;
+                        sqlx::query("SELECT pg_advisory_xact_lock(813411, 20261025)")
+                            .execute(&mut *tx)
+                            .await?;
+                        sqlx::query(&format!("DELETE FROM {} WHERE owner=$1", self.table))
+                            .bind(&owner)
+                            .execute(&mut *tx)
+                            .await?;
+                        tx.commit().await?;
+                    }
+                    Pool::Sqlite(pool) => {
+                        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+                        sqlx::query(&format!("DELETE FROM {} WHERE owner=?1", self.table))
+                            .bind(&owner)
+                            .execute(&mut *tx)
+                            .await?;
+                        tx.commit().await?;
+                    }
+                }
+                Ok(StorageAdminReply::Wiped { owner })
+            }
+        }
+    }
+
     pub async fn execute(
         &self,
         owner: &str,
@@ -138,7 +223,12 @@ impl SqlPlayerStorage {
                 request.op,
                 StorageOp::Set | StorageOp::Delete | StorageOp::Clear
             );
-            if !limits.consume(owner, write) {
+            let bytes = if request.op == StorageOp::Set {
+                request.value.len()
+            } else {
+                0
+            };
+            if !limits.consume(owner, write, bytes, limit) {
                 return fail(StorageStatus::RateLimited);
             }
         }
@@ -467,6 +557,7 @@ mod tests {
         let Pool::Postgres(pool) = &first.pool else {
             unreachable!()
         };
+        check_byte_limits_and_admin(&first).await;
         assert_eq!(
             first
                 .execute("alice", req(StorageOp::Set, vec![1; 64]), 1024, 0)
@@ -599,6 +690,135 @@ mod tests {
         }
     }
 
+    async fn check_byte_limits_and_admin(storage: &SqlPlayerStorage) {
+        use crate::admin::{StorageAdminAction as Action, StorageAdminReply as Reply};
+        for _ in 0..2 {
+            assert_eq!(
+                storage
+                    .execute(
+                        "byte-owner",
+                        req(StorageOp::Set, vec![3; 16_300]),
+                        16_384,
+                        0
+                    )
+                    .await
+                    .status,
+                StorageStatus::Ok
+            );
+        }
+        assert_eq!(
+            storage
+                .execute(
+                    "byte-owner",
+                    req(StorageOp::Set, vec![4; 16_300]),
+                    16_384,
+                    0
+                )
+                .await
+                .status,
+            StorageStatus::RateLimited
+        );
+        assert_eq!(
+            storage
+                .execute("byte-owner", req(StorageOp::Get, vec![]), 16_384, 0)
+                .await
+                .value,
+            vec![3; 16_300]
+        );
+        let inspection = storage
+            .admin(Action::Inspect("byte-owner".into()))
+            .await
+            .unwrap();
+        let Reply::Inspection { record, .. } = inspection else {
+            panic!()
+        };
+        assert_eq!(record.scopes["level"]["score"], 16_300);
+        assert!(matches!(
+            storage.admin(Action::Statistics).await.unwrap(),
+            Reply::Statistics { records: 1, .. }
+        ));
+        storage
+            .admin(Action::Wipe("byte-owner".into()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage.admin(Action::Statistics).await.unwrap(),
+            Reply::Statistics {
+                records: 0,
+                bytes: 0,
+                ..
+            }
+        ));
+        assert_eq!(
+            storage
+                .execute("shrinking", req(StorageOp::Set, vec![1; 128]), 1024, 0)
+                .await
+                .status,
+            StorageStatus::Ok
+        );
+        assert_eq!(
+            storage
+                .execute("shrinking", req(StorageOp::Set, vec![1; 64]), 8, 0)
+                .await
+                .status,
+            StorageStatus::Ok
+        );
+        assert_eq!(
+            storage
+                .execute("shrinking", req(StorageOp::Clear, vec![]), 8, 0)
+                .await
+                .status,
+            StorageStatus::Ok
+        );
+        // A corrupt SQL row must be removable without deserializing its payload.
+        match &storage.pool {
+            Pool::Postgres(pool) => {
+                sqlx::query(&format!(
+                    "INSERT INTO {} (owner,payload) VALUES ('corrupt',$1)",
+                    storage.table
+                ))
+                .bind(b"bad".to_vec())
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            Pool::Sqlite(pool) => {
+                sqlx::query(&format!(
+                    "INSERT INTO {} (owner,payload) VALUES ('corrupt',?1)",
+                    storage.table
+                ))
+                .bind(b"bad".to_vec())
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+        }
+        assert!(storage
+            .admin(Action::Inspect("corrupt".into()))
+            .await
+            .is_err());
+        storage.admin(Action::Wipe("corrupt".into())).await.unwrap();
+        assert!(matches!(
+            storage.admin(Action::Statistics).await.unwrap(),
+            Reply::Statistics {
+                records: 0,
+                bytes: 0,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_byte_limits_and_operator_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in [None, Some(dir.path().join("admin.db"))] {
+            let (storage, _) = SqlPlayerStorage::connect("", path.as_deref(), "basis_storage")
+                .await
+                .unwrap();
+            check_byte_limits_and_admin(&storage).await;
+        }
+    }
+
     #[tokio::test]
     async fn in_memory_sqlite_keeps_its_only_connection_alive() {
         let (storage, _) = SqlPlayerStorage::connect("", None, "basis_storage")
@@ -661,8 +881,8 @@ mod tests {
                     let reduced = storage.execute(&owner, request, per_player, total).await;
                     assert_eq!(reduced.status, StorageStatus::Ok);
                     assert!(reduced.used > 8);
-                    let mut request = req(StorageOp::Set, vec![1; 128]);
-                    request.scope = "two".into();
+                    let mut request = req(StorageOp::Set, vec![]);
+                    request.scope = "three".into();
                     let denied = storage.execute(&owner, request, per_player, total).await;
                     assert_eq!(denied.status, StorageStatus::Full);
                     assert_eq!(denied.used, reduced.used);

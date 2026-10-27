@@ -43,6 +43,38 @@ Useful flags:
 
 ## Configuration
 
+### Player storage compatibility and administration
+
+The storage network protocol is BasisVR compatible; the on-disk file format is
+**not compatible with the C# BasisVR server**. C# stores checksummed binary records
+at `storage/players/<first-two-hash-characters>/<owner-hash>.bsr`. BasisRust stores
+JSON at `storage/players/<owner-hash>.json`. Reusing a C# storage directory starts
+with apparently empty player accounts in BasisRust; existing `.bsr` files are not
+imported or deleted. There is currently **no supported conversion/import tool**.
+Keep a backup and retain the C# server to access those saves until a converter is
+available. Renaming `.bsr` files to `.json` does not convert them. Switching Rust
+storage backends also does not migrate data.
+
+Local console commands work with memory, file, SQLite and PostgreSQL backends:
+
+- `/storage`: active backend, account count and serialized record bytes.
+- `/storage show <uuid>`: a player's scopes, keys and value sizes, never values.
+- `/storage wipe <uuid>`: permanently remove **all scopes** for that identity and
+  reclaim its quota. This also removes corrupt records without decoding them.
+
+Commands use the verified player UUID/DID as the identity, as stored in the
+permissions data. They are local operator commands, not remote player requests.
+Wipes are serialized with normal writes; a subsequent client write can recreate
+an account. A console timeout does not cancel an operation already in progress.
+
+Set requests consume both operation and byte tokens for every backend: ten writes
+burst, two writes per second, plus a byte burst of twice the per-player quota and
+refill of half that quota per second. At the default 16 KiB quota, this means a
+32 KiB byte burst and 8 KiB/s refill. Delete and Clear consume write-operation
+tokens but no byte tokens, so byte throttling does not prevent cleanup. After a
+quota reduction, a shrinking payload larger than the new byte burst can spend
+from a full bucket once; its complete byte cost remains as debt until refilled.
+
 ### Cilbox SQL player storage (optional)
 
 `StorageEnabled`, `StorageBackend`, `StorageConnectionString`, and `StorageSqlTable`

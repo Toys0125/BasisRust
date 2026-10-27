@@ -10,6 +10,7 @@ use std::{
     sync::Arc,
 };
 
+pub mod admin;
 pub mod player;
 #[cfg(feature = "sql-storage")]
 pub mod sql;
