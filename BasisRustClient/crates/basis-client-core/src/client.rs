@@ -111,6 +111,7 @@ pub(crate) struct BasisClient {
     pub(crate) pose: Mutex<PoseState>,
     pub(crate) avatar_observer: Option<Arc<ObserverSession>>,
     pub(crate) scene_session: Option<Arc<crate::scene::SceneSession>>,
+    pub(crate) persistence_session: Option<Arc<crate::persistence::PersistenceSession>>,
     pub(crate) image_benchmark: Option<Arc<crate::image_benchmark::ImageBenchmarkSession>>,
     pub(crate) image_network_id: AtomicU16,
     pub(crate) packet_diagnostics: PacketDiagnostics,
@@ -240,6 +241,7 @@ impl BasisClient {
                 .then(|| config.observer_session.clone())
                 .flatten(),
             scene_session: (index == 0).then(|| config.scene_session.clone()).flatten(),
+            persistence_session: config.persistence_session.clone(),
             image_benchmark: config.image_benchmark.clone(),
             image_network_id: AtomicU16::new(u16::MAX),
             packet_diagnostics: PacketDiagnostics::default(),
@@ -386,6 +388,9 @@ impl BasisClient {
             if let Some(session) = &self.image_benchmark {
                 session.note_disconnect(self.index);
             }
+        }
+        if let Some(session) = &self.persistence_session {
+            session.cancel(self.index, self.connect_time);
         }
         if let Some(session) = &self.avatar_observer {
             session.release((self.index, self.connect_time));
@@ -1080,6 +1085,11 @@ impl BasisClient {
         if channel == channels::SCENE {
             if let Some(session) = &self.scene_session {
                 session.observe(payload);
+            }
+        }
+        if channel == channels::STORAGE {
+            if let Some(session) = &self.persistence_session {
+                session.observe(self, payload).await;
             }
         }
         match channel {

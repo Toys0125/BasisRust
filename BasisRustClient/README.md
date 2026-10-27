@@ -160,3 +160,48 @@ Validate all client packages with:
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+## Occasional persistence uploads
+
+Persistence simulation is opt-in. Each admitted, identity-verified client writes
+an exact **16,384-byte** changing binary value to its own `load-test/state` key on
+channel 32, then reads it back and compares every byte. The data is deterministic
+for verification and varies with the client, connection and write sequence.
+Only one Set/Get chain is in flight per client. Initial sends are staggered;
+the nominal interval defaults to 30 seconds. It works with randomized and
+`--sync-batching` movement modes, including Linux shared receive.
+
+Enable it in `Config.xml`:
+
+```xml
+<PersistenceUploadEnabled>true</PersistenceUploadEnabled>
+<PersistenceUploadIntervalSeconds>30</PersistenceUploadIntervalSeconds>
+```
+
+Or override XML from the command line:
+
+```sh
+cargo run --release -- --persistence-upload --persistence-interval-secs 10 \
+  --observe-persistence-csv persistence.csv
+# Explicitly disable a workload enabled in XML:
+cargo run --release -- --persistence-upload=false
+```
+
+The server needs verified DID authentication and `basis.storage.use` permission.
+Set `StorageMaxBytesPerPlayer` to **32768** (or at least 16404): the 16 KiB value
+plus scope/key overhead exceeds the default 16 KiB player quota. A smaller quota
+produces `Full` replies rather than silently shrinking the requested payload.
+
+`--observe-persistence-csv` records operation counts, statuses, distinct writers,
+readback failures, timeouts, backpressure, and Set/Get/complete-cycle p50/p95/p99
+latencies. Latencies have 0.1 ms histogram resolution and bounded storage; the
+CSV reports any histogram overflow. `--observe-persistence-start-file PATH`
+excludes warmup sends until the marker appears. The observation window defaults
+to 60 seconds (`--observe-persistence-window-secs`); uploads stop at its end so
+pending readbacks can drain. Without CSV observation, uploads continue until
+shutdown. Each operation has a 10-second reply timeout. Disconnects cancel old
+connection requests; late replies cannot complete a replacement connection's work.
+
+The CSV describes Set **plus** readback traffic, not write-only capacity. Server
+errors and mismatched data are counted explicitly. See the persistence benchmark
+report under `docs/performance` for measured workload settings and limitations.

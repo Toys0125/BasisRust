@@ -178,6 +178,8 @@ fn shared_receiver_process_raw(client: &BasisClient, bytes: &[u8]) -> bool {
                     | basis_protocol::channels::NET_ID_ASSIGNS
                     | basis_protocol::channels::DELTA_AVATAR
             ) || (channel == basis_protocol::channels::SCENE && client.scene_session.is_some())
+                || (channel == basis_protocol::channels::STORAGE
+                    && client.persistence_session.is_some())
                 || (matches!(
                     channel,
                     basis_protocol::channels::SCENE | basis_protocol::channels::DIRECT_SCENE_SERVER

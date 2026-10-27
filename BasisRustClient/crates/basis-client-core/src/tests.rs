@@ -687,6 +687,7 @@ async fn test_client_with_voice_diagnostics(
         pose: Mutex::new(PoseState::new_at([0.0; 3])),
         avatar_observer: None,
         scene_session: None,
+        persistence_session: None,
         image_benchmark: None,
         image_network_id: AtomicU16::new(u16::MAX),
         packet_diagnostics: PacketDiagnostics::default(),
@@ -4072,4 +4073,19 @@ fn additional_avatar_payload_boundaries_and_sequence_wrap_do_not_leave_stale_byt
             assert_eq!(packet[1], channels::PLAYER_AVATAR_HIGH);
         }
     }
+}
+
+#[test]
+fn persistence_xml_options_round_trip_and_strict_validation() {
+    let path = std::path::Path::new("Config.xml");
+    let parsed=Config::from_xml("<Configuration><PersistenceUploadEnabled>true</PersistenceUploadEnabled><PersistenceUploadIntervalSeconds>17</PersistenceUploadIntervalSeconds></Configuration>",path,true).unwrap();
+    assert!(parsed.persistence_upload_enabled);
+    assert_eq!(parsed.persistence_upload_interval_seconds, 17);
+    let round = Config::from_xml(&parsed.to_pretty_xml(), path, true).unwrap();
+    assert!(round.persistence_upload_enabled);
+    assert_eq!(round.persistence_upload_interval_seconds, 17);
+    for value in ["0", "86401", "bad"] {
+        assert!(Config::from_xml(&format!("<Configuration><PersistenceUploadIntervalSeconds>{value}</PersistenceUploadIntervalSeconds></Configuration>"),path,true).is_err());
+    }
+    assert!(!Config::default().persistence_upload_enabled);
 }
