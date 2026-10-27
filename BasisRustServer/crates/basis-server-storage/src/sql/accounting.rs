@@ -132,3 +132,20 @@ fn is_empty(owner: &str, bytes: &[u8]) -> bool {
     serde_json::from_slice::<PlayerRecord>(bytes)
         .is_ok_and(|record| record.owner == owner && record.scopes.is_empty())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn accounting_names_match_the_postgres_migration_script() {
+        let cases: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../tests/fixtures/accounting-names.json"))
+                .unwrap();
+        for case in cases {
+            assert_eq!(
+                usage_table(case["table"].as_str().unwrap()),
+                case["usage"].as_str().unwrap()
+            );
+        }
+    }
+}

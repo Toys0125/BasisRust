@@ -100,16 +100,31 @@ impl ResourceState {
     }
 
     pub fn modify_resource(&self, message: &ModifyResource) -> bool {
+        self.modify_resource_if(message, |resource| resource.mode == message.mode)
+            .is_some()
+    }
+
+    /// Authorize and update the current resource under one write lock. Returns
+    /// the committed message with server-owned mode and normalized static flags.
+    pub fn modify_resource_if(
+        &self,
+        message: &ModifyResource,
+        allowed: impl FnOnce(&ResourceManagementMessage) -> bool,
+    ) -> Option<ModifyResource> {
         let mut resources = self.resources.write();
-        let Some(resource) = resources.get_mut(&message.loaded_net_id) else {
-            return false;
-        };
-        if resource.mode != message.mode {
-            return false;
+        let resource = resources.get_mut(&message.loaded_net_id)?;
+        if !allowed(resource) {
+            return None;
         }
-        resource.static_admin_locked = message.static_admin_locked;
-        resource.static_resource = message.static_resource || message.static_admin_locked;
-        true
+        let committed = ModifyResource {
+            mode: resource.mode,
+            loaded_net_id: message.loaded_net_id.clone(),
+            static_resource: message.static_resource || message.static_admin_locked,
+            static_admin_locked: message.static_admin_locked,
+        };
+        resource.static_admin_locked = committed.static_admin_locked;
+        resource.static_resource = committed.static_resource;
+        Some(committed)
     }
 
     pub fn all_scene_unloads(&self) -> Vec<UnloadResource> {
@@ -734,6 +749,49 @@ mod tests {
             modify_scale: false,
             load_strategy: 0,
         }
+    }
+
+    #[test]
+    fn authorized_modification_checks_the_current_resource_under_the_write_lock() {
+        let state = ResourceState::default();
+        assert!(state.load_resource(resource("one", "alice")));
+        let request = ModifyResource {
+            mode: 99,
+            loaded_net_id: "one".into(),
+            static_resource: false,
+            static_admin_locked: true,
+        };
+        let committed = state
+            .modify_resource_if(&request, |current| {
+                assert!(
+                    state.resources.try_write().is_none(),
+                    "authorization must hold the mutation lock"
+                );
+                current.uuid_of_creator == "alice"
+            })
+            .unwrap();
+        assert_eq!(committed.mode, 0);
+        assert!(committed.static_resource && committed.static_admin_locked);
+        state.unload_resource("one").unwrap();
+        assert!(state.load_resource(resource("one", "bob")));
+        assert!(state
+            .modify_resource_if(&request, |current| current.uuid_of_creator == "alice")
+            .is_none());
+        let current = state.resources.read()["one"].clone();
+        assert!(!current.static_resource && !current.static_admin_locked);
+        assert!(state
+            .modify_resource_if(
+                &ModifyResource {
+                    loaded_net_id: "missing".into(),
+                    ..request.clone()
+                },
+                |_| panic!("missing IDs must not scan resources")
+            )
+            .is_none());
+        assert!(
+            !state.modify_resource(&request),
+            "legacy API must still reject mismatched mode"
+        );
     }
 
     #[test]

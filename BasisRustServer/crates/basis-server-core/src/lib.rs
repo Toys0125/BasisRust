@@ -629,6 +629,15 @@ impl ServerState {
                         warn!("Remote SQL unavailable at startup: using local SQLite fallback instead (data is separate)");
                     }
                     info!("Cilbox SQL storage selected backend: {backend:?}");
+                    let migration = storage.legacy_import_report();
+                    if migration.imported
+                        + migration.preserved
+                        + migration.empty
+                        + migration.previously_imported
+                        > 0
+                    {
+                        info!(?migration, "SQLite legacy player-storage migration");
+                    }
                     Some(storage)
                 }
                 Err(error) => {
@@ -3859,33 +3868,20 @@ async fn handle_message(
         }
         channels::MODIFY_RESOURCE => {
             let mut reader = NetReader::new(&payload);
-            let mut request = ModifyResource::deserialize(&mut reader)?;
-            let Some(resource) = state
-                .resources
-                .all_resources()
-                .into_iter()
-                .find(|resource| resource.loaded_net_id == request.loaded_net_id)
-            else {
-                return Ok(());
-            };
+            let request = ModifyResource::deserialize(&mut reader)?;
             let is_moderator = has_protection_permission(state, peer);
             let requester_uuid = state
                 .authenticated_peers
                 .get(&peer)
                 .map(|p| p.metadata.player_uuid.clone())
                 .unwrap_or_default();
-            let target_admin_locked = request.static_admin_locked;
-            let target_static = request.static_resource || target_admin_locked;
-            let involves_admin_tier = resource.static_admin_locked || target_admin_locked;
-            let is_creator =
-                !resource.uuid_of_creator.is_empty() && requester_uuid == resource.uuid_of_creator;
-            if (!is_creator || involves_admin_tier) && !is_moderator {
-                return Ok(());
-            }
-            request.mode = resource.mode;
-            request.static_resource = target_static;
-            request.static_admin_locked = target_admin_locked;
-            if state.resources.modify_resource(&request) {
+            if let Some(request) = state.resources.modify_resource_if(&request, |resource| {
+                let involves_admin_tier =
+                    resource.static_admin_locked || request.static_admin_locked;
+                let is_creator = !resource.uuid_of_creator.is_empty()
+                    && requester_uuid == resource.uuid_of_creator;
+                is_moderator || (is_creator && !involves_admin_tier)
+            }) {
                 let mut writer = NetWriter::new();
                 request.serialize(&mut writer)?;
                 state

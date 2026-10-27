@@ -45,15 +45,18 @@ Useful flags:
 
 ### Player storage compatibility and administration
 
-The storage network protocol is BasisVR compatible; the on-disk file format is
-**not compatible with the C# BasisVR server**. C# stores checksummed binary records
-at `storage/players/<first-two-hash-characters>/<owner-hash>.bsr`. BasisRust stores
-JSON at `storage/players/<owner-hash>.json`. Reusing a C# storage directory starts
-with apparently empty player accounts in BasisRust; existing `.bsr` files are not
-imported or deleted. There is currently **no supported conversion/import tool**.
-Keep a backup and retain the C# server to access those saves until a converter is
-available. Renaming `.bsr` files to `.json` does not convert them. Switching Rust
-storage backends also does not migrate data.
+The storage network protocol is BasisVR compatible. C# file saves use checksummed
+binary `.bsr` records; Rust file storage uses JSON. When persistent **SQLite** is
+selected, startup automatically imports valid C# saves from
+`storage/players/<first-two-hash-characters>/<owner-hash>.bsr` next to the SQLite
+database. Existing accounts are preserved, source files are unchanged, and
+migration markers prevent restart from resurrecting subsequently wiped accounts.
+An invalid new save rolls back the import and disables storage with an error.
+File/JSON, memory, in-memory SQLite and PostgreSQL do not import `.bsr` files.
+
+For backups, conversion checks, and the explicit SQLite-to-remote-PostgreSQL
+migration script, follow the [player storage migration guide](../docs/operations/player-storage-migration.md).
+Rust backend changes still do not synchronize or migrate existing JSON/SQL data.
 
 Local console commands work with memory, file, SQLite and PostgreSQL backends:
 

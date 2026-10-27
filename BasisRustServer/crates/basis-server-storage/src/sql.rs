@@ -2,6 +2,8 @@
 //! A remote connection is attempted only at startup; an in-flight outage returns
 //! Unavailable rather than silently switching databases and losing read-your-writes.
 mod accounting;
+mod legacy;
+pub use legacy::LegacyImportReport;
 
 use crate::player::{apply_request, quota_allows, PlayerRecord, RateLimiter};
 use anyhow::{Context, Result};
@@ -34,6 +36,7 @@ pub struct SqlPlayerStorage {
     table: String,
     usage_table: String,
     limits: Arc<Mutex<RateLimiter>>,
+    legacy_import: LegacyImportReport,
 }
 
 impl SqlPlayerStorage {
@@ -69,6 +72,7 @@ impl SqlPlayerStorage {
                         table: table.to_owned(),
                         usage_table: accounting::usage_table(table),
                         limits: Arc::new(Mutex::new(RateLimiter::default())),
+                        legacy_import: LegacyImportReport::default(),
                     },
                     SqlBackend::PostgreSql,
                 ));
@@ -101,15 +105,27 @@ impl SqlPlayerStorage {
         }
         let pool = pool_options.connect_with(options).await?;
         accounting::init_sqlite(&pool, table).await?;
+        let legacy_import = if let Some(parent) = sqlite_path.and_then(Path::parent) {
+            legacy::import(&pool, table, parent.join("players"))
+                .await
+                .context("SQLite legacy BSTR migration failed; source files were left unchanged")?
+        } else {
+            LegacyImportReport::default()
+        };
         Ok((
             Self {
                 pool: Pool::Sqlite(pool),
                 table: table.to_owned(),
                 usage_table: accounting::usage_table(table),
                 limits: Arc::new(Mutex::new(RateLimiter::default())),
+                legacy_import,
             },
             SqlBackend::Sqlite,
         ))
+    }
+
+    pub fn legacy_import_report(&self) -> LegacyImportReport {
+        self.legacy_import
     }
 
     /// Local operator access; mutations use the same locks and accounting as writes.
@@ -420,7 +436,7 @@ fn decode_record(data: Option<Vec<u8>>, owner: &str) -> Result<PlayerRecord> {
 mod tests {
     use super::*;
 
-    async fn sqlite_usage(storage: &SqlPlayerStorage) -> (i64, i64, i64) {
+    pub(super) async fn sqlite_usage(storage: &SqlPlayerStorage) -> (i64, i64, i64) {
         let Pool::Sqlite(pool) = &storage.pool else {
             unreachable!()
         };
@@ -548,7 +564,21 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        let (first, backend) = SqlPlayerStorage::connect(&url, None, &table).await.unwrap();
+        // PostgreSQL mode must never read legacy .bsr files or open SQLite.
+        let migration_dir = tempfile::tempdir().unwrap();
+        let legacy = migration_dir.path().join("players/aa");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join(format!("aa{}.bsr", "0".repeat(62))),
+            b"invalid legacy data",
+        )
+        .unwrap();
+        let sqlite_path = migration_dir.path().join("players.sqlite3");
+        let (first, backend) = SqlPlayerStorage::connect(&url, Some(&sqlite_path), &table)
+            .await
+            .unwrap();
+        assert_eq!(first.legacy_import_report().imported, 0);
+        assert!(!sqlite_path.exists());
         assert_eq!(
             backend,
             SqlBackend::PostgreSql,
