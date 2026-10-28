@@ -32,6 +32,12 @@ pub struct ClientOptions {
     pub scene_data_bytes: usize,
     pub scene_data_interval_ms: u64,
     pub scene_data_reliable: bool,
+    /// Override XML to send occasional 16 KiB storage values (disabled by default).
+    pub persistence_upload: Option<bool>,
+    pub persistence_interval_secs: Option<u64>,
+    pub observe_persistence_csv: Option<PathBuf>,
+    pub observe_persistence_start_file: Option<PathBuf>,
+    pub observe_persistence_window_secs: u64,
     pub observe_scene_csv: Option<PathBuf>,
     pub scene_start_file: Option<PathBuf>,
     /// Use synchronized worker batches instead of the default per-client randomized cadence.
@@ -98,6 +104,11 @@ impl Default for ClientOptions {
             scene_data_bytes: 0,
             scene_data_interval_ms: 50,
             scene_data_reliable: false,
+            persistence_upload: None,
+            persistence_interval_secs: None,
+            observe_persistence_csv: None,
+            observe_persistence_start_file: None,
+            observe_persistence_window_secs: 60,
             observe_scene_csv: None,
             scene_start_file: None,
             sync_batching: false,
@@ -144,6 +155,10 @@ pub struct Config {
     pub avatar_password: String,
     pub avatar_url: String,
     pub avatar_load_mode: u8,
+    pub persistence_upload_enabled: bool,
+    pub persistence_upload_interval_seconds: u64,
+    #[serde(skip)]
+    pub(crate) persistence_session: Option<Arc<crate::persistence::PersistenceSession>>,
     pub voice_enabled: bool,
     pub voice_audio_folder: String,
     pub voice_speaker_percent: u8,
@@ -181,6 +196,8 @@ pub(crate) struct RawConfig {
     pub(crate) avatar_password: Option<String>,
     pub(crate) avatar_url: Option<String>,
     pub(crate) avatar_load_mode: Option<String>,
+    pub(crate) persistence_upload_enabled: Option<String>,
+    pub(crate) persistence_upload_interval_seconds: Option<String>,
     pub(crate) voice_enabled: Option<String>,
     pub(crate) voice_audio_folder: Option<String>,
     pub(crate) voice_speaker_percent: Option<String>,
@@ -200,6 +217,9 @@ impl Default for Config {
             avatar_password: "N/A".to_string(),
             avatar_url: "LoadingAvatar".to_string(),
             avatar_load_mode: 1,
+            persistence_upload_enabled: false,
+            persistence_upload_interval_seconds: 30,
+            persistence_session: None,
             voice_enabled: false,
             voice_audio_folder: DEFAULT_VOICE_AUDIO_FOLDER.to_string(),
             voice_speaker_percent: DEFAULT_VOICE_SPEAKER_PERCENT,
@@ -280,6 +300,18 @@ impl Config {
                 defaults.avatar_load_mode,
                 "AvatarLoadMode",
             ),
+            persistence_upload_enabled: parse_or_default(
+                raw.persistence_upload_enabled,
+                defaults.persistence_upload_enabled,
+                "PersistenceUploadEnabled",
+            ),
+            persistence_upload_interval_seconds: parse_or_default::<u64>(
+                raw.persistence_upload_interval_seconds,
+                defaults.persistence_upload_interval_seconds,
+                "PersistenceUploadIntervalSeconds",
+            )
+            .clamp(1, 86400),
+            persistence_session: None,
             voice_enabled: parse_or_default(
                 raw.voice_enabled,
                 defaults.voice_enabled,
@@ -319,7 +351,7 @@ impl Config {
 
     pub(crate) fn to_pretty_xml(&self) -> String {
         format!(
-            "<Configuration>\n  <Password>{}</Password>\n  <Ip>{}</Ip>\n  <Port>{}</Port>\n  <ClientCount>{}</ClientCount>\n  <CompanyName>{}</CompanyName>\n  <ProductName>{}</ProductName>\n  <AvatarPassword>{}</AvatarPassword>\n  <AvatarUrl>{}</AvatarUrl>\n  <AvatarLoadMode>{}</AvatarLoadMode>\n  <VoiceEnabled>{}</VoiceEnabled>\n  <VoiceAudioFolder>{}</VoiceAudioFolder>\n  <VoiceSpeakerPercent>{}</VoiceSpeakerPercent>\n  <VoiceHearingDistance>{}</VoiceHearingDistance>\n  <VoiceFrameDurationMs>{}</VoiceFrameDurationMs>\n</Configuration>\n",
+            "<Configuration>\n  <Password>{}</Password>\n  <Ip>{}</Ip>\n  <Port>{}</Port>\n  <ClientCount>{}</ClientCount>\n  <CompanyName>{}</CompanyName>\n  <ProductName>{}</ProductName>\n  <AvatarPassword>{}</AvatarPassword>\n  <AvatarUrl>{}</AvatarUrl>\n  <AvatarLoadMode>{}</AvatarLoadMode>\n  <PersistenceUploadEnabled>{}</PersistenceUploadEnabled>\n  <PersistenceUploadIntervalSeconds>{}</PersistenceUploadIntervalSeconds>\n  <VoiceEnabled>{}</VoiceEnabled>\n  <VoiceAudioFolder>{}</VoiceAudioFolder>\n  <VoiceSpeakerPercent>{}</VoiceSpeakerPercent>\n  <VoiceHearingDistance>{}</VoiceHearingDistance>\n  <VoiceFrameDurationMs>{}</VoiceFrameDurationMs>\n</Configuration>\n",
             escape_xml(&self.password),
             escape_xml(&self.ip),
             self.port,
@@ -329,6 +361,8 @@ impl Config {
             escape_xml(&self.avatar_password),
             escape_xml(&self.avatar_url),
             self.avatar_load_mode,
+            self.persistence_upload_enabled,
+            self.persistence_upload_interval_seconds,
             self.voice_enabled,
             escape_xml(&self.voice_audio_folder),
             self.voice_speaker_percent,

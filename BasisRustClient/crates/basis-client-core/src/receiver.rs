@@ -170,14 +170,21 @@ fn shared_receiver_process_raw(client: &BasisClient, bytes: &[u8]) -> bool {
         }
         PacketProperty::Channeled => {
             let channel = packet.channel_id.unwrap() / 4;
-            if matches!(
-                channel,
-                basis_protocol::channels::AUTH_IDENTITY
-                    | basis_protocol::channels::META_DATA
-                    | basis_protocol::channels::NET_ID_ASSIGN
-                    | basis_protocol::channels::NET_ID_ASSIGNS
-                    | basis_protocol::channels::DELTA_AVATAR
-            ) || (channel == basis_protocol::channels::SCENE && client.scene_session.is_some())
+            // A message may start on the dedicated receiver and finish after
+            // handoff. All fragments must reach that same reassembler, even on
+            // channels whose completed application payload is intentionally ignored.
+            if bytes[0] & 0x80 != 0
+                || matches!(
+                    channel,
+                    basis_protocol::channels::AUTH_IDENTITY
+                        | basis_protocol::channels::META_DATA
+                        | basis_protocol::channels::NET_ID_ASSIGN
+                        | basis_protocol::channels::NET_ID_ASSIGNS
+                        | basis_protocol::channels::DELTA_AVATAR
+                )
+                || (channel == basis_protocol::channels::SCENE && client.scene_session.is_some())
+                || (channel == basis_protocol::channels::STORAGE
+                    && client.persistence_session.is_some())
                 || (matches!(
                     channel,
                     basis_protocol::channels::SCENE | basis_protocol::channels::DIRECT_SCENE_SERVER

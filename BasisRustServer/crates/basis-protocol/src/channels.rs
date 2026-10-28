@@ -48,8 +48,8 @@ pub const DELTA_HEADER_QUALITY_MASK: u8 = 0x03;
 pub const DELTA_HEADER_ADDITIONAL_DATA: u8 = 0x04;
 pub const DELTA_HEADER_LARGE_ID: u8 = 0x08;
 pub const SERVER_BOUND: u8 = 31;
-// 32/33 are retired in current Basis. Kept only so the Rust server's legacy database
-// subsystem remains buildable; current clients do not use these channels.
+pub const STORAGE: u8 = 32;
+// Channel 33 remains unassigned.
 pub const ADMIN: u8 = 34;
 pub const SERVER_STATISTICS: u8 = 35;
 pub const CAMERA_PIP_STATE: u8 = 36;

@@ -125,6 +125,7 @@ pub(crate) fn is_data(channel: u8, payload: &[u8]) -> bool {
                 | channels::CAMERA_PIP_POSITION
                 | channels::EVENTS
                 | channels::SERVER_BOUND
+                | channels::STORAGE
         )
 }
 
@@ -299,6 +300,7 @@ mod tests {
 
     #[test]
     fn data_and_control_routes_are_distinct() {
+        assert!(is_data(channels::STORAGE, &[1, 1, 0]));
         for channel in channels::PLAYER_AVATAR_QUALITY_CHANNELS {
             assert!(is_data(channel, &[]));
         }

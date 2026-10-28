@@ -284,7 +284,11 @@ pub(crate) async fn movement_workers(
                     let mut idx = worker;
                     while idx < snapshot.len() {
                         let client = &snapshot[idx];
-                        if client.connected.load(Ordering::Relaxed) {
+                        // Transport acceptance precedes the optional DID challenge.
+                        // Wait for post-login metadata before emitting movement.
+                        if client.connected.load(Ordering::Relaxed)
+                            && client.metadata_state().is_some()
+                        {
                             let sequence = client.movement_sequence.fetch_add(1, Ordering::Relaxed);
                             let mut pose = client.pose.lock().await;
                             let datagram = pose.write_movement_datagram_with_additional(
@@ -353,7 +357,11 @@ pub(crate) async fn movement_workers(
                         .pop()
                         .expect("movement deadline heap was non-empty");
                     if let Some(client) = snapshot.get(index) {
-                        if client.connected.load(Ordering::Relaxed) {
+                        // Transport acceptance precedes the optional DID challenge.
+                        // Wait for post-login metadata before emitting movement.
+                        if client.connected.load(Ordering::Relaxed)
+                            && client.metadata_state().is_some()
+                        {
                             let sequence = client.movement_sequence.fetch_add(1, Ordering::Relaxed);
                             let mut pose = client.pose.lock().await;
                             let datagram = pose.write_movement_datagram_with_additional(

@@ -39,6 +39,18 @@ pub(crate) struct Args {
     /// Send scene scripts over ReliableOrdered instead of Unreliable.
     #[arg(long)]
     scene_data_reliable: bool,
+    /// Send exact 16 KiB persistence values and verify each with a readback.
+    #[arg(long, num_args=0..=1, default_missing_value="true")]
+    persistence_upload: Option<bool>,
+    /// Nominal seconds between uploads per client; initial phases are staggered.
+    #[arg(long, value_parser=clap::value_parser!(u64).range(1..=86400))]
+    persistence_interval_secs: Option<u64>,
+    #[arg(long)]
+    observe_persistence_csv: Option<PathBuf>,
+    #[arg(long)]
+    observe_persistence_start_file: Option<PathBuf>,
+    #[arg(long, default_value_t=60, value_parser=clap::value_parser!(u64).range(1..=86400))]
+    observe_persistence_window_secs: u64,
     /// Write scene throughput, integrity, coverage, and latency metrics at shutdown.
     #[arg(long)]
     observe_scene_csv: Option<PathBuf>,
@@ -137,6 +149,11 @@ impl From<Args> for ClientOptions {
             scene_data_bytes: args.scene_data_bytes,
             scene_data_interval_ms: args.scene_data_interval_ms,
             scene_data_reliable: args.scene_data_reliable,
+            persistence_upload: args.persistence_upload,
+            persistence_interval_secs: args.persistence_interval_secs,
+            observe_persistence_csv: args.observe_persistence_csv,
+            observe_persistence_start_file: args.observe_persistence_start_file,
+            observe_persistence_window_secs: args.observe_persistence_window_secs,
             observe_scene_csv: args.observe_scene_csv,
             scene_start_file: args.scene_start_file,
             sync_batching: args.sync_batching,
@@ -183,6 +200,26 @@ mod tests {
         );
         let parsed: ClientOptions = Args::try_parse_from(["basis-rust-client"]).unwrap().into();
         assert_eq!(parsed, ClientOptions::default());
+    }
+
+    #[test]
+    fn persistence_is_opt_in_and_can_override_xml_in_both_directions() {
+        let enabled: ClientOptions = Args::try_parse_from([
+            "client",
+            "--persistence-upload",
+            "--persistence-interval-secs",
+            "10",
+        ])
+        .unwrap()
+        .into();
+        assert_eq!(enabled.persistence_upload, Some(true));
+        assert_eq!(enabled.persistence_interval_secs, Some(10));
+        let disabled: ClientOptions =
+            Args::try_parse_from(["client", "--persistence-upload=false"])
+                .unwrap()
+                .into();
+        assert_eq!(disabled.persistence_upload, Some(false));
+        assert!(Args::try_parse_from(["client", "--persistence-interval-secs", "0"]).is_err());
     }
 
     #[test]

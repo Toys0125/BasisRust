@@ -158,6 +158,20 @@ pub(super) fn validate_scalars(raw: &RawConfig, path: &Path) -> Result<()> {
         "an integer from 0 to 255",
     )?;
     scalar::<bool>(
+        &raw.persistence_upload_enabled,
+        "PersistenceUploadEnabled",
+        path,
+        |_| true,
+        "true or false",
+    )?;
+    scalar::<u64>(
+        &raw.persistence_upload_interval_seconds,
+        "PersistenceUploadIntervalSeconds",
+        path,
+        |v| (1..=86400).contains(v),
+        "an integer from 1 to 86400",
+    )?;
+    scalar::<bool>(
         &raw.voice_enabled,
         "VoiceEnabled",
         path,

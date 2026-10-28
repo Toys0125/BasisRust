@@ -43,6 +43,112 @@ Useful flags:
 
 ## Configuration
 
+### Player storage compatibility and administration
+
+The storage network protocol is BasisVR compatible. C# file saves use checksummed
+binary `.bsr` records; Rust file storage uses JSON. When persistent **SQLite** is
+selected, startup automatically imports valid C# saves from
+`storage/players/<first-two-hash-characters>/<owner-hash>.bsr` next to the SQLite
+database. Existing accounts are preserved, source files are unchanged, and
+migration markers prevent restart from resurrecting subsequently wiped accounts.
+An invalid new save rolls back the import and disables storage with an error.
+File/JSON, memory, in-memory SQLite and PostgreSQL do not import `.bsr` files.
+
+For backups, conversion checks, and the explicit SQLite-to-remote-PostgreSQL
+migration script, follow the [player storage migration guide](../docs/operations/player-storage-migration.md).
+Rust backend changes still do not synchronize or migrate existing JSON/SQL data.
+
+Local console commands work with memory, file, SQLite and PostgreSQL backends:
+
+- `/storage`: active backend, account count and serialized record bytes.
+- `/storage show <uuid>`: a player's scopes, keys and value sizes, never values.
+- `/storage wipe <uuid>`: permanently remove **all scopes** for that identity and
+  reclaim its quota. This also removes corrupt records without decoding them.
+
+Commands use the verified player UUID/DID as the identity, as stored in the
+permissions data. They are local operator commands, not remote player requests.
+Wipes are serialized with normal writes; a subsequent client write can recreate
+an account. A console timeout does not cancel an operation already in progress.
+
+Set requests consume both operation and byte tokens for every backend: ten writes
+burst, two writes per second, plus a byte burst of twice the per-player quota and
+refill of half that quota per second. At the default 16 KiB quota, this means a
+32 KiB byte burst and 8 KiB/s refill. Delete and Clear consume write-operation
+tokens but no byte tokens, so byte throttling does not prevent cleanup. After a
+quota reduction, a shrinking payload larger than the new byte burst can spend
+from a full bucket once; its complete byte cost remains as debt until refilled.
+
+### Cilbox SQL player storage (optional)
+
+`StorageEnabled`, `StorageBackend`, `StorageConnectionString`, and `StorageSqlTable`
+are startup settings. Edit them in the server XML configuration and restart the
+server; `/config set` rejects live changes to these fields without changing the
+running configuration. `BASIS_STORAGE_URL` is also read only at startup.
+Storage quota limits can be changed live.
+
+Persistent storage reconciles aggregate usage at startup, then updates accounting
+with each mutation instead of rescanning every account. File storage uses an OS
+directory lock and a recovery ledger; SQL storage maintains totals with database
+triggers. Deleting the last key or clearing the last scope removes the account's
+file or SQL row. Legacy empty accounts are removed during startup reconciliation.
+Stop the server before manually editing player files.
+
+SQL table names are ASCII identifiers of at most 63 bytes. The PostgreSQL user
+must own the storage table and its accounting objects, and have permission to
+create tables, functions, and triggers in the configured schema.
+
+Build or run with the `sql-storage` feature to add PostgreSQL and embedded
+SQLite support. The feature is **off by default**; the existing `file` and
+`memory` storage backends continue working without it.
+
+```sh
+cargo run -p basis-server-console --features sql-storage -- --base-dir .
+# Or: cargo build --release -p basis-server-console --features sql-storage
+```
+
+Set these fields in `config/config.xml` (inside the `<Configuration>` element):
+
+```xml
+<StorageEnabled>true</StorageEnabled>
+<StorageBackend>sql</StorageBackend>
+<StorageSqlTable>basis_storage</StorageSqlTable>
+<StorageMaxBytesPerPlayer>16384</StorageMaxBytesPerPlayer>
+<StorageMaxTotalMegabytes>256</StorageMaxTotalMegabytes>
+```
+
+For **remote PostgreSQL**, supply its connection URL as
+`BASIS_STORAGE_URL` (recommended, to keep credentials out of XML),
+for example `postgresql://user:password@db.example.net:5432/basis?sslmode=require`.
+Alternatively, set `<StorageConnectionString>postgresql://...</StorageConnectionString>`
+in the server XML. `BASIS_STORAGE_URL` overrides the XML value. TLS is
+available via SQLx/rustls; use `sslmode=require` for remote connections.
+
+**SQLite fallback:** With no remote URL, or if PostgreSQL cannot be connected
+to at startup, the server automatically opens
+`<base-dir>/storage/players.sqlite3` (creates it if missing). SQLite is
+embedded; there is no local database service to install. If
+`HasFileSupport=false`, the fallback SQLite database is in-memory instead.
+
+The chosen backend is logged on startup without printing connection
+credentials. Remote and fallback SQLite databases are **separate datasets**:
+falling back does not migrate existing PostgreSQL data, and when PostgreSQL
+becomes reachable on the next server restart, it is used again. A live
+PostgreSQL outage returns a storage-unavailable response rather than silently
+switching stores in the middle of a session (avoids split-brain writes).
+If PostgreSQL connects but its schema/accounting initialization fails, storage
+is disabled with an explicit error instead of selecting a different database.
+Back up the SQLite file and remote database independently. Changes to
+`StorageBackend` likewise do not migrate old `file` storage records.
+
+The server checks verified DID identity and the `basis.storage.use`
+permission before allowing Get/Set/Delete/Keys/Usage/Clear. SQL writes use
+transactions; PostgreSQL updates are serialized for cross-instance quota
+correctness. Storage byte limits and per-player operation throttles apply to
+both SQL variants. Non-SQL builds do not link SQLite or PostgreSQL libraries.
+The SQL table name must be a safe SQL identifier (letters, digits,
+underscores; cannot start with a digit). Only PostgreSQL remote URLs are
+supported; a MySQL URL is not a PostgreSQL connection.
+
 Image sharing uses the C# server's bandwidth governor and bounded image cache.
 `ImageShareEgressMegabitsPerSecond` (default 200) sets each sharer's relayed
 payload budget, counting recipient fan-out. Enforcement applies

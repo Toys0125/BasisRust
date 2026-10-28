@@ -89,6 +89,7 @@ impl Live {
             ipv4_address: "127.0.0.1".into(),
             ipv6_enabled: false,
             has_file_support: false,
+            storage_max_bytes_per_player: 32_768,
             use_auth: true,
             use_auth_identity: true,
             // Test the uncompressed upstream layout; extension codecs have their own vectors.

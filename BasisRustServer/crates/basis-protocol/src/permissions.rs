@@ -19,6 +19,7 @@ pub mod nodes {
     pub const OWNERSHIP_GET: &str = "basis.ownership.get";
     pub const CONTENT_SHARE_DELETE: &str = "basis.contentshare.delete";
     pub const CONTENT_SHARE_CREATE: &str = "basis.contentshare.create";
+    pub const STORAGE_USE: &str = "basis.storage.use";
     pub const PROTECTION: &str = "basis.protection";
     pub const CONFIGURATION_EDITOR: &str = "basis.configuration";
     pub const PLAYER_MODERATION: &str = "basis.moderation";
@@ -67,6 +68,7 @@ pub mod nodes {
         OWNERSHIP_GET,
         CONTENT_SHARE_DELETE,
         CONTENT_SHARE_CREATE,
+        STORAGE_USE,
         PROTECTION,
         CONFIGURATION_EDITOR,
         PLAYER_MODERATION,
@@ -107,6 +109,7 @@ pub const DEFAULT_GROUP_NODES: &[&str] = &[
     nodes::OWNERSHIP_GET,
     nodes::CONTENT_SHARE_DELETE,
     nodes::CONTENT_SHARE_CREATE,
+    nodes::STORAGE_USE,
 ];
 
 /// BasisVR's moderator grants. Seed history allows upgrades without restoring removed grants.

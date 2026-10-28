@@ -10,6 +10,7 @@ pub mod login;
 pub mod messages;
 pub mod permissions;
 pub mod server_info;
+pub mod storage;
 pub mod version;
 
 pub use config::ServerConfig;

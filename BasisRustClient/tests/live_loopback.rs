@@ -638,3 +638,75 @@ async fn additional_avatar_data_survives_real_client_fanout() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistence_uploads_verify_16k_values_with_shared_receive_in_both_modes() {
+    for synchronized in [false, true] {
+        let output = tempfile::tempdir().unwrap();
+        let csv = output.path().join("persistence.csv");
+        let marker = output.path().join("observe.start");
+        let mut args = vec![
+            "--persistence-upload",
+            "--persistence-interval-secs",
+            "1",
+            "--observe-persistence-window-secs",
+            "2",
+            "--observe-persistence-start-file",
+            marker.to_str().unwrap(),
+            "--observe-persistence-csv",
+            csv.to_str().unwrap(),
+        ];
+        if synchronized {
+            args.push("--sync-batching");
+        }
+        Live::start_with_args("default_password", 2, false, Fault::None, &args)
+            .await
+            .run(|live| {
+                Box::pin(async move {
+                    // Start the measurement only after both real DID-authenticated
+                    // clients have completed a Set and requested its readback.
+                    let deadline = Instant::now() + LIMIT;
+                    let mut readers = HashSet::new();
+                    while readers.len() < 2 {
+                        let packet = live.next(deadline).await;
+                        if !packet.from_server
+                            && packet.channeled(channels::STORAGE)
+                            && packet.bytes[0] & 0x80 == 0
+                            && packet.bytes.get(4) == Some(&0)
+                        {
+                            readers.insert(packet.client);
+                        }
+                    }
+                    std::fs::write(marker, []).unwrap();
+                    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                    live.finish().await;
+                })
+            })
+            .await;
+        let text = std::fs::read_to_string(csv).unwrap();
+        let mut lines = text.lines();
+        let headers: Vec<_> = lines.next().unwrap().split(',').collect();
+        let values: Vec<_> = lines.next().unwrap().split(',').collect();
+        assert_eq!(headers.len(), values.len());
+        let row: HashMap<_, _> = headers.into_iter().zip(values).collect();
+        assert_eq!(row["payload_bytes"], "16384");
+        assert_eq!(row["writers"], "2");
+        assert_eq!(row["verified_writers"], "2");
+        assert_eq!(row["sets_sent"], row["verified"]);
+        for field in [
+            "denied",
+            "full",
+            "rate_limited",
+            "unavailable",
+            "corrupt",
+            "malformed",
+            "send_errors",
+            "timeouts",
+            "canceled",
+            "pending",
+            "warmup_failures",
+        ] {
+            assert_eq!(row[field], "0", "{field}, sync={synchronized}");
+        }
+    }
+}

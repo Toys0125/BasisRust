@@ -955,7 +955,7 @@ mod tests {
         assert_eq!(manager.snapshot().seeded_defaults["Moderator"].len(), 25);
         let fresh = PermissionManager::default();
         fresh.ensure_defaults();
-        assert_eq!(fresh.snapshot().groups["default"].nodes.len(), 12);
+        assert_eq!(fresh.snapshot().groups["default"].nodes.len(), 13);
         assert_eq!(fresh.snapshot().groups["moderator"].nodes.len(), 25);
         assert!(fresh.is_in_group("unknown", "default"));
     }
@@ -998,6 +998,27 @@ mod tests {
     }
 
     #[test]
+    fn upgrading_existing_permissions_seeds_storage_without_overriding_removals() {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.path(),
+            "<Permissions><Groups><Group name='default'><Node value='-basis.contentshare.create'/><Node value='basis.contentshare.delete'/></Group></Groups><Users/><SeededDefaults><Group name='default'><Node value='basis.contentshare.create'/><Node value='basis.contentshare.delete'/></Group></SeededDefaults></Permissions>"
+        ).unwrap();
+        let manager = PermissionManager::new(fixture.path());
+        manager.load_from_xml().unwrap();
+        manager.ensure_defaults();
+        assert!(manager.has("new-user", nodes::STORAGE_USE));
+        assert!(manager.has("new-user", nodes::CONTENT_SHARE_DELETE));
+        assert!(!manager.has("new-user", nodes::CONTENT_SHARE_CREATE));
+        manager.save_to_xml().unwrap();
+        let reloaded = PermissionManager::new(fixture.path());
+        reloaded.load_from_xml().unwrap();
+        reloaded.ensure_defaults();
+        assert!(reloaded.has("new-user", nodes::STORAGE_USE));
+        assert!(!reloaded.has("new-user", nodes::CONTENT_SHARE_CREATE));
+    }
+
+    #[test]
     fn history_only_legacy_migration_is_dirty_and_persisted() {
         let fixture = Fixture::new();
         let node_elements = |nodes: &[&str]| {
@@ -1024,7 +1045,7 @@ mod tests {
 
         let reloaded = PermissionManager::new(fixture.path());
         reloaded.load_from_xml().unwrap();
-        assert_eq!(reloaded.snapshot().seeded_defaults["default"].len(), 12);
+        assert_eq!(reloaded.snapshot().seeded_defaults["default"].len(), 13);
         assert!(reloaded.snapshot().seeded_defaults["admin"].contains(nodes::ALL));
     }
 

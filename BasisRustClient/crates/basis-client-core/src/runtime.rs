@@ -132,6 +132,35 @@ async fn run_internal(
     let config_path = args.config.clone();
     let mut config = Config::load_or_create(&config_path, args.strict_config)?;
     config.additional_avatar_bytes = args.additional_avatar_bytes;
+    if let Some(enabled) = args.persistence_upload {
+        config.persistence_upload_enabled = enabled;
+    }
+    if let Some(interval) = args.persistence_interval_secs {
+        config.persistence_upload_interval_seconds = interval;
+    }
+    anyhow::ensure!(
+        (1..=86400).contains(&config.persistence_upload_interval_seconds),
+        "persistence interval must be 1..=86400 seconds"
+    );
+    anyhow::ensure!(
+        (1..=86400).contains(&args.observe_persistence_window_secs),
+        "persistence observation window must be 1..=86400 seconds"
+    );
+    config.persistence_session =
+        (config.persistence_upload_enabled || args.observe_persistence_csv.is_some()).then(|| {
+            Arc::new(crate::persistence::PersistenceSession::new(
+                config.persistence_upload_enabled,
+                Duration::from_secs(config.persistence_upload_interval_seconds),
+                args.observe_persistence_start_file.clone(),
+                args.observe_persistence_csv
+                    .as_ref()
+                    .map(|_| Duration::from_secs(args.observe_persistence_window_secs)),
+            ))
+        });
+
+    if config.persistence_upload_enabled {
+        info!("persistence uploads enabled: 16384-byte values every {}s/client; requires verified DID, basis.storage.use, and at least 16404 bytes of player quota", config.persistence_upload_interval_seconds);
+    }
     config.scene_session = (args.scene_data_bytes > 0).then(|| {
         Arc::new(crate::scene::SceneSession::new(
             args.scene_data_bytes,
@@ -430,6 +459,15 @@ async fn run_internal(
             args.scene_data_reliable,
         ))
     });
+    let persistence_stop = Arc::new(Notify::new());
+    let persistence_task = config.persistence_session.as_ref().map(|session| {
+        tokio::spawn(crate::persistence::run(
+            managed_clients.clone(),
+            shutdown.clone(),
+            persistence_stop.clone(),
+            session.clone(),
+        ))
+    });
     let avatar_diagnostic_task = if ClientAvatarDiagnostics::enabled_from_env() {
         match (
             config.observe_avatar_start_file.clone(),
@@ -593,6 +631,7 @@ async fn run_internal(
     }
     shutdown.store(true, Ordering::SeqCst);
     scene_stop.notify_one();
+    persistence_stop.notify_one();
     if let Some(task) = voice_diagnostic_task {
         match task.await {
             Ok(Ok(())) => {}
@@ -605,6 +644,18 @@ async fn run_internal(
         Some(task) => task.await.context("scene workload worker failed"),
         None => Ok(()),
     };
+    if let Some(task) = persistence_task {
+        shutdown_result =
+            shutdown_result.and(task.await.context("persistence workload worker failed"));
+    }
+    if let Some(session) = &config.persistence_session {
+        info!("persistence: {}", session.summary());
+    }
+    if let (Some(path), Some(session)) =
+        (&args.observe_persistence_csv, &config.persistence_session)
+    {
+        shutdown_result = shutdown_result.and(session.write_csv(path));
+    }
     if let Some(task) = image_task {
         let image_result = task
             .await

@@ -839,6 +839,96 @@ fn client_did(key: &SigningKey) -> String {
     format!("did:key:z{}", bs58::encode(multicodec).into_string())
 }
 
+async fn storage_set(client: &mut Client, id: u16) -> StorageStatus {
+    let mut request = NetWriter::new();
+    request.put_u8(storage::StorageOp::Set as u8);
+    request.put_u16(id);
+    request.put_bytes_with_length(b"wire-test").unwrap();
+    request.put_bytes_with_length(b"proof").unwrap();
+    request.put_bytes_with_length(b"value").unwrap();
+    client
+        .send(channels::STORAGE, request.as_slice(), true)
+        .await;
+    let payload = client
+        .receive(|channel, _| channel == channels::STORAGE)
+        .await;
+    let mut reply = NetReader::new(&payload);
+    assert_eq!(reply.get_u8().unwrap(), storage::StorageOp::Set as u8);
+    assert_eq!(reply.get_u16().unwrap(), id);
+    match reply.get_u8().unwrap() {
+        0 => StorageStatus::Ok,
+        1 => StorageStatus::NotFound,
+        2 => StorageStatus::Denied,
+        status => panic!("unexpected storage status {status}"),
+    }
+}
+
+#[tokio::test]
+async fn storage_authorization_is_bound_to_identity_proof_at_admission() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let claimed_key = SigningKey::from_bytes(&[119; 32]);
+    let claimed_did = client_did(&claimed_key);
+    let mut claimed = Client::connect(&state, &claimed_did).await;
+
+    assert_eq!(storage_set(&mut claimed, 1).await, StorageStatus::Denied);
+    state
+        .config
+        .write()
+        .set_field("UseAuthIdentity", "true")
+        .unwrap();
+    state.refresh_runtime_config_live().await;
+    assert_eq!(storage_set(&mut claimed, 2).await, StorageStatus::Denied);
+
+    let verified_key = SigningKey::from_bytes(&[120; 32]);
+    let verified_did = client_did(&verified_key);
+    let mut verified = Client::connect_pending(&state, &verified_did).await;
+    verified.answer_identity(&verified_key).await;
+    verified
+        .receive(|channel, _| channel == channels::META_DATA)
+        .await;
+    assert_eq!(storage_set(&mut verified, 3).await, StorageStatus::Ok);
+
+    // Recoverable headers get a correlated error rather than timing out. The
+    // same malformed body must not bypass proof checks on the unverified peer.
+    for (client, expected) in [
+        (&mut claimed, StorageStatus::Denied),
+        (&mut verified, StorageStatus::Invalid),
+    ] {
+        let mut valid_body = NetWriter::new();
+        valid_body.put_bytes_with_length(b"wire-test").unwrap();
+        valid_body.put_bytes_with_length(b"proof").unwrap();
+        valid_body.put_bytes_with_length(b"value").unwrap();
+        let mut trailing = valid_body.into_vec();
+        trailing.push(0);
+        for (index, body) in [vec![], vec![0, 0], trailing].into_iter().enumerate() {
+            let id = 20 + index as u16;
+            let mut request = vec![storage::StorageOp::Set as u8];
+            request.extend(id.to_le_bytes());
+            request.extend(body);
+            client.send(channels::STORAGE, &request, true).await;
+            let payload = client
+                .receive(|channel, _| channel == channels::STORAGE)
+                .await;
+            let mut reader = NetReader::new(&payload);
+            assert_eq!(reader.get_u8().unwrap(), storage::StorageOp::Set as u8);
+            assert_eq!(reader.get_u16().unwrap(), id);
+            assert_eq!(reader.get_u8().unwrap(), expected as u8);
+        }
+    }
+    let StorageAdminReply::Inspection { record, .. } = state
+        .storage_admin(StorageAdminAction::Inspect(verified_did))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(record.scopes.len(), 1);
+    assert_eq!(record.scopes["wire-test"]["proof"], 5);
+
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
 #[tokio::test]
 async fn admission_capacity_preserves_large_batches_and_releases_ip_and_global_slots() {
     let (state, shutdown, _) = super::tests::test_server(false).await;

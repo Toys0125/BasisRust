@@ -12,6 +12,7 @@ mod observer;
 mod observer_sequence;
 mod observer_session;
 mod packet_diagnostics;
+mod persistence;
 mod population;
 mod receiver;
 mod runtime;

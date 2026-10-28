@@ -164,6 +164,8 @@ pub struct ServerConfig {
     pub min_avatar_eye_height_meters: f32,
     pub max_avatar_eye_height_meters: f32,
     pub max_content_spheres_per_player: i32,
+    pub content_sphere_leave_timeout_seconds: i32,
+    pub content_sphere_deletion_timer_seconds: i32,
     pub max_network_ids_per_player: i32,
     pub max_loaded_resources_per_player: i32,
     /// Authenticated application-data uploads before fanout; 0 disables admission.
@@ -189,6 +191,14 @@ pub struct ServerConfig {
     pub camera_capture_locked: bool,
     pub prop_grabbing_locked: bool,
     pub safe_display_names_forced: bool,
+    pub content_removal_locked: bool,
+    pub external_links_locked: bool,
+    pub storage_enabled: bool,
+    pub storage_backend: String,
+    pub storage_max_bytes_per_player: i32,
+    pub storage_max_total_megabytes: i32,
+    pub storage_connection_string: String,
+    pub storage_sql_table: String,
     pub api_enabled: bool,
     pub api_host: String,
     pub api_port: u16,
@@ -198,7 +208,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            config_version: 14,
+            config_version: 17,
             peer_limit: u16::MAX as i32,
             network_stack_id: String::new(),
             set_port: 4296,
@@ -298,6 +308,8 @@ impl Default for ServerConfig {
             min_avatar_eye_height_meters: 0.1,
             max_avatar_eye_height_meters: 100.0,
             max_content_spheres_per_player: 32,
+            content_sphere_leave_timeout_seconds: 60,
+            content_sphere_deletion_timer_seconds: 0,
             max_network_ids_per_player: 32768,
             max_loaded_resources_per_player: 16384,
             max_upload_bytes_per_second_per_player: 128 * 1024,
@@ -320,6 +332,14 @@ impl Default for ServerConfig {
             camera_capture_locked: false,
             prop_grabbing_locked: false,
             safe_display_names_forced: false,
+            content_removal_locked: false,
+            external_links_locked: false,
+            storage_enabled: true,
+            storage_backend: "file".to_owned(),
+            storage_max_bytes_per_player: 16_384,
+            storage_max_total_megabytes: 256,
+            storage_connection_string: String::new(),
+            storage_sql_table: "basis_storage".to_owned(),
             api_enabled: false,
             api_host: "localhost".to_string(),
             api_port: 10667,
@@ -329,7 +349,7 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    pub const CURRENT_CONFIG_VERSION: i32 = 14;
+    pub const CURRENT_CONFIG_VERSION: i32 = 17;
     pub const CONFIG_FOLDER_NAME: &'static str = "config";
     pub const LOGS_FOLDER_NAME: &'static str = "logs";
     pub const INITIAL_RESOURCES_FOLDER_NAME: &'static str = "initialresources";
@@ -662,6 +682,32 @@ impl ServerConfig {
         override_field!("CameraCaptureLocked", camera_capture_locked, bool);
         override_field!("PropGrabbingLocked", prop_grabbing_locked, bool);
         override_field!("SafeDisplayNamesForced", safe_display_names_forced, bool);
+        override_field!("ContentRemovalLocked", content_removal_locked, bool);
+        override_field!("ExternalLinksLocked", external_links_locked, bool);
+        override_field!("StorageEnabled", storage_enabled, bool);
+        override_string!("StorageBackend", storage_backend);
+        override_field!(
+            "StorageMaxBytesPerPlayer",
+            storage_max_bytes_per_player,
+            i32
+        );
+        override_field!("StorageMaxTotalMegabytes", storage_max_total_megabytes, i32);
+        // StorageConnectionString is read directly from XML; the optional
+        // BASIS_STORAGE_URL environment override is resolved at server startup
+        // rather than written into this serializable configuration object.
+        // This avoids persisting an environment-supplied DB password when an
+        // administrator saves unrelated runtime configuration changes.
+        override_string!("StorageSqlTable", storage_sql_table);
+        override_field!(
+            "ContentSphereLeaveTimeoutSeconds",
+            content_sphere_leave_timeout_seconds,
+            i32
+        );
+        override_field!(
+            "ContentSphereDeletionTimerSeconds",
+            content_sphere_deletion_timer_seconds,
+            i32
+        );
         override_field!("ApiEnabled", api_enabled, bool);
         override_string!("ApiHost", api_host);
         override_field!("ApiPort", api_port, u16);
@@ -697,6 +743,7 @@ impl ServerConfig {
             || name.contains("apikey")
             || name.contains("secret")
             || name.contains("token")
+            || name.contains("connectionstring")
     }
 
     pub fn field_names(&self) -> Vec<String> {
@@ -720,6 +767,23 @@ impl ServerConfig {
             serde_json::Value::Null => String::new(),
             other => other.to_string(),
         })
+    }
+
+    /// Storage handles are bound at startup; a live edit must not pretend to
+    /// switch databases or enable a backend that was never initialized.
+    pub fn set_live_field(&mut self, name: &str, value: &str) -> Result<()> {
+        anyhow::ensure!(
+            ![
+                "StorageEnabled",
+                "StorageBackend",
+                "StorageConnectionString",
+                "StorageSqlTable"
+            ]
+            .iter()
+            .any(|field| field.eq_ignore_ascii_case(name)),
+            "{name} requires a server restart; edit the server XML configuration and restart"
+        );
+        self.set_field(name, value)
     }
 
     pub fn set_field(&mut self, name: &str, value: &str) -> Result<()> {
@@ -769,6 +833,35 @@ impl ServerConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn storage_initialization_fields_reject_live_edits_without_mutating_config() {
+        let mut config = super::ServerConfig::default();
+        let before = serde_json::to_value(&config).unwrap();
+        for (field, value) in [
+            ("StorageEnabled", "false"),
+            ("storagebackend", "sql"),
+            ("StorageConnectionString", "postgres://test"),
+            ("StorageSqlTable", "other"),
+        ] {
+            let error = config.set_live_field(field, value).unwrap_err();
+            assert!(error.to_string().contains("restart"));
+            assert_eq!(serde_json::to_value(&config).unwrap(), before);
+        }
+        config
+            .set_live_field("StorageMaxBytesPerPlayer", "4096")
+            .unwrap();
+        assert_eq!(config.storage_max_bytes_per_player, 4096);
+        config
+            .set_live_field("StorageMaxTotalMegabytes", "32")
+            .unwrap();
+        assert_eq!(config.storage_max_total_megabytes, 32);
+        config.set_field("StorageBackend", "sql").unwrap();
+        assert_eq!(
+            config.storage_backend, "sql",
+            "offline/startup edits remain supported"
+        );
+    }
+
     #[test]
     fn basisvr_restriction_modes_and_new_policy_fields_roundtrip() {
         use super::*;
@@ -1037,6 +1130,9 @@ mod tests {
         );
         assert!(config.set_field("DefinitelyNotAField", "1").is_err());
         assert!(ServerConfig::is_secret_field_name("ApiKey"));
+        assert!(ServerConfig::is_secret_field_name(
+            "StorageConnectionString"
+        ));
         assert!(ServerConfig::is_secret_field_name("Password"));
     }
 
@@ -1083,7 +1179,7 @@ mod tests {
         let xml = std::fs::read_to_string(&path).unwrap();
         assert!(xml.starts_with("<Configuration>\n"));
         assert!(
-            xml.contains("\n  <ConfigVersion>14</ConfigVersion>\n  <PeerLimit>65535</PeerLimit>\n")
+            xml.contains("\n  <ConfigVersion>17</ConfigVersion>\n  <PeerLimit>65535</PeerLimit>\n")
         );
         assert!(xml.contains(
             "\n  <CompanyName>Basis Unity</CompanyName>\n  <ProductName>Basis Unity</ProductName>\n"

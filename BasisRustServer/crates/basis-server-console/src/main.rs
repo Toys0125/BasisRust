@@ -1,6 +1,7 @@
 #[cfg(feature = "benchmark-validation")]
 use basis_server_health::{SceneBatchMetrics, UploadBudgetMetrics};
 mod shutdown;
+mod storage_commands;
 
 const DIAGNOSTIC_TARGET: &str = "basis_server_console::diagnostics";
 
@@ -89,6 +90,10 @@ impl ConsoleHelper {
                 ("/status", "/status  - server status / live status"),
                 ("/config", "/config  - inspect or live-edit configuration"),
                 ("/perm", "/perm  - permission management"),
+                (
+                    "/storage",
+                    "/storage  - player storage status, show or wipe",
+                ),
                 ("/help", "/help  - show command help"),
                 ("/clear", "/clear  - clear the console"),
                 ("/shutdown", "/shutdown  - stop the server"),
@@ -270,6 +275,27 @@ impl ConsoleHelper {
                         current_start,
                         self.config_value_pairs(completed[1], current),
                     ));
+                }
+            }
+            "/storage" => {
+                if completed.len() == 1 {
+                    return Ok((
+                        current_start,
+                        filter_pairs(
+                            current,
+                            [
+                                ("show", "show  - inspect names and sizes"),
+                                ("wipe", "wipe  - delete all data for a player"),
+                            ],
+                        ),
+                    ));
+                }
+                if completed.len() == 2
+                    && ["show", "wipe"]
+                        .iter()
+                        .any(|cmd| completed[1].eq_ignore_ascii_case(cmd))
+                {
+                    return Ok((current_start, self.permission_user_pairs(current)));
                 }
             }
             "/perm" => {
@@ -1387,6 +1413,14 @@ fn start_console_listener(
                 Box::new(move |args| handle_perm_command(&server, args)),
             );
         }
+        {
+            let server = server.clone();
+            let runtime = runtime.clone();
+            commands.insert(
+                "/storage".to_string(),
+                Box::new(move |args| storage_commands::handle(&server, &runtime, args)),
+            );
+        }
         commands.insert(
             "/help".to_string(),
             Box::new(move |_| {
@@ -1408,6 +1442,9 @@ fn start_console_listener(
                 println!("/config save - Saves the current in-memory config to config.xml.");
                 println!("/config <field> [value] - Legacy read/live-set syntax.");
                 println!("/perm help - Shows permission command help.");
+                println!("/storage - Shows player storage statistics.");
+                println!("/storage show <uuid> - Lists scopes, keys and sizes without values.");
+                println!("/storage wipe <uuid> - Deletes all stored data for a player.");
             }),
         );
 
@@ -1538,7 +1575,7 @@ fn set_config_field_live(
 ) {
     {
         let mut config = server.config.write();
-        if let Err(err) = config.set_field(field, value) {
+        if let Err(err) = config.set_live_field(field, value) {
             println!("Failed to set {field}: {err}");
             return;
         }

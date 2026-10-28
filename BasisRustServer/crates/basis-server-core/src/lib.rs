@@ -1,6 +1,7 @@
 mod admin_runtime;
 mod avatar_sync;
 mod benchmark_validation;
+mod content_share_validation;
 mod event_diagnostics;
 #[cfg(feature = "gpu")]
 mod gpu_distance;
@@ -28,6 +29,7 @@ pub use scene_relay::SceneRelaySnapshot;
 pub use upload_budget::UploadBudgetSnapshot;
 
 use anyhow::{Context, Result};
+use basis_protocol::storage::{self, StorageReply, StorageStatus};
 use basis_protocol::{
     application::NetworkApplication,
     avatar::BitQuality,
@@ -59,7 +61,10 @@ use basis_server_permissions::PermissionManager;
 use basis_server_resources::{
     ContentShareState, NetIdState, OwnershipState, PipState, ResourceState,
 };
-use basis_server_storage::PersistentDatabase;
+pub use basis_server_storage::admin::{StorageAdminAction, StorageAdminReply};
+#[cfg(feature = "sql-storage")]
+use basis_server_storage::sql::{SqlBackend, SqlPlayerStorage};
+use basis_server_storage::{player::PlayerStorage, PersistentDatabase};
 use basis_transport::{
     DeliveryMethod, DisconnectReason, OrderedAdmissionConfig, OrderedEvent, PeerId, PeerSession,
     ServerEvent, TransportHandle,
@@ -96,6 +101,8 @@ pub struct ConnectedPeer {
     // Present for live connections. Unit fixtures that exercise app state without a
     // transport session may leave this absent.
     pub session: Option<PeerSession>,
+    /// Whether this connection completed the connection-bound DID proof.
+    pub identity_verified: bool,
     // A fresh counter per authenticated connection. Clones share admission work;
     // old in-flight permits cannot decrement a replacement connection's quota.
     pub(crate) scene_pending: Arc<AtomicU64>,
@@ -481,6 +488,9 @@ pub struct ServerState {
     admissions_per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
     pub permissions: PermissionManager,
     pub database: PersistentDatabase,
+    pub player_storage: Option<PlayerStorage>,
+    #[cfg(feature = "sql-storage")]
+    pub sql_player_storage: Option<SqlPlayerStorage>,
     pub resources: ResourceState,
     pub net_ids: NetIdState,
     pub ownership: OwnershipState,
@@ -565,6 +575,78 @@ impl ServerState {
             database
         } else {
             PersistentDatabase::default()
+        };
+
+        let player_storage = if config.storage_enabled {
+            let backend = config.storage_backend.trim().to_ascii_lowercase();
+            if backend == "file" || backend == "memory" {
+                let root = if backend == "file" && config.has_file_support {
+                    Some(base_dir.join("storage").join("players"))
+                } else {
+                    None
+                };
+                match PlayerStorage::new(root) {
+                    Ok(storage) => Some(storage),
+                    Err(error) => {
+                        warn!("Cilbox server storage disabled: {error:#}");
+                        None
+                    }
+                }
+            } else {
+                #[cfg(not(feature = "sql-storage"))]
+                warn!(
+                    "Unsupported player-storage backend '{}'; SQL storage needs --features sql-storage",
+                    config.storage_backend
+                );
+                #[cfg(feature = "sql-storage")]
+                if backend != "sql" {
+                    warn!(
+                        "Unsupported player-storage backend '{}'; disabled",
+                        config.storage_backend
+                    );
+                }
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(feature = "sql-storage")]
+        let sql_player_storage = if config.storage_enabled
+            && config.storage_backend.eq_ignore_ascii_case("sql")
+        {
+            let path = config
+                .has_file_support
+                .then(|| base_dir.join("storage").join("players.sqlite3"));
+            let remote_url = std::env::var("BASIS_STORAGE_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| config.storage_connection_string.clone());
+            match SqlPlayerStorage::connect(&remote_url, path.as_deref(), &config.storage_sql_table)
+                .await
+            {
+                Ok((storage, backend)) => {
+                    if backend == SqlBackend::Sqlite && !remote_url.is_empty() {
+                        warn!("Remote SQL unavailable at startup: using local SQLite fallback instead (data is separate)");
+                    }
+                    info!("Cilbox SQL storage selected backend: {backend:?}");
+                    let migration = storage.legacy_import_report();
+                    if migration.imported
+                        + migration.preserved
+                        + migration.empty
+                        + migration.previously_imported
+                        > 0
+                    {
+                        info!(?migration, "SQLite legacy player-storage migration");
+                    }
+                    Some(storage)
+                }
+                Err(error) => {
+                    warn!("Cilbox SQL storage disabled: {error:#}");
+                    None
+                }
+            }
+        } else {
+            None
         };
 
         let bind_addr = if config.override_auto_discovery_of_ipv {
@@ -652,6 +734,9 @@ impl ServerState {
             admissions_per_ip: Arc::new(Mutex::new(HashMap::new())),
             permissions,
             database,
+            player_storage,
+            #[cfg(feature = "sql-storage")]
+            sql_player_storage,
             resources: ResourceState::default(),
             net_ids: NetIdState::default(),
             ownership: OwnershipState::default(),
@@ -714,6 +799,7 @@ impl ServerState {
         state.workers.lock().extend([
             spawn_leave_broadcast_loop(state.clone()),
             spawn_image_replay_loop(state.clone()),
+            spawn_content_expiry_loop(state.clone()),
             admin_runtime::spawn_permission_updates(state.clone()),
             tokio::spawn(event_loop(
                 state.clone(),
@@ -867,6 +953,20 @@ impl ServerState {
         self.refresh_runtime_config();
         broadcast_lock_state(self).await;
         admin_runtime::broadcast_locomotion_policy(self).await;
+    }
+
+    /// Console-only storage administration. No client protocol exposes these operations.
+    pub async fn storage_admin(&self, action: StorageAdminAction) -> Result<StorageAdminReply> {
+        #[cfg(feature = "sql-storage")]
+        if let Some(sql) = &self.sql_player_storage {
+            return sql.admin(action).await;
+        }
+        let db = self
+            .player_storage
+            .as_ref()
+            .context("Player storage is off or unavailable")?
+            .clone();
+        tokio::task::spawn_blocking(move || db.admin(action)).await?
     }
 
     pub fn players_text(&self) -> String {
@@ -2725,6 +2825,7 @@ async fn finalize_accept(
         metadata: metadata.clone(),
         ready: ready.clone(),
         session: Some(session.clone()),
+        identity_verified,
         scene_pending: Arc::new(AtomicU64::new(0)),
         upload_bucket: Arc::new(Mutex::new(upload_budget::Bucket::default())),
     };
@@ -3042,7 +3143,11 @@ async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: D
             )
             .await;
     }
-    for removed in state.content_share.remove_player(peer) {
+    let leave_timeout = state.config.read().content_sphere_leave_timeout_seconds;
+    for removed in state
+        .content_share
+        .remove_player_with_timeout(peer, leave_timeout)
+    {
         let mut writer = NetWriter::new();
         writer.put_u8(channels::CONTENT_SHARE_SUB_CLEANUP);
         if let Err(err) = removed.serialize(&mut writer) {
@@ -3731,11 +3836,24 @@ async fn handle_message(
         channels::UNLOAD_RESOURCE => {
             let mut reader = NetReader::new(&payload);
             let request = UnloadResource::deserialize(&mut reader)?;
-            if let Some(resource) = state.resources.unload_resource(&request.loaded_net_id) {
-                if resource.is_admin_locked && !has_protection_permission(state, peer) {
-                    state.resources.load_resource(resource);
-                    return Ok(());
-                }
+            let is_moderator = has_protection_permission(state, peer);
+            let requester_uuid = state
+                .authenticated_peers
+                .get(&peer)
+                .map(|p| p.metadata.player_uuid.clone())
+                .unwrap_or_default();
+            let removal_locked = state.global_state.read().content_removal_locked;
+            if state
+                .resources
+                .unload_resource_if(&request.loaded_net_id, |resource| {
+                    is_moderator
+                        || (!resource.is_admin_locked
+                            && (!removal_locked
+                                || (!requester_uuid.is_empty()
+                                    && requester_uuid == resource.uuid_of_creator)))
+                })
+                .is_some()
+            {
                 let mut writer = NetWriter::new();
                 request.serialize(&mut writer)?;
                 state
@@ -3750,33 +3868,20 @@ async fn handle_message(
         }
         channels::MODIFY_RESOURCE => {
             let mut reader = NetReader::new(&payload);
-            let mut request = ModifyResource::deserialize(&mut reader)?;
-            let Some(resource) = state
-                .resources
-                .all_resources()
-                .into_iter()
-                .find(|resource| resource.loaded_net_id == request.loaded_net_id)
-            else {
-                return Ok(());
-            };
+            let request = ModifyResource::deserialize(&mut reader)?;
             let is_moderator = has_protection_permission(state, peer);
             let requester_uuid = state
                 .authenticated_peers
                 .get(&peer)
                 .map(|p| p.metadata.player_uuid.clone())
                 .unwrap_or_default();
-            let target_admin_locked = request.static_admin_locked;
-            let target_static = request.static_resource || target_admin_locked;
-            let involves_admin_tier = resource.static_admin_locked || target_admin_locked;
-            let is_creator =
-                !resource.uuid_of_creator.is_empty() && requester_uuid == resource.uuid_of_creator;
-            if (!is_creator || involves_admin_tier) && !is_moderator {
-                return Ok(());
-            }
-            request.mode = resource.mode;
-            request.static_resource = target_static;
-            request.static_admin_locked = target_admin_locked;
-            if state.resources.modify_resource(&request) {
+            if let Some(request) = state.resources.modify_resource_if(&request, |resource| {
+                let involves_admin_tier =
+                    resource.static_admin_locked || request.static_admin_locked;
+                let is_creator = !resource.uuid_of_creator.is_empty()
+                    && requester_uuid == resource.uuid_of_creator;
+                is_moderator || (is_creator && !involves_admin_tier)
+            }) {
                 let mut writer = NetWriter::new();
                 request.serialize(&mut writer)?;
                 state
@@ -3881,12 +3986,122 @@ async fn handle_message(
                     .await;
             }
         }
+        channels::STORAGE => {
+            let (request, malformed) = match storage::read_request(&payload) {
+                Some(request) => (request, false),
+                None => {
+                    let Some((op, id)) = storage::read_request_header(&payload) else {
+                        return Ok(());
+                    };
+                    (
+                        storage::StorageRequest {
+                            op,
+                            id,
+                            scope: String::new(),
+                            key: String::new(),
+                            value: Vec::new(),
+                        },
+                        true,
+                    )
+                }
+            };
+            let Some(peer_info) = state.authenticated_peers.get(&peer) else {
+                return Ok(());
+            };
+            let uuid = peer_info.metadata.player_uuid.clone();
+            let session = peer_info.session.clone();
+            let identity_verified = peer_info.identity_verified;
+            drop(peer_info);
+            let (enabled, per_player, max_total, verified) = {
+                let config = state.config.read();
+                (
+                    config.storage_enabled,
+                    if config.storage_max_bytes_per_player > 0 {
+                        config.storage_max_bytes_per_player as usize
+                    } else {
+                        storage::DEFAULT_BYTES_PER_PLAYER
+                    },
+                    if config.storage_max_total_megabytes > 0 {
+                        config.storage_max_total_megabytes as usize * 1024 * 1024
+                    } else {
+                        256 * 1024 * 1024
+                    },
+                    config.use_auth_identity && identity_verified,
+                )
+            };
+            let status = if !verified
+                || !state
+                    .permissions
+                    .has(&uuid, basis_server_permissions::nodes::STORAGE_USE)
+            {
+                Some(StorageStatus::Denied)
+            } else if !enabled
+                || (state.player_storage.is_none() && {
+                    #[cfg(feature = "sql-storage")]
+                    {
+                        state.sql_player_storage.is_none()
+                    }
+                    #[cfg(not(feature = "sql-storage"))]
+                    {
+                        true
+                    }
+                })
+            {
+                Some(StorageStatus::Unavailable)
+            } else if malformed {
+                Some(StorageStatus::Invalid)
+            } else {
+                None
+            };
+            let reply = if let Some(status) = status {
+                StorageReply {
+                    op: request.op,
+                    id: request.id,
+                    status,
+                    used: 0,
+                    limit: per_player.min(storage::MAX_BYTES_PER_PLAYER) as i32,
+                    value: Vec::new(),
+                    keys: Vec::new(),
+                }
+            } else {
+                execute_player_storage(state, &uuid, request, per_player, max_total).await
+            };
+            if let Some(session) = session {
+                state
+                    .transport
+                    .send_session(
+                        &session,
+                        channels::STORAGE,
+                        DeliveryMethod::ReliableOrdered,
+                        &storage::write_reply(&reply),
+                    )
+                    .await?;
+            }
+        }
         channels::CONTENT_SHARE => {
             let mut reader = NetReader::new(&payload);
             match reader.get_u8()? {
                 channels::CONTENT_SHARE_SUB_DROP => {
                     let request = ContentShareMessage::deserialize(&mut reader)?;
-                    if content_locked(state, request.content_type, peer) {
+                    let allowed = state.authenticated_peers.get(&peer).is_some_and(|p| {
+                        state.permissions.has(
+                            &p.metadata.player_uuid,
+                            basis_server_permissions::nodes::CONTENT_SHARE_CREATE,
+                        )
+                    });
+                    if !allowed || content_locked(state, request.content_type, peer) {
+                        return Ok(());
+                    }
+                    let Some(nested_types) = content_share_validation::validate(
+                        request.content_type,
+                        &request.content_url,
+                    ) else {
+                        return Ok(());
+                    };
+                    if nested_types
+                        .into_iter()
+                        .any(|kind| content_locked(state, kind, peer))
+                    {
                         return Ok(());
                     }
                     let Some(peer_state) = state.authenticated_peers.get(&peer) else {
@@ -3926,7 +4141,21 @@ async fn handle_message(
                 }
                 channels::CONTENT_SHARE_SUB_CLEANUP => {
                     let request = ContentShareCleanupMessage::deserialize(&mut reader)?;
-                    if let Some(server_message) = state.content_share.remove(peer, request) {
+                    let allowed = state.authenticated_peers.get(&peer).is_some_and(|p| {
+                        state.permissions.has(
+                            &p.metadata.player_uuid,
+                            basis_server_permissions::nodes::CONTENT_SHARE_DELETE,
+                        )
+                    });
+                    if !allowed {
+                        return Ok(());
+                    }
+                    let moderator = has_protection_permission(state, peer);
+                    let locked = state.global_state.read().content_removal_locked;
+                    if let Some(server_message) = state
+                        .content_share
+                        .remove_authorized(peer, request, moderator, locked)
+                    {
                         let mut writer = NetWriter::new();
                         writer.put_u8(channels::CONTENT_SHARE_SUB_CLEANUP);
                         server_message.serialize(&mut writer)?;
@@ -4856,14 +5085,11 @@ fn content_locked(state: &ServerState, content_type: ContentShareType, peer: Pee
                     basis_server_permissions::nodes::RESOURCE_LOCK_BYPASS_SERVER,
                 )
         }
-        // Reject unimplemented inline share types until their BasisVR v56
-        // content validations and policy toggles are ported. In particular,
-        // links must never bypass the upstream anti-spoofing URL checks.
+        ContentShareType::Link => locks.external_links_locked,
         ContentShareType::DollyTrack
-        | ContentShareType::Link
         | ContentShareType::Text
         | ContentShareType::Folder
-        | ContentShareType::Setting => true,
+        | ContentShareType::Setting => false,
     }
 }
 
@@ -5062,27 +5288,38 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
             .await;
         }
         AdminRequestMode::GlobalGetResourceLimits => {
-            let value = state.config.read().max_content_spheres_per_player;
-            send_admin_payload_to_peer(
-                state,
-                peer,
-                encode_i32_admin_state_payload(AdminRequestMode::GlobalGetResourceLimits, value),
-            )
-            .await?;
+            let payload = {
+                let config = state.config.read();
+                encode_resource_limits_payload(&config)
+            };
+            send_admin_payload_to_peer(state, peer, payload).await?;
         }
         AdminRequestMode::SetGlobalResourceLimits => {
-            let requested = reader.get_i32().unwrap_or(32);
-            let value = if requested < 1 {
-                32
-            } else {
-                requested.min(4096)
+            let (max_spheres, leave_timeout, deletion_timer) = {
+                let config = state.config.read();
+                (
+                    reader
+                        .get_i32()
+                        .unwrap_or(config.max_content_spheres_per_player)
+                        .clamp(1, 4096),
+                    reader
+                        .get_i32()
+                        .unwrap_or(config.content_sphere_leave_timeout_seconds)
+                        .clamp(0, 86400),
+                    reader
+                        .get_i32()
+                        .unwrap_or(config.content_sphere_deletion_timer_seconds)
+                        .clamp(0, 86400),
+                )
             };
-            state.config.write().max_content_spheres_per_player = value;
-            broadcast_admin_payload(
-                state,
-                encode_i32_admin_state_payload(AdminRequestMode::GlobalGetResourceLimits, value),
-            )
-            .await;
+            let payload = {
+                let mut config = state.config.write();
+                config.max_content_spheres_per_player = max_spheres;
+                config.content_sphere_leave_timeout_seconds = leave_timeout;
+                config.content_sphere_deletion_timer_seconds = deletion_timer;
+                encode_resource_limits_payload(&config)
+            };
+            broadcast_admin_payload(state, payload).await;
         }
         AdminRequestMode::GlobalGetReductionSettings => {
             let payload = encode_reduction_settings_payload(&state.config.read());
@@ -5223,6 +5460,22 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
                 state,
                 |s| &mut s.safe_display_names_forced,
                 |c| &mut c.safe_display_names_forced,
+            )
+            .await;
+        }
+        AdminRequestMode::GlobalToggleContentRemoval => {
+            toggle_simple_lock(
+                state,
+                |s| &mut s.content_removal_locked,
+                |c| &mut c.content_removal_locked,
+            )
+            .await;
+        }
+        AdminRequestMode::GlobalToggleExternalLinks => {
+            toggle_simple_lock(
+                state,
+                |s| &mut s.external_links_locked,
+                |c| &mut c.external_links_locked,
             )
             .await;
         }
@@ -5962,10 +6215,7 @@ async fn send_initial_admin_state_to_peer(state: &ServerState, peer_id: PeerId) 
             config.min_avatar_eye_height_meters,
             config.max_avatar_eye_height_meters,
         ),
-        encode_i32_admin_state_payload(
-            AdminRequestMode::GlobalGetResourceLimits,
-            config.max_content_spheres_per_player,
-        ),
+        encode_resource_limits_payload(&config),
         encode_reduction_settings_payload(&config),
         encode_image_bandwidth_payload(&config),
         encode_i32_admin_state_payload(AdminRequestMode::GlobalGetPeerLimit, config.peer_limit),
@@ -6005,6 +6255,8 @@ fn write_lock_state_fields(writer: &mut NetWriter, locks: &GlobalState) {
     writer.put_bool(locks.prop_grabbing_locked);
     writer.put_bool(locks.safe_display_names_forced);
     writer.put_bool(locks.gifs_locked);
+    writer.put_bool(locks.content_removal_locked);
+    writer.put_bool(locks.external_links_locked);
 }
 
 fn encode_bool_admin_state_payload(mode: AdminRequestMode, value: bool) -> Vec<u8> {
@@ -6018,6 +6270,88 @@ fn encode_u8_admin_state_payload(mode: AdminRequestMode, value: u8) -> Vec<u8> {
     let mut writer = NetWriter::new();
     writer.put_u8(mode as u8);
     writer.put_u8(value);
+    writer.into_vec()
+}
+
+async fn execute_player_storage(
+    state: &ServerState,
+    owner: &str,
+    request: storage::StorageRequest,
+    per_player: usize,
+    max_total: usize,
+) -> StorageReply {
+    #[cfg(feature = "sql-storage")]
+    if let Some(sql) = &state.sql_player_storage {
+        return sql.execute(owner, request, per_player, max_total).await;
+    }
+
+    let db = state
+        .player_storage
+        .as_ref()
+        .expect("storage backend validated")
+        .clone();
+    let fallback = request.clone();
+    let owner = owner.to_owned();
+    match tokio::task::spawn_blocking(move || db.execute(&owner, request, per_player, max_total))
+        .await
+    {
+        Ok(reply) => reply,
+        Err(_) => StorageReply {
+            op: fallback.op,
+            id: fallback.id,
+            status: StorageStatus::Unavailable,
+            used: 0,
+            limit: per_player.min(storage::MAX_BYTES_PER_PLAYER) as i32,
+            value: Vec::new(),
+            keys: Vec::new(),
+        },
+    }
+}
+
+fn spawn_content_expiry_loop(state: ServerState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            if state.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            let (leave, delete) = {
+                let config = state.config.read();
+                (
+                    config.content_sphere_leave_timeout_seconds,
+                    config.content_sphere_deletion_timer_seconds,
+                )
+            };
+            for removed in state
+                .content_share
+                .expire_due(Instant::now(), leave, delete)
+            {
+                let mut writer = NetWriter::new();
+                writer.put_u8(channels::CONTENT_SHARE_SUB_CLEANUP);
+                if removed.serialize(&mut writer).is_err() {
+                    continue;
+                }
+                state
+                    .broadcast(
+                        channels::CONTENT_SHARE,
+                        DeliveryMethod::ReliableOrdered,
+                        writer.as_slice(),
+                        None,
+                    )
+                    .await;
+            }
+        }
+    })
+}
+
+fn encode_resource_limits_payload(config: &ServerConfig) -> Vec<u8> {
+    let mut writer = NetWriter::new();
+    writer.put_u8(AdminRequestMode::GlobalGetResourceLimits as u8);
+    writer.put_i32(config.max_content_spheres_per_player);
+    writer.put_i32(config.content_sphere_leave_timeout_seconds);
+    writer.put_i32(config.content_sphere_deletion_timer_seconds);
     writer.into_vec()
 }
 
@@ -6329,6 +6663,8 @@ fn admin_mode_persists_config(mode: AdminRequestMode) -> bool {
             | AdminRequestMode::GlobalToggleCameraCapture
             | AdminRequestMode::GlobalTogglePropGrabbing
             | AdminRequestMode::GlobalToggleSafeDisplayNames
+            | AdminRequestMode::GlobalToggleContentRemoval
+            | AdminRequestMode::GlobalToggleExternalLinks
             | AdminRequestMode::SetServerName
             | AdminRequestMode::SetServerMotd
             | AdminRequestMode::SetAllowlistMode
@@ -6392,7 +6728,9 @@ fn admin_mode_required_permission(mode: AdminRequestMode) -> Option<&'static str
         | AdminRequestMode::GlobalToggleMediaPlayer
         | AdminRequestMode::GlobalToggleCameraCapture
         | AdminRequestMode::GlobalTogglePropGrabbing
-        | AdminRequestMode::GlobalToggleSafeDisplayNames => nodes::MODERATION_GLOBAL_LOCK,
+        | AdminRequestMode::GlobalToggleSafeDisplayNames
+        | AdminRequestMode::GlobalToggleContentRemoval
+        | AdminRequestMode::GlobalToggleExternalLinks => nodes::MODERATION_GLOBAL_LOCK,
         AdminRequestMode::SetGlobalHeadlessAudio => nodes::MODERATION_HEADLESS_AUDIO,
         AdminRequestMode::SetUserOpusBitrate
         | AdminRequestMode::SetGlobalOpusFrameDuration
@@ -6974,6 +7312,7 @@ mod tests {
             metadata: test_ready_message().player_meta_data_message,
             ready: test_ready_message(),
             session: None,
+            identity_verified: false,
             scene_pending: Arc::new(AtomicU64::new(0)),
             upload_bucket: Arc::new(Mutex::new(upload_budget::Bucket::default())),
         }

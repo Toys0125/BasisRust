@@ -32,12 +32,20 @@ impl ResourceState {
         message: ResourceManagementMessage,
         max_per_creator: usize,
     ) -> bool {
+        self.insert_resource(&mut self.resources.write(), message, max_per_creator)
+    }
+
+    fn insert_resource(
+        &self,
+        resources: &mut HashMap<String, ResourceManagementMessage>,
+        message: ResourceManagementMessage,
+        max_per_creator: usize,
+    ) -> bool {
         let id = message.loaded_net_id.clone();
         if id.is_empty() {
             return false;
         }
         let creator = message.uuid_of_creator.clone();
-        let mut resources = self.resources.write();
         if resources.contains_key(&id) {
             return false;
         }
@@ -54,12 +62,25 @@ impl ResourceState {
     }
 
     pub fn unload_resource(&self, id: &str) -> Option<ResourceManagementMessage> {
-        self.preload_sessions.write().remove(id);
-        let removed = self.resources.write().remove(id);
-        if let Some(resource) = removed.as_ref() {
-            self.note_resource_removed(&resource.uuid_of_creator);
+        self.unload_resource_if(id, |_| true)
+    }
+
+    /// Authorize the actual resource under the same lock as removal.
+    pub fn unload_resource_if(
+        &self,
+        id: &str,
+        allowed: impl FnOnce(&ResourceManagementMessage) -> bool,
+    ) -> Option<ResourceManagementMessage> {
+        let mut resources = self.resources.write();
+        if !allowed(resources.get(id)?) {
+            return None;
         }
-        removed
+        let removed = resources.remove(id)?;
+        // Keep the resource lock until cleanup completes so a replacement with
+        // the same ID cannot lose its preload session or creator accounting.
+        self.preload_sessions.write().remove(id);
+        self.note_resource_removed(&removed.uuid_of_creator);
+        Some(removed)
     }
 
     fn note_resource_removed(&self, creator: &str) {
@@ -79,16 +100,31 @@ impl ResourceState {
     }
 
     pub fn modify_resource(&self, message: &ModifyResource) -> bool {
+        self.modify_resource_if(message, |resource| resource.mode == message.mode)
+            .is_some()
+    }
+
+    /// Authorize and update the current resource under one write lock. Returns
+    /// the committed message with server-owned mode and normalized static flags.
+    pub fn modify_resource_if(
+        &self,
+        message: &ModifyResource,
+        allowed: impl FnOnce(&ResourceManagementMessage) -> bool,
+    ) -> Option<ModifyResource> {
         let mut resources = self.resources.write();
-        let Some(resource) = resources.get_mut(&message.loaded_net_id) else {
-            return false;
-        };
-        if resource.mode != message.mode {
-            return false;
+        let resource = resources.get_mut(&message.loaded_net_id)?;
+        if !allowed(resource) {
+            return None;
         }
-        resource.static_admin_locked = message.static_admin_locked;
-        resource.static_resource = message.static_resource || message.static_admin_locked;
-        true
+        let committed = ModifyResource {
+            mode: resource.mode,
+            loaded_net_id: message.loaded_net_id.clone(),
+            static_resource: message.static_resource || message.static_admin_locked,
+            static_admin_locked: message.static_admin_locked,
+        };
+        resource.static_admin_locked = committed.static_admin_locked;
+        resource.static_resource = committed.static_resource;
+        Some(committed)
     }
 
     pub fn all_scene_unloads(&self) -> Vec<UnloadResource> {
@@ -177,7 +213,8 @@ impl ResourceState {
         peers: &[u16],
         max_per_creator: usize,
     ) -> bool {
-        if !self.load_resource_with_limit(resource.clone(), max_per_creator) {
+        let mut resources = self.resources.write();
+        if !self.insert_resource(&mut resources, resource.clone(), max_per_creator) {
             return false;
         }
         self.preload_sessions.write().insert(
@@ -393,9 +430,16 @@ impl OwnershipState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SharedSphere {
+    message: ServerContentShareMessage,
+    dropped_at: Instant,
+    left_at: Option<Instant>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ContentShareState {
-    spheres: Arc<RwLock<HashMap<String, ServerContentShareMessage>>>,
+    spheres: Arc<RwLock<HashMap<String, SharedSphere>>>,
 }
 
 impl ContentShareState {
@@ -453,7 +497,7 @@ impl ContentShareState {
         if spheres.contains_key(&server.content_share_message.sphere_net_id)
             || spheres
                 .values()
-                .filter(|sphere| sphere.player_id == player_id)
+                .filter(|sphere| sphere.message.player_id == player_id && sphere.left_at.is_none())
                 .count()
                 >= max_per_player
         {
@@ -461,50 +505,117 @@ impl ContentShareState {
         }
         spheres.insert(
             server.content_share_message.sphere_net_id.clone(),
-            server.clone(),
+            SharedSphere {
+                message: server.clone(),
+                dropped_at: Instant::now(),
+                left_at: None,
+            },
         );
         Some(server)
     }
 
-    pub fn remove(
+    /// Check ownership and protection under the same lock as removal, so concurrent
+    /// requests cannot bypass the content-removal policy.
+    pub fn remove_authorized(
         &self,
         player_id: u16,
         message: ContentShareCleanupMessage,
+        is_moderator: bool,
+        content_removal_locked: bool,
     ) -> Option<ServerContentShareCleanupMessage> {
-        if self
-            .spheres
-            .write()
-            .remove(&message.sphere_net_id)
-            .is_some()
+        let mut spheres = self.spheres.write();
+        let existing = spheres.get(&message.sphere_net_id)?;
+        let is_owner = existing.left_at.is_none() && existing.message.player_id == player_id;
+        if !is_owner
+            && !is_moderator
+            && (existing.message.sharer_protected || content_removal_locked)
         {
-            Some(ServerContentShareCleanupMessage {
-                player_id,
-                content_share_cleanup_message: message,
-            })
-        } else {
-            None
+            return None;
         }
+        spheres.remove(&message.sphere_net_id)?;
+        Some(ServerContentShareCleanupMessage {
+            player_id,
+            content_share_cleanup_message: message,
+        })
     }
 
     pub fn remove_player(&self, player_id: u16) -> Vec<ServerContentShareCleanupMessage> {
+        self.remove_player_with_timeout(player_id, 0)
+    }
+
+    pub fn remove_player_with_timeout(
+        &self,
+        player_id: u16,
+        leave_timeout_seconds: i32,
+    ) -> Vec<ServerContentShareCleanupMessage> {
         let mut spheres = self.spheres.write();
+        let now = Instant::now();
         let keys: Vec<_> = spheres
             .iter()
-            .filter_map(|(key, value)| (value.player_id == player_id).then_some(key.clone()))
+            .filter_map(|(key, value)| {
+                (value.message.player_id == player_id && value.left_at.is_none())
+                    .then_some(key.clone())
+            })
             .collect();
-        let mut removed = Vec::with_capacity(keys.len());
+        let mut removed = Vec::new();
         for key in keys {
-            spheres.remove(&key);
-            removed.push(ServerContentShareCleanupMessage {
-                player_id,
-                content_share_cleanup_message: ContentShareCleanupMessage { sphere_net_id: key },
-            });
+            if leave_timeout_seconds > 0 {
+                if let Some(sphere) = spheres.get_mut(&key) {
+                    sphere.left_at = Some(now);
+                }
+            } else {
+                spheres.remove(&key);
+                removed.push(ServerContentShareCleanupMessage {
+                    player_id,
+                    content_share_cleanup_message: ContentShareCleanupMessage {
+                        sphere_net_id: key,
+                    },
+                });
+            }
         }
         removed
     }
 
+    pub fn expire_due(
+        &self,
+        now: Instant,
+        leave_timeout_seconds: i32,
+        deletion_timer_seconds: i32,
+    ) -> Vec<ServerContentShareCleanupMessage> {
+        let mut spheres = self.spheres.write();
+        let leave_after = Duration::from_secs(leave_timeout_seconds.max(0) as u64);
+        let delete_after = Duration::from_secs(deletion_timer_seconds.max(0) as u64);
+        let due: Vec<_> = spheres
+            .iter()
+            .filter_map(|(key, sphere)| {
+                let left_expired = sphere
+                    .left_at
+                    .is_some_and(|left| now.saturating_duration_since(left) >= leave_after);
+                let lifetime_expired = deletion_timer_seconds > 0
+                    && now.saturating_duration_since(sphere.dropped_at) >= delete_after;
+                (left_expired || lifetime_expired)
+                    .then_some((key.clone(), sphere.message.player_id))
+            })
+            .collect();
+        due.into_iter()
+            .map(|(key, player_id)| {
+                spheres.remove(&key);
+                ServerContentShareCleanupMessage {
+                    player_id,
+                    content_share_cleanup_message: ContentShareCleanupMessage {
+                        sphere_net_id: key,
+                    },
+                }
+            })
+            .collect()
+    }
+
     pub fn all(&self) -> Vec<ServerContentShareMessage> {
-        self.spheres.read().values().cloned().collect()
+        self.spheres
+            .read()
+            .values()
+            .map(|s| s.message.clone())
+            .collect()
     }
 
     pub fn reset(&self) {
@@ -614,6 +725,100 @@ impl PipState {
 mod tests {
     use super::*;
 
+    fn resource(id: &str, creator: &str) -> ResourceManagementMessage {
+        ResourceManagementMessage {
+            mode: 0,
+            loaded_net_id: id.into(),
+            unlock_password: String::new(),
+            combined_url: "https://example.com/resource".into(),
+            uuid_of_creator: creator.into(),
+            is_admin_locked: true,
+            position_x: 0.0,
+            position_y: 0.0,
+            position_z: 0.0,
+            quaternion_x: 0.0,
+            quaternion_y: 0.0,
+            quaternion_z: 0.0,
+            quaternion_w: 1.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            scale_z: 1.0,
+            persist: false,
+            static_resource: false,
+            static_admin_locked: false,
+            modify_scale: false,
+            load_strategy: 0,
+        }
+    }
+
+    #[test]
+    fn authorized_modification_checks_the_current_resource_under_the_write_lock() {
+        let state = ResourceState::default();
+        assert!(state.load_resource(resource("one", "alice")));
+        let request = ModifyResource {
+            mode: 99,
+            loaded_net_id: "one".into(),
+            static_resource: false,
+            static_admin_locked: true,
+        };
+        let committed = state
+            .modify_resource_if(&request, |current| {
+                assert!(
+                    state.resources.try_write().is_none(),
+                    "authorization must hold the mutation lock"
+                );
+                current.uuid_of_creator == "alice"
+            })
+            .unwrap();
+        assert_eq!(committed.mode, 0);
+        assert!(committed.static_resource && committed.static_admin_locked);
+        state.unload_resource("one").unwrap();
+        assert!(state.load_resource(resource("one", "bob")));
+        assert!(state
+            .modify_resource_if(&request, |current| current.uuid_of_creator == "alice")
+            .is_none());
+        let current = state.resources.read()["one"].clone();
+        assert!(!current.static_resource && !current.static_admin_locked);
+        assert!(state
+            .modify_resource_if(
+                &ModifyResource {
+                    loaded_net_id: "missing".into(),
+                    ..request.clone()
+                },
+                |_| panic!("missing IDs must not scan resources")
+            )
+            .is_none());
+        assert!(
+            !state.modify_resource(&request),
+            "legacy API must still reject mismatched mode"
+        );
+    }
+
+    #[test]
+    fn authorized_unload_preserves_denied_preloads_and_cleans_up_once() {
+        let state = ResourceState::default();
+        assert!(state.start_preload(resource("one", "alice"), &[1], 1));
+        assert!(state
+            .unload_resource_if("missing", |_| panic!("missing ID must not scan resources"))
+            .is_none());
+        assert!(state
+            .unload_resource_if("one", |resource| !resource.is_admin_locked)
+            .is_none());
+        assert!(state.preload_sessions.read().contains_key("one"));
+        assert!(!state.load_resource_with_limit(resource("two", "alice"), 1));
+        assert!(state
+            .unload_resource_if("one", |resource| resource.uuid_of_creator == "alice")
+            .is_some());
+        assert!(!state.preload_sessions.read().contains_key("one"));
+        assert!(state.unload_resource("one").is_none());
+        assert!(state.load_resource_with_limit(resource("one", "bob"), 1));
+        assert!(state
+            .unload_resource_if("one", |resource| resource.uuid_of_creator == "alice")
+            .is_none());
+        assert!(state.load_resource_with_limit(resource("two", "alice"), 1));
+        assert_eq!(state.creator_counts.read().get("bob"), Some(&1));
+    }
+
     #[test]
     fn net_id_namespace_exhausts_gracefully_and_preserves_live_names_until_reset() {
         let state = NetIdState::default();
@@ -648,6 +853,75 @@ mod tests {
         let removed = state.remove_player(7);
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].ownership_id, "a");
+    }
+
+    #[test]
+    fn protected_content_cleanup_requires_owner_or_moderator() {
+        let state = ContentShareState::default();
+        let msg = ContentShareMessage {
+            sphere_net_id: "protected".into(),
+            content_url: "u".into(),
+            unlock_password: String::new(),
+            content_type: basis_protocol::messages::ContentShareType::Avatar,
+            position_x: 0.0,
+            position_y: 0.0,
+            position_z: 0.0,
+        };
+        state.add_with_limit_and_protection(1, "owner".into(), "name".into(), msg, 10, true);
+        let cleanup = || ContentShareCleanupMessage {
+            sphere_net_id: "protected".into(),
+        };
+        assert!(state
+            .remove_authorized(2, cleanup(), false, false)
+            .is_none());
+        assert_eq!(state.all().len(), 1);
+        assert!(state.remove_authorized(1, cleanup(), false, true).is_some());
+        assert!(state.all().is_empty());
+    }
+
+    #[test]
+    fn locked_content_cleanup_requires_owner_or_moderator() {
+        let state = ContentShareState::default();
+        let msg = ContentShareMessage {
+            sphere_net_id: "locked".into(),
+            content_url: "u".into(),
+            unlock_password: String::new(),
+            content_type: basis_protocol::messages::ContentShareType::Avatar,
+            position_x: 0.0,
+            position_y: 0.0,
+            position_z: 0.0,
+        };
+        state.add(1, "owner".into(), "name".into(), msg);
+        let cleanup = || ContentShareCleanupMessage {
+            sphere_net_id: "locked".into(),
+        };
+        assert!(state.remove_authorized(2, cleanup(), false, true).is_none());
+        assert!(state.remove_authorized(2, cleanup(), true, true).is_some());
+    }
+
+    #[test]
+    fn spheres_expire_after_disconnect_or_configured_lifetime() {
+        let state = ContentShareState::default();
+        let msg = ContentShareMessage {
+            sphere_net_id: "later".into(),
+            content_url: "u".into(),
+            unlock_password: String::new(),
+            content_type: basis_protocol::messages::ContentShareType::Avatar,
+            position_x: 0.0,
+            position_y: 0.0,
+            position_z: 0.0,
+        };
+        state.add(8, "owner".into(), "name".into(), msg);
+        assert!(state.remove_player_with_timeout(8, 60).is_empty());
+        assert_eq!(state.all().len(), 1);
+        assert!(state.expire_due(Instant::now(), 60, 0).is_empty());
+        assert_eq!(
+            state
+                .expire_due(Instant::now() + Duration::from_secs(61), 60, 0)
+                .len(),
+            1
+        );
+        assert!(state.all().is_empty());
     }
 
     #[test]
