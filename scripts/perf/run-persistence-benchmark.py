@@ -146,7 +146,9 @@ def run_trial(args, output, backend, clients, enabled, repeat):
                 '--quit-batch-size','100','--quit-batch-delay-ms','0']
     owner=ProcessTree(); samples=[]; sampler=native_sampler(); server=client=None
     metadata={'backend':backend,'clients':clients,'uploads_enabled':enabled,'repeat':repeat,'server_command':server_cmd,'client_command':client_cmd,
-              'warmup_seconds':args.warmup_seconds,'window_seconds':args.window_seconds,'server_cpus':args.server_cpus,'client_cpus':args.client_cpus,'table':table}
+              'warmup_seconds':args.warmup_seconds,'window_seconds':args.window_seconds,'drain_seconds':args.drain_seconds,
+              'server_cpus':args.server_cpus,'client_cpus':args.client_cpus,
+              'server_workers':args.server_workers,'client_workers':args.client_workers,'table':table}
     write_json(output/'run.json',metadata)
     try:
         with (output/'server.log').open('w') as server_log, (output/'client.log').open('w') as client_log:

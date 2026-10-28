@@ -7,16 +7,17 @@ Frozen workload source: `cc2d0d71ea2426d4ba5775175571e9033376d681`. All 48 trial
 - 100 and 1,000 headless clients; memory, JSON file, SQLite WAL and PostgreSQL backends.
 - Three paired repeats per population/backend, uploads off versus on. Backend order rotates; control/treatment order alternates.
 - Each client moves using the Unity-policy simulation at nominal 50 Hz in groups of ten, spaced 1,000 units apart. Voice, image and scene workloads are disabled.
-- Persistence sends exact 16,384-byte changing pseudo-random values every nominal ten seconds, with staggered initial phases. Each successful Set is followed by a Get and full byte comparison.
-- Twenty-second warmup after full authenticated population, then a sixty-second observation window and three-second drain. One Set/Get chain may be in flight per client.
-- Server logical CPU affinity: `0-7`, 8 Tokio/Rayon workers. Client affinity: `8-11`, 4 runtime workers. PostgreSQL affinity: `[12, 13, 14, 15]`. This host has eight physical cores/sixteen logical CPUs; the default role split gives four/two/two physical cores respectively.
+- Persistence sends exact 16,384-byte changing pseudo-random values every nominal 10 seconds, with staggered initial phases. Each successful Set is followed by a Get and full byte comparison.
+- 20-second warmup after full authenticated population, then a 60-second observation window and 3-second drain. One Set/Get chain may be in flight per client.
+- Server logical CPU affinity: `0-7`, 8 Tokio/Rayon workers. Client affinity: `8-11`, 4 runtime workers. PostgreSQL affinity: `[12, 13, 14, 15]`. Host process allowed logical CPUs: `[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]`. Physical-core topology was not recorded.
+- Legacy trial records omit `server_workers, client_workers, drain_seconds`; those values are configured settings from the manifest, not independently cross-checked per trial.
 - Latency is application RTT over the actual v56 reliable/fragmented Basis protocol, including sealed client uplinks: Set enqueue to its reply, Get enqueue to its reply, and Set enqueue to Get reply arrival. Readback correctness is required separately. Histograms use 0.1 ms bins; no overflow occurred.
 - CPU is CPU-seconds divided by measured wall-seconds (1.0 = one logical CPU fully busy). RSS is the maximum sampled at 1 Hz. PostgreSQL CPU is separate from the game-server process; summed database RSS is retained only in raw artifacts because shared pages are double-counted.
 - Eligibility requires the full population and avatar state count at every 1 Hz sample, at least 95% of nominal avatar uplinks and persistence offers, every client completing a verified write, and no failed storage statuses/integrity errors/timeouts/cancellations/pending requests. The avatar observer requires all nine expected nearby peers, no stale peers at window end, and no decode failures.
 
 ## Results
 
-Numbers below are medians of three per-trial values. The latency range is the minimum/maximum per-trial p95, not a confidence interval. CPU deltas are medians of matched-pair differences. Offered storage load is 10 or 100 writes/s; these results do not establish maximum backend capacity.
+Numbers below are medians of three per-trial values. The latency range is the minimum/maximum per-trial p95, not a confidence interval. CPU deltas are medians of matched-pair differences. Nominal offered storage load: 10 writes/s (100 clients), 100 writes/s (1,000 clients); these results do not establish maximum backend capacity.
 
 | Clients | Backend | Idle server CPU | Upload server CPU | Paired CPU delta | Verified writes/s | Set→Get p50 ms | p95 ms (range) | p99 ms | Avatar p95 idle→upload ms |
 |---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -57,7 +58,7 @@ Numbers below are medians of three per-trial values. The latency range is the mi
 - This is a colocated CPU/storage test. PostgreSQL uses local TCP on a dedicated test service; WAN latency and remote TLS overhead are not represented. The client is headless and does not model Unity rendering cost.
 - SQLite uses WAL with SQLx’s default FULL synchronous policy. File persistence uses atomic replacement and file/directory sync. PostgreSQL settings are recorded below.
 - Three repeats characterize this host/workload only. Inspect all samples and ranges before generalizing small CPU or latency differences.
-- Setup pilots were excluded, including a ten-second 1,000-client pilot that missed one writer at an interval boundary. An initial matrix was discarded after exposing a shared-receiver fragment-handoff disconnect; the fix was regression-tested before restarting with new frozen binaries. Formal sixty-second runs require all writers.
+- Only the trials in the supplied results are summarized. Setup pilots and discarded runs are excluded; every included upload trial requires all configured writers.
 
 ```json
 {"version" : "PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit", "fsync" : "on", "synchronous_commit" : "on", "shared_buffers" : "128MB"}
@@ -70,14 +71,18 @@ All individual measurements are in [pr38-persistence-benchmark.csv](pr38-persist
 
 ## Reproduce
 
-Build SQL-enabled server and client release binaries. Supply a dedicated local PostgreSQL URL through `BASIS_BENCH_POSTGRES_URL`, matching libpq `PG*`/service settings for `psql`, and the owned PostgreSQL postmaster PID. Keep database CPU affinity on 12–15 for the role split above. The benchmark uses Python standard-library tools and `psql`; report plotting additionally needs Matplotlib and NumPy (install them in a private virtual environment).
+Build SQL-enabled server and client release binaries. Supply a dedicated local PostgreSQL URL through `BASIS_BENCH_POSTGRES_URL`, matching libpq `PG*`/service settings for `psql`, and the owned PostgreSQL postmaster PID. Match the recorded database affinity (`[12, 13, 14, 15]`) before running. The benchmark uses Python standard-library tools and `psql`; report plotting additionally needs Matplotlib and NumPy (install them in a private virtual environment).
 
 ```sh
 cargo build --release --locked --manifest-path BasisRustServer/Cargo.toml -p basis-server-console --features sql-storage
 cargo build --release --locked --manifest-path BasisRustClient/Cargo.toml --bin basis-rust-client
 python3 -B scripts/perf/run-persistence-benchmark.py \
   --server /path/to/frozen/server --client /path/to/frozen/client \
-  --output /new/empty/output-path --postgres-pid YOUR_TEST_POSTMASTER_PID
+  --output /new/empty/output-path --postgres-pid YOUR_TEST_POSTMASTER_PID \
+  --warmup-seconds 20 --window-seconds 60 \
+  --interval-seconds 10 --drain-seconds 3 \
+  --server-cpus 0-7 --server-workers 8 \
+  --client-cpus 8-11 --client-workers 4
 python3 -B scripts/perf/summarize-persistence-benchmark.py \
   --input /new/empty/output-path --output docs/performance/pr38-persistence-benchmark.md
 ```

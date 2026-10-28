@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Publish all frozen persistence trials, paired medians, ranges and an exportable plot."""
+"""Publish the full 100/1,000-client, four-backend, three-repeat matrix.
+
+Custom timings and CPU allocations are read from the saved manifest.
+"""
 import argparse
 import csv
 import json
@@ -37,10 +40,47 @@ def validate_results(results):
     return groups
 
 
+def validate_settings(manifest, results):
+    settings=manifest['settings']
+    if (sorted(settings['clients'])!=[100,1000] or sorted(settings['backends'])!=sorted(BACKENDS)
+            or settings['repeats']!=3):
+        raise ValueError('report requires the full 100/1,000-client, four-backend, three-repeat matrix')
+    for key in ['warmup_seconds','window_seconds','interval_seconds','drain_seconds','server_workers','client_workers']:
+        value=settings[key]
+        minimum=0 if key in ['warmup_seconds','drain_seconds'] else 1
+        if type(value) is not int or value<minimum:
+            raise ValueError('invalid saved setting: '+key)
+    for row in results:
+        for key in ['warmup_seconds','window_seconds','server_cpus','client_cpus']:
+            if row[key]!=settings[key]:
+                raise ValueError('trial disagrees with manifest: '+key)
+        if float(row['storage']['interval_secs'])!=settings['interval_seconds']:
+            raise ValueError('trial disagrees with manifest: interval_seconds')
+    # Legacy complete matrices predate these per-trial fields. Describe their
+    # manifest-only provenance explicitly, but never accept partially mixed data.
+    for key in ['server_workers','client_workers','drain_seconds']:
+        present=[key in row for row in results]
+        if any(present) and not all(present):
+            raise ValueError('incomplete per-trial setting: '+key)
+        if all(present) and any(row[key]!=settings[key] for row in results):
+            raise ValueError('trial disagrees with manifest: '+key)
+    return settings
+
+
+def median(rows,key):
+    return statistics.median(metric(row,key) for row in rows)
+
+
 def summarize(source, output):
     results=json.loads((source/'results.json').read_text())
     manifest=json.loads((source/'manifest.json').read_text())
     groups=validate_results(results)
+    settings=validate_settings(manifest,results)
+    interval=settings['interval_seconds'];window=settings['window_seconds']
+    offered=', '.join(f'{count/interval:g} writes/s ({count:,} clients)' for count in [100,1000])
+    legacy=[key for key in ['server_workers','client_workers','drain_seconds'] if key not in results[0]]
+    provenance=(f"- Legacy trial records omit `{', '.join(legacy)}`; those values are configured settings from the manifest, not independently cross-checked per trial."
+                if legacy else '- Worker counts, CPU affinities and timings agree between each trial record and the saved manifest.')
     output.parent.mkdir(parents=True,exist_ok=True)
     csv_path=output.with_suffix('.csv')
     fields=['clients','backend','uploads','repeat','server_cpu_cores','client_cpu_cores','postgres_cpu_cores','server_rss_peak_mib','client_rss_peak_mib','verified','writers','writes_per_second','offered_load_ratio','set_p50_ms','set_p95_ms','set_p99_ms','get_p50_ms','get_p95_ms','get_p99_ms','cycle_p50_ms','cycle_p95_ms','cycle_p99_ms','avatar_gap_p95_ms','avatar_uplink_updates_per_second','valid']
@@ -50,7 +90,6 @@ def summarize(source, output):
             flat={key:row.get(key,'') for key in fields}
             flat.update({key:row['storage'][key] for key in ['verified','writers','set_p50_ms','set_p95_ms','set_p99_ms','get_p50_ms','get_p95_ms','get_p99_ms','cycle_p50_ms','cycle_p95_ms','cycle_p99_ms']})
             flat['uploads']=row['uploads_enabled'];writer.writerow(flat)
-    def median(rows,key): return statistics.median(metric(row,key) for row in rows)
     def pairs(count,backend,key):
         idle={row['repeat']:row for row in groups[count,backend,False]}
         return [metric(row,key)-metric(idle[row['repeat']],key) for row in groups[count,backend,True]]
@@ -60,14 +99,15 @@ def summarize(source, output):
            '- 100 and 1,000 headless clients; memory, JSON file, SQLite WAL and PostgreSQL backends.',
            '- Three paired repeats per population/backend, uploads off versus on. Backend order rotates; control/treatment order alternates.',
            '- Each client moves using the Unity-policy simulation at nominal 50 Hz in groups of ten, spaced 1,000 units apart. Voice, image and scene workloads are disabled.',
-           '- Persistence sends exact 16,384-byte changing pseudo-random values every nominal ten seconds, with staggered initial phases. Each successful Set is followed by a Get and full byte comparison.',
-           '- Twenty-second warmup after full authenticated population, then a sixty-second observation window and three-second drain. One Set/Get chain may be in flight per client.',
-           f"- Server logical CPU affinity: `{manifest['settings']['server_cpus']}`, {manifest['settings']['server_workers']} Tokio/Rayon workers. Client affinity: `{manifest['settings']['client_cpus']}`, {manifest['settings']['client_workers']} runtime workers. PostgreSQL affinity: `{manifest.get('postgres_affinity',[])}`. This host has eight physical cores/sixteen logical CPUs; the default role split gives four/two/two physical cores respectively.",
+           f'- Persistence sends exact 16,384-byte changing pseudo-random values every nominal {interval} seconds, with staggered initial phases. Each successful Set is followed by a Get and full byte comparison.',
+           f"- {settings['warmup_seconds']}-second warmup after full authenticated population, then a {window}-second observation window and {settings['drain_seconds']}-second drain. One Set/Get chain may be in flight per client.",
+           f"- Server logical CPU affinity: `{settings['server_cpus']}`, {settings['server_workers']} Tokio/Rayon workers. Client affinity: `{settings['client_cpus']}`, {settings['client_workers']} runtime workers. PostgreSQL affinity: `{manifest.get('postgres_affinity','not recorded')}`. Host process allowed logical CPUs: `{manifest.get('affinity','not recorded')}`. Physical-core topology was not recorded.",
+           provenance,
            '- Latency is application RTT over the actual v56 reliable/fragmented Basis protocol, including sealed client uplinks: Set enqueue to its reply, Get enqueue to its reply, and Set enqueue to Get reply arrival. Readback correctness is required separately. Histograms use 0.1 ms bins; no overflow occurred.',
            '- CPU is CPU-seconds divided by measured wall-seconds (1.0 = one logical CPU fully busy). RSS is the maximum sampled at 1 Hz. PostgreSQL CPU is separate from the game-server process; summed database RSS is retained only in raw artifacts because shared pages are double-counted.',
            '- Eligibility requires the full population and avatar state count at every 1 Hz sample, at least 95% of nominal avatar uplinks and persistence offers, every client completing a verified write, and no failed storage statuses/integrity errors/timeouts/cancellations/pending requests. The avatar observer requires all nine expected nearby peers, no stale peers at window end, and no decode failures.',
            '', '## Results','',
-           'Numbers below are medians of three per-trial values. The latency range is the minimum/maximum per-trial p95, not a confidence interval. CPU deltas are medians of matched-pair differences. Offered storage load is 10 or 100 writes/s; these results do not establish maximum backend capacity.','',
+           f'Numbers below are medians of three per-trial values. The latency range is the minimum/maximum per-trial p95, not a confidence interval. CPU deltas are medians of matched-pair differences. Nominal offered storage load: {offered}; these results do not establish maximum backend capacity.','',
            '| Clients | Backend | Idle server CPU | Upload server CPU | Paired CPU delta | Verified writes/s | Set→Get p50 ms | p95 ms (range) | p99 ms | Avatar p95 idle→upload ms |',
            '|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|']
     for count in [100,1000]:
@@ -95,20 +135,29 @@ def summarize(source, output):
                   '- This is a colocated CPU/storage test. PostgreSQL uses local TCP on a dedicated test service; WAN latency and remote TLS overhead are not represented. The client is headless and does not model Unity rendering cost.',
                   '- SQLite uses WAL with SQLx’s default FULL synchronous policy. File persistence uses atomic replacement and file/directory sync. PostgreSQL settings are recorded below.',
                   '- Three repeats characterize this host/workload only. Inspect all samples and ranges before generalizing small CPU or latency differences.',
-                  '- Setup pilots were excluded, including a ten-second 1,000-client pilot that missed one writer at an interval boundary. An initial matrix was discarded after exposing a shared-receiver fragment-handoff disconnect; the fix was regression-tested before restarting with new frozen binaries. Formal sixty-second runs require all writers.',
+                  '- Only the trials in the supplied results are summarized. Setup pilots and discarded runs are excluded; every included upload trial requires all configured writers.',
                   '', '```json',manifest.get('postgres_settings','{}'),'```','',
                   f"Server SHA-256: `{manifest['server_sha256']}`  ",f"Client SHA-256: `{manifest['client_sha256']}`",'',
                   f'All individual measurements are in [{csv_path.name}]({csv_path.name}). Raw health samples, logs, commands and manifests are retained locally at `{source}`.','',
                   '## Reproduce','',
-                  'Build SQL-enabled server and client release binaries. Supply a dedicated local PostgreSQL URL through `BASIS_BENCH_POSTGRES_URL`, matching libpq `PG*`/service settings for `psql`, and the owned PostgreSQL postmaster PID. Keep database CPU affinity on 12–15 for the role split above. The benchmark uses Python standard-library tools and `psql`; report plotting additionally needs Matplotlib and NumPy (install them in a private virtual environment).','',
+                  f"Build SQL-enabled server and client release binaries. Supply a dedicated local PostgreSQL URL through `BASIS_BENCH_POSTGRES_URL`, matching libpq `PG*`/service settings for `psql`, and the owned PostgreSQL postmaster PID. Match the recorded database affinity (`{manifest.get('postgres_affinity','not recorded')}`) before running. The benchmark uses Python standard-library tools and `psql`; report plotting additionally needs Matplotlib and NumPy (install them in a private virtual environment).",'',
                   '```sh','cargo build --release --locked --manifest-path BasisRustServer/Cargo.toml -p basis-server-console --features sql-storage',
                   'cargo build --release --locked --manifest-path BasisRustClient/Cargo.toml --bin basis-rust-client',
                   'python3 -B scripts/perf/run-persistence-benchmark.py \\',
                   '  --server /path/to/frozen/server --client /path/to/frozen/client \\',
-                  '  --output /new/empty/output-path --postgres-pid YOUR_TEST_POSTMASTER_PID',
+                  '  --output /new/empty/output-path --postgres-pid YOUR_TEST_POSTMASTER_PID \\',
+                  f"  --warmup-seconds {settings['warmup_seconds']} --window-seconds {window} \\",
+                  f"  --interval-seconds {interval} --drain-seconds {settings['drain_seconds']} \\",
+                  f"  --server-cpus {settings['server_cpus']} --server-workers {settings['server_workers']} \\",
+                  f"  --client-cpus {settings['client_cpus']} --client-workers {settings['client_workers']}",
                   'python3 -B scripts/perf/summarize-persistence-benchmark.py \\',
                   '  --input /new/empty/output-path --output docs/performance/pr38-persistence-benchmark.md','```',''])
     output.write_text('\n'.join(lines))
+    plot_results(groups,output,window)
+    print(output)
+
+
+def plot_results(groups,output,window_seconds):
     # Standard static figures are exportable alongside the versioned report.
     import matplotlib
     matplotlib.use('Agg')
@@ -128,10 +177,9 @@ def summarize(source, output):
         axes[index].set_ylim(0,max(median(groups[1000,b,e],field) for b in BACKENDS for e in [False,True])*1.3)
         axes[index].legend()
     for axis in axes: axis.spines[['top','right']].set_visible(False);axis.grid(axis='y',alpha=.2);axis.set_axisbelow(True)
-    fig.suptitle('Verified persistence under movement load · 3 paired repeats · 60-second windows',fontsize=14)
+    fig.suptitle(f'Verified persistence under movement load · 3 paired repeats · {window_seconds}-second windows',fontsize=14)
     fig.savefig(output.with_suffix('.png'),dpi=160);fig.savefig(output.with_suffix('.svg'))
     plt.close(fig)
-    print(output)
 
 
 def main():

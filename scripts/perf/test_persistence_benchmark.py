@@ -1,6 +1,11 @@
 import importlib.util
+import contextlib
+import io
+import json
 from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 spec=importlib.util.spec_from_file_location('persistence_benchmark',Path(__file__).with_name('run-persistence-benchmark.py'))
 bench=importlib.util.module_from_spec(spec)
@@ -45,9 +50,84 @@ class PersistenceBenchmarkTests(unittest.TestCase):
 
 
 class PublicationValidationTests(unittest.TestCase):
-    def test_duplicate_repeats_missing_and_nonfinite_metrics_are_rejected(self):
+    def setUp(self):
         spec=importlib.util.spec_from_file_location('persistence_summary',Path(__file__).with_name('summarize-persistence-benchmark.py'))
-        report=importlib.util.module_from_spec(spec);spec.loader.exec_module(report)
+        self.report=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.report)
+
+    def publication_fixture(self):
+        settings=dict(clients=[100,1000],backends=self.report.BACKENDS,repeats=3,
+                      warmup_seconds=7,window_seconds=120,interval_seconds=30,drain_seconds=5,
+                      server_cpus='0-3',server_workers=4,client_cpus='4-5',client_workers=2)
+        manifest=dict(settings=settings,source_head='test',server_sha256='server',client_sha256='client',
+                      cpu_model='test CPU',platform='test OS',affinity=list(range(12)),postgres_affinity=[6,7])
+        rows=[]
+        for count in [100,1000]:
+            for backend in self.report.BACKENDS:
+                for enabled in [False,True]:
+                    for repeat in [1,2,3]:
+                        row=dict({key:1 for key in self.report.METRICS},clients=count,backend=backend,
+                                 uploads_enabled=enabled,repeat=repeat,valid=True,postgres_cpu_cores=1,
+                                 **{key:settings[key] for key in ['warmup_seconds','window_seconds','drain_seconds','server_cpus','client_cpus','server_workers','client_workers']})
+                        row['storage']={key:1 for key in self.report.METRICS if key.startswith(('set_','get_','cycle_'))}
+                        row['storage'].update(interval_secs='30',verified='400' if enabled else '0',writers=str(count) if enabled else '0')
+                        rows.append(row)
+        return manifest,rows
+
+    def test_custom_timings_and_affinity_are_reported_and_reproduced(self):
+        manifest,rows=self.publication_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory);output=source/'report.md'
+            (source/'manifest.json').write_text(json.dumps(manifest))
+            (source/'results.json').write_text(json.dumps(rows))
+            with mock.patch.object(self.report,'plot_results') as plot,contextlib.redirect_stdout(io.StringIO()):
+                self.report.summarize(source,output)
+            text=output.read_text()
+            for expected in ['every nominal 30 seconds','7-second warmup','120-second observation window and 5-second drain',
+                             '3.33333 writes/s (100 clients), 33.3333 writes/s (1,000 clients)',
+                             'Server logical CPU affinity: `0-3`, 4','Client affinity: `4-5`, 2',
+                             'PostgreSQL affinity: `[6, 7]`','Host process allowed logical CPUs: `[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]`',
+                             '--warmup-seconds 7 --window-seconds 120','--interval-seconds 30 --drain-seconds 5',
+                             '--server-cpus 0-3 --server-workers 4','--client-cpus 4-5 --client-workers 2']:
+                self.assertIn(expected,text)
+            for stale in ['ten seconds','sixty-second','eight physical','four/two/two','12–15']:
+                self.assertNotIn(stale,text)
+            self.assertEqual(plot.call_args.args[2],120)
+
+    def test_mixed_or_unsupported_settings_are_rejected_before_publication(self):
+        for field in ['warmup_seconds','window_seconds','drain_seconds','server_cpus','client_cpus','server_workers','client_workers']:
+            manifest,rows=self.publication_fixture();rows[0][field]='mismatch'
+            with self.assertRaisesRegex(ValueError,'trial disagrees with manifest: '+field):
+                self.report.validate_settings(manifest,rows)
+        manifest,rows=self.publication_fixture();rows[0]['storage']['interval_secs']='10'
+        with self.assertRaisesRegex(ValueError,'interval_seconds'):
+            self.report.validate_settings(manifest,rows)
+        for field in ['window_seconds','interval_seconds','server_workers','client_workers']:
+            manifest,rows=self.publication_fixture();manifest['settings'][field]=0
+            with self.assertRaisesRegex(ValueError,'invalid saved setting: '+field):
+                self.report.validate_settings(manifest,rows)
+        manifest,rows=self.publication_fixture();manifest['settings']['clients']=[100]
+        with self.assertRaisesRegex(ValueError,'full 100/1,000-client'):
+            self.report.validate_settings(manifest,rows)
+
+    def test_legacy_settings_are_disclosed_and_partial_metadata_is_rejected(self):
+        manifest,rows=self.publication_fixture()
+        del rows[0]['server_workers']
+        with self.assertRaisesRegex(ValueError,'incomplete per-trial setting: server_workers'):
+            self.report.validate_settings(manifest,rows)
+        for row in rows:
+            row.pop('server_workers',None);row.pop('client_workers');row.pop('drain_seconds')
+        self.report.validate_settings(manifest,rows)
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory);output=source/'report.md'
+            (source/'manifest.json').write_text(json.dumps(manifest))
+            (source/'results.json').write_text(json.dumps(rows))
+            with mock.patch.object(self.report,'plot_results'),contextlib.redirect_stdout(io.StringIO()):
+                self.report.summarize(source,output)
+            self.assertIn('Legacy trial records omit `server_workers, client_workers, drain_seconds`',output.read_text())
+            self.assertIn('not independently cross-checked per trial',output.read_text())
+
+    def test_duplicate_repeats_missing_and_nonfinite_metrics_are_rejected(self):
+        report=self.report
         def fixture():
             return [dict({key:1 for key in report.METRICS},clients=count,backend=backend,uploads_enabled=enabled,repeat=repeat,valid=True,postgres_cpu_cores=1)
                     for count in [100,1000] for backend in report.BACKENDS for enabled in [False,True] for repeat in [1,2,3]]
