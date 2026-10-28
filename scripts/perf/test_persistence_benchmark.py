@@ -1,5 +1,6 @@
 import importlib.util
 import contextlib
+import csv
 import io
 import json
 from pathlib import Path
@@ -92,8 +93,13 @@ class PublicationValidationTests(unittest.TestCase):
             for stale in ['ten seconds','sixty-second','eight physical','four/two/two','12–15']:
                 self.assertNotIn(stale,text)
             self.assertIn('observed offered load was 100–100% of nominal',text)
-            self.assertNotIn('.csv',text)
-            self.assertFalse(output.with_suffix('.csv').exists())
+            self.assertIn('export is generated beside this report for local analysis',text)
+            self.assertNotIn('](report.csv)',text)
+            with output.with_suffix('.csv').open(newline='') as file:
+                exported=list(csv.DictReader(file))
+            self.assertEqual(len(exported),48)
+            self.assertEqual(exported[0]['verified'],'0')
+            self.assertEqual(exported[-1]['verified'],'400')
             self.assertEqual(plot.call_args.args[2],120)
 
     def test_mixed_or_unsupported_settings_are_rejected_before_publication(self):

@@ -68,7 +68,7 @@ Numbers below are medians of three per-trial values. The latency range is the mi
 Server SHA-256: `b5bcbc001d543c06b2cf5569c2f841a49df97e85572fae06d9b43e060c4fd40f`  
 Client SHA-256: `491c4e7b7cc1e258cd2dac1b8644d5dc42edd9411e9eb06e4e3f2163a640c8af`
 
-The tables summarize all 48 trials. Individual measurements (`results.json`), raw health samples, logs, commands and manifests remain local at `/tmp/pr38-persistence-full-cc2d0d7`.
+The tables summarize all 48 trials. A `pr38-persistence-benchmark.csv` export is generated beside this report for local analysis and excluded from the committed report. Individual measurements (`results.json`), raw health samples, logs, commands and manifests remain local at `/tmp/pr38-persistence-full-cc2d0d7`.
 
 ## Reproduce
 

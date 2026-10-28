@@ -10,3 +10,4 @@ captures/
 
 # Keep generated benchmark data local; commit Markdown summaries instead.
 /docs/performance/results/*.json
+/docs/performance/pr38-persistence-benchmark.csv
