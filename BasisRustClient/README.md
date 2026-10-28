@@ -203,5 +203,6 @@ shutdown. Each operation has a 10-second reply timeout. Disconnects cancel old
 connection requests; late replies cannot complete a replacement connection's work.
 
 The CSV describes Set **plus** readback traffic, not write-only capacity. Server
-errors and mismatched data are counted explicitly. See the persistence benchmark
-report under `docs/performance` for measured workload settings and limitations.
+errors and mismatched data are counted explicitly. See the
+[persistence benchmark report](../docs/performance/pr38-persistence-benchmark.md)
+for measured workload settings and limitations.

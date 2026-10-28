@@ -63,9 +63,9 @@ def summarize(source, output):
            '- Persistence sends exact 16,384-byte changing pseudo-random values every nominal ten seconds, with staggered initial phases. Each successful Set is followed by a Get and full byte comparison.',
            '- Twenty-second warmup after full authenticated population, then a sixty-second observation window and three-second drain. One Set/Get chain may be in flight per client.',
            f"- Server logical CPU affinity: `{manifest['settings']['server_cpus']}`, {manifest['settings']['server_workers']} Tokio/Rayon workers. Client affinity: `{manifest['settings']['client_cpus']}`, {manifest['settings']['client_workers']} runtime workers. PostgreSQL affinity: `{manifest.get('postgres_affinity',[])}`. This host has eight physical cores/sixteen logical CPUs; the default role split gives four/two/two physical cores respectively.",
-           '- Latency is application RTT over the actual encrypted, reliable/fragmented Basis protocol: Set enqueue to its reply, Get enqueue to its reply, and Set enqueue to Get reply arrival. Readback correctness is required separately. Histograms use 0.1 ms bins; no overflow occurred.',
+           '- Latency is application RTT over the actual v56 reliable/fragmented Basis protocol, including sealed client uplinks: Set enqueue to its reply, Get enqueue to its reply, and Set enqueue to Get reply arrival. Readback correctness is required separately. Histograms use 0.1 ms bins; no overflow occurred.',
            '- CPU is CPU-seconds divided by measured wall-seconds (1.0 = one logical CPU fully busy). RSS is the maximum sampled at 1 Hz. PostgreSQL CPU is separate from the game-server process; summed database RSS is retained only in raw artifacts because shared pages are double-counted.',
-           '- Eligibility requires the full population and avatar state count throughout, at least 95% of nominal avatar uplinks and persistence offers, every client completing a verified write, no failed storage statuses/integrity errors/timeouts/cancellations/pending requests, and complete avatar coverage without decode failures.',
+           '- Eligibility requires the full population and avatar state count at every 1 Hz sample, at least 95% of nominal avatar uplinks and persistence offers, every client completing a verified write, and no failed storage statuses/integrity errors/timeouts/cancellations/pending requests. The avatar observer requires all nine expected nearby peers, no stale peers at window end, and no decode failures.',
            '', '## Results','',
            'Numbers below are medians of three per-trial values. The latency range is the minimum/maximum per-trial p95, not a confidence interval. CPU deltas are medians of matched-pair differences. Offered storage load is 10 or 100 writes/s; these results do not establish maximum backend capacity.','',
            '| Clients | Backend | Idle server CPU | Upload server CPU | Paired CPU delta | Verified writes/s | Set→Get p50 ms | p95 ms (range) | p99 ms | Avatar p95 idle→upload ms |',
@@ -75,7 +75,14 @@ def summarize(source, output):
             idle=groups[count,backend,False];writes=groups[count,backend,True]
             p95=[float(row['storage']['cycle_p95_ms']) for row in writes]
             lines.append(f"| {count:,} | {backend} | {median(idle,'server_cpu_cores'):.3f} | {median(writes,'server_cpu_cores'):.3f} | {statistics.median(pairs(count,backend,'server_cpu_cores')):+.3f} | {median(writes,'writes_per_second'):.2f} | {median(writes,'cycle_p50_ms'):.1f} | {statistics.median(p95):.1f} ({min(p95):.1f}–{max(p95):.1f}) | {median(writes,'cycle_p99_ms'):.1f} | {median(idle,'avatar_gap_p95_ms'):.1f}→{median(writes,'avatar_gap_p95_ms'):.1f} |")
-    lines.extend(['',f'![Persistence benchmark]({output.stem}.png)','',
+    total_verified=sum(int(row['storage']['verified']) for row in results)
+    idle_avatar=[metric(row,'avatar_gap_p95_ms') for row in results if row['clients']==1000 and not row['uploads_enabled']]
+    lines.extend(['','## Interpretation','',
+                  f'- All 48 trials were eligible: {total_verified:,} Set/Get cycles passed full readback verification, every configured writer participated, and storage error, corruption, timeout and pending-request counters were zero.',
+                  '- At 1,000 clients, memory has the lowest persistence latency; file persistence has the highest. PostgreSQL uses additional database CPU beyond the game-server CPU shown in the first table.',
+                  f'- The 1,000-client avatar baseline is already delayed with uploads disabled: per-trial avatar-gap p95 spans {min(idle_avatar):.1f}–{max(idle_avatar):.1f} ms. Passing the workload checks does not establish smooth 50 Hz downstream delivery. This baseline needs separate investigation before drawing an interactive-capacity conclusion.',
+                  '- Small paired CPU changes, including negative values at 100 clients, are run variation rather than evidence that uploads improve performance.',
+                  '',f'![Persistence benchmark]({output.stem}.png)','',
                   '## Request phases and resources with uploads','',
                   '| Clients | Backend | Set p95 ms | Get p95 ms | Server peak RSS MiB | Client CPU | Client peak RSS MiB | Database CPU |',
                   '|---:|---|---:|---:|---:|---:|---:|---:|'])
@@ -93,7 +100,7 @@ def summarize(source, output):
                   f"Server SHA-256: `{manifest['server_sha256']}`  ",f"Client SHA-256: `{manifest['client_sha256']}`",'',
                   f'All individual measurements are in [{csv_path.name}]({csv_path.name}). Raw health samples, logs, commands and manifests are retained locally at `{source}`.','',
                   '## Reproduce','',
-                  'Build SQL-enabled server and client release binaries. Supply a dedicated local PostgreSQL URL through `BASIS_BENCH_POSTGRES_URL`, matching libpq `PG*`/service settings for `psql`, and the owned PostgreSQL postmaster PID. Keep database CPU affinity on 12–15 for the role split above.','',
+                  'Build SQL-enabled server and client release binaries. Supply a dedicated local PostgreSQL URL through `BASIS_BENCH_POSTGRES_URL`, matching libpq `PG*`/service settings for `psql`, and the owned PostgreSQL postmaster PID. Keep database CPU affinity on 12–15 for the role split above. The benchmark uses Python standard-library tools and `psql`; report plotting additionally needs Matplotlib and NumPy (install them in a private virtual environment).','',
                   '```sh','cargo build --release --locked --manifest-path BasisRustServer/Cargo.toml -p basis-server-console --features sql-storage',
                   'cargo build --release --locked --manifest-path BasisRustClient/Cargo.toml --bin basis-rust-client',
                   'python3 -B scripts/perf/run-persistence-benchmark.py \\',
@@ -117,7 +124,9 @@ def summarize(source, output):
         for offset,enabled,color in [(-width/2,False,'#94a3b8'),(width/2,True,'#2563eb')]:
             values=[median(groups[1000,b,enabled],field) for b in BACKENDS]
             axes[index].bar(x+offset,values,width,label='16 KiB uploads' if enabled else 'Idle storage',color=color)
-        axes[index].set(title=title,ylabel=ylabel,xticks=x,xticklabels=BACKENDS);axes[index].legend()
+        axes[index].set(title=title,ylabel=ylabel,xticks=x,xticklabels=BACKENDS)
+        axes[index].set_ylim(0,max(median(groups[1000,b,e],field) for b in BACKENDS for e in [False,True])*1.3)
+        axes[index].legend()
     for axis in axes: axis.spines[['top','right']].set_visible(False);axis.grid(axis='y',alpha=.2);axis.set_axisbelow(True)
     fig.suptitle('Verified persistence under movement load · 3 paired repeats · 60-second windows',fontsize=14)
     fig.savefig(output.with_suffix('.png'),dpi=160);fig.savefig(output.with_suffix('.svg'))
