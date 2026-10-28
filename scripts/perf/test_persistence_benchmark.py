@@ -91,6 +91,9 @@ class PublicationValidationTests(unittest.TestCase):
                 self.assertIn(expected,text)
             for stale in ['ten seconds','sixty-second','eight physical','four/two/two','12–15']:
                 self.assertNotIn(stale,text)
+            self.assertIn('observed offered load was 100–100% of nominal',text)
+            self.assertNotIn('.csv',text)
+            self.assertFalse(output.with_suffix('.csv').exists())
             self.assertEqual(plot.call_args.args[2],120)
 
     def test_mixed_or_unsupported_settings_are_rejected_before_publication(self):

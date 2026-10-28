@@ -4,7 +4,6 @@
 Custom timings and CPU allocations are read from the saved manifest.
 """
 import argparse
-import csv
 import json
 import math
 from pathlib import Path
@@ -82,14 +81,6 @@ def summarize(source, output):
     provenance=(f"- Legacy trial records omit `{', '.join(legacy)}`; those values are configured settings from the manifest, not independently cross-checked per trial."
                 if legacy else '- Worker counts, CPU affinities and timings agree between each trial record and the saved manifest.')
     output.parent.mkdir(parents=True,exist_ok=True)
-    csv_path=output.with_suffix('.csv')
-    fields=['clients','backend','uploads','repeat','server_cpu_cores','client_cpu_cores','postgres_cpu_cores','server_rss_peak_mib','client_rss_peak_mib','verified','writers','writes_per_second','offered_load_ratio','set_p50_ms','set_p95_ms','set_p99_ms','get_p50_ms','get_p95_ms','get_p99_ms','cycle_p50_ms','cycle_p95_ms','cycle_p99_ms','avatar_gap_p95_ms','avatar_uplink_updates_per_second','valid']
-    with csv_path.open('w',newline='') as file:
-        writer=csv.DictWriter(file,fieldnames=fields);writer.writeheader()
-        for row in results:
-            flat={key:row.get(key,'') for key in fields}
-            flat.update({key:row['storage'][key] for key in ['verified','writers','set_p50_ms','set_p95_ms','set_p99_ms','get_p50_ms','get_p95_ms','get_p99_ms','cycle_p50_ms','cycle_p95_ms','cycle_p99_ms']})
-            flat['uploads']=row['uploads_enabled'];writer.writerow(flat)
     def pairs(count,backend,key):
         idle={row['repeat']:row for row in groups[count,backend,False]}
         return [metric(row,key)-metric(idle[row['repeat']],key) for row in groups[count,backend,True]]
@@ -116,9 +107,11 @@ def summarize(source, output):
             p95=[float(row['storage']['cycle_p95_ms']) for row in writes]
             lines.append(f"| {count:,} | {backend} | {median(idle,'server_cpu_cores'):.3f} | {median(writes,'server_cpu_cores'):.3f} | {statistics.median(pairs(count,backend,'server_cpu_cores')):+.3f} | {median(writes,'writes_per_second'):.2f} | {median(writes,'cycle_p50_ms'):.1f} | {statistics.median(p95):.1f} ({min(p95):.1f}–{max(p95):.1f}) | {median(writes,'cycle_p99_ms'):.1f} | {median(idle,'avatar_gap_p95_ms'):.1f}→{median(writes,'avatar_gap_p95_ms'):.1f} |")
     total_verified=sum(int(row['storage']['verified']) for row in results)
+    offered_ratios=[metric(row,'offered_load_ratio')*100 for row in results if row['uploads_enabled']]
     idle_avatar=[metric(row,'avatar_gap_p95_ms') for row in results if row['clients']==1000 and not row['uploads_enabled']]
     lines.extend(['','## Interpretation','',
                   f'- All 48 trials were eligible: {total_verified:,} Set/Get cycles passed full readback verification, every configured writer participated, and storage error, corruption, timeout and pending-request counters were zero.',
+                  f'- Across upload trials, observed offered load was {min(offered_ratios):g}–{max(offered_ratios):g}% of nominal.',
                   '- At 1,000 clients, memory has the lowest persistence latency; file persistence has the highest. PostgreSQL uses additional database CPU beyond the game-server CPU shown in the first table.',
                   f'- The 1,000-client avatar baseline is already delayed with uploads disabled: per-trial avatar-gap p95 spans {min(idle_avatar):.1f}–{max(idle_avatar):.1f} ms. Passing the workload checks does not establish smooth 50 Hz downstream delivery. This baseline needs separate investigation before drawing an interactive-capacity conclusion.',
                   '- Small paired CPU changes, including negative values at 100 clients, are run variation rather than evidence that uploads improve performance.',
@@ -138,7 +131,7 @@ def summarize(source, output):
                   '- Only the trials in the supplied results are summarized. Setup pilots and discarded runs are excluded; every included upload trial requires all configured writers.',
                   '', '```json',manifest.get('postgres_settings','{}'),'```','',
                   f"Server SHA-256: `{manifest['server_sha256']}`  ",f"Client SHA-256: `{manifest['client_sha256']}`",'',
-                  f'All individual measurements are in [{csv_path.name}]({csv_path.name}). Raw health samples, logs, commands and manifests are retained locally at `{source}`.','',
+                  f'The tables summarize all 48 trials. Individual measurements (`results.json`), raw health samples, logs, commands and manifests remain local at `{source}`.','',
                   '## Reproduce','',
                   f"Build SQL-enabled server and client release binaries. Supply a dedicated local PostgreSQL URL through `BASIS_BENCH_POSTGRES_URL`, matching libpq `PG*`/service settings for `psql`, and the owned PostgreSQL postmaster PID. Match the recorded database affinity (`{manifest.get('postgres_affinity','not recorded')}`) before running. The benchmark uses Python standard-library tools and `psql`; report plotting additionally needs Matplotlib and NumPy (install them in a private virtual environment).",'',
                   '```sh','cargo build --release --locked --manifest-path BasisRustServer/Cargo.toml -p basis-server-console --features sql-storage',

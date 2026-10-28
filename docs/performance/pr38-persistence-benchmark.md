@@ -33,6 +33,7 @@ Numbers below are medians of three per-trial values. The latency range is the mi
 ## Interpretation
 
 - All 48 trials were eligible: 79,072 Set/Get cycles passed full readback verification, every configured writer participated, and storage error, corruption, timeout and pending-request counters were zero.
+- Across upload trials, observed offered load was 99.5–100% of nominal.
 - At 1,000 clients, memory has the lowest persistence latency; file persistence has the highest. PostgreSQL uses additional database CPU beyond the game-server CPU shown in the first table.
 - The 1,000-client avatar baseline is already delayed with uploads disabled: per-trial avatar-gap p95 spans 174.8–198.6 ms. Passing the workload checks does not establish smooth 50 Hz downstream delivery. This baseline needs separate investigation before drawing an interactive-capacity conclusion.
 - Small paired CPU changes, including negative values at 100 clients, are run variation rather than evidence that uploads improve performance.
@@ -67,7 +68,7 @@ Numbers below are medians of three per-trial values. The latency range is the mi
 Server SHA-256: `b5bcbc001d543c06b2cf5569c2f841a49df97e85572fae06d9b43e060c4fd40f`  
 Client SHA-256: `491c4e7b7cc1e258cd2dac1b8644d5dc42edd9411e9eb06e4e3f2163a640c8af`
 
-All individual measurements are in [pr38-persistence-benchmark.csv](pr38-persistence-benchmark.csv). Raw health samples, logs, commands and manifests are retained locally at `/tmp/pr38-persistence-full-cc2d0d7`.
+The tables summarize all 48 trials. Individual measurements (`results.json`), raw health samples, logs, commands and manifests remain local at `/tmp/pr38-persistence-full-cc2d0d7`.
 
 ## Reproduce
 
