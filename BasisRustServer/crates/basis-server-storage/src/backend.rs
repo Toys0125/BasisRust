@@ -159,6 +159,9 @@ impl StorageBackendRegistry {
         registry
     }
 
+    /// Resolve a case-insensitive backend name and initialize it with the supplied context.
+    ///
+    /// Returns an error when the name is not registered or its factory fails.
     pub async fn create(
         &self,
         name: &str,
@@ -181,6 +184,7 @@ impl Default for StorageBackendRegistry {
 }
 
 impl PlayerStorageBackend for PlayerStorage {
+    /// Run file/memory operations on a blocking worker, returning Unavailable if it fails.
     fn execute<'a>(
         &'a self,
         owner: &'a str,
@@ -202,6 +206,7 @@ impl PlayerStorageBackend for PlayerStorage {
         })
     }
 
+    /// Run console administration on a blocking worker and propagate storage or task errors.
     fn admin<'a>(&'a self, action: StorageAdminAction) -> StorageAdminFuture<'a> {
         let storage = self.clone();
         Box::pin(async move {

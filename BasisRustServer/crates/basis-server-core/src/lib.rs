@@ -539,6 +539,7 @@ impl ServerState {
         .await
     }
 
+    /// Start with an explicit configuration file path and the built-in storage registry.
     pub async fn start_with_config_path(
         config: ServerConfig,
         base_dir: &Path,
@@ -571,6 +572,10 @@ impl ServerState {
         .await
     }
 
+    /// Start with an explicit configuration file path and application-registered storage backends.
+    ///
+    /// The configured backend is initialized once at startup. If initialization
+    /// fails, the server continues with player storage unavailable.
     pub async fn start_with_config_path_and_storage_registry(
         mut config: ServerConfig,
         base_dir: &Path,
@@ -3336,6 +3341,8 @@ async fn handle_uplink_avatar_delta(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Dispatch a client protocol message, applying channel-specific authorization
+/// before invoking player storage or other application services.
 async fn handle_message(
     state: &ServerState,
     peer: PeerId,
@@ -6237,6 +6244,7 @@ fn encode_u8_admin_state_payload(mode: AdminRequestMode, value: u8) -> Vec<u8> {
     writer.into_vec()
 }
 
+/// Dispatch a storage request after the caller validates the backend and owner permissions.
 async fn execute_player_storage(
     state: &ServerState,
     owner: &str,
