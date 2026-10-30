@@ -11,6 +11,7 @@ use std::{
 };
 
 pub mod admin;
+pub mod backend;
 pub mod player;
 #[cfg(feature = "sql-storage")]
 pub mod sql;

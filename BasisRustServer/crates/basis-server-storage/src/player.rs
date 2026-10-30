@@ -258,7 +258,7 @@ impl PlayerStorage {
         let mut used = 0usize;
         for entry in fs::read_dir(root)? {
             let path = entry?.path();
-            if !path.extension().is_some_and(|ext| ext == "json") {
+            if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
             let bytes = fs::read(&path)?;
