@@ -339,6 +339,7 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
+ "tracing",
  "windows-sys 0.59.0",
  "xattr",
 ]

@@ -80,6 +80,10 @@ from a full bucket once; its complete byte cost remains as debt until refilled.
 
 ### Cilbox SQL player storage (optional)
 
+For a common interface across file, memory, SQL, and application-defined
+backends, including registration and implementation examples, see
+[Custom player-storage backends](docs/storage-backends.md).
+
 `StorageEnabled`, `StorageBackend`, `StorageConnectionString`, and `StorageSqlTable`
 are startup settings. Edit them in the server XML configuration and restart the
 server; `/config set` rejects live changes to these fields without changing the

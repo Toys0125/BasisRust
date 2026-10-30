@@ -62,9 +62,10 @@ use basis_server_resources::{
     ContentShareState, NetIdState, OwnershipState, PipState, ResourceState,
 };
 pub use basis_server_storage::admin::{StorageAdminAction, StorageAdminReply};
-#[cfg(feature = "sql-storage")]
-use basis_server_storage::sql::{SqlBackend, SqlPlayerStorage};
-use basis_server_storage::{player::PlayerStorage, PersistentDatabase};
+use basis_server_storage::{
+    backend::{PlayerStorageBackend, StorageBackendContext, StorageBackendRegistry},
+    PersistentDatabase,
+};
 use basis_transport::{
     DeliveryMethod, DisconnectReason, OrderedAdmissionConfig, OrderedEvent, PeerId, PeerSession,
     ServerEvent, TransportHandle,
@@ -488,9 +489,7 @@ pub struct ServerState {
     admissions_per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
     pub permissions: PermissionManager,
     pub database: PersistentDatabase,
-    pub player_storage: Option<PlayerStorage>,
-    #[cfg(feature = "sql-storage")]
-    pub sql_player_storage: Option<SqlPlayerStorage>,
+    pub player_storage: Option<Arc<dyn PlayerStorageBackend>>,
     pub resources: ResourceState,
     pub net_ids: NetIdState,
     pub ownership: OwnershipState,
@@ -540,10 +539,48 @@ impl ServerState {
         .await
     }
 
+    /// Start with an explicit configuration file path and the built-in storage registry.
     pub async fn start_with_config_path(
+        config: ServerConfig,
+        base_dir: &Path,
+        config_path: &Path,
+    ) -> Result<(Self, oneshot::Sender<()>)> {
+        Self::start_with_config_path_and_storage_registry(
+            config,
+            base_dir,
+            config_path,
+            StorageBackendRegistry::default(),
+        )
+        .await
+    }
+
+    /// Embedders can register custom storage backends before starting the server.
+    /// The configured StorageBackend name is resolved against this registry.
+    pub async fn start_with_storage_registry(
+        config: ServerConfig,
+        base_dir: &Path,
+        registry: StorageBackendRegistry,
+    ) -> Result<(Self, oneshot::Sender<()>)> {
+        Self::start_with_config_path_and_storage_registry(
+            config,
+            base_dir,
+            &base_dir
+                .join(ServerConfig::CONFIG_FOLDER_NAME)
+                .join("config.xml"),
+            registry,
+        )
+        .await
+    }
+
+    /// Start with an explicit configuration file path and application-registered storage backends.
+    ///
+    /// The configured backend is initialized once at startup. If initialization
+    /// fails, the server continues with player storage unavailable.
+    pub async fn start_with_config_path_and_storage_registry(
         mut config: ServerConfig,
         base_dir: &Path,
         config_path: &Path,
+        registry: StorageBackendRegistry,
     ) -> Result<(Self, oneshot::Sender<()>)> {
         // RejoinOnly's captured population is session-only; a restart unlocks it.
         if config.basis_user_restriction_mode == BasisUserRestrictionMode::RejoinOnly {
@@ -578,70 +615,20 @@ impl ServerState {
         };
 
         let player_storage = if config.storage_enabled {
-            let backend = config.storage_backend.trim().to_ascii_lowercase();
-            if backend == "file" || backend == "memory" {
-                let root = if backend == "file" && config.has_file_support {
-                    Some(base_dir.join("storage").join("players"))
-                } else {
-                    None
-                };
-                match PlayerStorage::new(root) {
-                    Ok(storage) => Some(storage),
-                    Err(error) => {
-                        warn!("Cilbox server storage disabled: {error:#}");
-                        None
-                    }
-                }
-            } else {
-                #[cfg(not(feature = "sql-storage"))]
-                warn!(
-                    "Unsupported player-storage backend '{}'; SQL storage needs --features sql-storage",
-                    config.storage_backend
-                );
-                #[cfg(feature = "sql-storage")]
-                if backend != "sql" {
-                    warn!(
-                        "Unsupported player-storage backend '{}'; disabled",
-                        config.storage_backend
-                    );
-                }
-                None
-            }
-        } else {
-            None
-        };
-        #[cfg(feature = "sql-storage")]
-        let sql_player_storage = if config.storage_enabled
-            && config.storage_backend.eq_ignore_ascii_case("sql")
-        {
-            let path = config
-                .has_file_support
-                .then(|| base_dir.join("storage").join("players.sqlite3"));
-            let remote_url = std::env::var("BASIS_STORAGE_URL")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| config.storage_connection_string.clone());
-            match SqlPlayerStorage::connect(&remote_url, path.as_deref(), &config.storage_sql_table)
+            let backend = config.storage_backend.as_str();
+            match registry
+                .create(
+                    backend,
+                    StorageBackendContext {
+                        base_dir: base_dir.to_path_buf(),
+                        config: config.clone(),
+                    },
+                )
                 .await
             {
-                Ok((storage, backend)) => {
-                    if backend == SqlBackend::Sqlite && !remote_url.is_empty() {
-                        warn!("Remote SQL unavailable at startup: using local SQLite fallback instead (data is separate)");
-                    }
-                    info!("Cilbox SQL storage selected backend: {backend:?}");
-                    let migration = storage.legacy_import_report();
-                    if migration.imported
-                        + migration.preserved
-                        + migration.empty
-                        + migration.previously_imported
-                        > 0
-                    {
-                        info!(?migration, "SQLite legacy player-storage migration");
-                    }
-                    Some(storage)
-                }
+                Ok(storage) => Some(storage),
                 Err(error) => {
-                    warn!("Cilbox SQL storage disabled: {error:#}");
+                    warn!("Cilbox server storage disabled: {error:#}");
                     None
                 }
             }
@@ -735,8 +722,6 @@ impl ServerState {
             permissions,
             database,
             player_storage,
-            #[cfg(feature = "sql-storage")]
-            sql_player_storage,
             resources: ResourceState::default(),
             net_ids: NetIdState::default(),
             ownership: OwnershipState::default(),
@@ -957,16 +942,11 @@ impl ServerState {
 
     /// Console-only storage administration. No client protocol exposes these operations.
     pub async fn storage_admin(&self, action: StorageAdminAction) -> Result<StorageAdminReply> {
-        #[cfg(feature = "sql-storage")]
-        if let Some(sql) = &self.sql_player_storage {
-            return sql.admin(action).await;
-        }
-        let db = self
-            .player_storage
+        self.player_storage
             .as_ref()
             .context("Player storage is off or unavailable")?
-            .clone();
-        tokio::task::spawn_blocking(move || db.admin(action)).await?
+            .admin(action)
+            .await
     }
 
     pub fn players_text(&self) -> String {
@@ -3361,6 +3341,8 @@ async fn handle_uplink_avatar_delta(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Dispatch a client protocol message, applying channel-specific authorization
+/// before invoking player storage or other application services.
 async fn handle_message(
     state: &ServerState,
     peer: PeerId,
@@ -4035,18 +4017,7 @@ async fn handle_message(
                     .has(&uuid, basis_server_permissions::nodes::STORAGE_USE)
             {
                 Some(StorageStatus::Denied)
-            } else if !enabled
-                || (state.player_storage.is_none() && {
-                    #[cfg(feature = "sql-storage")]
-                    {
-                        state.sql_player_storage.is_none()
-                    }
-                    #[cfg(not(feature = "sql-storage"))]
-                    {
-                        true
-                    }
-                })
-            {
+            } else if !enabled || state.player_storage.is_none() {
                 Some(StorageStatus::Unavailable)
             } else if malformed {
                 Some(StorageStatus::Invalid)
@@ -6273,6 +6244,7 @@ fn encode_u8_admin_state_payload(mode: AdminRequestMode, value: u8) -> Vec<u8> {
     writer.into_vec()
 }
 
+/// Dispatch a storage request after the caller validates the backend and owner permissions.
 async fn execute_player_storage(
     state: &ServerState,
     owner: &str,
@@ -6280,32 +6252,12 @@ async fn execute_player_storage(
     per_player: usize,
     max_total: usize,
 ) -> StorageReply {
-    #[cfg(feature = "sql-storage")]
-    if let Some(sql) = &state.sql_player_storage {
-        return sql.execute(owner, request, per_player, max_total).await;
-    }
-
-    let db = state
+    state
         .player_storage
         .as_ref()
         .expect("storage backend validated")
-        .clone();
-    let fallback = request.clone();
-    let owner = owner.to_owned();
-    match tokio::task::spawn_blocking(move || db.execute(&owner, request, per_player, max_total))
+        .execute(owner, request, per_player, max_total)
         .await
-    {
-        Ok(reply) => reply,
-        Err(_) => StorageReply {
-            op: fallback.op,
-            id: fallback.id,
-            status: StorageStatus::Unavailable,
-            used: 0,
-            limit: per_player.min(storage::MAX_BYTES_PER_PLAYER) as i32,
-            value: Vec::new(),
-            keys: Vec::new(),
-        },
-    }
 }
 
 fn spawn_content_expiry_loop(state: ServerState) -> tokio::task::JoinHandle<()> {

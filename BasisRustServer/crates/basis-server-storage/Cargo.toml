@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 default = []
-sql-storage = ["dep:sqlx", "dep:tokio"]
+sql-storage = ["dep:sqlx"]
 
 [[example]]
 name = "player-storage-quota-benchmark"
@@ -17,7 +17,8 @@ anyhow.workspace = true
 basis-protocol = { path = "../basis-protocol" }
 sha2.workspace = true
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "sqlite"], optional = true }
-tokio = { workspace = true, optional = true }
+tokio.workspace = true
+tracing.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
