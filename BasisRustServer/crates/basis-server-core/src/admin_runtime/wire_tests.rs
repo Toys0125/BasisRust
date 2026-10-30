@@ -864,6 +864,121 @@ async fn storage_set(client: &mut Client, id: u16) -> StorageStatus {
 }
 
 #[tokio::test]
+async fn custom_storage_startup_dispatches_only_authorized_requests() {
+    use basis_server_storage::backend::StorageFuture;
+
+    struct RecordedRequest {
+        owner: String,
+        request: storage::StorageRequest,
+        per_player: usize,
+        total: usize,
+    }
+
+    #[derive(Default)]
+    struct RecordingBackend {
+        calls: Mutex<Vec<RecordedRequest>>,
+    }
+
+    impl PlayerStorageBackend for RecordingBackend {
+        fn execute<'a>(
+            &'a self,
+            owner: &'a str,
+            request: storage::StorageRequest,
+            per_player: usize,
+            total: usize,
+        ) -> StorageFuture<'a> {
+            Box::pin(async move {
+                let reply = StorageReply {
+                    op: request.op,
+                    id: request.id,
+                    status: StorageStatus::Ok,
+                    used: 0,
+                    limit: per_player as i32,
+                    value: Vec::new(),
+                    keys: Vec::new(),
+                };
+                self.calls.lock().push(RecordedRequest {
+                    owner: owner.into(),
+                    request,
+                    per_player,
+                    total,
+                });
+                reply
+            })
+        }
+    }
+
+    let backend = Arc::new(RecordingBackend::default());
+    let mut registry = StorageBackendRegistry::new();
+    let factory_backend = backend.clone();
+    registry
+        .register("recording", move |_| {
+            let backend = factory_backend.clone();
+            async move { Ok(backend as Arc<dyn PlayerStorageBackend>) }
+        })
+        .unwrap();
+    let config = ServerConfig {
+        has_file_support: false,
+        use_auth: false,
+        use_auth_identity: false,
+        override_auto_discovery_of_ipv: true,
+        ipv4_address: "127.0.0.1".into(),
+        set_port: 0,
+        storage_enabled: true,
+        storage_backend: "recording".into(),
+        storage_max_bytes_per_player: 2048,
+        storage_max_total_megabytes: 3,
+        ..ServerConfig::default()
+    };
+    let dir = std::env::temp_dir().join(format!("basis-custom-storage-{}", uuid::Uuid::new_v4()));
+    let (state, shutdown) = ServerState::start_with_storage_registry(config, &dir, registry)
+        .await
+        .unwrap();
+    assert!(state.player_storage.is_some());
+
+    let claimed_key = SigningKey::from_bytes(&[121; 32]);
+    let mut claimed = Client::connect(&state, &client_did(&claimed_key)).await;
+    assert_eq!(storage_set(&mut claimed, 1).await, StorageStatus::Denied);
+    assert!(backend.calls.lock().is_empty());
+
+    state.config.write().use_auth_identity = true;
+    state.refresh_runtime_config_live().await;
+    assert_eq!(storage_set(&mut claimed, 2).await, StorageStatus::Denied);
+    assert!(backend.calls.lock().is_empty());
+
+    let verified_key = SigningKey::from_bytes(&[122; 32]);
+    let verified_did = client_did(&verified_key);
+    let mut verified = Client::connect_pending(&state, &verified_did).await;
+    verified.answer_identity(&verified_key).await;
+    verified
+        .receive(|channel, _| channel == channels::META_DATA)
+        .await;
+    assert_eq!(storage_set(&mut verified, 3).await, StorageStatus::Ok);
+    {
+        let calls = backend.calls.lock();
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        assert_eq!(call.owner, verified_did);
+        assert_eq!(call.request.op, storage::StorageOp::Set);
+        assert_eq!(call.request.id, 3);
+        assert_eq!(call.request.scope, "wire-test");
+        assert_eq!(call.request.key, "proof");
+        assert_eq!(call.request.value, b"value");
+        assert_eq!(call.per_player, 2048);
+        assert_eq!(call.total, 3 * 1024 * 1024);
+    }
+
+    state
+        .permissions
+        .add_user_node(&verified_did, "-basis.storage.use");
+    assert_eq!(storage_set(&mut verified, 4).await, StorageStatus::Denied);
+    assert_eq!(backend.calls.lock().len(), 1);
+
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
 async fn storage_authorization_is_bound_to_identity_proof_at_admission() {
     let (state, shutdown, _) = super::tests::test_server(false).await;
     let claimed_key = SigningKey::from_bytes(&[119; 32]);
