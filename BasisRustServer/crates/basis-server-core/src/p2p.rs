@@ -101,6 +101,13 @@ impl P2pBroker {
         }
     }
 
+    /// Collect NAT endpoints for an accepted P2P session and introduce the two participants.
+    ///
+    /// `remote_addr` is the observed UDP source; repeated requests from that endpoint
+    /// update its advertised `local_addr` without occupying the other participant's slot.
+    /// Once both endpoints are known, retries resend both introductions with the full
+    /// prediction window for different NATs, since UDP delivery is not acknowledged.
+    /// Unknown tokens, unaccepted sessions and third endpoints are ignored.
     pub async fn handle_nat_introduction_request(
         &self,
         transport: &TransportHandle,
@@ -482,6 +489,7 @@ mod tests {
     use std::time::Duration;
     use tokio::{net::UdpSocket, time::timeout};
 
+    /// Verify duplicate requests cannot self-introduce and valid retries resend the opposite endpoints.
     #[tokio::test]
     async fn introduction_retries_require_two_distinct_endpoints_and_can_resend() {
         let (transport, _events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
@@ -546,6 +554,7 @@ mod tests {
         transport.shutdown();
     }
 
+    /// Verify both peers retain port prediction when retrying an unconfirmed different-NAT introduction.
     #[tokio::test]
     async fn introduction_retry_preserves_port_prediction_after_unconfirmed_response() {
         let (transport, _events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
@@ -602,6 +611,8 @@ mod tests {
         broker
     }
 
+    /// Receive a broker datagram and validate its IPv4 endpoints, session token and prediction count.
+    /// Return the bytes so retry tests can also compare the complete introduction packets.
     async fn receive_introduction(
         socket: &UdpSocket,
         other: SocketAddr,

@@ -576,6 +576,7 @@ impl ServerState {
     ///
     /// The configured backend is initialized once at startup. If initialization
     /// fails, the server continues with player storage unavailable.
+    /// Disabling NAT punching logs a warning and prevents new direct P2P requests.
     pub async fn start_with_config_path_and_storage_registry(
         mut config: ServerConfig,
         base_dir: &Path,
@@ -3346,6 +3347,8 @@ async fn handle_uplink_avatar_delta(
 #[allow(clippy::too_many_arguments)]
 /// Dispatch a client protocol message, applying channel-specific authorization
 /// before invoking player storage or other application services.
+/// New direct P2P requests require NAT punching to be enabled as well as permission
+/// under the global direct-connect lock; requests denied by either check are cancelled.
 async fn handle_message(
     state: &ServerState,
     peer: PeerId,
