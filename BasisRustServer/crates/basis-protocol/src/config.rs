@@ -218,7 +218,7 @@ impl Default for ServerConfig {
             company_name: crate::application::DEFAULT_COMPANY_NAME.to_string(),
             product_name: crate::application::DEFAULT_PRODUCT_NAME.to_string(),
             use_native_sockets: true,
-            nat_punch_enabled: false,
+            nat_punch_enabled: true,
             ping_interval: 1500,
             disconnect_timeout: 30000,
             simulate_packet_loss: false,
@@ -1040,12 +1040,24 @@ mod tests {
         );
         assert!(config.use_auth);
         assert!(config.use_auth_identity);
+        assert!(config.nat_punch_enabled);
         assert!(config.worlds_locked);
         assert!(!config.avatars_locked);
         assert!(!config.health_include_extended_metrics);
         assert!(config.enable_avatar_bundle_zstd);
         assert!(!config.avatar_bundle_zstd_delta_bundles);
         assert_eq!(config.avatar_bundle_zstd_level, -5);
+    }
+
+    #[test]
+    fn nat_punch_defaults_on_for_existing_configs_but_preserves_explicit_opt_out() {
+        let omitted: ServerConfig = quick_xml::de::from_str("<Configuration/>").unwrap();
+        assert!(omitted.nat_punch_enabled);
+        let disabled: ServerConfig = quick_xml::de::from_str(
+            "<Configuration><NatPunchEnabled>false</NatPunchEnabled></Configuration>",
+        )
+        .unwrap();
+        assert!(!disabled.nat_punch_enabled);
     }
 
     #[test]

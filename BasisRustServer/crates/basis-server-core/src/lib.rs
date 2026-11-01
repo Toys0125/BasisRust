@@ -669,6 +669,9 @@ impl ServerState {
             })?;
         transport.set_compact_merge_send(config.compact_merged);
         info!("server listening on {}", transport.local_addr()?);
+        if !config.nat_punch_enabled {
+            warn!("[P2P] NatPunchEnabled=false; direct peer connections are disabled. Set NatPunchEnabled=true to enable them.");
+        }
 
         let p2p_broker = p2p::P2pBroker::default();
         let mut avatar_sync = AvatarSyncSystem::new(
@@ -4179,12 +4182,13 @@ async fn handle_message(
         }
         channels::P2P => {
             let peers = state.authenticated_peers.clone();
-            let direct_connect_allowed = !state.global_state.read().direct_connect_locked
-                || peer_has_permission(
-                    state,
-                    peer,
-                    basis_server_permissions::nodes::MODERATION_GLOBAL_LOCK,
-                );
+            let direct_connect_allowed = state.config.read().nat_punch_enabled
+                && (!state.global_state.read().direct_connect_locked
+                    || peer_has_permission(
+                        state,
+                        peer,
+                        basis_server_permissions::nodes::MODERATION_GLOBAL_LOCK,
+                    ));
             state
                 .p2p_broker
                 .handle_signal(
