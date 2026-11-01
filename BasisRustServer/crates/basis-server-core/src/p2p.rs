@@ -119,14 +119,21 @@ impl P2pBroker {
             warn!("[P2P] NAT request before session ready {}", preview(&token));
             return;
         }
-        if session.endpoint_a_internal.is_none() {
+        // The Unity client retries introductions on a timer. Identify participants by
+        // their observed UDP endpoint so a retry cannot fill the other participant's slot.
+        if session.endpoint_a_external == Some(remote_addr) {
+            session.endpoint_a_internal = Some(local_addr);
+        } else if session.endpoint_b_external == Some(remote_addr) {
+            session.endpoint_b_internal = Some(local_addr);
+        } else if session.endpoint_a_external.is_none() {
             session.endpoint_a_internal = Some(local_addr);
             session.endpoint_a_external = Some(remote_addr);
-            return;
-        }
-        if session.endpoint_b_internal.is_none() {
+        } else if session.endpoint_b_external.is_none() {
             session.endpoint_b_internal = Some(local_addr);
             session.endpoint_b_external = Some(remote_addr);
+        } else {
+            // Both participants are known. A third endpoint must not replace either.
+            return;
         }
         let Some(a_internal) = session.endpoint_a_internal else {
             return;
@@ -140,6 +147,7 @@ impl P2pBroker {
         let Some(b_external) = session.endpoint_b_external else {
             return;
         };
+        let first_introduction = session.state != SessionState::Punched;
         session.state = SessionState::Punched;
         drop(session);
 
@@ -153,9 +161,13 @@ impl P2pBroker {
         } else {
             (a_internal, b_internal)
         };
-        // Match current LiteNetLib defaults: spray 32 predicted ports for different-NAT peers,
-        // but skip the spray when both peers already share the same external address.
-        let prediction_count = if same_nat { 0 } else { 32 };
+        // Spray predicted ports only on the first introduction for different-NAT peers.
+        // Retries re-send the known endpoints without repeating the expensive spray.
+        let prediction_count = if same_nat || !first_introduction {
+            0
+        } else {
+            32
+        };
         if let Err(err) = transport
             .send_nat_introduce(
                 a_internal,
@@ -467,4 +479,107 @@ pub fn pack_pair(a: PeerId, b: PeerId) -> u64 {
 
 fn preview(token: &str) -> &str {
     token.get(..8).unwrap_or(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::{net::UdpSocket, time::timeout};
+
+    #[tokio::test]
+    async fn introduction_retries_require_two_distinct_endpoints_and_can_resend() {
+        let (transport, _events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = a.local_addr().unwrap();
+        let b_addr = b.local_addr().unwrap();
+        let broker = P2pBroker::default();
+        let token = "retry-test";
+        broker.sessions.insert(
+            token.into(),
+            P2pSession {
+                initiator_peer_id: 0,
+                target_peer_id: 1,
+                state: SessionState::ReadyForPunch,
+                endpoint_a_internal: None,
+                endpoint_a_external: None,
+                endpoint_b_internal: None,
+                endpoint_b_external: None,
+                initiator_link_up: false,
+                target_link_up: false,
+            },
+        );
+        for _ in 0..2 {
+            broker
+                .handle_nat_introduction_request(&transport, a_addr, a_addr, token.into())
+                .await;
+        }
+        {
+            let session = broker.sessions.get(token).unwrap();
+            assert_eq!(session.state, SessionState::ReadyForPunch);
+            assert_eq!(session.endpoint_a_external, Some(a_addr));
+            assert_eq!(session.endpoint_b_external, None);
+        }
+        let mut packet = [0; 512];
+        assert!(timeout(Duration::from_millis(40), a.recv_from(&mut packet))
+            .await
+            .is_err());
+
+        broker
+            .handle_nat_introduction_request(&transport, b_addr, b_addr, token.into())
+            .await;
+        // Each participant must receive the other participant's endpoint, never itself.
+        let first_a = receive_introduction(&a, b_addr, token).await;
+        let first_b = receive_introduction(&b, a_addr, token).await;
+        assert_eq!(
+            broker.sessions.get(token).unwrap().state,
+            SessionState::Punched
+        );
+
+        // A retry still re-sends the correct introduction to recover a lost UDP response.
+        broker
+            .handle_nat_introduction_request(&transport, a_addr, a_addr, token.into())
+            .await;
+        assert_eq!(receive_introduction(&a, b_addr, token).await, first_a);
+        assert_eq!(receive_introduction(&b, a_addr, token).await, first_b);
+
+        broker
+            .handle_nat_introduction_request(
+                &transport,
+                other.local_addr().unwrap(),
+                other.local_addr().unwrap(),
+                token.into(),
+            )
+            .await;
+        assert!(timeout(Duration::from_millis(40), a.recv_from(&mut packet))
+            .await
+            .is_err());
+        assert_eq!(
+            broker.sessions.get(token).unwrap().endpoint_b_external,
+            Some(b_addr)
+        );
+        transport.shutdown();
+    }
+
+    async fn receive_introduction(socket: &UdpSocket, other: SocketAddr, token: &str) -> Vec<u8> {
+        let mut packet = [0; 512];
+        let (len, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut packet))
+            .await
+            .expect("NAT introduction not sent")
+            .unwrap();
+        assert_eq!(packet[0], basis_transport::PacketProperty::NatMessage as u8);
+        let mut reader = NetReader::new(&packet[9..len]);
+        for _ in 0..2 {
+            assert_eq!(reader.get_u8().unwrap(), 0); // IPv4
+            assert_eq!(reader.get_bytes(4).unwrap(), [127, 0, 0, 1]);
+            assert_eq!(reader.get_u16().unwrap(), other.port());
+        }
+        assert_eq!(reader.get_string().unwrap(), token);
+        assert_eq!(reader.get_u8().unwrap(), 0); // same NAT: no predicted-port spray
+        packet[..len].to_vec()
+    }
 }
