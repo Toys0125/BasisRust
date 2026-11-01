@@ -147,7 +147,6 @@ impl P2pBroker {
         let Some(b_external) = session.endpoint_b_external else {
             return;
         };
-        let first_introduction = session.state != SessionState::Punched;
         session.state = SessionState::Punched;
         drop(session);
 
@@ -161,13 +160,9 @@ impl P2pBroker {
         } else {
             (a_internal, b_internal)
         };
-        // Spray predicted ports only on the first introduction for different-NAT peers.
-        // Retries re-send the known endpoints without repeating the expensive spray.
-        let prediction_count = if same_nat || !first_introduction {
-            0
-        } else {
-            32
-        };
+        // Introductions are unacknowledged UDP: retries need the full prediction window
+        // too, because either peer may have missed the previous response.
+        let prediction_count = if same_nat { 0 } else { 32 };
         if let Err(err) = transport
             .send_nat_introduce(
                 a_internal,
@@ -497,22 +492,8 @@ mod tests {
         let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let a_addr = a.local_addr().unwrap();
         let b_addr = b.local_addr().unwrap();
-        let broker = P2pBroker::default();
         let token = "retry-test";
-        broker.sessions.insert(
-            token.into(),
-            P2pSession {
-                initiator_peer_id: 0,
-                target_peer_id: 1,
-                state: SessionState::ReadyForPunch,
-                endpoint_a_internal: None,
-                endpoint_a_external: None,
-                endpoint_b_internal: None,
-                endpoint_b_external: None,
-                initiator_link_up: false,
-                target_link_up: false,
-            },
-        );
+        let broker = ready_broker(token);
         for _ in 0..2 {
             broker
                 .handle_nat_introduction_request(&transport, a_addr, a_addr, token.into())
@@ -533,8 +514,8 @@ mod tests {
             .handle_nat_introduction_request(&transport, b_addr, b_addr, token.into())
             .await;
         // Each participant must receive the other participant's endpoint, never itself.
-        let first_a = receive_introduction(&a, b_addr, token).await;
-        let first_b = receive_introduction(&b, a_addr, token).await;
+        let first_a = receive_introduction(&a, b_addr, token, 0).await;
+        let first_b = receive_introduction(&b, a_addr, token, 0).await;
         assert_eq!(
             broker.sessions.get(token).unwrap().state,
             SessionState::Punched
@@ -544,8 +525,8 @@ mod tests {
         broker
             .handle_nat_introduction_request(&transport, a_addr, a_addr, token.into())
             .await;
-        assert_eq!(receive_introduction(&a, b_addr, token).await, first_a);
-        assert_eq!(receive_introduction(&b, a_addr, token).await, first_b);
+        assert_eq!(receive_introduction(&a, b_addr, token, 0).await, first_a);
+        assert_eq!(receive_introduction(&b, a_addr, token, 0).await, first_b);
 
         broker
             .handle_nat_introduction_request(
@@ -565,7 +546,68 @@ mod tests {
         transport.shutdown();
     }
 
-    async fn receive_introduction(socket: &UdpSocket, other: SocketAddr, token: &str) -> Vec<u8> {
+    #[tokio::test]
+    async fn introduction_retry_preserves_port_prediction_after_unconfirmed_response() {
+        let (transport, _events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Receive on both loopback IPs while presenting a distinct observed IP to the broker.
+        let b = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let a_addr = a.local_addr().unwrap();
+        let b_addr = SocketAddr::from(([127, 0, 0, 2], b.local_addr().unwrap().port()));
+        let token = "prediction-retry-test";
+        let broker = ready_broker(token);
+        broker
+            .handle_nat_introduction_request(&transport, a_addr, a_addr, token.into())
+            .await;
+        broker
+            .handle_nat_introduction_request(&transport, b_addr, b_addr, token.into())
+            .await;
+        // Discard the first unacknowledged responses, as if lost before either client used them.
+        receive_introduction(&a, b_addr, token, 32).await;
+        receive_introduction(&b, a_addr, token, 32).await;
+        assert_eq!(
+            broker.sessions.get(token).unwrap().state,
+            SessionState::Punched
+        );
+
+        // Either participant's retry must restore the full prediction window for both peers.
+        for address in [a_addr, b_addr] {
+            broker
+                .handle_nat_introduction_request(&transport, address, address, token.into())
+                .await;
+            receive_introduction(&a, b_addr, token, 32).await;
+            receive_introduction(&b, a_addr, token, 32).await;
+        }
+        transport.shutdown();
+    }
+
+    fn ready_broker(token: &str) -> P2pBroker {
+        let broker = P2pBroker::default();
+        broker.sessions.insert(
+            token.into(),
+            P2pSession {
+                initiator_peer_id: 0,
+                target_peer_id: 1,
+                state: SessionState::ReadyForPunch,
+                endpoint_a_internal: None,
+                endpoint_a_external: None,
+                endpoint_b_internal: None,
+                endpoint_b_external: None,
+                initiator_link_up: false,
+                target_link_up: false,
+            },
+        );
+        broker
+    }
+
+    async fn receive_introduction(
+        socket: &UdpSocket,
+        other: SocketAddr,
+        token: &str,
+        prediction_count: u8,
+    ) -> Vec<u8> {
         let mut packet = [0; 512];
         let (len, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut packet))
             .await
@@ -575,11 +617,14 @@ mod tests {
         let mut reader = NetReader::new(&packet[9..len]);
         for _ in 0..2 {
             assert_eq!(reader.get_u8().unwrap(), 0); // IPv4
-            assert_eq!(reader.get_bytes(4).unwrap(), [127, 0, 0, 1]);
+            let std::net::IpAddr::V4(other_ip) = other.ip() else {
+                panic!("expected IPv4 test endpoint");
+            };
+            assert_eq!(reader.get_bytes(4).unwrap(), other_ip.octets());
             assert_eq!(reader.get_u16().unwrap(), other.port());
         }
         assert_eq!(reader.get_string().unwrap(), token);
-        assert_eq!(reader.get_u8().unwrap(), 0); // same NAT: no predicted-port spray
+        assert_eq!(reader.get_u8().unwrap(), prediction_count);
         packet[..len].to_vec()
     }
 }
