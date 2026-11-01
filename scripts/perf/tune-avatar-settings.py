@@ -105,7 +105,7 @@ def validate(args):
     if b'BASIS_AVATAR_FLUSH_LANES' not in args.server.read_bytes():
         raise ValueError('Server lacks the flush-lane capability marker; build PR27 or later (this check is not binary attestation)')
     server, client = xml_values(args.server_config), xml_values(args.client_config)
-    required = {'ConfigVersion': '14', 'HealthIncludeExtendedMetrics': 'true', 'HealthIncludeBSRProfiling': 'false',
+    required = {'ConfigVersion': '17', 'HealthIncludeExtendedMetrics': 'true', 'HealthIncludeBSRProfiling': 'false',
                 'EnableBSRProfiling': 'false', 'EnableConsole': 'false', 'HealthPath': '/health',
                 'SimulatePacketLoss': 'false', 'SimulateLatency': 'false', 'ReuseAddresss': 'false',
                 'Ipv6Enabled': 'true', 'OverrideAutoDiscoveryOfIpv': 'false', 'IPv6Address': '::1',

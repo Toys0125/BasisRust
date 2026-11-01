@@ -834,6 +834,35 @@ impl ServerConfig {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn benchmark_fixtures_load_without_rewriting_frozen_config() {
+        let fixtures = [
+            include_str!("../../../../docs/performance/fixtures/avatar-cpu-only-server.xml"),
+            include_str!("../../../../docs/performance/fixtures/avatar-1500-server.xml"),
+        ];
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("basis-benchmark-config-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.xml");
+        for fixture in fixtures {
+            std::fs::write(&path, fixture).unwrap();
+            let config = super::ServerConfig::load_or_create(&path).unwrap();
+            assert_eq!(
+                config.config_version,
+                super::ServerConfig::CURRENT_CONFIG_VERSION
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                fixture,
+                "startup must preserve the benchmark's byte-for-byte config provenance"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn storage_initialization_fields_reject_live_edits_without_mutating_config() {
         let mut config = super::ServerConfig::default();
         let before = serde_json::to_value(&config).unwrap();

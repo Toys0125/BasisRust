@@ -36,6 +36,24 @@ def measured_runs():
 
 
 class ValidationTests(unittest.TestCase):
+    def test_server_fixture_version_matches_startup_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            server, client = root / 'server', root / 'client'
+            server.write_bytes(b'BASIS_AVATAR_FLUSH_LANES')
+            client.touch()
+            config = root / 'config.xml'
+            fixture = (CLI.FIXTURES / 'avatar-cpu-only-server.xml').read_text()
+            args = CLI.parser().parse_args(['--output', str(root / 'output'),
+                                           '--server', str(server), '--client', str(client),
+                                           '--server-config', str(config)])
+            config.write_text(fixture)
+            CLI.validate(args)
+            config.write_text(fixture.replace('<ConfigVersion>17</ConfigVersion>',
+                                              '<ConfigVersion>14</ConfigVersion>'))
+            with self.assertRaisesRegex(ValueError, 'ConfigVersion=17'):
+                CLI.validate(args)
+
     def test_lane_settings_distinct_and_bounded(self):
         self.assertEqual(CLI.lane_values('0,6,8'), [0, 6, 8])
         for text in ('-1,6', '0,9', '0,6,6', '6', '0, 6', '0,6,', '0,6.0'):

@@ -1,5 +1,5 @@
 <Configuration>
-  <ConfigVersion>14</ConfigVersion>
+  <ConfigVersion>17</ConfigVersion>
   <PeerLimit>65535</PeerLimit>
   <NetworkStackId />
   <SetPort>4296</SetPort>
