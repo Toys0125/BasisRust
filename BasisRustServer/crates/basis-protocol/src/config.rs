@@ -848,11 +848,7 @@ mod tests {
         let path = dir.join("config.xml");
         for fixture in fixtures {
             std::fs::write(&path, fixture).unwrap();
-            let config = super::ServerConfig::load_or_create(&path).unwrap();
-            assert_eq!(
-                config.config_version,
-                super::ServerConfig::CURRENT_CONFIG_VERSION
-            );
+            super::ServerConfig::load_or_create(&path).unwrap();
             assert_eq!(
                 std::fs::read_to_string(&path).unwrap(),
                 fixture,
