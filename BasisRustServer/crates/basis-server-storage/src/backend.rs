@@ -130,18 +130,33 @@ impl StorageBackendRegistry {
                     .config
                     .has_file_support
                     .then(|| ctx.base_dir.join("storage").join("players.sqlite3"));
-                let remote_url = std::env::var("BASIS_STORAGE_URL")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| ctx.config.storage_connection_string.clone());
-                let (backend, selected) = SqlPlayerStorage::connect(
+                let remote_url = match std::env::var("BASIS_STORAGE_URL") {
+                    Ok(value) if !value.trim().is_empty() => value,
+                    Ok(_) | Err(std::env::VarError::NotPresent) => {
+                        ctx.config.storage_connection_string.clone()
+                    }
+                    Err(error) => return Err(error).context("reading BASIS_STORAGE_URL"),
+                };
+                let allow_fallback = match std::env::var("BASIS_STORAGE_ALLOW_SQLITE_FALLBACK") {
+                    Ok(value) if value.eq_ignore_ascii_case("true") => true,
+                    Ok(value) if value.eq_ignore_ascii_case("false") => false,
+                    Ok(_) => {
+                        bail!("BASIS_STORAGE_ALLOW_SQLITE_FALLBACK must be 'true' or 'false'")
+                    }
+                    Err(std::env::VarError::NotPresent) => false,
+                    Err(error) => {
+                        return Err(error).context("reading BASIS_STORAGE_ALLOW_SQLITE_FALLBACK")
+                    }
+                };
+                let (backend, selected) = SqlPlayerStorage::connect_with_fallback(
                     &remote_url,
                     sqlite_path.as_deref(),
                     &ctx.config.storage_sql_table,
+                    allow_fallback,
                 )
                 .await?;
-                if selected == SqlBackend::Sqlite && !remote_url.is_empty() {
-                    tracing::warn!("Remote SQL unavailable at startup: using local SQLite fallback instead (data is separate)");
+                if selected == SqlBackend::Sqlite && !remote_url.trim().is_empty() {
+                    tracing::warn!("Remote SQL unavailable at startup: operator opted into local SQLite fallback (data is separate)");
                 }
                 tracing::info!("Cilbox SQL storage selected backend: {selected:?}");
                 let migration = backend.legacy_import_report();
@@ -257,6 +272,21 @@ pub fn unavailable(request: &StorageRequest, per_player_limit: usize) -> Storage
 mod tests {
     use super::*;
     use basis_protocol::storage::{StorageOp, StorageStatus};
+
+    #[cfg(feature = "sql-storage")]
+    static SQL_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[cfg(feature = "sql-storage")]
+    fn set_sql_test_env(remote: Option<&str>, fallback: Option<&str>) {
+        match remote {
+            Some(value) => std::env::set_var("BASIS_STORAGE_URL", value),
+            None => std::env::remove_var("BASIS_STORAGE_URL"),
+        }
+        match fallback {
+            Some(value) => std::env::set_var("BASIS_STORAGE_ALLOW_SQLITE_FALLBACK", value),
+            None => std::env::remove_var("BASIS_STORAGE_ALLOW_SQLITE_FALLBACK"),
+        }
+    }
 
     fn request(op: StorageOp, value: &[u8]) -> StorageRequest {
         StorageRequest {
@@ -417,6 +447,8 @@ mod tests {
     #[cfg(feature = "sql-storage")]
     #[tokio::test]
     async fn sql_factory_uses_the_same_interface() {
+        let _guard = SQL_ENV_LOCK.lock().await;
+        set_sql_test_env(None, None);
         let dir = tempfile::tempdir().unwrap();
         let registry = StorageBackendRegistry::default();
         let mut ctx = context(dir.path());
@@ -454,5 +486,89 @@ mod tests {
                 .status,
             StorageStatus::NotFound
         );
+    }
+
+    #[cfg(feature = "sql-storage")]
+    #[tokio::test]
+    async fn remote_sql_failure_is_denied_without_fallback_opt_in() {
+        let _guard = SQL_ENV_LOCK.lock().await;
+        set_sql_test_env(Some("postgres://127.0.0.1:1/unavailable"), None);
+        let dir = tempfile::tempdir().unwrap();
+        let result = StorageBackendRegistry::default()
+            .create("sql", context(dir.path()))
+            .await;
+        assert!(result.is_err());
+        let err = format!("{:#}", result.err().unwrap());
+        assert!(err.contains("connecting to configured PostgreSQL"), "{err}");
+        set_sql_test_env(None, None);
+    }
+
+    #[cfg(feature = "sql-storage")]
+    #[tokio::test]
+    async fn explicit_remote_sql_fallback_uses_sqlite_and_sql_accounting() {
+        let _guard = SQL_ENV_LOCK.lock().await;
+        set_sql_test_env(Some("postgres://127.0.0.1:1/unavailable"), Some("true"));
+        let dir = tempfile::tempdir().unwrap();
+        let store = StorageBackendRegistry::default()
+            .create("sql", context(dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .execute("alice", request(StorageOp::Set, b"opted-in"), 1024, 4096)
+                .await
+                .status,
+            StorageStatus::Ok
+        );
+        assert!(matches!(
+            store.admin(StorageAdminAction::Statistics).await.unwrap(),
+            StorageAdminReply::Statistics {
+                backend: "sqlite",
+                records: 1,
+                bytes
+            } if bytes > 0
+        ));
+        set_sql_test_env(None, None);
+    }
+
+    #[cfg(feature = "sql-storage")]
+    #[tokio::test]
+    async fn invalid_sql_fallback_opt_in_is_rejected() {
+        let _guard = SQL_ENV_LOCK.lock().await;
+        set_sql_test_env(Some("postgres://127.0.0.1:1/unavailable"), Some("yes"));
+        let dir = tempfile::tempdir().unwrap();
+        let result = StorageBackendRegistry::default()
+            .create("sql", context(dir.path()))
+            .await;
+        assert!(result.is_err());
+        assert!(format!("{:#}", result.err().unwrap()).contains("must be 'true' or 'false'"));
+        set_sql_test_env(None, None);
+    }
+
+    #[cfg(feature = "sql-storage")]
+    #[tokio::test]
+    async fn successful_remote_sql_selection_is_preserved() {
+        let _guard = SQL_ENV_LOCK.lock().await;
+        set_sql_test_env(None, None);
+        let url = std::env::var("BASIS_TEST_POSTGRES_URL");
+        let Ok(url) = url else {
+            // The default successful SQL operation test covers local-only mode;
+            // CI can supply this value for remote selection coverage.
+            return;
+        };
+        set_sql_test_env(Some(&url), Some("false"));
+        let dir = tempfile::tempdir().unwrap();
+        let store = StorageBackendRegistry::default()
+            .create("sql", context(dir.path()))
+            .await
+            .expect("configured remote PostgreSQL should initialize");
+        assert!(matches!(
+            store.admin(StorageAdminAction::Statistics).await.unwrap(),
+            StorageAdminReply::Statistics {
+                backend: "postgresql",
+                ..
+            }
+        ));
+        set_sql_test_env(None, None);
     }
 }
