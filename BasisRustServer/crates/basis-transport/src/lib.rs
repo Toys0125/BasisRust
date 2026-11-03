@@ -11107,12 +11107,31 @@ mod tests {
             .await
             .unwrap();
 
-        let ack = build_ack_packet(0, 0, 0, &[0; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2]);
+        let pending = build_outbound_packet(
+            &peer_state,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"compact-ack-regression",
+        );
+        let (pending_channel, pending_sequence) = pending.reliable_key.unwrap();
+        record_pending_reliable(
+            &peer_state,
+            pending_channel,
+            pending_sequence,
+            pending.bytes,
+            None,
+        );
+        assert_eq!(peer_state.total_pending(), 1);
+        let mut ack_bits = vec![0; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
+        let bit = pending_sequence as usize % DEFAULT_WINDOW_SIZE;
+        ack_bits[bit / 8] |= 1 << (bit % 8);
+        let ack = build_ack_packet(0, pending_channel, pending_sequence, &ack_bits);
         let mut compact_raw_ack = vec![PacketProperty::CompactMerged as u8, 0x40, ack.len() as u8];
         compact_raw_ack.extend_from_slice(&ack);
         process_compact_merged_packet(&handle, &tx, remote_addr, 0, &compact_raw_ack, &peer_state)
             .await
             .unwrap();
+        assert_eq!(peer_state.total_pending(), 0);
 
         for expected in [0x51, 0x53, 0x52] {
             match rx.recv().await.unwrap() {
