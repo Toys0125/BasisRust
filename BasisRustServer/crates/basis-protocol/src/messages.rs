@@ -3,9 +3,9 @@ use crate::{
     io::{NetReader, NetWriter, Result as ReadResult, WriteResult},
     permissions,
 };
-use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
+use flate2::{write::DeflateEncoder, Compression, Decompress, FlushDecompress, Status};
 use serde_json::{Map, Number, Value};
-use std::io::{Read, Write};
+use std::io::Write;
 use uuid::Uuid;
 
 pub trait BasisSerialize {
@@ -634,18 +634,56 @@ fn compress_permission_extras(extras: &[String]) -> Vec<u8> {
     out
 }
 
+fn decompress_deflate_bounded(data: &[u8], max_bytes: usize) -> Option<Vec<u8>> {
+    let mut decoder = Decompress::new(false);
+    let mut output = Vec::with_capacity(max_bytes.saturating_add(1));
+    let mut chunk = [0u8; 8192];
+
+    loop {
+        let input_offset = usize::try_from(decoder.total_in()).ok()?;
+        let output_len =
+            (max_bytes.saturating_add(1).saturating_sub(output.len())).min(chunk.len());
+        if output_len == 0 {
+            return None;
+        }
+        let before_in = decoder.total_in();
+        let before_out = decoder.total_out();
+        let status = decoder
+            .decompress(
+                &data[input_offset..],
+                &mut chunk[..output_len],
+                if input_offset < data.len() {
+                    FlushDecompress::None
+                } else {
+                    FlushDecompress::Finish
+                },
+            )
+            .ok()?;
+        let consumed = usize::try_from(decoder.total_in() - before_in).ok()?;
+        let produced = usize::try_from(decoder.total_out() - before_out).ok()?;
+        output.extend_from_slice(&chunk[..produced]);
+
+        if output.len() > max_bytes {
+            return None;
+        }
+        if status == Status::StreamEnd {
+            return Some(output);
+        }
+        if consumed == 0 && produced == 0 {
+            return None;
+        }
+    }
+}
+
 pub fn decompress_permission_extras(data: &[u8], expected_count: usize) -> Vec<String> {
     const MAX_DECOMPRESSED_BYTES: usize = 1024 * 1024;
     if data.is_empty() || expected_count == 0 {
         return Vec::new();
     }
     let raw = if data[0] == 1 {
-        let mut decoder = DeflateDecoder::new(&data[1..]);
-        let mut output = Vec::new();
-        let mut limited = decoder.by_ref().take((MAX_DECOMPRESSED_BYTES + 1) as u64);
-        if limited.read_to_end(&mut output).is_err() || output.len() > MAX_DECOMPRESSED_BYTES {
+        let Some(output) = decompress_deflate_bounded(&data[1..], MAX_DECOMPRESSED_BYTES) else {
             return Vec::new();
-        }
+        };
         output
     } else {
         if data.len().saturating_sub(1) > MAX_DECOMPRESSED_BYTES {
@@ -653,10 +691,14 @@ pub fn decompress_permission_extras(data: &[u8], expected_count: usize) -> Vec<S
         }
         data[1..].to_vec()
     };
-    String::from_utf8_lossy(&raw)
+    let extras: Vec<String> = String::from_utf8_lossy(&raw)
         .split('\0')
         .map(str::to_string)
-        .collect()
+        .collect();
+    if extras.len() != expected_count {
+        return Vec::new();
+    }
+    extras
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -878,16 +920,19 @@ impl BasisDeserialize for ServerReadyBatchMessage {
         }
         let framed = reader.get_bytes(len as usize)?;
         let payload = if compressed {
-            let mut decoder = DeflateDecoder::new(framed);
-            let mut out = Vec::new();
-            decoder
-                .read_to_end(&mut out)
-                .map_err(|_| crate::io::NetReadError::Underflow {
+            decompress_deflate_bounded(framed, Self::MAX_PAYLOAD_BYTES).ok_or(
+                crate::io::NetReadError::Underflow {
                     needed: 1,
                     remaining: 0,
-                })?;
-            out
+                },
+            )?
         } else {
+            if framed.len() > Self::MAX_PAYLOAD_BYTES {
+                return Err(crate::io::NetReadError::Underflow {
+                    needed: 1,
+                    remaining: 0,
+                });
+            }
             framed.to_vec()
         };
         Ok(Self { count, payload })
@@ -2776,6 +2821,111 @@ mod tests {
         let decoded = ServerReadyBatchMessage::deserialize(&mut reader).unwrap();
         assert_eq!(decoded.count, 3);
         assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn server_ready_batch_accepts_payload_at_decompression_limit() {
+        let payload = vec![0x41; ServerReadyBatchMessage::MAX_PAYLOAD_BYTES];
+        let message = ServerReadyBatchMessage { count: 1, payload };
+        let mut writer = NetWriter::new();
+        message.serialize(&mut writer).unwrap();
+
+        let mut reader = NetReader::new(writer.as_slice());
+        assert_eq!(
+            ServerReadyBatchMessage::deserialize(&mut reader).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn server_ready_batch_rejects_compressed_payload_above_limit() {
+        let payload = vec![0x41; ServerReadyBatchMessage::MAX_PAYLOAD_BYTES + 1];
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut writer = NetWriter::new();
+        writer.put_u16(1);
+        writer.put_bool(true);
+        writer.put_i32(compressed.len() as i32);
+        writer.put_bytes(&compressed);
+        let mut reader = NetReader::new(writer.as_slice());
+        assert!(ServerReadyBatchMessage::deserialize(&mut reader).is_err());
+    }
+
+    #[test]
+    fn server_ready_batch_rejects_oversized_uncompressed_payload() {
+        let payload = vec![0x41; ServerReadyBatchMessage::MAX_PAYLOAD_BYTES + 1];
+        let mut writer = NetWriter::new();
+        writer.put_u16(1);
+        writer.put_bool(false);
+        writer.put_i32(payload.len() as i32);
+        writer.put_bytes(&payload);
+        let mut reader = NetReader::new(writer.as_slice());
+        assert!(ServerReadyBatchMessage::deserialize(&mut reader).is_err());
+    }
+
+    #[test]
+    fn server_ready_batch_rejects_truncated_deflate_stream() {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(b"truncated payload").unwrap();
+        let mut compressed = encoder.finish().unwrap();
+        compressed.pop();
+        let mut writer = NetWriter::new();
+        writer.put_u16(1);
+        writer.put_bool(true);
+        writer.put_i32(compressed.len() as i32);
+        writer.put_bytes(&compressed);
+        let mut reader = NetReader::new(writer.as_slice());
+        assert!(ServerReadyBatchMessage::deserialize(&mut reader).is_err());
+    }
+
+    #[test]
+    fn server_ready_batch_rejects_corrupt_deflate_stream() {
+        let mut writer = NetWriter::new();
+        writer.put_u16(1);
+        writer.put_bool(true);
+        writer.put_i32(4);
+        writer.put_bytes(&[0xff, 0xff, 0xff, 0xff]);
+        let mut reader = NetReader::new(writer.as_slice());
+        assert!(ServerReadyBatchMessage::deserialize(&mut reader).is_err());
+    }
+
+    #[test]
+    fn permission_extras_round_trip_and_enforce_count_and_size() {
+        let extras = vec![
+            "custom.permission.a".to_owned(),
+            "custom.permission.b".to_owned(),
+        ];
+        let encoded = compress_permission_extras(&extras);
+        assert_eq!(decompress_permission_extras(&encoded, extras.len()), extras);
+        assert!(decompress_permission_extras(&encoded, 1).is_empty());
+
+        let boundary = vec![b'x'; 1024 * 1024];
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&boundary).unwrap();
+        let mut encoded_boundary = vec![1];
+        encoded_boundary.extend_from_slice(&encoder.finish().unwrap());
+        assert_eq!(
+            decompress_permission_extras(&encoded_boundary, 1)[0].len(),
+            boundary.len()
+        );
+
+        let bomb = vec![b'x'; 1024 * 1024 + 1];
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&bomb).unwrap();
+        let mut encoded_bomb = vec![1];
+        encoded_bomb.extend_from_slice(&encoder.finish().unwrap());
+        assert!(decompress_permission_extras(&encoded_bomb, 1).is_empty());
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(b"truncated").unwrap();
+        let mut compressed = encoder.finish().unwrap();
+        compressed.pop();
+        let mut truncated = vec![1];
+        truncated.extend_from_slice(&compressed);
+        assert!(decompress_permission_extras(&truncated, 1).is_empty());
+        assert!(decompress_permission_extras(&[1, 0xff, 0xff, 0xff, 0xff], 1).is_empty());
     }
 
     #[test]
