@@ -544,6 +544,7 @@ fn preview(token: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use basis_transport::{PacketProperty, PeerSession, ServerEvent};
     use std::time::Duration;
     use tokio::{net::UdpSocket, time::timeout};
 
@@ -782,6 +783,146 @@ mod tests {
             .get(&2)
             .is_some_and(|s| s.contains("token")));
         transport.shutdown();
+    }
+
+    #[tokio::test]
+    async fn destructive_signals_reach_only_the_registered_counterpart() {
+        for sub in [
+            channels::P2P_SUB_CANCEL,
+            channels::P2P_SUB_DECLINE,
+            channels::P2P_SUB_LINK_LOST,
+        ] {
+            for reverse in [false, true] {
+                let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+                    .await
+                    .unwrap();
+                transport.set_compact_merge_send(false);
+                let (a_socket, a) = connected_signal_peer(&transport, &mut events).await;
+                let (b_socket, b) = connected_signal_peer(&transport, &mut events).await;
+                let (_outsider_socket, outsider) =
+                    connected_signal_peer(&transport, &mut events).await;
+                let broker = P2pBroker::default();
+                broker.claim_session("routing", session(a.peer_id(), b.peer_id()));
+                broker.track_peer_session(a.peer_id(), "routing");
+                broker.track_peer_session(b.peer_id(), "routing");
+                for (sender, other) in [
+                    (outsider.peer_id(), b.peer_id()),
+                    (a.peer_id(), outsider.peer_id()),
+                    (b.peer_id(), outsider.peer_id()),
+                ] {
+                    broker
+                        .handle_signal(
+                            &transport,
+                            sender,
+                            &encode_signal(sub, other, "routing"),
+                            true,
+                            |_| true,
+                        )
+                        .await;
+                    for peer in [&a, &b, &outsider] {
+                        assert_no_signal_queued(&transport, peer).await;
+                    }
+                }
+                let (sender, recipient, socket) = if reverse {
+                    (&b, &a, &a_socket)
+                } else {
+                    (&a, &b, &b_socket)
+                };
+                broker
+                    .handle_signal(
+                        &transport,
+                        sender.peer_id(),
+                        &encode_signal(sub, recipient.peer_id(), "routing"),
+                        true,
+                        |_| true,
+                    )
+                    .await;
+                let received = receive_signal(socket).await;
+                assert_eq!(received, encode_signal(sub, sender.peer_id(), "routing"));
+                // Receivers deliberately send no ACKs. Any wrongly forwarded
+                // signal remains queued or pending and cannot become idle.
+                assert!(!transport.reliable_idle(recipient));
+                assert_no_signal_queued(&transport, sender).await;
+                assert_no_signal_queued(&transport, &outsider).await;
+                transport.shutdown();
+            }
+        }
+    }
+
+    async fn connected_signal_peer(
+        transport: &TransportHandle,
+        events: &mut tokio::sync::mpsc::Receiver<ServerEvent>,
+    ) -> (UdpSocket, PeerSession) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut request = NetWriter::new();
+        request.put_u8(PacketProperty::ConnectRequest as u8);
+        request.put_i32(basis_protocol::version::LITENETLIB_PROTOCOL_ID);
+        request.put_i64(123);
+        request.put_i32(0);
+        request.put_u8(16);
+        request.put_bytes(&[0; 16]);
+        socket
+            .send_to(request.as_slice(), transport.local_addr().unwrap())
+            .await
+            .unwrap();
+        let request = timeout(Duration::from_secs(2), async {
+            loop {
+                if let ServerEvent::ConnectionRequest(request) = events.recv().await.unwrap() {
+                    break request;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let peer = transport.accept_session(&request).await.unwrap();
+        let mut packet = [0; 1024];
+        timeout(Duration::from_secs(2), socket.recv_from(&mut packet))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            PacketProperty::from_byte(packet[0]),
+            Some(PacketProperty::ConnectAccept)
+        );
+        (socket, peer)
+    }
+
+    async fn assert_no_signal_queued(transport: &TransportHandle, peer: &PeerSession) {
+        timeout(Duration::from_secs(2), async {
+            // reliable_idle takes the send-turn lock, so dispatch cannot hide
+            // a packet while moving it between queued and pending state.
+            while !transport.reliable_idle(peer) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unexpected reliable signal queued for peer");
+    }
+
+    async fn receive_signal(socket: &UdpSocket) -> Vec<u8> {
+        timeout(Duration::from_secs(2), async {
+            let mut packet = [0; 2048];
+            loop {
+                let (len, _) = socket.recv_from(&mut packet).await.unwrap();
+                let mut frame = &packet[..len];
+                if PacketProperty::from_byte(frame[0]) == Some(PacketProperty::Merged) {
+                    let mut reader = NetReader::new(&frame[1..]);
+                    let size = reader.get_u16().unwrap() as usize;
+                    frame = reader.get_bytes(size).unwrap();
+                }
+                if frame.len() >= 4
+                    && PacketProperty::from_byte(frame[0]) == Some(PacketProperty::Channeled)
+                {
+                    assert_eq!(
+                        frame[3],
+                        DeliveryMethod::channel_id(channels::P2P, DeliveryMethod::ReliableOrdered)
+                    );
+                    return frame[4..].to_vec();
+                }
+            }
+        })
+        .await
+        .expect("registered counterpart did not receive its P2P signal")
     }
 
     fn session(initiator_peer_id: PeerId, target_peer_id: PeerId) -> P2pSession {
