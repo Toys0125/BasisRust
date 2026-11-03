@@ -652,11 +652,7 @@ fn decompress_deflate_bounded(data: &[u8], max_bytes: usize) -> Option<Vec<u8>> 
             .decompress(
                 &data[input_offset..],
                 &mut chunk[..output_len],
-                if input_offset < data.len() {
-                    FlushDecompress::None
-                } else {
-                    FlushDecompress::Finish
-                },
+                FlushDecompress::None,
             )
             .ok()?;
         let consumed = usize::try_from(decoder.total_in() - before_in).ok()?;
