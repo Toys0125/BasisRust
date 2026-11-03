@@ -816,6 +816,7 @@ async fn async_main(
     };
     let mut config = ServerConfig::load_or_create(&config_path)?;
     config.process_environment_overrides()?;
+    config.validate_auth()?;
     if args.no_console {
         config.enable_console = false;
     }

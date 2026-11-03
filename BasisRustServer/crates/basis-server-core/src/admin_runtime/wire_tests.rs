@@ -1083,6 +1083,9 @@ async fn password_rejection_creates_no_challenge_and_valid_identity_keeps_wire_f
     let did = client_did(&key);
     {
         let mut config = state.config.write();
+        // Keep the upstream compatibility credential explicit in this test;
+        // ServerConfig defaults no longer enable it implicitly.
+        config.password = "default_password".to_owned();
         config.use_auth = true;
         config.use_auth_identity = true;
     }
