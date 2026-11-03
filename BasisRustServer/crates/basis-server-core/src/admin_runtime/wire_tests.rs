@@ -418,7 +418,7 @@ async fn ownership_get_and_remove_use_authenticated_peer_identity() {
     let mut owner = Client::connect(&state, "ownership-owner").await;
     let mut attacker = Client::connect(&state, "ownership-attacker").await;
     let (owner_peer, _) = session_for_uuid(&state, "ownership-owner");
-    let (attacker_peer, _) = session_for_uuid(&state, "ownership-attacker");
+    let (attacker_peer, attacker_session) = session_for_uuid(&state, "ownership-attacker");
     state
         .ownership
         .switch_ownership("peer-owned-object", owner_peer);
@@ -489,14 +489,21 @@ async fn ownership_get_and_remove_use_authenticated_peer_identity() {
     }
     .serialize(&mut request)
     .unwrap();
-    attacker
-        .send(
-            channels::REMOVE_CURRENT_OWNER_REQUEST,
-            request.as_slice(),
-            true,
-        )
-        .await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Await the handler itself: socket-write completion or a fixed sleep
+    // cannot prove the spoofed REMOVE was processed before this assertion.
+    crate::handle_message(
+        &state,
+        attacker_peer,
+        Some(&attacker_session),
+        channels::REMOVE_CURRENT_OWNER_REQUEST,
+        DeliveryMethod::ReliableOrdered,
+        Bytes::copy_from_slice(request.as_slice()),
+        false,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
     assert!(state
         .ownership
         .all()
