@@ -336,6 +336,7 @@ mod tests {
     async fn ingress_charges_once_before_fanout_preserves_images_and_realtime_admission() {
         let config = ServerConfig {
             has_file_support: false,
+            use_auth: false,
             set_port: 0,
             override_auto_discovery_of_ipv: true,
             ipv4_address: "127.0.0.1".into(),
@@ -499,6 +500,7 @@ mod tests {
         use tokio::{net::UdpSocket, time::timeout};
         let config = ServerConfig {
             has_file_support: false,
+            use_auth: false,
             set_port: 0,
             override_auto_discovery_of_ipv: true,
             ipv4_address: "127.0.0.1".into(),
@@ -587,6 +589,7 @@ mod tests {
             PAYLOAD_BYTES.div_ceil(RELIABLE_FRAGMENT_PAYLOAD_SIZE) as u16;
         let config = ServerConfig {
             has_file_support: false,
+            use_auth: false,
             set_port: 0,
             override_auto_discovery_of_ipv: true,
             ipv4_address: "127.0.0.1".into(),

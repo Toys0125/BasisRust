@@ -91,6 +91,7 @@ impl Live {
             has_file_support: false,
             storage_max_bytes_per_player: 32_768,
             use_auth: true,
+            password: "default_password".into(),
             use_auth_identity: true,
             // Test the uncompressed upstream layout; extension codecs have their own vectors.
             enable_avatar_bundle_compression: false,

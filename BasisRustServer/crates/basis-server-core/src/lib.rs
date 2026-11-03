@@ -582,6 +582,7 @@ impl ServerState {
         config_path: &Path,
         registry: StorageBackendRegistry,
     ) -> Result<(Self, oneshot::Sender<()>)> {
+        config.validate_auth()?;
         // RejoinOnly's captured population is session-only; a restart unlocks it.
         if config.basis_user_restriction_mode == BasisUserRestrictionMode::RejoinOnly {
             config.basis_user_restriction_mode = BasisUserRestrictionMode::Normal;
@@ -2736,8 +2737,8 @@ async fn handle_connection_request(
 }
 
 fn password_matches(server_password: &str, auth_bytes: &[u8]) -> bool {
-    if server_password.is_empty() {
-        return true;
+    if server_password.trim().is_empty() {
+        return false;
     }
     if auth_bytes.is_empty() {
         return false;
@@ -7122,6 +7123,7 @@ mod tests {
             std::env::temp_dir().join(format!("basis-core-shutdown-{}.json", uuid::Uuid::new_v4()));
         let config = ServerConfig {
             has_file_support: false,
+            use_auth: false,
             set_port: 0,
             override_auto_discovery_of_ipv: true,
             ipv4_address: "127.0.0.1".into(),
@@ -7173,9 +7175,10 @@ mod tests {
     }
 
     #[test]
-    fn password_comparison_preserves_open_empty_utf8_and_mismatch_semantics() {
-        assert!(password_matches("", b""));
-        assert!(password_matches("", b"arbitrary"));
+    fn password_comparison_rejects_empty_and_preserves_utf8_and_mismatch_semantics() {
+        assert!(!password_matches("", b""));
+        assert!(!password_matches("", b"arbitrary"));
+        assert!(!password_matches(" \t", b" \t"));
         assert!(!password_matches("default_password", b""));
         assert!(password_matches("default_password", b"default_password"));
         for index in 0..16 {
@@ -7186,6 +7189,37 @@ mod tests {
         assert!(!password_matches("default_password", b"default_password\0"));
         assert!(password_matches("páss🔑", "páss🔑".as_bytes()));
         assert!(!password_matches("páss🔑", b"pass"));
+    }
+
+    #[tokio::test]
+    async fn shared_startup_rejects_empty_password_before_files_or_socket() {
+        let path =
+            std::env::temp_dir().join(format!("basis-invalid-auth-{}", uuid::Uuid::new_v4()));
+        // Occupying the port proves auth validation happens before socket bind.
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for password in ["", " \t"] {
+            let config = ServerConfig {
+                password: password.into(),
+                use_auth: true,
+                has_file_support: true,
+                set_port: socket.local_addr().unwrap().port(),
+                override_auto_discovery_of_ipv: true,
+                ipv4_address: "127.0.0.1".into(),
+                ..ServerConfig::default()
+            };
+            let error = ServerState::start(config, &path)
+                .await
+                .err()
+                .expect("invalid auth must fail");
+            assert!(
+                error.to_string().contains("authentication is enabled"),
+                "{error:#}"
+            );
+            assert!(
+                !path.exists(),
+                "invalid auth must not create configuration files"
+            );
+        }
     }
 
     #[test]
