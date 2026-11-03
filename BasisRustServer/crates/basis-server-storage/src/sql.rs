@@ -711,12 +711,25 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        let error = SqlPlayerStorage::connect(&url, None, &view)
+        let fallback_dir = tempfile::tempdir().unwrap();
+        let fallback_path = fallback_dir.path().join("must-not-be-created.sqlite3");
+        for allow_fallback in [false, true] {
+            let error = SqlPlayerStorage::connect_with_fallback(
+                &url,
+                Some(&fallback_path),
+                &view,
+                allow_fallback,
+            )
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("accounting initialization failed"));
+            assert!(error
+                .to_string()
+                .contains("accounting initialization failed"));
+            assert!(
+                !fallback_path.exists(),
+                "schema errors must never create SQLite, even with fallback enabled"
+            );
+        }
         sqlx::query(&format!("DROP VIEW {view}"))
             .execute(pool)
             .await

@@ -130,23 +130,19 @@ impl StorageBackendRegistry {
                     .config
                     .has_file_support
                     .then(|| ctx.base_dir.join("storage").join("players.sqlite3"));
-                let remote_url = match std::env::var("BASIS_STORAGE_URL") {
-                    Ok(value) if !value.trim().is_empty() => value,
-                    Ok(_) | Err(std::env::VarError::NotPresent) => {
+                let remote_url = match storage_env_value("BASIS_STORAGE_URL", std::env::var("BASIS_STORAGE_URL"))? {
+                    Some(value) if !value.trim().is_empty() => value,
+                    _ => {
                         ctx.config.storage_connection_string.clone()
                     }
-                    Err(error) => return Err(error).context("reading BASIS_STORAGE_URL"),
                 };
-                let allow_fallback = match std::env::var("BASIS_STORAGE_ALLOW_SQLITE_FALLBACK") {
-                    Ok(value) if value.eq_ignore_ascii_case("true") => true,
-                    Ok(value) if value.eq_ignore_ascii_case("false") => false,
-                    Ok(_) => {
+                let allow_fallback = match storage_env_value("BASIS_STORAGE_ALLOW_SQLITE_FALLBACK", std::env::var("BASIS_STORAGE_ALLOW_SQLITE_FALLBACK"))? {
+                    Some(value) if value.eq_ignore_ascii_case("true") => true,
+                    Some(value) if value.eq_ignore_ascii_case("false") => false,
+                    Some(_) => {
                         bail!("BASIS_STORAGE_ALLOW_SQLITE_FALLBACK must be 'true' or 'false'")
                     }
-                    Err(std::env::VarError::NotPresent) => false,
-                    Err(error) => {
-                        return Err(error).context("reading BASIS_STORAGE_ALLOW_SQLITE_FALLBACK")
-                    }
+                    None => false,
                 };
                 let (backend, selected) = SqlPlayerStorage::connect_with_fallback(
                     &remote_url,
@@ -255,6 +251,20 @@ impl PlayerStorageBackend for SqlPlayerStorage {
     }
 }
 
+#[cfg(feature = "sql-storage")]
+fn storage_env_value(
+    name: &str,
+    value: std::result::Result<String, std::env::VarError>,
+) -> Result<Option<String>> {
+    match value {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        // NotUnicode carries the original value, which can include credentials.
+        // Do not retain that error as a source in startup's printed error chain.
+        Err(std::env::VarError::NotUnicode(_)) => bail!("{name} must be valid Unicode"),
+    }
+}
+
 /// Standard backend-error response for an unavailable store.
 pub fn unavailable(request: &StorageRequest, per_player_limit: usize) -> StorageReply {
     StorageReply {
@@ -272,6 +282,22 @@ pub fn unavailable(request: &StorageRequest, per_player_limit: usize) -> Storage
 mod tests {
     use super::*;
     use basis_protocol::storage::{StorageOp, StorageStatus};
+
+    #[cfg(feature = "sql-storage")]
+    #[test]
+    fn invalid_unicode_storage_environment_never_exposes_supplied_values() {
+        for name in ["BASIS_STORAGE_URL", "BASIS_STORAGE_ALLOW_SQLITE_FALLBACK"] {
+            let secret = "postgres://owner:private-test-credential@localhost/database";
+            let error = storage_env_value(name, Err(std::env::VarError::NotUnicode(secret.into())))
+                .unwrap_err();
+            assert_eq!(
+                format!("{error:#}"),
+                format!("{name} must be valid Unicode")
+            );
+            assert!(!format!("{error:?}").contains("private-test-credential"));
+            assert_eq!(error.chain().count(), 1);
+        }
+    }
 
     #[cfg(feature = "sql-storage")]
     static SQL_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
