@@ -667,7 +667,7 @@ fn decompress_deflate_bounded(data: &[u8], max_bytes: usize) -> Option<Vec<u8>> 
             return None;
         }
         if status == Status::StreamEnd {
-            return Some(output);
+            return (usize::try_from(decoder.total_in()).ok()? == data.len()).then_some(output);
         }
         if consumed == 0 && produced == 0 {
             return None;
@@ -876,12 +876,24 @@ pub struct ServerReadyBatchMessage {
 }
 
 impl ServerReadyBatchMessage {
+    /// Target for combining records, not a limit on one complete READY record.
     pub const MAX_PAYLOAD_BYTES: usize = 32 * 1024;
+    /// A READY record can contain three u16-length metadata strings, a
+    /// u16-length avatar and 255 additional 255-byte avatar fields, plus fixed
+    /// pose/header data. Keep room for all of those in a singleton batch while
+    /// imposing the same hard bound on serialization and decompression.
+    pub const MAX_DECODED_PAYLOAD_BYTES: usize = 512 * 1024;
     pub const MIN_COMPRESS_BYTES: usize = 256;
 }
 
 impl BasisSerialize for ServerReadyBatchMessage {
     fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
+        if self.payload.len() > Self::MAX_DECODED_PAYLOAD_BYTES {
+            return Err(crate::io::NetWriteError::LengthOverflow {
+                length: self.payload.len(),
+                max: Self::MAX_DECODED_PAYLOAD_BYTES,
+            });
+        }
         let mut compressed_payload = None;
         if self.payload.len() >= Self::MIN_COMPRESS_BYTES {
             let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
@@ -920,14 +932,14 @@ impl BasisDeserialize for ServerReadyBatchMessage {
         }
         let framed = reader.get_bytes(len as usize)?;
         let payload = if compressed {
-            decompress_deflate_bounded(framed, Self::MAX_PAYLOAD_BYTES).ok_or(
+            decompress_deflate_bounded(framed, Self::MAX_DECODED_PAYLOAD_BYTES).ok_or(
                 crate::io::NetReadError::Underflow {
                     needed: 1,
                     remaining: 0,
                 },
             )?
         } else {
-            if framed.len() > Self::MAX_PAYLOAD_BYTES {
+            if framed.len() > Self::MAX_DECODED_PAYLOAD_BYTES {
                 return Err(crate::io::NetReadError::Underflow {
                     needed: 1,
                     remaining: 0,
@@ -2825,7 +2837,7 @@ mod tests {
 
     #[test]
     fn server_ready_batch_accepts_payload_at_decompression_limit() {
-        let payload = vec![0x41; ServerReadyBatchMessage::MAX_PAYLOAD_BYTES];
+        let payload = vec![0x41; ServerReadyBatchMessage::MAX_DECODED_PAYLOAD_BYTES];
         let message = ServerReadyBatchMessage { count: 1, payload };
         let mut writer = NetWriter::new();
         message.serialize(&mut writer).unwrap();
@@ -2839,7 +2851,7 @@ mod tests {
 
     #[test]
     fn server_ready_batch_rejects_compressed_payload_above_limit() {
-        let payload = vec![0x41; ServerReadyBatchMessage::MAX_PAYLOAD_BYTES + 1];
+        let payload = vec![0x41; ServerReadyBatchMessage::MAX_DECODED_PAYLOAD_BYTES + 1];
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
         encoder.write_all(&payload).unwrap();
         let compressed = encoder.finish().unwrap();
@@ -2855,7 +2867,7 @@ mod tests {
 
     #[test]
     fn server_ready_batch_rejects_oversized_uncompressed_payload() {
-        let payload = vec![0x41; ServerReadyBatchMessage::MAX_PAYLOAD_BYTES + 1];
+        let payload = vec![0x41; ServerReadyBatchMessage::MAX_DECODED_PAYLOAD_BYTES + 1];
         let mut writer = NetWriter::new();
         writer.put_u16(1);
         writer.put_bool(false);
@@ -2863,6 +2875,21 @@ mod tests {
         writer.put_bytes(&payload);
         let mut reader = NetReader::new(writer.as_slice());
         assert!(ServerReadyBatchMessage::deserialize(&mut reader).is_err());
+    }
+
+    #[test]
+    fn server_ready_batch_writer_rejects_oversized_payload_without_writing() {
+        let message = ServerReadyBatchMessage {
+            count: 1,
+            payload: vec![0; ServerReadyBatchMessage::MAX_DECODED_PAYLOAD_BYTES + 1],
+        };
+        let mut writer = NetWriter::new();
+        writer.put_u8(0xa5);
+        assert!(matches!(
+            message.serialize(&mut writer),
+            Err(crate::io::NetWriteError::LengthOverflow { .. })
+        ));
+        assert_eq!(writer.as_slice(), &[0xa5]);
     }
 
     #[test]
@@ -2889,6 +2916,25 @@ mod tests {
         writer.put_bytes(&[0xff, 0xff, 0xff, 0xff]);
         let mut reader = NetReader::new(writer.as_slice());
         assert!(ServerReadyBatchMessage::deserialize(&mut reader).is_err());
+    }
+
+    #[test]
+    fn ready_and_permission_deflate_reject_trailing_bytes() {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(b"custom.permission").unwrap();
+        let mut compressed = encoder.finish().unwrap();
+        compressed.push(0xa5);
+        let mut writer = NetWriter::new();
+        writer.put_u16(1);
+        writer.put_bool(true);
+        writer.put_i32(compressed.len() as i32);
+        writer.put_bytes(&compressed);
+        assert!(
+            ServerReadyBatchMessage::deserialize(&mut NetReader::new(writer.as_slice())).is_err()
+        );
+        let mut extras = vec![1];
+        extras.extend_from_slice(&compressed);
+        assert!(decompress_permission_extras(&extras, 1).is_empty());
     }
 
     #[test]
