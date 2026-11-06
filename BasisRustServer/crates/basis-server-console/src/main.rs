@@ -2,6 +2,7 @@
 use basis_server_health::{SceneBatchMetrics, UploadBudgetMetrics};
 mod shutdown;
 mod storage_commands;
+mod terminal_guard;
 
 const DIAGNOSTIC_TARGET: &str = "basis_server_console::diagnostics";
 
@@ -1082,7 +1083,9 @@ async fn async_main(
                 running.store(false, Ordering::SeqCst);
                 reclaim_task.abort();
                 request_shutdown(shutdown_tx);
-                let _ = server.shutdown().await;
+                if let Err(cleanup) = server.shutdown().await {
+                    warn!("startup failure cleanup failed: {cleanup:#}");
+                }
                 return Err(err.into());
             }
         };
@@ -1091,11 +1094,13 @@ async fn async_main(
     // discarded when the periodic branch wins select.
     let stop_signal = shutdown::stop_signal();
     tokio::pin!(stop_signal);
+    let mut signal_error = None;
     loop {
         tokio::select! {
             result = &mut stop_signal => {
                 if let Err(err) = result {
                     warn!("failed to listen for stop signal: {err}");
+                    signal_error = Some(err);
                 }
                 running.store(false, Ordering::SeqCst);
                 break;
@@ -1116,13 +1121,26 @@ async fn async_main(
     // Persistence runs before native joins. The independent watchdog covers
     // synchronous saves and runtime teardown that an async timeout cannot stop.
     let result = server.shutdown().await;
-    let _ = reclaim_task.await;
+    if let Err(err) = reclaim_task.await {
+        if !err.is_cancelled() {
+            return Err(err).context("memory reclaim task failed during shutdown");
+        }
+    }
     // Output can block in an OS sink too. Join only after persistence, while
     // the independent watchdog still covers a stalled writer.
-    let _ = tokio::task::spawn_blocking(move || output_thread.join()).await;
+    let output_join = tokio::task::spawn_blocking(move || output_thread.join())
+        .await
+        .context("joining console output worker task")?;
+    if output_join.is_err() {
+        return Err(anyhow::anyhow!(
+            "console output worker panicked during shutdown"
+        ));
+    }
     if let Some(thread) = console_thread {
-        if thread.is_finished() {
-            let _ = thread.join();
+        if thread.is_finished() && thread.join().is_err() {
+            return Err(anyhow::anyhow!(
+                "console input worker panicked during shutdown"
+            ));
         }
         // Rustyline's blocking stdin read cannot be cancelled portably. A still
         // waiting input thread is detached; it never delays process termination.
@@ -1132,6 +1150,9 @@ async fn async_main(
         Err(err) => warn!("server shutdown failed: {err:#}"),
     }
     result?;
+    if let Some(err) = signal_error {
+        return Err(err).context("stop signal listener failed");
+    }
     Ok(())
 }
 
@@ -1622,7 +1643,8 @@ fn run_live_status(server: &ServerState, running: &Arc<AtomicBool>) {
     let mut stdout = io::stdout();
     let mut verbose = false;
     let mut rendered_rows = 0u16;
-    let raw_mode_enabled = terminal::enable_raw_mode().is_ok();
+    let mut terminal_guard = terminal_guard::TerminalGuard::new();
+    let _ = terminal_guard.enable_raw_mode();
     println!();
 
     loop {
@@ -1684,9 +1706,6 @@ fn run_live_status(server: &ServerState, running: &Arc<AtomicBool>) {
         }
     }
 
-    if raw_mode_enabled {
-        let _ = terminal::disable_raw_mode();
-    }
     println!();
 }
 

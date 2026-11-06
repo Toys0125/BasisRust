@@ -1,8 +1,9 @@
 # Console shutdown
 
-The console starts shutdown on Ctrl+C or `/shutdown`. A watchdog on a dedicated
-OS thread gives shutdown five seconds, followed by at most 250 ms for a final
-output flush attempt. It stays armed through Tokio runtime destruction. A
+The console starts shutdown on Ctrl+C or `/shutdown`; Unix also handles
+SIGTERM, and Windows handles Ctrl+Break. A watchdog on a dedicated OS thread
+gives shutdown five seconds, followed by at most 250 ms for a final output
+flush attempt. It stays armed through Tokio runtime destruction. A
 Tokio future timeout alone cannot bound synchronous file I/O, a thread join, or
 started `spawn_blocking` work.
 
@@ -16,6 +17,12 @@ even when the configured status interval is long.
 GPU submission channels are closed and GPU worker handles are joined after
 persistence. Tokio runtime destruction cancels remaining async transport/health
 and authentication-timer tasks and releases their resources.
+
+The live status view restores raw mode through an RAII guard, including when its
+loop unwinds. The guard also tracks cursor visibility and alternate-screen
+state if those modes are enabled. Shutdown reports signal-listener and
+worker-task failures as errors so the process exits with a failure status
+rather than reporting success after incomplete cleanup.
 
 Started blocking memory reclamation, GPU readback, or native driver destruction
 cannot be cancelled. If cleanup or runtime destruction stalls, the watchdog
@@ -57,6 +64,7 @@ Focused checks (from the repository root):
 
 ```sh
 CARGO_BUILD_JOBS=2 cargo test --manifest-path BasisRustServer/Cargo.toml -p basis-server-console shutdown::tests -- --test-threads=1
+CARGO_BUILD_JOBS=2 cargo test --manifest-path BasisRustServer/Cargo.toml -p basis-server-console terminal_guard::tests -- --test-threads=1
 CARGO_BUILD_JOBS=2 cargo test --manifest-path BasisRustServer/Cargo.toml -p basis-server-core shutdown_saves -- --test-threads=1
 CARGO_BUILD_JOBS=2 cargo test --manifest-path BasisRustServer/Cargo.toml -p basis-server-core profile_window_capture
 CARGO_BUILD_JOBS=2 cargo test --manifest-path BasisRustServer/Cargo.toml -p basis-server-core --features gpu shutdown_drops_channels
