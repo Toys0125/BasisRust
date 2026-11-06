@@ -322,6 +322,11 @@ impl P2pBroker {
             // linked session. This sweep is bounded by the shared maintenance cadence.
             self.offloaded_pairs
                 .retain(|pair, _| active_offloads.contains(pair));
+            // Removing an expired token also untracks its pair marker. Another
+            // linked token for the same pair may still own an unexpired lease.
+            for pair in active_offloads {
+                self.offloaded_pairs.insert(pair, ());
+            }
             notifications
         };
         for (to, sub, token, other) in notifications {
@@ -355,10 +360,9 @@ impl P2pBroker {
                     .offloaded_pairs
                     .insert(pack_pair(initiator, target), ())
                     .is_none();
-                if newly_offloaded {
-                    let deadline = tokio::time::Instant::now() + OFFLOAD_LEASE;
-                    session.offload_lease_deadline = Some(deadline);
-                }
+                session
+                    .offload_lease_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + OFFLOAD_LEASE);
                 Some((initiator, target, newly_offloaded))
             } else {
                 None
@@ -1033,6 +1037,78 @@ mod tests {
             receive_signal(&b_socket).await,
             encode_signal(channels::P2P_SUB_LINK_LOST, a.peer_id(), "lease-test")
         );
+        transport.shutdown();
+    }
+
+    #[tokio::test]
+    async fn every_linked_token_has_a_fixed_lease_even_for_the_same_pair() {
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (_a_socket, a) = connected_signal_peer(&transport, &mut events).await;
+        let (_b_socket, b) = connected_signal_peer(&transport, &mut events).await;
+        let broker = P2pBroker::default();
+        for token in ["first-lease", "second-lease"] {
+            let mut linked = session(a.peer_id(), b.peer_id());
+            linked.state = SessionState::Punched;
+            linked.initiator_link_up = true;
+            assert!(broker.claim_session(token, linked, |_| true));
+            broker
+                .handle_link_up(
+                    &transport,
+                    b.peer_id(),
+                    BasisP2PSignalMessage {
+                        other_player_id: a.peer_id(),
+                        session_token: token.into(),
+                        ephemeral_public_key: None,
+                    },
+                )
+                .await;
+        }
+        let second_deadline = broker
+            .sessions
+            .get("second-lease")
+            .unwrap()
+            .offload_lease_deadline
+            .expect("every linked session needs its own deadline");
+        broker
+            .handle_link_up(
+                &transport,
+                b.peer_id(),
+                BasisP2PSignalMessage {
+                    other_player_id: a.peer_id(),
+                    session_token: "second-lease".into(),
+                    ephemeral_public_key: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            broker
+                .sessions
+                .get("second-lease")
+                .unwrap()
+                .offload_lease_deadline,
+            Some(second_deadline)
+        );
+
+        // Model two links established at different times without a long sleep.
+        let first_deadline = second_deadline - Duration::from_secs(1);
+        broker
+            .sessions
+            .get_mut("first-lease")
+            .unwrap()
+            .offload_lease_deadline = Some(first_deadline);
+        broker.maintain_lifecycle(&transport, first_deadline).await;
+        assert!(!broker.sessions.contains_key("first-lease"));
+        assert!(broker.sessions.contains_key("second-lease"));
+        assert!(
+            broker.is_offloaded(a.peer_id(), b.peer_id()),
+            "another unexpired linked session must retain the pair marker"
+        );
+        broker.maintain_lifecycle(&transport, second_deadline).await;
+        assert!(broker.sessions.is_empty());
+        assert!(broker.peer_sessions.is_empty());
+        assert!(!broker.is_offloaded(a.peer_id(), b.peer_id()));
         transport.shutdown();
     }
 
