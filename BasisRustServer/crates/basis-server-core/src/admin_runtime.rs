@@ -1129,9 +1129,15 @@ mod tests {
         assert!(loaded.has("saved", basis_server_permissions::nodes::PERMISSIONS_EDIT));
         let malformed = "<Permissions><Groups>";
         fs::write(dir.join("config/permissions.xml"), malformed).unwrap();
-        assert!(ServerState::start(ServerConfig::default(), &dir)
+        let config = ServerConfig {
+            password: "permissions-startup-test-password".into(),
+            ..ServerConfig::default()
+        };
+        let error = ServerState::start(config, &dir)
             .await
-            .is_err());
+            .err()
+            .expect("malformed permissions must stop startup");
+        assert!(format!("{error:#}").contains("parsing permissions"));
         assert_eq!(
             fs::read_to_string(dir.join("config/permissions.xml")).unwrap(),
             malformed
