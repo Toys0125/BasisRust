@@ -3914,7 +3914,7 @@ async fn handle_message(
             let request = OwnershipTransferMessage::deserialize(&mut reader)?;
             let current_owner = state
                 .ownership
-                .request_new_or_existing(&request.ownership_id, request.player_id);
+                .request_new_or_existing(&request.ownership_id, peer);
             let response = OwnershipTransferMessage {
                 player_id: current_owner,
                 ownership_id: request.ownership_id,
@@ -3955,10 +3955,7 @@ async fn handle_message(
         channels::REMOVE_CURRENT_OWNER_REQUEST => {
             let mut reader = NetReader::new(&payload);
             let request = OwnershipTransferMessage::deserialize(&mut reader)?;
-            if state
-                .ownership
-                .remove_if_owner(&request.ownership_id, request.player_id)
-            {
+            if state.ownership.remove_if_owner(&request.ownership_id, peer) {
                 let mut writer = NetWriter::new();
                 request.serialize(&mut writer)?;
                 state
@@ -4182,6 +4179,7 @@ async fn handle_message(
         }
         channels::P2P => {
             let peers = state.authenticated_peers.clone();
+            let transport = state.transport.clone();
             let direct_connect_allowed = state.config.read().nat_punch_enabled
                 && (!state.global_state.read().direct_connect_locked
                     || peer_has_permission(
@@ -4196,7 +4194,16 @@ async fn handle_message(
                     peer,
                     &payload,
                     direct_connect_allowed,
-                    move |id| peers.contains_key(&id),
+                    move |id| {
+                        // Metadata can outlive a closing connection while its
+                        // outstanding handlers drain; it alone is not admission.
+                        peers.get(&id).is_some_and(|peer| {
+                            peer.session.as_ref().is_some_and(|session| {
+                                transport.is_current_session(session)
+                                    && session.try_read_lease().is_some()
+                            })
+                        })
+                    },
                 )
                 .await;
         }
@@ -6765,6 +6772,38 @@ pub fn migrate_legacy_resource_dirs(base_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ownership_get_and_remove_authorize_authenticated_peer_not_payload_player() {
+        let ownership = OwnershipState::default();
+        let authenticated_peer = 17;
+        let spoofed_player_id = 29;
+
+        // GET creates ownership for the authenticated requester, even when the
+        // serialized player_id names another peer.
+        assert_eq!(
+            ownership.request_new_or_existing("new-object", authenticated_peer),
+            authenticated_peer
+        );
+        assert_eq!(
+            ownership.request_new_or_existing("new-object", spoofed_player_id),
+            authenticated_peer
+        );
+
+        ownership.switch_ownership("owned-object", authenticated_peer);
+        // A forged REMOVE cannot delete another peer's ownership.
+        assert!(!ownership.remove_if_owner("owned-object", spoofed_player_id));
+        let retained = ownership
+            .all()
+            .into_iter()
+            .map(|owner| owner.ownership_id)
+            .collect::<Vec<_>>();
+        assert!(retained.iter().any(|id| id == "new-object"));
+        assert!(retained.iter().any(|id| id == "owned-object"));
+        // Legitimate owner removal still works.
+        assert!(ownership.remove_if_owner("owned-object", authenticated_peer));
+        assert!(!ownership.remove_if_owner("owned-object", authenticated_peer));
+    }
 
     #[tokio::test]
     async fn reliable_ordered_handlers_wait_for_the_previous_handler() {

@@ -412,6 +412,131 @@ fn session_for_uuid(state: &ServerState, uuid: &str) -> (PeerId, PeerSession) {
     )
 }
 
+#[tokio::test]
+async fn ownership_get_and_remove_use_authenticated_peer_identity() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let mut owner = Client::connect(&state, "ownership-owner").await;
+    let mut attacker = Client::connect(&state, "ownership-attacker").await;
+    let (owner_peer, _) = session_for_uuid(&state, "ownership-owner");
+    let (attacker_peer, attacker_session) = session_for_uuid(&state, "ownership-attacker");
+    state
+        .ownership
+        .switch_ownership("peer-owned-object", owner_peer);
+
+    let mut request = NetWriter::new();
+    OwnershipTransferMessage {
+        player_id: owner_peer,
+        ownership_id: "peer-owned-object".into(),
+    }
+    .serialize(&mut request)
+    .unwrap();
+    attacker
+        .send(
+            channels::GET_CURRENT_OWNER_REQUEST,
+            request.as_slice(),
+            true,
+        )
+        .await;
+    let response = attacker
+        .receive(|channel, _| channel == channels::GET_CURRENT_OWNER_REQUEST)
+        .await;
+    let mut reader = NetReader::new(&response);
+    assert_eq!(
+        OwnershipTransferMessage::deserialize(&mut reader)
+            .unwrap()
+            .player_id,
+        owner_peer,
+        "spoofed GET must not replace the current owner"
+    );
+
+    let mut request = NetWriter::new();
+    OwnershipTransferMessage {
+        player_id: owner_peer,
+        ownership_id: "new-peer-owned-object".into(),
+    }
+    .serialize(&mut request)
+    .unwrap();
+    attacker
+        .send(
+            channels::GET_CURRENT_OWNER_REQUEST,
+            request.as_slice(),
+            true,
+        )
+        .await;
+    let response = attacker
+        .receive(|channel, payload| {
+            if channel != channels::GET_CURRENT_OWNER_REQUEST {
+                return false;
+            }
+            let mut reader = NetReader::new(payload);
+            OwnershipTransferMessage::deserialize(&mut reader)
+                .is_ok_and(|message| message.ownership_id == "new-peer-owned-object")
+        })
+        .await;
+    let mut reader = NetReader::new(&response);
+    assert_eq!(
+        OwnershipTransferMessage::deserialize(&mut reader)
+            .unwrap()
+            .player_id,
+        attacker_peer,
+        "GET must assign an unowned object to the authenticated requester"
+    );
+
+    let mut request = NetWriter::new();
+    OwnershipTransferMessage {
+        player_id: owner_peer,
+        ownership_id: "peer-owned-object".into(),
+    }
+    .serialize(&mut request)
+    .unwrap();
+    // Await the handler itself: socket-write completion or a fixed sleep
+    // cannot prove the spoofed REMOVE was processed before this assertion.
+    crate::handle_message(
+        &state,
+        attacker_peer,
+        Some(&attacker_session),
+        channels::REMOVE_CURRENT_OWNER_REQUEST,
+        DeliveryMethod::ReliableOrdered,
+        Bytes::copy_from_slice(request.as_slice()),
+        false,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(state
+        .ownership
+        .all()
+        .iter()
+        .any(|entry| entry.ownership_id == "peer-owned-object" && entry.player_id == owner_peer));
+
+    owner
+        .send(
+            channels::REMOVE_CURRENT_OWNER_REQUEST,
+            request.as_slice(),
+            true,
+        )
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !state
+                .ownership
+                .all()
+                .iter()
+                .any(|entry| entry.ownership_id == "peer-owned-object")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("legitimate owner REMOVE should succeed");
+
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
 fn registry_subscribe_event(peer: PeerId, session: PeerSession) -> ServerEvent {
     let mut payload = NetWriter::new();
     payload.put_u8(channels::REGISTRY_SUB_SUBSCRIBE);
@@ -425,6 +550,56 @@ fn registry_subscribe_event(peer: PeerId, session: PeerSession) -> ServerEvent {
         delivery: DeliveryMethod::ReliableOrdered,
         payload: Bytes::from(payload.as_slice().to_vec()),
     }
+}
+
+#[tokio::test]
+async fn p2p_requests_reject_a_closing_target_before_metadata_cleanup() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let mut initiator = Client::connect(&state, "p2p-live-initiator").await;
+    let _target = Client::connect(&state, "p2p-closing-target").await;
+    let (initiator_peer, initiator_session) = session_for_uuid(&state, "p2p-live-initiator");
+    let (target_peer, target_session) = session_for_uuid(&state, "p2p-closing-target");
+    let lease = target_session.try_read_lease().unwrap();
+    request_disconnect(&state, &target_session, "closing P2P target")
+        .await
+        .unwrap();
+    assert!(
+        state.authenticated_peers.contains_key(&target_peer),
+        "held lease must defer metadata cleanup"
+    );
+    let mut writer = NetWriter::new();
+    writer.put_u8(channels::P2P_SUB_REQUEST);
+    basis_protocol::messages::BasisP2PSignalMessage {
+        other_player_id: target_peer,
+        session_token: "closing-target".into(),
+        ephemeral_public_key: None,
+    }
+    .serialize(&mut writer)
+    .unwrap();
+    crate::handle_message(
+        &state,
+        initiator_peer,
+        Some(&initiator_session),
+        channels::P2P,
+        DeliveryMethod::ReliableOrdered,
+        Bytes::copy_from_slice(writer.as_slice()),
+        false,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let response = initiator
+        .receive(|channel, _| channel == channels::P2P)
+        .await;
+    drop(lease);
+    assert_eq!(
+        response[0],
+        channels::P2P_SUB_CANCEL,
+        "stale metadata must not arm a new P2P session"
+    );
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
 }
 
 async fn wait_for_disconnect_cleanups(state: &ServerState) {

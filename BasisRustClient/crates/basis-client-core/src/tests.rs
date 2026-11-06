@@ -840,6 +840,58 @@ async fn reliable_voice_diagnostics_skip_duplicates_on_direct_merged_and_compact
 }
 
 #[tokio::test]
+async fn ordinary_receive_rejects_nested_merged_containers_before_dispatch() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(0, server.local_addr().unwrap()).await;
+    let initial_drops = client.packet_diagnostics.snapshot()[4];
+
+    for property in [PacketProperty::Merged, PacketProperty::CompactMerged] {
+        // Header connection bits are valid LiteNetLib flags and must not hide
+        // the nested property from the container check.
+        let nested = [property as u8 | 0x60, 0];
+        let mut outer = vec![PacketProperty::Merged as u8];
+        outer.extend_from_slice(&(nested.len() as u16).to_le_bytes());
+        outer.extend_from_slice(&nested);
+        client.handle_packet(&outer).await.unwrap();
+    }
+
+    // A maliciously deep chain is rejected at its first nested boundary,
+    // without recursively walking the packet.
+    let mut deep = vec![PacketProperty::Channeled as u8, 0, 0, 0, 0];
+    for _ in 0..1000 {
+        let mut outer = vec![PacketProperty::Merged as u8];
+        outer.extend_from_slice(&(deep.len() as u16).to_le_bytes());
+        outer.extend_from_slice(&deep);
+        deep = outer;
+    }
+    client.handle_packet(&deep).await.unwrap();
+    assert_eq!(client.packet_diagnostics.snapshot()[4] - initial_drops, 3);
+    assert!(!client.ack_pending.load(Ordering::Relaxed));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shared_receive_rejects_nested_merged_containers() {
+    use std::os::fd::AsRawFd;
+
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(1, server.local_addr().unwrap()).await;
+    let initial_drops = client.packet_diagnostics.snapshot()[4];
+
+    for property in [PacketProperty::Merged, PacketProperty::CompactMerged] {
+        let nested = [property as u8 | 0x20, 0];
+        let mut outer = vec![PacketProperty::Merged as u8];
+        outer.extend_from_slice(&(nested.len() as u16).to_le_bytes());
+        outer.extend_from_slice(&nested);
+        assert!(
+            shared_receiver_process_merged(&client, client.socket.as_raw_fd(), &outer).is_empty()
+        );
+    }
+    assert_eq!(client.packet_diagnostics.snapshot()[4] - initial_drops, 2);
+    assert!(!client.ack_pending.load(Ordering::Relaxed));
+}
+
+#[tokio::test]
 async fn unreliable_voice_repeats_remain_counted() {
     use crate::voice_diagnostics::WindowActiveTestGuard;
 
