@@ -1,6 +1,7 @@
 //! The watchdog stays armed through Tokio runtime destruction: a timeout on an
 //! async future cannot interrupt synchronous I/O, thread joins, or native GPU work.
 use std::{
+    future::Future,
     io::{self, Write},
     sync::mpsc::{self, RecvTimeoutError},
     thread,
@@ -16,16 +17,40 @@ pub async fn stop_signal() -> io::Result<()> {
     #[cfg(windows)]
     {
         let mut ctrl_break = tokio::signal::windows::ctrl_break()?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            signal = ctrl_break.recv() => signal.ok_or_else(|| {
-                io::Error::other("Ctrl+Break listener closed")
-            }),
-        }
+        wait_for_stop_signal(tokio::signal::ctrl_c(), async move {
+            ctrl_break
+                .recv()
+                .await
+                .ok_or_else(|| io::Error::other("Ctrl+Break listener closed"))
+        })
+        .await
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        wait_for_stop_signal(tokio::signal::ctrl_c(), async move {
+            terminate
+                .recv()
+                .await
+                .ok_or_else(|| io::Error::other("SIGTERM listener closed"))
+        })
+        .await
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         tokio::signal::ctrl_c().await
+    }
+}
+
+async fn wait_for_stop_signal<C, S>(ctrl_c: C, secondary: S) -> io::Result<()>
+where
+    C: Future<Output = io::Result<()>>,
+    S: Future<Output = io::Result<()>>,
+{
+    tokio::select! {
+        result = ctrl_c => result,
+        result = secondary => result,
     }
 }
 
@@ -111,9 +136,20 @@ pub fn flush_output(forced_message: Option<&'static str>) -> bool {
 mod tests {
     use super::*;
     use std::{
+        future,
         process::{Command, Stdio},
         time::Instant,
     };
+
+    #[tokio::test]
+    async fn either_stop_signal_source_is_supported_on_every_platform() {
+        wait_for_stop_signal(future::pending(), future::ready(Ok(())))
+            .await
+            .unwrap();
+        wait_for_stop_signal(future::ready(Ok(())), future::pending())
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn graceful_runtime_joins_blocking_work_and_flushes() {
