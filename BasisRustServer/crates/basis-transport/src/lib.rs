@@ -3,6 +3,8 @@ mod sealed_inbound;
 
 #[cfg(test)]
 mod bench_branches;
+#[cfg(test)]
+mod nat_tests;
 
 use basis_protocol::{
     channels,
@@ -4916,7 +4918,9 @@ fn read_litenet_endpoint(bytes: &[u8], position: &mut usize) -> Option<SocketAdd
 }
 
 fn write_litenet_endpoint(packet: &mut Vec<u8>, endpoint: SocketAddr) {
-    match endpoint.ip() {
+    // Dual-stack receives map IPv4 peers to IPv6; advertise their actual family so
+    // clients with separate IPv4 and IPv6-only sockets choose the IPv4 send socket.
+    match endpoint.ip().to_canonical() {
         IpAddr::V4(addr) => {
             packet.push(0);
             packet.extend_from_slice(&addr.octets());
