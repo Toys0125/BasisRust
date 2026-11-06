@@ -5012,6 +5012,10 @@ async fn process_merged_packet(
             break;
         }
         let packet = &bytes[position..position + size];
+        if is_nested_merged_packet(packet) {
+            position += size;
+            continue;
+        }
         if is_valid_merged_packet(packet) {
             Box::pin(process_packet_for_peer(
                 handle,
@@ -5025,6 +5029,15 @@ async fn process_merged_packet(
         position += size;
     }
     Ok(())
+}
+
+fn is_nested_merged_packet(bytes: &[u8]) -> bool {
+    bytes.first().is_some_and(|header| {
+        matches!(
+            PacketProperty::from_byte(*header),
+            Some(PacketProperty::Merged | PacketProperty::CompactMerged)
+        )
+    })
 }
 
 async fn process_compact_merged_packet(
@@ -5085,7 +5098,9 @@ async fn process_compact_merged_packet(
             else {
                 break;
             };
-            if !matches!(property, PacketProperty::Ack | PacketProperty::Channeled) {
+            if is_nested_merged_packet(payload)
+                || !matches!(property, PacketProperty::Ack | PacketProperty::Channeled)
+            {
                 break;
             }
             Box::pin(process_packet_for_peer(
@@ -10936,6 +10951,204 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn merged_parsers_reject_nested_wrappers_and_keep_flat_entries() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let remote = UdpSocket::bind(loopback_addr(0)).await.unwrap();
+        let remote_addr = remote.local_addr().unwrap();
+        let request = ConnectionRequest {
+            remote_addr,
+            payload: Bytes::new(),
+            connection_number: 0,
+            connect_time: 123,
+            local_peer_id: 0,
+        };
+        let peer = handle.accept(&request).await.unwrap();
+        let peer_state = handle.peers.get(&peer).unwrap().clone();
+        let (tx, mut rx) = mpsc::channel(16);
+
+        let unreliable = [PacketProperty::Unreliable as u8, channels::CHAT, 0x51];
+        let classic = |child: &[u8]| {
+            let mut packet = vec![PacketProperty::Merged as u8, child.len() as u8, 0];
+            packet.extend_from_slice(child);
+            packet
+        };
+        let compact = |child: &[u8]| {
+            let mut packet = vec![PacketProperty::CompactMerged as u8, 0x40, child.len() as u8];
+            packet.extend_from_slice(child);
+            packet
+        };
+
+        // Each nested wrapper contains a valid message that the old recursive
+        // dispatch path would emit. Four bytes also make compact raw entries
+        // structurally admissible where needed.
+        for child_property in [PacketProperty::Merged, PacketProperty::CompactMerged] {
+            let nested_message = [PacketProperty::Unreliable as u8, channels::CHAT, 0x61];
+            let child = match child_property {
+                PacketProperty::Merged => classic(&nested_message),
+                PacketProperty::CompactMerged => {
+                    vec![PacketProperty::CompactMerged as u8, channels::CHAT, 1, 0x61]
+                }
+                _ => unreachable!(),
+            };
+            let classic_nested = classic(&child);
+            process_merged_packet(&handle, &tx, remote_addr, &classic_nested, &peer_state)
+                .await
+                .unwrap();
+            let compact_nested = compact(&child);
+            process_compact_merged_packet(
+                &handle,
+                &tx,
+                remote_addr,
+                0,
+                &compact_nested,
+                &peer_state,
+            )
+            .await
+            .unwrap();
+            assert!(rx.try_recv().is_err());
+        }
+
+        // A deeply nested sequence cannot restart recursive dispatch.
+        let mut deeply_nested = classic(&unreliable);
+        for _ in 0..32 {
+            deeply_nested = classic(&deeply_nested);
+        }
+        process_merged_packet(&handle, &tx, remote_addr, &deeply_nested, &peer_state)
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+
+        // Truncated and malformed nested frames are ignored without dispatch.
+        for malformed in [
+            vec![
+                PacketProperty::Merged as u8,
+                4,
+                0,
+                PacketProperty::Merged as u8,
+            ],
+            vec![PacketProperty::Merged as u8, 1],
+            vec![PacketProperty::CompactMerged as u8, 0x40],
+            vec![
+                PacketProperty::CompactMerged as u8,
+                0x40,
+                4,
+                PacketProperty::CompactMerged as u8,
+            ],
+        ] {
+            if malformed[0] & 0x1f == PacketProperty::Merged as u8 {
+                process_merged_packet(&handle, &tx, remote_addr, &malformed, &peer_state)
+                    .await
+                    .unwrap();
+            } else {
+                process_compact_merged_packet(
+                    &handle,
+                    &tx,
+                    remote_addr,
+                    0,
+                    &malformed,
+                    &peer_state,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        assert!(rx.try_recv().is_err());
+
+        // Flat classic/compact Unreliable, classic reliable data and control,
+        // and compact raw ACK entries use their ordinary decoder paths.
+        let flat_classic = classic(&unreliable);
+        process_merged_packet(&handle, &tx, remote_addr, &flat_classic, &peer_state)
+            .await
+            .unwrap();
+        let reliable_channel =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let reliable = [
+            PacketProperty::Channeled as u8,
+            0,
+            0,
+            reliable_channel,
+            0x53,
+        ];
+        let flat_classic_reliable = classic(&reliable);
+        process_merged_packet(
+            &handle,
+            &tx,
+            remote_addr,
+            &flat_classic_reliable,
+            &peer_state,
+        )
+        .await
+        .unwrap();
+        let ping = [PacketProperty::Ping as u8, 0x34, 0x12];
+        let flat_classic_ping = classic(&ping);
+        process_merged_packet(&handle, &tx, remote_addr, &flat_classic_ping, &peer_state)
+            .await
+            .unwrap();
+        let mut pong = [0u8; 32];
+        let pong_len = time::timeout(Duration::from_secs(1), async {
+            loop {
+                let len = remote.recv_from(&mut pong).await.unwrap().0;
+                if pong[0] & 0x1f == PacketProperty::Pong as u8 {
+                    break len;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(pong_len >= 3);
+        assert_eq!(&pong[1..3], &[0x34, 0x12]);
+
+        let flat_compact = [PacketProperty::CompactMerged as u8, channels::CHAT, 1, 0x52];
+        process_compact_merged_packet(&handle, &tx, remote_addr, 0, &flat_compact, &peer_state)
+            .await
+            .unwrap();
+
+        let pending = build_outbound_packet(
+            &peer_state,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"compact-ack-regression",
+        );
+        let (pending_channel, pending_sequence) = pending.reliable_key.unwrap();
+        record_pending_reliable(
+            &peer_state,
+            pending_channel,
+            pending_sequence,
+            pending.bytes,
+            None,
+        );
+        assert_eq!(peer_state.total_pending(), 1);
+        let mut ack_bits = vec![0; (DEFAULT_WINDOW_SIZE - 1) / 8 + 2];
+        let bit = pending_sequence as usize % DEFAULT_WINDOW_SIZE;
+        ack_bits[bit / 8] |= 1 << (bit % 8);
+        let ack = build_ack_packet(0, pending_channel, pending_sequence, &ack_bits);
+        let mut compact_raw_ack = vec![PacketProperty::CompactMerged as u8, 0x40, ack.len() as u8];
+        compact_raw_ack.extend_from_slice(&ack);
+        process_compact_merged_packet(&handle, &tx, remote_addr, 0, &compact_raw_ack, &peer_state)
+            .await
+            .unwrap();
+        assert_eq!(peer_state.total_pending(), 0);
+
+        for expected in [0x51, 0x53, 0x52] {
+            match rx.recv().await.unwrap() {
+                ServerEvent::Message {
+                    payload, delivery, ..
+                } => {
+                    assert_eq!(payload.as_ref(), &[expected]);
+                    if expected == 0x53 {
+                        assert_eq!(delivery, DeliveryMethod::ReliableOrdered);
+                    } else {
+                        assert_eq!(delivery, DeliveryMethod::Unreliable);
+                    }
+                }
+                other => panic!("unexpected flat merged event: {other:?}"),
+            }
+        }
+        assert!(rx.try_recv().is_err());
         handle.shutdown();
     }
 
