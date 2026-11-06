@@ -257,3 +257,157 @@ async fn rejected_image_data_is_not_cached_but_cache_controls_still_work() {
     assert_eq!(state.image_egress_dropped().0, 4);
     state.shutdown().await.unwrap();
 }
+
+fn scene_envelope(index: u16, recipients: &[u16], data: &[u8]) -> Vec<u8> {
+    let mut writer = NetWriter::new();
+    SceneDataMessage {
+        message_index: index,
+        recipients: recipients.to_vec(),
+        payload: data.to_vec(),
+    }
+    .serialize(&mut writer)
+    .unwrap();
+    writer.into_vec()
+}
+
+#[tokio::test]
+async fn image_manager_namespace_is_reserved_before_client_registration_and_after_reset() {
+    let state = server().await;
+    let index = state
+        .net_ids
+        .find(image_cache::IMAGE_MANAGER_IDENTIFIER)
+        .expect("the server must reserve the image manager before any client registers names");
+    assert_eq!(
+        state.net_ids.add_or_find_for_peer("ordinary-scene", 1, 1),
+        Some((index + 1, false))
+    );
+    // Clients can discover the shared manager, but never create or own its entry.
+    for peer in [1, 2] {
+        assert_eq!(
+            state
+                .net_ids
+                .add_or_find_for_peer(image_cache::IMAGE_MANAGER_IDENTIFIER, peer, 0),
+            Some((index, true))
+        );
+    }
+    state.net_ids.reset();
+    assert_eq!(state.net_ids.find("ordinary-scene"), None);
+    assert_eq!(
+        state.net_ids.find(image_cache::IMAGE_MANAGER_IDENTIFIER),
+        Some(index)
+    );
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn upload_exemption_requires_reserved_namespace_and_valid_image_framing() {
+    let state = server().await;
+    add_peer(&state, 1);
+    let image_index = state
+        .net_ids
+        .add_or_find_for_peer(image_cache::IMAGE_MANAGER_IDENTIFIER, 1, 10)
+        .unwrap()
+        .0;
+    let ordinary_index = state
+        .net_ids
+        .add_or_find_for_peer("OrdinaryScene", 1, 10)
+        .unwrap()
+        .0;
+
+    let mut valid_spawn = vec![1];
+    valid_spawn.extend([4; 16]);
+    valid_spawn.extend(1u16.to_le_bytes());
+    valid_spawn.push(0); // empty owner name
+    for value in [8i32, 8, 1, 1] {
+        valid_spawn.extend(value.to_le_bytes());
+    }
+    valid_spawn.extend([0; 28]);
+    assert!(is_image_scene_upload(
+        &state,
+        &scene_envelope(image_index, &[], &valid_spawn)
+    ));
+    for (offset, value) in [(20, -1_i32), (24, -1), (28, -1), (20, 0), (24, 0)] {
+        let mut invalid_spawn = valid_spawn.clone();
+        invalid_spawn[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        assert!(!is_image_scene_upload(
+            &state,
+            &scene_envelope(image_index, &[], &invalid_spawn)
+        ));
+    }
+
+    let truncated_chunk = [
+        vec![2],
+        vec![4; 16],
+        0i32.to_le_bytes().to_vec(),
+        8i32.to_le_bytes().to_vec(),
+    ]
+    .concat();
+    assert!(!is_image_scene_upload(
+        &state,
+        &scene_envelope(image_index, &[], &truncated_chunk)
+    ));
+    assert!(!is_image_scene_upload(
+        &state,
+        &scene_envelope(ordinary_index, &[], &valid_spawn)
+    ));
+    assert!(!is_image_scene_upload(
+        &state,
+        &scene_envelope(image_index, &[2], &[1, 4])
+    ));
+    let mut malformed_recipients = image_index.to_le_bytes().to_vec();
+    malformed_recipients.extend(2u16.to_le_bytes());
+    malformed_recipients.extend(2u16.to_le_bytes());
+    malformed_recipients.extend([1, 4]);
+    assert!(!is_image_scene_upload(&state, &malformed_recipients));
+
+    // The first large ordinary frame can spend the reliable burst; malformed image
+    // data then faces the same depleted session bucket. A valid image spawn is exempt.
+    state.upload_budget.rate.store(1, Ordering::Relaxed);
+    let ordinary = scene_envelope(ordinary_index, &[], &[9; 64]);
+    handle_message(
+        &state,
+        1,
+        None,
+        channels::SCENE,
+        DeliveryMethod::ReliableOrdered,
+        Bytes::from(ordinary),
+        false,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let malformed_image = scene_envelope(image_index, &[], &truncated_chunk);
+    handle_message(
+        &state,
+        1,
+        None,
+        channels::SCENE,
+        DeliveryMethod::ReliableOrdered,
+        Bytes::from(malformed_image),
+        false,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let valid_image = scene_envelope(image_index, &[], &valid_spawn);
+    handle_message(
+        &state,
+        1,
+        None,
+        channels::SCENE,
+        DeliveryMethod::ReliableOrdered,
+        Bytes::from(valid_image),
+        false,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let budget = state.upload_budget_snapshot();
+    assert_eq!(budget.accepted_messages, 1);
+    assert_eq!(budget.rejected_messages, 1);
+    assert_eq!(budget.image_exempt_messages, 1);
+    state.shutdown().await.unwrap();
+}

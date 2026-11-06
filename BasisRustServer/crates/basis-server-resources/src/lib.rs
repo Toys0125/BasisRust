@@ -312,9 +312,21 @@ pub struct NetIdState {
     by_name: Arc<RwLock<HashMap<String, u16>>>,
     next_id: Arc<RwLock<u32>>,
     per_peer_assigned: Arc<RwLock<HashMap<u16, usize>>>,
+    reserved_name: Option<Arc<str>>,
 }
 
 impl NetIdState {
+    /// Reserve a server-owned shared service before accepting client registrations.
+    /// Clients may discover the existing mapping without creating or owning it.
+    pub fn with_reserved_name(name: &str) -> Self {
+        Self {
+            by_name: Arc::new(RwLock::new(HashMap::from([(name.to_owned(), 0)]))),
+            next_id: Arc::new(RwLock::new(1)),
+            reserved_name: Some(Arc::from(name)),
+            ..Self::default()
+        }
+    }
+
     pub fn add_or_find_for_peer(
         &self,
         name: &str,
@@ -361,9 +373,19 @@ impl NetIdState {
     }
 
     pub fn reset(&self) {
-        self.by_name.write().clear();
-        *self.next_id.write() = 0;
-        self.per_peer_assigned.write().clear();
+        // Match registration's lock order and keep the reserved mapping visible
+        // throughout reset; a client must never win a new allocation for it.
+        let mut by_name = self.by_name.write();
+        let mut counts = self.per_peer_assigned.write();
+        let mut next_id = self.next_id.write();
+        by_name.clear();
+        counts.clear();
+        *next_id = if let Some(name) = &self.reserved_name {
+            by_name.insert(name.to_string(), 0);
+            1
+        } else {
+            0
+        };
     }
 }
 

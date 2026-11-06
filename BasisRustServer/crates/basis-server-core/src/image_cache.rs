@@ -704,6 +704,48 @@ impl ImageCache {
     }
 }
 
+/// Return true only for a complete client image data frame. The image upload
+/// allowance is reserved for the manager's known data opcodes; control and
+/// malformed messages stay subject to ordinary upload admission.
+pub(crate) fn is_valid_image_upload(payload: &[u8]) -> bool {
+    if payload.len() < HEADER_BYTES {
+        return false;
+    }
+    match payload[0] {
+        OP_SPAWN => {
+            let Some((chunk_count, pose_offset)) = read_spawn_header(payload) else {
+                return false;
+            };
+            chunk_count > 0 && pose_offset.checked_add(POSE_BYTES) == Some(payload.len())
+        }
+        OP_CHUNK | OP_ANIMATION_CHUNK => {
+            const CHUNK_DATA_OFFSET: usize = HEADER_BYTES + 8;
+            let Some(index) = read_i32(payload, HEADER_BYTES) else {
+                return false;
+            };
+            let Some(size) = read_i32(payload, HEADER_BYTES + 4) else {
+                return false;
+            };
+            index >= 0
+                && size >= 0
+                && usize::try_from(size)
+                    .ok()
+                    .and_then(|size| CHUNK_DATA_OFFSET.checked_add(size))
+                    == Some(payload.len())
+        }
+        OP_TRANSFORM => payload.len() == TRANSFORM_BYTES,
+        OP_DESPAWN => payload.len() == HEADER_BYTES,
+        OP_ANIMATION_SPAWN => {
+            // opcode + id + format + total bytes + chunk count + epoch
+            const ANIMATION_SPAWN_BYTES: usize = HEADER_BYTES + 1 + 4 + 4 + 8;
+            payload.len() == ANIMATION_SPAWN_BYTES
+                && read_i32(payload, HEADER_BYTES + 1 + 4).is_some_and(|count| count > 0)
+                && read_i32(payload, HEADER_BYTES + 1).is_some_and(|size| size >= 0)
+        }
+        _ => false,
+    }
+}
+
 fn seed_already_held(image: &mut CachedImage, recipients: &[u16], connected: &[u16]) {
     let peers = if recipients.is_empty() {
         connected
@@ -751,6 +793,12 @@ fn read_spawn_header(payload: &[u8]) -> Option<(i32, usize)> {
         return None;
     }
     offset += length;
+    let width = read_i32(payload, offset)?;
+    let height = read_i32(payload, offset.checked_add(4)?)?;
+    let total_bytes = read_i32(payload, offset.checked_add(8)?)?;
+    if width <= 0 || height <= 0 || total_bytes < 0 {
+        return None;
+    }
     offset = offset.checked_add(12)?;
     let total_chunks = read_i32(payload, offset)?;
     Some((total_chunks, offset.checked_add(4)?))
@@ -834,6 +882,69 @@ mod tests {
             payload.extend_from_slice(&value.to_le_bytes());
         }
         payload
+    }
+
+    #[test]
+    fn image_upload_validation_covers_all_data_opcodes_and_exact_lengths() {
+        let mut despawn = vec![OP_DESPAWN];
+        despawn.extend([1; 16]);
+        let mut animation = vec![OP_ANIMATION_SPAWN];
+        animation.extend([1; 16]);
+        animation.push(2);
+        animation.extend(4_i32.to_le_bytes());
+        animation.extend(1_i32.to_le_bytes());
+        animation.extend(0_i64.to_le_bytes());
+        let frames = [
+            spawn(1, 7, 1, 0.0),
+            chunk(1, 0, 4, OP_CHUNK),
+            chunk(1, 0, 0, OP_CHUNK),
+            transform(1, 0.0),
+            despawn,
+            animation.clone(),
+            chunk(1, 0, 4, OP_ANIMATION_CHUNK),
+            chunk(1, 0, 0, OP_ANIMATION_CHUNK),
+        ];
+        for frame in frames {
+            assert!(is_valid_image_upload(&frame), "valid opcode {}", frame[0]);
+            for end in 0..frame.len() {
+                assert!(
+                    !is_valid_image_upload(&frame[..end]),
+                    "opcode {} accepted a frame truncated at {end}",
+                    frame[0]
+                );
+            }
+            let mut extra = frame;
+            extra.push(0);
+            assert!(!is_valid_image_upload(&extra));
+        }
+        for opcode in [OP_CHUNK, OP_ANIMATION_CHUNK] {
+            for offset in [HEADER_BYTES, HEADER_BYTES + 4] {
+                let mut invalid = chunk(1, 0, 4, opcode);
+                invalid[offset..offset + 4].copy_from_slice(&(-1_i32).to_le_bytes());
+                assert!(!is_valid_image_upload(&invalid));
+            }
+        }
+        for (offset, value) in [
+            (HEADER_BYTES + 1, -1_i32),
+            (HEADER_BYTES + 5, 0),
+            (HEADER_BYTES + 5, -1),
+        ] {
+            let mut invalid = animation.clone();
+            invalid[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(!is_valid_image_upload(&invalid));
+        }
+        assert!(!is_valid_image_upload(&spawn(1, 7, 0, 0.0)));
+        assert!(!is_valid_image_upload(&spawn(1, 7, -1, 0.0)));
+        for opcode in [
+            5,
+            OP_SERVER_CACHE_STATE,
+            OP_SERVER_CACHE_OFFER,
+            OP_SERVER_CACHE_REQUEST,
+        ] {
+            let mut control = vec![opcode];
+            control.extend([1; 16]);
+            assert!(!is_valid_image_upload(&control));
+        }
     }
 
     fn observe(
