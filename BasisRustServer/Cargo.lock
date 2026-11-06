@@ -218,6 +218,7 @@ dependencies = [
  "thiserror",
  "unicode-general-category",
  "uuid",
+ "windows-sys 0.59.0",
  "zstd-safe",
 ]
 

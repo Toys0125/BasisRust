@@ -2,6 +2,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{env, fs, io::Write, path::Path};
 
+#[cfg(windows)]
+#[path = "windows_security.rs"]
+mod windows_security;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u8)]
 pub enum BasisUserRestrictionMode {
@@ -863,6 +867,14 @@ fn atomic_write_with(
     path: &Path,
     write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
 ) -> Result<()> {
+    atomic_write_with_directory_sync(path, write, sync_parent_directory)
+}
+
+fn atomic_write_with_directory_sync(
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+    sync_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<()> {
     let resolved_path = resolve_config_path(path)
         .with_context(|| format!("resolving config {}", path.display()))?;
     let path = resolved_path.as_path();
@@ -875,6 +887,15 @@ fn atomic_write_with(
         .suffix(".tmp")
         .tempfile_in(parent)
         .with_context(|| format!("creating temporary config in {}", parent.display()))?;
+    #[cfg(windows)]
+    if path.exists() {
+        // Match the destination's access policy before any serialized secrets
+        // are written to the temporary file. Leave the original untouched if
+        // the ACL cannot be copied.
+        windows_security::Security::read(path)
+            .and_then(|security| security.apply(temporary.path()))
+            .with_context(|| format!("preserving config access rules for {}", path.display()))?;
+    }
     write(temporary.as_file_mut())
         .with_context(|| format!("writing temporary config for {}", path.display()))?;
 
@@ -895,6 +916,21 @@ fn atomic_write_with(
         .persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("replacing config {}", path.display()))?;
+    sync_directory(parent).with_context(|| {
+        format!(
+            "config {} was replaced, but syncing directory {} failed; crash durability is uncertain",
+            path.display(),
+            parent.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn sync_parent_directory(parent: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = parent;
     Ok(())
 }
 
@@ -1491,6 +1527,24 @@ mod tests {
             .unwrap()
             .validate_auth()
             .is_ok());
+    }
+
+    #[test]
+    fn directory_sync_failure_reports_uncertain_durability_after_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.xml");
+        std::fs::write(&path, b"previous").unwrap();
+
+        let error = atomic_write_with_directory_sync(
+            &path,
+            |file| file.write_all(b"replacement"),
+            |_| Err(std::io::Error::other("injected directory sync failure")),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("was replaced"));
+        assert!(error.to_string().contains("crash durability is uncertain"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
     }
 
     #[test]
