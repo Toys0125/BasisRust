@@ -397,11 +397,16 @@ pub struct AdditionalAvatarData {
 
 impl BasisSerialize for AdditionalAvatarData {
     fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
-        let len = self.data.len().min(u8::MAX as usize);
-        writer.put_u8(len as u8);
+        let len = u8::try_from(self.data.len()).map_err(|_| {
+            crate::io::NetWriteError::LengthOverflow {
+                length: self.data.len(),
+                max: usize::from(u8::MAX),
+            }
+        })?;
+        writer.put_u8(len);
         if len > 0 {
             writer.put_u8(self.message_index);
-            writer.put_bytes(&self.data[..len]);
+            writer.put_bytes(&self.data);
         }
         Ok(())
     }
@@ -3282,6 +3287,65 @@ mod tests {
             AdditionalAvatarData::deserialize(&mut reader).unwrap(),
             item
         );
+    }
+
+    #[test]
+    fn additional_avatar_data_rejects_oversize_without_truncating() {
+        let maximum = AdditionalAvatarData {
+            message_index: 9,
+            data: vec![0xa5; usize::from(u8::MAX)],
+        };
+        let mut writer = NetWriter::new();
+        maximum.serialize(&mut writer).unwrap();
+        assert_eq!(&writer.as_slice()[..2], &[u8::MAX, 9]);
+        assert_eq!(writer.len(), 257);
+        assert_eq!(
+            AdditionalAvatarData::deserialize(&mut NetReader::new(writer.as_slice())).unwrap(),
+            maximum
+        );
+
+        let oversized = AdditionalAvatarData {
+            data: vec![0xa5; 256],
+            ..maximum
+        };
+        let mut writer = NetWriter::new();
+        writer.put_u8(0x42);
+        assert!(matches!(
+            oversized.serialize(&mut writer),
+            Err(crate::io::NetWriteError::LengthOverflow {
+                length: 256,
+                max: 255
+            })
+        ));
+        assert_eq!(writer.as_slice(), &[0x42]);
+
+        let avatar = LocalAvatarSyncMessage {
+            additional_avatar_datas: vec![oversized],
+            ..LocalAvatarSyncMessage::empty_high()
+        };
+        assert!(avatar.serialize(&mut NetWriter::new()).is_err());
+        assert!(avatar
+            .serialize_for_channel(&mut NetWriter::new(), true)
+            .is_err());
+    }
+
+    #[test]
+    fn local_avatar_rejects_missing_minimum_additional_entry_bytes() {
+        let mut writer = NetWriter::new();
+        writer.put_u8(BitQuality::High as u8);
+        writer.put_bytes(&vec![0; BitQuality::High.payload_len()]);
+        writer.put_u8(2); // two additional entries
+        writer.put_u8(7); // linked avatar index
+        writer.put_u8(0); // only one empty entry is present
+        let mut reader = NetReader::new(writer.as_slice());
+        assert!(matches!(
+            LocalAvatarSyncMessage::deserialize(&mut reader),
+            Err(crate::io::NetReadError::Underflow {
+                needed: 3,
+                remaining: 2
+            })
+        ));
+        assert_eq!(reader.remaining(), 2);
     }
 
     #[test]
