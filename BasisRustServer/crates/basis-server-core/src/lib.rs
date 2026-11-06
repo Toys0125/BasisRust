@@ -4074,7 +4074,7 @@ async fn handle_message(
                         &session,
                         channels::STORAGE,
                         DeliveryMethod::ReliableOrdered,
-                        &storage::write_reply(&reply),
+                        &storage::write_reply(&reply)?,
                     )
                     .await?;
             }

@@ -566,7 +566,8 @@ mod tests {
             limit: 32768,
             value: bytes.clone(),
             keys: vec![],
-        });
+        })
+        .unwrap();
         assert_eq!(reply(&reply_bytes).unwrap().value, bytes);
         reply_bytes.pop();
         assert!(reply(&reply_bytes).is_none());
@@ -603,14 +604,20 @@ mod tests {
             value: vec![],
             keys: vec![],
         };
-        session.observe(&client, &write_reply(&response)).await;
+        session
+            .observe(&client, &write_reply(&response).unwrap())
+            .await;
         assert_eq!(session.state.lock().unwrap().metrics.stale, 1);
         response.id = 3;
-        session.observe(&client, &write_reply(&response)).await;
+        session
+            .observe(&client, &write_reply(&response).unwrap())
+            .await;
         response.op = StorageOp::Get;
         response.id = 4;
         response.value = value(1, client.connect_time, 0);
-        session.observe(&client, &write_reply(&response)).await;
+        session
+            .observe(&client, &write_reply(&response).unwrap())
+            .await;
         assert_eq!(session.state.lock().unwrap().metrics.verified, 1);
         assert!(session.state.lock().unwrap().connections[&1]
             .pending
@@ -631,7 +638,9 @@ mod tests {
             measured: true,
         });
         response.id = 5; // old bytes, successful protocol status: integrity must still fail.
-        session.observe(&client, &write_reply(&response)).await;
+        session
+            .observe(&client, &write_reply(&response).unwrap())
+            .await;
         assert_eq!(session.state.lock().unwrap().metrics.corrupt, 1);
         session.cancel(1, client.connect_time + 1);
         assert!(session.state.lock().unwrap().connections.contains_key(&1));
