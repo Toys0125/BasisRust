@@ -13,6 +13,10 @@ const MAX_SESSIONS_PER_PEER: usize = 4096;
 const MAX_SESSION_TOKEN_LEN: usize = 64;
 const INTRODUCTION_BURST: u8 = 4;
 const INTRODUCTION_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+// A direct link without a LINK_LOST signal is treated as stale after 30 minutes.
+// The lease is intentionally long for healthy sessions and is renewed only by
+// establishing a new direct link; expiry falls back to the existing relay path.
+const OFFLOAD_LEASE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SessionState {
@@ -34,6 +38,7 @@ struct P2pSession {
     target_link_up: bool,
     introduction_window_started: Instant,
     introduction_sends_in_window: u8,
+    offload_lease_deadline: Option<tokio::time::Instant>,
 }
 
 #[derive(Clone, Default)]
@@ -273,26 +278,40 @@ impl P2pBroker {
         message: BasisP2PSignalMessage,
     ) {
         let token = message.session_token.clone();
-        let Some(mut session) = self.sessions.get_mut(&token) else {
-            return;
+        let transition = {
+            let _lifecycle = self.lifecycle.lock();
+            let Some(mut session) = self.sessions.get_mut(&token) else {
+                return;
+            };
+            if sender == session.initiator_peer_id {
+                session.initiator_link_up = true;
+            } else if sender == session.target_peer_id {
+                session.target_link_up = true;
+            } else {
+                return;
+            }
+            if session.initiator_link_up && session.target_link_up {
+                let initiator = session.initiator_peer_id;
+                let target = session.target_peer_id;
+                let newly_offloaded = self
+                    .offloaded_pairs
+                    .insert(pack_pair(initiator, target), ())
+                    .is_none();
+                let deadline = if newly_offloaded {
+                    let deadline = tokio::time::Instant::now() + OFFLOAD_LEASE;
+                    session.offload_lease_deadline = Some(deadline);
+                    Some(deadline)
+                } else {
+                    session.offload_lease_deadline
+                };
+                Some((initiator, target, newly_offloaded, deadline))
+            } else {
+                None
+            }
         };
-        if sender == session.initiator_peer_id {
-            session.initiator_link_up = true;
-        } else if sender == session.target_peer_id {
-            session.target_link_up = true;
-        } else {
-            return;
-        }
-        if session.initiator_link_up && session.target_link_up {
-            let initiator = session.initiator_peer_id;
-            let target = session.target_peer_id;
-            let newly_offloaded = self
-                .offloaded_pairs
-                .insert(pack_pair(initiator, target), ())
-                .is_none();
-            drop(session);
+        if let Some((initiator, target, newly_offloaded, deadline)) = transition {
             if newly_offloaded {
-                info!("[P2P] offloaded pair ({initiator},{target})");
+                info!("[P2P] offloaded pair ({initiator},{target}) for 30 minute lease");
                 self.send_sub(
                     transport,
                     initiator,
@@ -310,7 +329,84 @@ impl P2pBroker {
                 )
                 .await;
             }
+            if newly_offloaded {
+                if let Some(deadline) = deadline {
+                    let broker = self.clone();
+                    let transport = transport.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep_until(deadline).await;
+                        broker
+                            .expire_offload_lease(&transport, &token, deadline)
+                            .await;
+                    });
+                }
+            }
         }
+    }
+
+    async fn expire_offload_lease(
+        &self,
+        transport: &TransportHandle,
+        token: &str,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        self.expire_offload_lease_at(transport, token, deadline, tokio::time::Instant::now())
+            .await
+    }
+
+    async fn expire_offload_lease_at(
+        &self,
+        transport: &TransportHandle,
+        token: &str,
+        deadline: tokio::time::Instant,
+        now: tokio::time::Instant,
+    ) -> bool {
+        let expired_pair = {
+            let _lifecycle = self.lifecycle.lock();
+            let Some(session) = self.sessions.get(token) else {
+                return false;
+            };
+            if session.offload_lease_deadline != Some(deadline)
+                || now < deadline
+                || !session.initiator_link_up
+                || !session.target_link_up
+            {
+                return false;
+            }
+            let initiator = session.initiator_peer_id;
+            let target = session.target_peer_id;
+            drop(session);
+            let Some((_, removed)) = self.sessions.remove(token) else {
+                return false;
+            };
+            self.untrack_session(&removed, token);
+            Some((initiator, target))
+        };
+        let Some((initiator, target)) = expired_pair else {
+            return false;
+        };
+
+        // Session, indexes, and relay eligibility transition atomically above. Notify
+        // both still-connected peers through the existing signal so clients drop the
+        // old direct route before continuing over the relay path.
+        self.send_sub(
+            transport,
+            initiator,
+            channels::P2P_SUB_LINK_LOST,
+            token,
+            target,
+        )
+        .await;
+        self.send_sub(
+            transport,
+            target,
+            channels::P2P_SUB_LINK_LOST,
+            token,
+            initiator,
+        )
+        .await;
+        info!("[P2P] offload lease expired for pair ({initiator},{target})");
+        true
     }
 
     async fn handle_request<F>(
@@ -351,6 +447,7 @@ impl P2pBroker {
             target_link_up: false,
             introduction_window_started: Instant::now(),
             introduction_sends_in_window: 0,
+            offload_lease_deadline: None,
         };
         if !self.claim_session(&message.session_token, session, &is_authenticated) {
             // Tokens identify one live pair. Claim atomically so simultaneous
@@ -417,24 +514,27 @@ impl P2pBroker {
         sender: PeerId,
         message: BasisP2PSignalMessage,
     ) {
-        let Some(mut session) = self.sessions.get_mut(&message.session_token) else {
-            return;
-        };
-        if !session.authorizes(sender, message.other_player_id) {
-            return;
+        {
+            let _lifecycle = self.lifecycle.lock();
+            let Some(mut session) = self.sessions.get_mut(&message.session_token) else {
+                return;
+            };
+            if !session.authorizes(sender, message.other_player_id) {
+                return;
+            }
+            session.endpoint_a_internal = None;
+            session.endpoint_a_external = None;
+            session.endpoint_b_internal = None;
+            session.endpoint_b_external = None;
+            session.initiator_link_up = false;
+            session.target_link_up = false;
+            session.state = SessionState::ReadyForPunch;
+            session.offload_lease_deadline = None;
+            self.offloaded_pairs.remove(&pack_pair(
+                session.initiator_peer_id,
+                session.target_peer_id,
+            ));
         }
-        session.endpoint_a_internal = None;
-        session.endpoint_a_external = None;
-        session.endpoint_b_internal = None;
-        session.endpoint_b_external = None;
-        session.initiator_link_up = false;
-        session.target_link_up = false;
-        session.state = SessionState::ReadyForPunch;
-        self.offloaded_pairs.remove(&pack_pair(
-            session.initiator_peer_id,
-            session.target_peer_id,
-        ));
-        drop(session);
         self.send_sub(
             transport,
             message.other_player_id,
@@ -830,6 +930,87 @@ mod tests {
         assert!(!broker.peer_sessions.contains_key(&40));
         assert!(!broker.peer_sessions.contains_key(&41));
         assert!(!broker.is_offloaded(40, 41));
+        transport.shutdown();
+    }
+
+    #[tokio::test]
+    async fn offload_lease_expires_connected_pair_and_notifies_both_peers() {
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (a_socket, a) = connected_signal_peer(&transport, &mut events).await;
+        let (b_socket, b) = connected_signal_peer(&transport, &mut events).await;
+        let broker = P2pBroker::default();
+        let mut linked = session(a.peer_id(), b.peer_id());
+        linked.state = SessionState::Punched;
+        linked.endpoint_a_external = Some(a_socket.local_addr().unwrap());
+        linked.endpoint_b_external = Some(b_socket.local_addr().unwrap());
+        linked.initiator_link_up = true;
+        broker.sessions.insert("lease-test".into(), linked);
+        broker.track_peer_session(a.peer_id(), "lease-test");
+        broker.track_peer_session(b.peer_id(), "lease-test");
+
+        broker
+            .handle_link_up(
+                &transport,
+                b.peer_id(),
+                BasisP2PSignalMessage {
+                    other_player_id: a.peer_id(),
+                    session_token: "lease-test".into(),
+                    ephemeral_public_key: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            receive_signal(&a_socket).await,
+            encode_signal(channels::P2P_SUB_OFFLOADED, b.peer_id(), "lease-test")
+        );
+        assert_eq!(
+            receive_signal(&b_socket).await,
+            encode_signal(channels::P2P_SUB_OFFLOADED, a.peer_id(), "lease-test")
+        );
+        let deadline = broker
+            .sessions
+            .get("lease-test")
+            .unwrap()
+            .offload_lease_deadline
+            .unwrap();
+        assert!(transport.peer_addr(a.peer_id()).is_some());
+        assert!(transport.peer_addr(b.peer_id()).is_some());
+        assert!(broker.is_offloaded(a.peer_id(), b.peer_id()));
+        assert!(
+            !broker
+                .expire_offload_lease_at(
+                    &transport,
+                    "lease-test",
+                    deadline,
+                    deadline - Duration::from_nanos(1),
+                )
+                .await
+        );
+        assert!(broker.is_offloaded(a.peer_id(), b.peer_id()));
+        assert!(broker.sessions.contains_key("lease-test"));
+
+        assert!(
+            broker
+                .expire_offload_lease_at(&transport, "lease-test", deadline, deadline)
+                .await
+        );
+
+        assert!(!broker.is_offloaded(a.peer_id(), b.peer_id()));
+        assert!(!broker.sessions.contains_key("lease-test"));
+        assert!(!broker.peer_sessions.contains_key(&a.peer_id()));
+        assert!(!broker.peer_sessions.contains_key(&b.peer_id()));
+        assert!(transport.peer_addr(a.peer_id()).is_some());
+        assert!(transport.peer_addr(b.peer_id()).is_some());
+        assert_eq!(
+            receive_signal(&a_socket).await,
+            encode_signal(channels::P2P_SUB_LINK_LOST, b.peer_id(), "lease-test")
+        );
+        assert_eq!(
+            receive_signal(&b_socket).await,
+            encode_signal(channels::P2P_SUB_LINK_LOST, a.peer_id(), "lease-test")
+        );
         transport.shutdown();
     }
 
@@ -1244,6 +1425,7 @@ mod tests {
             target_link_up: false,
             introduction_window_started: Instant::now(),
             introduction_sends_in_window: 0,
+            offload_lease_deadline: None,
         }
     }
 
@@ -1276,6 +1458,7 @@ mod tests {
                 target_link_up: false,
                 introduction_window_started: Instant::now(),
                 introduction_sends_in_window: 0,
+                offload_lease_deadline: None,
             },
         );
         broker
