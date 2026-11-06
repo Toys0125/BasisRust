@@ -6,11 +6,17 @@ use basis_protocol::{
 use basis_transport::{DeliveryMethod, PeerId, TransportHandle};
 use dashmap::{mapref::entry::Entry, DashMap};
 use parking_lot::Mutex;
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Instant};
 use tracing::{info, warn};
 
 const MAX_SESSIONS_PER_PEER: usize = 4096;
 const MAX_SESSION_TOKEN_LEN: usize = 64;
+const INTRODUCTION_BURST: u8 = 4;
+const INTRODUCTION_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+// A direct link without a LINK_LOST signal is treated as stale after 30 minutes.
+// The lease is intentionally long for healthy sessions and is renewed only by
+// establishing a new direct link; expiry falls back to the existing relay path.
+const OFFLOAD_LEASE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SessionState {
@@ -30,6 +36,9 @@ struct P2pSession {
     endpoint_b_external: Option<SocketAddr>,
     initiator_link_up: bool,
     target_link_up: bool,
+    introduction_window_started: Instant,
+    introduction_sends_in_window: u8,
+    offload_lease_deadline: Option<tokio::time::Instant>,
 }
 
 #[derive(Clone, Default)]
@@ -122,6 +131,19 @@ impl P2pBroker {
             warn!("[P2P] NAT request before session ready {}", preview(&token));
             return;
         }
+        let is_initiator_endpoint = transport
+            .peer_addr(session.initiator_peer_id)
+            .is_some_and(|addr| same_endpoint(addr, remote_addr));
+        let is_target_endpoint = transport
+            .peer_addr(session.target_peer_id)
+            .is_some_and(|addr| same_endpoint(addr, remote_addr));
+        if !is_initiator_endpoint && !is_target_endpoint {
+            warn!(
+                "[P2P] NAT request endpoint does not match a session participant {}",
+                preview(&token)
+            );
+            return;
+        }
         // The Unity client retries introductions on a timer. Identify participants by
         // their observed UDP endpoint so a retry cannot fill the other participant's slot.
         if session.endpoint_a_external == Some(remote_addr) {
@@ -150,10 +172,20 @@ impl P2pBroker {
         let Some(b_external) = session.endpoint_b_external else {
             return;
         };
+        let now = Instant::now();
+        if now.duration_since(session.introduction_window_started) >= INTRODUCTION_WINDOW {
+            session.introduction_window_started = now;
+            session.introduction_sends_in_window = 0;
+        }
+        if session.introduction_sends_in_window >= INTRODUCTION_BURST {
+            return;
+        }
+        session.introduction_sends_in_window += 1;
         session.state = SessionState::Punched;
         drop(session);
 
-        let same_nat = a_external.ip() == b_external.ip();
+        let prediction_count = prediction_count(a_external, b_external);
+        let same_nat = prediction_count == 0;
         let same_host = same_nat && a_internal.ip() == b_internal.ip();
         let (a_internal, b_internal) = if same_host {
             (
@@ -165,7 +197,6 @@ impl P2pBroker {
         };
         // Introductions are unacknowledged UDP: retries need the full prediction window
         // too, because either peer may have missed the previous response.
-        let prediction_count = if same_nat { 0 } else { 32 };
         if let Err(err) = transport
             .send_nat_introduce(
                 a_internal,
@@ -212,6 +243,97 @@ impl P2pBroker {
         }
     }
 
+    /// Periodic lifecycle maintenance for stale peers and expired direct-link leases.
+    /// This scan is shared by the core worker, never triggered by untrusted NAT tokens.
+    pub(crate) async fn maintain_lifecycle(
+        &self,
+        transport: &TransportHandle,
+        now: tokio::time::Instant,
+    ) {
+        let notifications = {
+            let _lifecycle = self.lifecycle.lock();
+            let candidates: Vec<_> = self
+                .sessions
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.value().clone()))
+                .collect();
+            let mut notifications = Vec::new();
+            let mut active_offloads = HashSet::new();
+
+            for (token, session) in candidates {
+                let initiator_connected = transport.peer_addr(session.initiator_peer_id).is_some();
+                let target_connected = transport.peer_addr(session.target_peer_id).is_some();
+                if !initiator_connected || !target_connected {
+                    if self.sessions.remove(&token).is_some() {
+                        self.untrack_session(&session, &token);
+                        if initiator_connected {
+                            notifications.push((
+                                session.initiator_peer_id,
+                                channels::P2P_SUB_CANCEL,
+                                token,
+                                session.target_peer_id,
+                            ));
+                        } else if target_connected {
+                            notifications.push((
+                                session.target_peer_id,
+                                channels::P2P_SUB_CANCEL,
+                                token,
+                                session.initiator_peer_id,
+                            ));
+                        }
+                    }
+                    continue;
+                }
+
+                let lease_expired = session
+                    .offload_lease_deadline
+                    .is_some_and(|deadline| deadline <= now)
+                    && session.initiator_link_up
+                    && session.target_link_up;
+                if !lease_expired {
+                    if session.initiator_link_up && session.target_link_up {
+                        active_offloads
+                            .insert(pack_pair(session.initiator_peer_id, session.target_peer_id));
+                    }
+                    continue;
+                }
+                if let Some((_, removed)) = self.sessions.remove(&token) {
+                    self.untrack_session(&removed, &token);
+                    notifications.push((
+                        session.initiator_peer_id,
+                        channels::P2P_SUB_LINK_LOST,
+                        token.clone(),
+                        session.target_peer_id,
+                    ));
+                    notifications.push((
+                        session.target_peer_id,
+                        channels::P2P_SUB_LINK_LOST,
+                        token,
+                        session.initiator_peer_id,
+                    ));
+                    info!(
+                        "[P2P] offload lease expired for pair ({},{})",
+                        session.initiator_peer_id, session.target_peer_id
+                    );
+                }
+            }
+
+            // Repair orphaned pair markers while preserving any pair with another live,
+            // linked session. This sweep is bounded by the shared maintenance cadence.
+            self.offloaded_pairs
+                .retain(|pair, _| active_offloads.contains(pair));
+            // Removing an expired token also untracks its pair marker. Another
+            // linked token for the same pair may still own an unexpired lease.
+            for pair in active_offloads {
+                self.offloaded_pairs.insert(pair, ());
+            }
+            notifications
+        };
+        for (to, sub, token, other) in notifications {
+            self.send_sub(transport, to, sub, &token, other).await;
+        }
+    }
+
     async fn handle_link_up(
         &self,
         transport: &TransportHandle,
@@ -219,26 +341,36 @@ impl P2pBroker {
         message: BasisP2PSignalMessage,
     ) {
         let token = message.session_token.clone();
-        let Some(mut session) = self.sessions.get_mut(&token) else {
-            return;
+        let transition = {
+            let _lifecycle = self.lifecycle.lock();
+            let Some(mut session) = self.sessions.get_mut(&token) else {
+                return;
+            };
+            if sender == session.initiator_peer_id {
+                session.initiator_link_up = true;
+            } else if sender == session.target_peer_id {
+                session.target_link_up = true;
+            } else {
+                return;
+            }
+            if session.initiator_link_up && session.target_link_up {
+                let initiator = session.initiator_peer_id;
+                let target = session.target_peer_id;
+                let newly_offloaded = self
+                    .offloaded_pairs
+                    .insert(pack_pair(initiator, target), ())
+                    .is_none();
+                session
+                    .offload_lease_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + OFFLOAD_LEASE);
+                Some((initiator, target, newly_offloaded))
+            } else {
+                None
+            }
         };
-        if sender == session.initiator_peer_id {
-            session.initiator_link_up = true;
-        } else if sender == session.target_peer_id {
-            session.target_link_up = true;
-        } else {
-            return;
-        }
-        if session.initiator_link_up && session.target_link_up {
-            let initiator = session.initiator_peer_id;
-            let target = session.target_peer_id;
-            let newly_offloaded = self
-                .offloaded_pairs
-                .insert(pack_pair(initiator, target), ())
-                .is_none();
-            drop(session);
+        if let Some((initiator, target, newly_offloaded)) = transition {
             if newly_offloaded {
-                info!("[P2P] offloaded pair ({initiator},{target})");
+                info!("[P2P] offloaded pair ({initiator},{target}) for 30 minute lease");
                 self.send_sub(
                     transport,
                     initiator,
@@ -295,6 +427,9 @@ impl P2pBroker {
             endpoint_b_external: None,
             initiator_link_up: false,
             target_link_up: false,
+            introduction_window_started: Instant::now(),
+            introduction_sends_in_window: 0,
+            offload_lease_deadline: None,
         };
         if !self.claim_session(&message.session_token, session, &is_authenticated) {
             // Tokens identify one live pair. Claim atomically so simultaneous
@@ -361,24 +496,47 @@ impl P2pBroker {
         sender: PeerId,
         message: BasisP2PSignalMessage,
     ) {
-        let Some(mut session) = self.sessions.get_mut(&message.session_token) else {
-            return;
-        };
-        if !session.authorizes(sender, message.other_player_id) {
-            return;
+        {
+            let _lifecycle = self.lifecycle.lock();
+            let pair = {
+                let Some(session) = self.sessions.get(&message.session_token) else {
+                    return;
+                };
+                if !session.authorizes(sender, message.other_player_id) {
+                    return;
+                }
+                pack_pair(session.initiator_peer_id, session.target_peer_id)
+            };
+            // LINK_LOST describes the shared direct peer link. Clear every token
+            // for this pair so housekeeping cannot resurrect an older link claim.
+            // Use the participant index, bounded by MAX_SESSIONS_PER_PEER.
+            let mut tokens = self
+                .peer_sessions
+                .get(&sender)
+                .map(|tokens| tokens.value().clone())
+                .unwrap_or_default();
+            tokens.insert(message.session_token.clone());
+            for token in tokens {
+                let Some(mut session) = self.sessions.get_mut(&token) else {
+                    continue;
+                };
+                if pack_pair(session.initiator_peer_id, session.target_peer_id) != pair {
+                    continue;
+                }
+                session.endpoint_a_internal = None;
+                session.endpoint_a_external = None;
+                session.endpoint_b_internal = None;
+                session.endpoint_b_external = None;
+                session.initiator_link_up = false;
+                session.target_link_up = false;
+                // A pending token must still receive ACCEPT before punching.
+                if session.state != SessionState::Awaiting {
+                    session.state = SessionState::ReadyForPunch;
+                }
+                session.offload_lease_deadline = None;
+            }
+            self.offloaded_pairs.remove(&pair);
         }
-        session.endpoint_a_internal = None;
-        session.endpoint_a_external = None;
-        session.endpoint_b_internal = None;
-        session.endpoint_b_external = None;
-        session.initiator_link_up = false;
-        session.target_link_up = false;
-        session.state = SessionState::ReadyForPunch;
-        self.offloaded_pairs.remove(&pack_pair(
-            session.initiator_peer_id,
-            session.target_peer_id,
-        ));
-        drop(session);
         self.send_sub(
             transport,
             message.other_player_id,
@@ -437,6 +595,10 @@ impl P2pBroker {
                 .peer_sessions
                 .get(&initiator)
                 .is_some_and(|tokens| tokens.len() >= MAX_SESSIONS_PER_PEER)
+            || self
+                .peer_sessions
+                .get(&target)
+                .is_some_and(|tokens| tokens.len() >= MAX_SESSIONS_PER_PEER)
         {
             return false;
         }
@@ -486,6 +648,8 @@ impl P2pBroker {
         if let Some(mut sessions) = self.peer_sessions.get_mut(&peer) {
             sessions.remove(token);
         }
+        self.peer_sessions
+            .remove_if(&peer, |_, sessions| sessions.is_empty());
     }
 
     async fn send_sub(
@@ -549,6 +713,28 @@ fn preview(token: &str) -> &str {
     token.get(..8).unwrap_or(token)
 }
 
+fn same_endpoint(a: SocketAddr, b: SocketAddr) -> bool {
+    fn normalized(addr: SocketAddr) -> (std::net::IpAddr, u16) {
+        match addr {
+            SocketAddr::V6(v6) => v6
+                .ip()
+                .to_ipv4_mapped()
+                .map(|ip| (ip.into(), v6.port()))
+                .unwrap_or(((*v6.ip()).into(), v6.port())),
+            SocketAddr::V4(v4) => ((*v4.ip()).into(), v4.port()),
+        }
+    }
+    normalized(a) == normalized(b)
+}
+
+fn prediction_count(a_external: SocketAddr, b_external: SocketAddr) -> u8 {
+    if a_external.ip() == b_external.ip() {
+        0
+    } else {
+        32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,16 +744,33 @@ mod tests {
 
     #[tokio::test]
     async fn introduction_retries_require_two_distinct_endpoints_and_can_resend() {
-        let (transport, _events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
-        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (a, a_peer) = connected_signal_peer(&transport, &mut events).await;
+        let (b, b_peer) =
+            connected_signal_peer_at(&transport, &mut events, "127.0.0.2:0".parse().unwrap()).await;
         let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let a_addr = a.local_addr().unwrap();
         let b_addr = b.local_addr().unwrap();
         let token = "retry-test";
-        let broker = ready_broker(token);
+        let broker = ready_broker_for(token, a_peer.peer_id(), b_peer.peer_id());
+        broker
+            .handle_nat_introduction_request(
+                &transport,
+                other.local_addr().unwrap(),
+                other.local_addr().unwrap(),
+                token.into(),
+            )
+            .await;
+        {
+            let session = broker.sessions.get(token).unwrap();
+            assert_eq!(
+                session.endpoint_a_external, None,
+                "spoofed endpoint claimed a slot"
+            );
+            assert_eq!(session.endpoint_b_external, None);
+        }
         for _ in 0..2 {
             broker
                 .handle_nat_introduction_request(&transport, a_addr, a_addr, token.into())
@@ -588,8 +791,8 @@ mod tests {
             .handle_nat_introduction_request(&transport, b_addr, b_addr, token.into())
             .await;
         // Each participant must receive the other participant's endpoint, never itself.
-        let first_a = receive_introduction(&a, b_addr, token, 0).await;
-        let first_b = receive_introduction(&b, a_addr, token, 0).await;
+        let first_a = receive_introduction(&a, b_addr, token, 32).await;
+        let first_b = receive_introduction(&b, a_addr, token, 32).await;
         assert_eq!(
             broker.sessions.get(token).unwrap().state,
             SessionState::Punched
@@ -599,8 +802,8 @@ mod tests {
         broker
             .handle_nat_introduction_request(&transport, a_addr, a_addr, token.into())
             .await;
-        assert_eq!(receive_introduction(&a, b_addr, token, 0).await, first_a);
-        assert_eq!(receive_introduction(&b, a_addr, token, 0).await, first_b);
+        assert_eq!(receive_introduction(&a, b_addr, token, 32).await, first_a);
+        assert_eq!(receive_introduction(&b, a_addr, token, 32).await, first_b);
 
         broker
             .handle_nat_introduction_request(
@@ -622,16 +825,16 @@ mod tests {
 
     #[tokio::test]
     async fn introduction_retry_preserves_port_prediction_after_unconfirmed_response() {
-        let (transport, _events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
-        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        // Receive on both loopback IPs while presenting a distinct observed IP to the broker.
-        let b = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let (a, a_peer) = connected_signal_peer(&transport, &mut events).await;
+        let (b, b_peer) =
+            connected_signal_peer_at(&transport, &mut events, "127.0.0.2:0".parse().unwrap()).await;
         let a_addr = a.local_addr().unwrap();
-        let b_addr = SocketAddr::from(([127, 0, 0, 2], b.local_addr().unwrap().port()));
+        let b_addr = b.local_addr().unwrap();
         let token = "prediction-retry-test";
-        let broker = ready_broker(token);
+        let broker = ready_broker_for(token, a_peer.peer_id(), b_peer.peer_id());
         broker
             .handle_nat_introduction_request(&transport, a_addr, a_addr, token.into())
             .await;
@@ -655,6 +858,366 @@ mod tests {
             receive_introduction(&b, a_addr, token, 32).await;
         }
         transport.shutdown();
+    }
+
+    #[test]
+    fn prediction_window_preserves_cross_nat_compatibility() {
+        let a: SocketAddr = "192.0.2.10:1000".parse().unwrap();
+        let b: SocketAddr = "198.51.100.20:2000".parse().unwrap();
+        assert_eq!(prediction_count(a, b), 32);
+        assert_eq!(prediction_count(a, "192.0.2.10:2000".parse().unwrap()), 0);
+        assert!(same_endpoint(
+            "127.0.0.1:9000".parse().unwrap(),
+            "[::ffff:127.0.0.1]:9000".parse().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn introduction_burst_is_bounded_per_pair_and_retry_window_reopens() {
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (a, a_peer) = connected_signal_peer(&transport, &mut events).await;
+        let (b, b_peer) = connected_signal_peer(&transport, &mut events).await;
+        let a_addr = a.local_addr().unwrap();
+        let b_addr = b.local_addr().unwrap();
+        let token = "burst-test";
+        let broker = ready_broker_for(token, a_peer.peer_id(), b_peer.peer_id());
+        broker
+            .handle_nat_introduction_request(&transport, a_addr, a_addr, token.into())
+            .await;
+        for _ in 0..INTRODUCTION_BURST + 3 {
+            broker
+                .handle_nat_introduction_request(&transport, b_addr, b_addr, token.into())
+                .await;
+        }
+        assert_eq!(
+            broker
+                .sessions
+                .get(token)
+                .unwrap()
+                .introduction_sends_in_window,
+            4
+        );
+        for _ in 0..INTRODUCTION_BURST {
+            receive_introduction(&a, b_addr, token, 0).await;
+            receive_introduction(&b, a_addr, token, 0).await;
+        }
+        let mut packet = [0; 512];
+        assert!(timeout(Duration::from_millis(40), a.recv_from(&mut packet))
+            .await
+            .is_err());
+
+        tokio::time::sleep(INTRODUCTION_WINDOW).await;
+        broker
+            .handle_nat_introduction_request(&transport, a_addr, a_addr, token.into())
+            .await;
+        receive_introduction(&a, b_addr, token, 0).await;
+        receive_introduction(&b, a_addr, token, 0).await;
+        transport.shutdown();
+    }
+
+    #[tokio::test]
+    async fn stale_transport_cleanup_notifies_connected_counterpart_with_token() {
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (socket, peer) = connected_signal_peer(&transport, &mut events).await;
+        let disconnected = PeerId::MAX;
+        let broker = P2pBroker::default();
+        let mut stale = session(peer.peer_id(), disconnected);
+        stale.state = SessionState::Punched;
+        stale.initiator_link_up = true;
+        stale.target_link_up = true;
+        broker.sessions.insert("stale".into(), stale);
+        broker.track_peer_session(peer.peer_id(), "stale");
+        broker.track_peer_session(disconnected, "stale");
+        broker
+            .offloaded_pairs
+            .insert(pack_pair(peer.peer_id(), disconnected), ());
+
+        broker
+            .handle_nat_introduction_request(
+                &transport,
+                socket.local_addr().unwrap(),
+                socket.local_addr().unwrap(),
+                "unknown-token".into(),
+            )
+            .await;
+        assert!(broker.sessions.contains_key("stale"));
+
+        broker
+            .maintain_lifecycle(&transport, tokio::time::Instant::now())
+            .await;
+
+        assert!(!broker.sessions.contains_key("stale"));
+        assert!(!broker.peer_sessions.contains_key(&peer.peer_id()));
+        assert!(!broker.peer_sessions.contains_key(&disconnected));
+        assert!(!broker.is_offloaded(peer.peer_id(), disconnected));
+        assert_eq!(
+            receive_signal(&socket).await,
+            encode_signal(channels::P2P_SUB_CANCEL, disconnected, "stale")
+        );
+        transport.shutdown();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_maintenance_cleans_churn_without_per_session_timers() {
+        let (transport, _events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let broker = P2pBroker::default();
+        for index in 0..256u16 {
+            let initiator = index.wrapping_mul(2);
+            let target = initiator.wrapping_add(1);
+            let token = format!("churn-{index}");
+            let mut stale = session(initiator, target);
+            stale.state = SessionState::Punched;
+            stale.initiator_link_up = true;
+            stale.target_link_up = true;
+            stale.offload_lease_deadline = Some(tokio::time::Instant::now());
+            broker.sessions.insert(token.clone(), stale);
+            broker.track_peer_session(initiator, &token);
+            broker.track_peer_session(target, &token);
+            broker
+                .offloaded_pairs
+                .insert(pack_pair(initiator, target), ());
+        }
+
+        broker
+            .maintain_lifecycle(&transport, tokio::time::Instant::now())
+            .await;
+
+        assert!(broker.sessions.is_empty());
+        assert!(broker.peer_sessions.is_empty());
+        assert!(broker.offloaded_pairs.is_empty());
+        transport.shutdown();
+    }
+
+    #[tokio::test]
+    async fn offload_lease_expires_connected_pair_and_notifies_both_peers() {
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (a_socket, a) = connected_signal_peer(&transport, &mut events).await;
+        let (b_socket, b) = connected_signal_peer(&transport, &mut events).await;
+        let broker = P2pBroker::default();
+        let mut linked = session(a.peer_id(), b.peer_id());
+        linked.state = SessionState::Punched;
+        linked.endpoint_a_external = Some(a_socket.local_addr().unwrap());
+        linked.endpoint_b_external = Some(b_socket.local_addr().unwrap());
+        linked.initiator_link_up = true;
+        broker.sessions.insert("lease-test".into(), linked);
+        broker.track_peer_session(a.peer_id(), "lease-test");
+        broker.track_peer_session(b.peer_id(), "lease-test");
+
+        broker
+            .handle_link_up(
+                &transport,
+                b.peer_id(),
+                BasisP2PSignalMessage {
+                    other_player_id: a.peer_id(),
+                    session_token: "lease-test".into(),
+                    ephemeral_public_key: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            receive_signal(&a_socket).await,
+            encode_signal(channels::P2P_SUB_OFFLOADED, b.peer_id(), "lease-test")
+        );
+        assert_eq!(
+            receive_signal(&b_socket).await,
+            encode_signal(channels::P2P_SUB_OFFLOADED, a.peer_id(), "lease-test")
+        );
+        let deadline = broker
+            .sessions
+            .get("lease-test")
+            .unwrap()
+            .offload_lease_deadline
+            .unwrap();
+        assert!(transport.peer_addr(a.peer_id()).is_some());
+        assert!(transport.peer_addr(b.peer_id()).is_some());
+        assert!(broker.is_offloaded(a.peer_id(), b.peer_id()));
+        broker
+            .maintain_lifecycle(&transport, deadline - Duration::from_nanos(1))
+            .await;
+        assert!(broker.is_offloaded(a.peer_id(), b.peer_id()));
+        assert!(broker.sessions.contains_key("lease-test"));
+
+        broker.maintain_lifecycle(&transport, deadline).await;
+
+        assert!(!broker.is_offloaded(a.peer_id(), b.peer_id()));
+        assert!(!broker.sessions.contains_key("lease-test"));
+        assert!(!broker.peer_sessions.contains_key(&a.peer_id()));
+        assert!(!broker.peer_sessions.contains_key(&b.peer_id()));
+        assert!(transport.peer_addr(a.peer_id()).is_some());
+        assert!(transport.peer_addr(b.peer_id()).is_some());
+        assert_eq!(
+            receive_signal(&a_socket).await,
+            encode_signal(channels::P2P_SUB_LINK_LOST, b.peer_id(), "lease-test")
+        );
+        assert_eq!(
+            receive_signal(&b_socket).await,
+            encode_signal(channels::P2P_SUB_LINK_LOST, a.peer_id(), "lease-test")
+        );
+        transport.shutdown();
+    }
+
+    #[tokio::test]
+    async fn every_linked_token_has_a_fixed_lease_even_for_the_same_pair() {
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (_a_socket, a) = connected_signal_peer(&transport, &mut events).await;
+        let (_b_socket, b) = connected_signal_peer(&transport, &mut events).await;
+        let broker = P2pBroker::default();
+        for token in ["first-lease", "second-lease"] {
+            let mut linked = session(a.peer_id(), b.peer_id());
+            linked.state = SessionState::Punched;
+            linked.initiator_link_up = true;
+            assert!(broker.claim_session(token, linked, |_| true));
+            broker
+                .handle_link_up(
+                    &transport,
+                    b.peer_id(),
+                    BasisP2PSignalMessage {
+                        other_player_id: a.peer_id(),
+                        session_token: token.into(),
+                        ephemeral_public_key: None,
+                    },
+                )
+                .await;
+        }
+        let second_deadline = broker
+            .sessions
+            .get("second-lease")
+            .unwrap()
+            .offload_lease_deadline
+            .expect("every linked session needs its own deadline");
+        broker
+            .handle_link_up(
+                &transport,
+                b.peer_id(),
+                BasisP2PSignalMessage {
+                    other_player_id: a.peer_id(),
+                    session_token: "second-lease".into(),
+                    ephemeral_public_key: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            broker
+                .sessions
+                .get("second-lease")
+                .unwrap()
+                .offload_lease_deadline,
+            Some(second_deadline)
+        );
+
+        // Model two links established at different times without a long sleep.
+        let first_deadline = second_deadline - Duration::from_secs(1);
+        broker
+            .sessions
+            .get_mut("first-lease")
+            .unwrap()
+            .offload_lease_deadline = Some(first_deadline);
+        broker.maintain_lifecycle(&transport, first_deadline).await;
+        assert!(!broker.sessions.contains_key("first-lease"));
+        assert!(broker.sessions.contains_key("second-lease"));
+        assert!(
+            broker.is_offloaded(a.peer_id(), b.peer_id()),
+            "another unexpired linked session must retain the pair marker"
+        );
+        broker.maintain_lifecycle(&transport, second_deadline).await;
+        assert!(broker.sessions.is_empty());
+        assert!(broker.peer_sessions.is_empty());
+        assert!(!broker.is_offloaded(a.peer_id(), b.peer_id()));
+        transport.shutdown();
+    }
+
+    #[tokio::test]
+    async fn link_lost_cannot_be_undone_by_another_token_for_the_same_pair() {
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (_a_socket, a) = connected_signal_peer(&transport, &mut events).await;
+        let (_b_socket, b) = connected_signal_peer(&transport, &mut events).await;
+        let broker = P2pBroker::default();
+        let now = tokio::time::Instant::now();
+        for token in ["first-link", "second-link"] {
+            let mut linked = session(a.peer_id(), b.peer_id());
+            linked.state = SessionState::Punched;
+            linked.initiator_link_up = true;
+            linked.target_link_up = true;
+            linked.offload_lease_deadline = Some(now + OFFLOAD_LEASE);
+            assert!(broker.claim_session(token, linked, |_| true));
+        }
+        assert!(broker.claim_session("pending-link", session(a.peer_id(), b.peer_id()), |_| true));
+        broker
+            .offloaded_pairs
+            .insert(pack_pair(a.peer_id(), b.peer_id()), ());
+        broker
+            .handle_signal(
+                &transport,
+                a.peer_id(),
+                &encode_signal(channels::P2P_SUB_LINK_LOST, b.peer_id(), "first-link"),
+                true,
+                |_| true,
+            )
+            .await;
+        assert!(!broker.is_offloaded(a.peer_id(), b.peer_id()));
+        broker.maintain_lifecycle(&transport, now).await;
+        assert!(
+            !broker.is_offloaded(a.peer_id(), b.peer_id()),
+            "housekeeping must not restore a lost direct link"
+        );
+        for token in ["first-link", "second-link"] {
+            let session = broker.sessions.get(token).unwrap();
+            assert!(!session.initiator_link_up && !session.target_link_up);
+            assert_eq!(session.state, SessionState::ReadyForPunch);
+            assert!(session.offload_lease_deadline.is_none());
+        }
+        assert_eq!(
+            broker.sessions.get("pending-link").unwrap().state,
+            SessionState::Awaiting
+        );
+        transport.shutdown();
+    }
+
+    #[test]
+    fn session_admission_bounds_both_participants_and_releases_capacity() {
+        for crowded_is_target in [false, true] {
+            let broker = P2pBroker::default();
+            let pair = |other| {
+                if crowded_is_target {
+                    (other, 1)
+                } else {
+                    (1, other)
+                }
+            };
+            for index in 0..MAX_SESSIONS_PER_PEER {
+                let (initiator, target) = pair(u16::try_from(index + 2).unwrap());
+                assert!(broker.claim_session(
+                    &format!("bounded-{index}"),
+                    session(initiator, target),
+                    |_| true
+                ));
+            }
+            let (initiator, target) = pair(5000);
+            assert!(!broker.claim_session("overflow", session(initiator, target), |_| true));
+            assert_eq!(broker.sessions.len(), MAX_SESSIONS_PER_PEER);
+            assert!(broker.peer_sessions.get(&5000).is_none());
+            let (first_initiator, first_target) = pair(2);
+            assert!(broker
+                .remove_session_if_authorized("bounded-0", first_initiator, first_target)
+                .is_some());
+            assert!(broker.claim_session("overflow", session(initiator, target), |_| true));
+            assert_eq!(
+                broker.peer_sessions.get(&1).unwrap().len(),
+                MAX_SESSIONS_PER_PEER
+            );
+        }
     }
 
     #[tokio::test]
@@ -975,7 +1538,15 @@ mod tests {
         transport: &TransportHandle,
         events: &mut tokio::sync::mpsc::Receiver<ServerEvent>,
     ) -> (UdpSocket, PeerSession) {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        connected_signal_peer_at(transport, events, "127.0.0.1:0".parse().unwrap()).await
+    }
+
+    async fn connected_signal_peer_at(
+        transport: &TransportHandle,
+        events: &mut tokio::sync::mpsc::Receiver<ServerEvent>,
+        bind: SocketAddr,
+    ) -> (UdpSocket, PeerSession) {
+        let socket = UdpSocket::bind(bind).await.unwrap();
         let mut request = NetWriter::new();
         request.put_u8(PacketProperty::ConnectRequest as u8);
         request.put_i32(basis_protocol::version::LITENETLIB_PROTOCOL_ID);
@@ -1058,6 +1629,9 @@ mod tests {
             endpoint_b_external: None,
             initiator_link_up: false,
             target_link_up: false,
+            introduction_window_started: Instant::now(),
+            introduction_sends_in_window: 0,
+            offload_lease_deadline: None,
         }
     }
 
@@ -1074,13 +1648,13 @@ mod tests {
         writer.as_slice().to_vec()
     }
 
-    fn ready_broker(token: &str) -> P2pBroker {
+    fn ready_broker_for(token: &str, initiator: PeerId, target: PeerId) -> P2pBroker {
         let broker = P2pBroker::default();
         broker.sessions.insert(
             token.into(),
             P2pSession {
-                initiator_peer_id: 0,
-                target_peer_id: 1,
+                initiator_peer_id: initiator,
+                target_peer_id: target,
                 state: SessionState::ReadyForPunch,
                 endpoint_a_internal: None,
                 endpoint_a_external: None,
@@ -1088,6 +1662,9 @@ mod tests {
                 endpoint_b_external: None,
                 initiator_link_up: false,
                 target_link_up: false,
+                introduction_window_started: Instant::now(),
+                introduction_sends_in_window: 0,
+                offload_lease_deadline: None,
             },
         );
         broker
@@ -1107,11 +1684,14 @@ mod tests {
         assert_eq!(packet[0], basis_transport::PacketProperty::NatMessage as u8);
         let mut reader = NetReader::new(&packet[9..len]);
         for _ in 0..2 {
-            assert_eq!(reader.get_u8().unwrap(), 0); // IPv4
-            let std::net::IpAddr::V4(other_ip) = other.ip() else {
-                panic!("expected IPv4 test endpoint");
+            let address_family = reader.get_u8().unwrap();
+            let expected_family = if other.is_ipv4() { 0 } else { 1 };
+            assert_eq!(address_family, expected_family);
+            let expected_ip = match other.ip() {
+                std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+                std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
             };
-            assert_eq!(reader.get_bytes(4).unwrap(), other_ip.octets());
+            assert_eq!(reader.get_bytes(expected_ip.len()).unwrap(), expected_ip);
             assert_eq!(reader.get_u16().unwrap(), other.port());
         }
         assert_eq!(reader.get_string().unwrap(), token);
