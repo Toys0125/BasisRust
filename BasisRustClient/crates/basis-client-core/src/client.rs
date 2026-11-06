@@ -397,7 +397,7 @@ impl BasisClient {
         }
         let drops = self.packet_diagnostics.snapshot();
         if drops.iter().any(|count| *count != 0) {
-            debug!(client = self.index, ?drops, "packet drop counts: empty, unknown_property, short_header, invalid_ack_size, invalid_merged");
+            debug!(client = self.index, ?drops, "packet drop counts: empty, unknown_property, short_header, invalid_ack_size, invalid_merged, shared_handoff_full");
         }
         self.stop_receive_loop();
     }
