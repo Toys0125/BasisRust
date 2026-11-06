@@ -704,6 +704,48 @@ impl ImageCache {
     }
 }
 
+/// Return true only for a complete client image data frame. The image upload
+/// allowance is reserved for the manager's known data opcodes; control and
+/// malformed messages stay subject to ordinary upload admission.
+pub(crate) fn is_valid_image_upload(payload: &[u8]) -> bool {
+    if payload.len() < HEADER_BYTES {
+        return false;
+    }
+    match payload[0] {
+        OP_SPAWN => {
+            let Some((chunk_count, pose_offset)) = read_spawn_header(payload) else {
+                return false;
+            };
+            chunk_count > 0 && pose_offset.checked_add(POSE_BYTES) == Some(payload.len())
+        }
+        OP_CHUNK | OP_ANIMATION_CHUNK => {
+            const CHUNK_DATA_OFFSET: usize = HEADER_BYTES + 8;
+            let Some(index) = read_i32(payload, HEADER_BYTES) else {
+                return false;
+            };
+            let Some(size) = read_i32(payload, HEADER_BYTES + 4) else {
+                return false;
+            };
+            index >= 0
+                && size >= 0
+                && usize::try_from(size)
+                    .ok()
+                    .and_then(|size| CHUNK_DATA_OFFSET.checked_add(size))
+                    == Some(payload.len())
+        }
+        OP_TRANSFORM => payload.len() == TRANSFORM_BYTES,
+        OP_DESPAWN => payload.len() == HEADER_BYTES,
+        OP_ANIMATION_SPAWN => {
+            // opcode + id + format + total bytes + chunk count + epoch
+            const ANIMATION_SPAWN_BYTES: usize = HEADER_BYTES + 1 + 4 + 4 + 8;
+            payload.len() == ANIMATION_SPAWN_BYTES
+                && read_i32(payload, HEADER_BYTES + 1 + 4).is_some_and(|count| count > 0)
+                && read_i32(payload, HEADER_BYTES + 1).is_some_and(|size| size >= 0)
+        }
+        _ => false,
+    }
+}
+
 fn seed_already_held(image: &mut CachedImage, recipients: &[u16], connected: &[u16]) {
     let peers = if recipients.is_empty() {
         connected

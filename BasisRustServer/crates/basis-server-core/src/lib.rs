@@ -4339,15 +4339,22 @@ async fn relay_avatar_generic(
 // Match a fully valid Scene envelope before granting the image exemption. Image
 // uploads use the separate image fanout governor and cached replay allowance.
 fn is_image_scene_upload(state: &ServerState, payload: &[u8]) -> bool {
-    let Some(image_index) = state.net_ids.find("BasisImagePickupManager") else {
+    let Some(image_index) = state.net_ids.find(image_cache::IMAGE_MANAGER_IDENTIFIER) else {
         return false;
     };
     let mut reader = NetReader::new(payload);
-    // Scene payload is the entire remaining slice, so there are no trailing bytes.
-    reader.get_u16().is_ok_and(|index| index == image_index)
-        && reader
-            .get_u16()
-            .is_ok_and(|count| reader.remaining() >= usize::from(count) * 2)
+    if reader.get_u16().ok() != Some(image_index) {
+        return false;
+    }
+    let Ok(count) = reader.get_u16() else {
+        return false;
+    };
+    for _ in 0..count {
+        if reader.get_u16().is_err() {
+            return false;
+        }
+    }
+    image_cache::is_valid_image_upload(reader.remaining_slice())
 }
 
 async fn relay_scene_generic(
