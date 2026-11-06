@@ -418,13 +418,18 @@ mod tests {
 
         let (image, _) = server
             .net_ids
-            .add_or_find_for_peer("BasisImagePickupManager", 0, 10)
+            .add_or_find_for_peer(crate::image_cache::IMAGE_MANAGER_IDENTIFIER, 0, 10)
             .unwrap();
+        let mut image_chunk = vec![2];
+        image_chunk.extend([0; 16]);
+        image_chunk.extend(0i32.to_le_bytes());
+        image_chunk.extend(300000i32.to_le_bytes());
+        image_chunk.resize(image_chunk.len() + 300000, 0);
         let mut writer = NetWriter::new();
         SceneDataMessage {
             message_index: image,
             recipients: Vec::new(),
-            payload: vec![0; 300000],
+            payload: image_chunk,
         }
         .serialize(&mut writer)
         .unwrap();
@@ -451,7 +456,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(server.upload_budget_snapshot().image_exempt_bytes, 300004);
+        assert_eq!(server.upload_budget_snapshot().image_exempt_bytes, 300029);
         assert_eq!(server.upload_budget_snapshot().rejected_messages, 1);
 
         server
