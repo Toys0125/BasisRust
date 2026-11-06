@@ -246,7 +246,12 @@ From this workspace, these commands use `./config/config.xml`. Keep the
 compatibility default password for local parity tests only; configure matching
 non-empty deployment passwords on clients. `ApiEnabled=false` and
 `MaxSceneRelayMegabitsPerSecondPerPlayer=0` remain upstream defaults. Operators
-can explicitly enable/configure the API or set relay limits.
+can set relay limits.
+
+The API service is not implemented in this server build, so startup rejects
+`ApiEnabled=true` with an actionable error. The Docker image health endpoint
+defaults to TCP port 10666. When changing it in Docker Compose, set
+`BASIS_HEALTH_PORT` so the service, health check, and published port stay aligned.
 
 `MaxUploadBytesPerSecondPerPlayer` defaults to `131072` (128 KiB/s) for each
 authenticated connection before fanout. Set the same XML/environment field to
