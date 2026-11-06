@@ -582,7 +582,7 @@ impl ServerState {
         config_path: &Path,
         registry: StorageBackendRegistry,
     ) -> Result<(Self, oneshot::Sender<()>)> {
-        config.validate_auth()?;
+        config.validate_startup()?;
         // RejoinOnly's captured population is session-only; a restart unlocks it.
         if config.basis_user_restriction_mode == BasisUserRestrictionMode::RejoinOnly {
             config.basis_user_restriction_mode = BasisUserRestrictionMode::Normal;
@@ -794,6 +794,9 @@ impl ServerState {
                 shutdown_rx,
             )),
             spawn_database_snapshot_loop(state.database.clone(), state.shutdown.clone()),
+            // Keep lifecycle maintenance after the existing worker entries: some
+            // lifecycle tests intentionally control worker index zero.
+            spawn_p2p_lifecycle_loop(state.clone()),
         ]);
         Ok((state, shutdown_tx))
     }
@@ -1414,6 +1417,32 @@ fn spawn_leave_broadcast_loop(state: ServerState) -> tokio::task::JoinHandle<()>
                 break;
             }
             flush_pending_leaves(&state).await;
+        }
+    })
+}
+
+fn spawn_p2p_lifecycle_loop(state: ServerState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut shutdown_checks = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if state.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    state
+                        .p2p_broker
+                        .maintain_lifecycle(&state.transport, tokio::time::Instant::now())
+                        .await;
+                }
+                _ = shutdown_checks.tick() => {
+                    if state.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+            }
         }
     })
 }
@@ -7367,6 +7396,29 @@ mod tests {
                 "invalid auth must not create configuration files"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn shared_startup_rejects_unsupported_api_before_files_or_socket() {
+        let path =
+            std::env::temp_dir().join(format!("basis-unsupported-api-{}", uuid::Uuid::new_v4()));
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = ServerConfig {
+            use_auth: false,
+            api_enabled: true,
+            has_file_support: true,
+            set_port: socket.local_addr().unwrap().port(),
+            override_auto_discovery_of_ipv: true,
+            ipv4_address: "127.0.0.1".into(),
+            ..ServerConfig::default()
+        };
+
+        let error = ServerState::start(config, &path)
+            .await
+            .err()
+            .expect("unsupported API must fail startup");
+        assert!(error.to_string().contains("ApiEnabled=true"), "{error:#}");
+        assert!(!path.exists(), "startup rejection must not create files");
     }
 
     #[test]

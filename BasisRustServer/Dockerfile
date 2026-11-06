@@ -146,6 +146,7 @@ ENV BASIS_BASE_DIR=/app \
     BASIS_STATUS_INTERVAL_SECS=60
 
 # Gameplay traffic is UDP. 10666/tcp serves the JSON /health endpoint.
+# Override HealthCheckPort and publish the same TCP port when changing this default.
 EXPOSE 4296/udp
 EXPOSE 10666/tcp
 
