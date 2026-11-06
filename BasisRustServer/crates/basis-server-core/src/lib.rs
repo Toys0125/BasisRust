@@ -852,8 +852,10 @@ impl ServerState {
         const TOKENS_PER_SECOND: f32 = 8.0;
         const TOKEN_BURST: f32 = 16.0;
         const MAX_TRACKED_PEERS: usize = 4096;
-        if self.jiggle_buckets.len() > MAX_TRACKED_PEERS {
-            self.jiggle_buckets.clear();
+        if !self.jiggle_buckets.contains_key(&peer_id)
+            && self.jiggle_buckets.len() >= MAX_TRACKED_PEERS
+        {
+            evict_oldest_jiggle_bucket(&self.jiggle_buckets);
         }
         let now = Instant::now();
         let mut bucket = self
@@ -1255,6 +1257,16 @@ impl ServerState {
     }
 }
 
+fn evict_oldest_jiggle_bucket(buckets: &DashMap<PeerId, JiggleTokenBucket>) {
+    if let Some(oldest) = buckets
+        .iter()
+        .min_by_key(|entry| entry.last_refill)
+        .map(|entry| *entry.key())
+    {
+        buckets.remove(&oldest);
+    }
+}
+
 const DATABASE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 
 fn spawn_database_snapshot_loop(
@@ -1568,10 +1580,21 @@ fn serialize_server_ready(peer_id: PeerId, ready: &ReadyMessage) -> Result<Vec<u
 }
 
 fn frame_join_records(records: &[Arc<JoinBroadcastRecord>]) -> Result<Vec<u8>> {
-    let count = u16::try_from(records.len()).expect("join batch count fits u16");
-    let mut payload = Vec::new();
-    for record in records {
-        payload.extend_from_slice(&record.payload.read());
+    let count = u16::try_from(records.len())
+        .map_err(|_| anyhow::anyhow!("join batch record count exceeds protocol limit"))?;
+    let snapshots = records
+        .iter()
+        .map(|record| record.payload.read().clone())
+        .collect::<Vec<_>>();
+    let payload_len = snapshots.iter().try_fold(0usize, |total, payload| {
+        total
+            .checked_add(payload.len())
+            .filter(|&len| len <= ServerReadyBatchMessage::MAX_DECODED_PAYLOAD_BYTES)
+            .ok_or_else(|| anyhow::anyhow!("join batch payload exceeds protocol limit"))
+    })?;
+    let mut payload = Vec::with_capacity(payload_len);
+    for record in snapshots {
+        payload.extend_from_slice(&record);
     }
     let mut writer = NetWriter::with_capacity(payload.len() + 32);
     ServerReadyBatchMessage { count, payload }.serialize(&mut writer)?;
@@ -2985,9 +3008,14 @@ async fn send_accept_fanout(
             .unwrap_or_else(|| existing.ready.clone());
         let record = serialize_server_ready(existing.id, &ready)?;
 
-        if batch_count > 0
-            && batch_payload.len() + record.len() > ServerReadyBatchMessage::MAX_PAYLOAD_BYTES
-        {
+        let combined_len = batch_payload
+            .len()
+            .checked_add(record.len())
+            .ok_or_else(|| anyhow::anyhow!("join batch payload length overflow"))?;
+        if record.len() > ServerReadyBatchMessage::MAX_DECODED_PAYLOAD_BYTES {
+            anyhow::bail!("join record exceeds protocol payload limit");
+        }
+        if batch_count > 0 && combined_len > ServerReadyBatchMessage::MAX_PAYLOAD_BYTES {
             let mut writer = NetWriter::new();
             ServerReadyBatchMessage {
                 count: batch_count,
@@ -3002,8 +3030,17 @@ async fn send_accept_fanout(
             batch_count = 0;
         }
 
+        let next_count = batch_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("join batch record count exceeds protocol limit"))?;
+        let combined_len = batch_payload
+            .len()
+            .checked_add(record.len())
+            .filter(|&len| len <= ServerReadyBatchMessage::MAX_DECODED_PAYLOAD_BYTES)
+            .ok_or_else(|| anyhow::anyhow!("join batch payload exceeds protocol limit"))?;
+        batch_payload.reserve(combined_len - batch_payload.len());
         batch_payload.extend_from_slice(&record);
-        batch_count = batch_count.saturating_add(1);
+        batch_count = next_count;
     }
     if batch_count > 0 {
         let mut writer = NetWriter::new();
@@ -6838,6 +6875,44 @@ pub fn migrate_legacy_resource_dirs(base_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jiggle_bucket_pressure_evicts_only_oldest_state() {
+        let buckets = DashMap::new();
+        let now = Instant::now();
+        for (peer, age) in [(1, 30), (2, 20), (3, 10)] {
+            buckets.insert(
+                peer,
+                JiggleTokenBucket {
+                    tokens: 3.0,
+                    last_refill: now - Duration::from_secs(age),
+                },
+            );
+        }
+
+        evict_oldest_jiggle_bucket(&buckets);
+
+        assert!(!buckets.contains_key(&1));
+        assert!(buckets.contains_key(&2));
+        assert!(buckets.contains_key(&3));
+    }
+
+    #[test]
+    fn join_batch_framing_rejects_payloads_above_protocol_limit() {
+        let record = |sequence| {
+            Arc::new(JoinBroadcastRecord {
+                sequence,
+                peer_id: sequence as PeerId,
+                revision: AtomicU64::new(0),
+                payload: RwLock::new(vec![
+                    0;
+                    ServerReadyBatchMessage::MAX_DECODED_PAYLOAD_BYTES / 2
+                        + 1
+                ]),
+            })
+        };
+        assert!(frame_join_records(&[record(1), record(2)]).is_err());
+    }
 
     #[test]
     fn ownership_get_and_remove_authorize_authenticated_peer_not_payload_player() {
