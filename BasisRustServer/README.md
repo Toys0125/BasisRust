@@ -43,6 +43,14 @@ Useful flags:
 
 ## Configuration
 
+### World database durability
+
+The file-backed world database is atomically snapshotted to `config/database.json`
+when changed, with periodic coalesced saves every 30 seconds. A sudden process or
+machine failure can therefore lose up to roughly 30 seconds of recent world
+database changes. Normal shutdown saves again after accepted work and cleanup
+finish; in-memory mode does not write a snapshot.
+
 ### Player storage compatibility and administration
 
 The storage network protocol is BasisVR compatible. C# file saves use checksummed
