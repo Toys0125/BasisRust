@@ -704,12 +704,12 @@ async fn send_image(
         &recipients,
         &spawn,
     )?;
-    if client
+    if let Err(err) = client
         .send_reliable_ordered(channels::SCENE, &payload)
         .await
-        .is_err()
     {
         session.metrics.lock().unwrap().send_errors += 1;
+        return Err(err).context("sending image benchmark spawn");
     }
     let mut next = Instant::now()
         + fanout_pacing_duration(
@@ -736,12 +736,12 @@ async fn send_image(
             &recipients,
             &chunk,
         )?;
-        if client
+        if let Err(err) = client
             .send_reliable_ordered(channels::SCENE, &payload)
             .await
-            .is_err()
         {
             session.metrics.lock().unwrap().send_errors += 1;
+            return Err(err).with_context(|| format!("sending image benchmark chunk {index}"));
         }
         next += fanout_pacing_duration(
             chunk.len(),
@@ -871,6 +871,28 @@ pub async fn run_workload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn image_sender_propagates_spawn_and_chunk_send_failures() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for (stage, successful_sends) in [("spawn", 0), ("chunk", 1)] {
+            let client = crate::tests::test_client(0, server.local_addr().unwrap()).await;
+            *client.sealed_outbound.lock().unwrap() =
+                Some(([7; 32], i64::MAX as u64 - successful_sends));
+            let session = session(4, 1, Path::new(""));
+            let result = time::timeout(
+                Duration::from_secs(1),
+                send_image(client, session.clone(), vec![101, 102], 100),
+            )
+            .await
+            .expect("a failed sender must return without waiting for receiver completion")
+            .expect_err("send failure must propagate");
+            assert!(format!("{result:#}").contains(stage));
+            assert_eq!(session.metrics.lock().unwrap().send_errors, 1);
+            assert_eq!(session.metrics.lock().unwrap().uploads_done, 0);
+            let _ = std::fs::remove_file(&session.options.output_path);
+        }
+    }
 
     #[test]
     fn fanout_pacing_charges_bytes_once_per_recipient_at_aggregate_rate() {
