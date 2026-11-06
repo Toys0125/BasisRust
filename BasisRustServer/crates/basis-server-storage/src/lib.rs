@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -7,7 +7,10 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 pub mod admin;
@@ -28,6 +31,9 @@ pub struct BasisData {
 pub struct PersistentDatabase {
     path: Option<PathBuf>,
     data: Arc<RwLock<HashMap<String, BasisData>>>,
+    generation: Arc<AtomicU64>,
+    saved_generation: Arc<AtomicU64>,
+    save_lock: Arc<Mutex<()>>,
 }
 
 impl PersistentDatabase {
@@ -39,6 +45,9 @@ impl PersistentDatabase {
         Self {
             path: Some(path.into()),
             data: Arc::new(RwLock::new(HashMap::new())),
+            generation: Arc::new(AtomicU64::new(0)),
+            saved_generation: Arc::new(AtomicU64::new(0)),
+            save_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -56,11 +65,15 @@ impl PersistentDatabase {
         for value in values {
             data.insert(value.name.clone(), value);
         }
+        self.generation.store(0, Ordering::Release);
+        self.saved_generation.store(0, Ordering::Release);
         Ok(())
     }
 
     pub fn add_or_update(&self, value: BasisData) {
-        self.data.write().insert(value.name.clone(), value);
+        let mut data = self.data.write();
+        data.insert(value.name.clone(), value);
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn get(&self, name: &str) -> Option<BasisData> {
@@ -68,12 +81,60 @@ impl PersistentDatabase {
     }
 
     pub fn shutdown(&self) -> Result<()> {
+        if self.path.is_none() {
+            return Ok(());
+        }
+        self.save(true)
+    }
+
+    /// Persist pending changes at most once per caller tick. A single server
+    /// worker owns the cadence, so a slow disk cannot accumulate save tasks.
+    pub fn save_if_dirty(&self) -> Result<bool> {
+        if self.path.is_none()
+            || self.generation.load(Ordering::Acquire)
+                == self.saved_generation.load(Ordering::Acquire)
+        {
+            return Ok(false);
+        }
+        self.save(false)?;
+        Ok(true)
+    }
+
+    fn save(&self, force: bool) -> Result<()> {
+        self.save_using(force, |path, json| {
+            atomic_write_with(path, |file| file.write_all(json.as_bytes()), sync_directory)
+        })
+    }
+
+    fn save_using(
+        &self,
+        force: bool,
+        persist: impl FnOnce(&Path, &str) -> Result<()>,
+    ) -> Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let values: Vec<_> = self.data.read().values().cloned().collect();
+        let _save_guard = self.save_lock.lock();
+        let (generation, values) = {
+            let data = self.data.read();
+            (
+                self.generation.load(Ordering::Acquire),
+                data.values().cloned().collect::<Vec<_>>(),
+            )
+        };
+        if !force && generation == self.saved_generation.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let json = serde_json::to_string_pretty(&values)?;
-        atomic_write_with(path, |file| file.write_all(json.as_bytes()), sync_directory)
+        persist(path, &json)?;
+        // Hold a read lock while advancing the saved generation. Mutations take
+        // the write lock, so one racing this save remains visibly dirty.
+        let data = self.data.read();
+        if self.generation.load(Ordering::Acquire) == generation {
+            self.saved_generation.store(generation, Ordering::Release);
+        }
+        drop(data);
+        Ok(())
     }
 }
 
@@ -301,6 +362,62 @@ mod tests {
             json!({"nested": [true, 42, "hello"]})
         );
         assert_no_temporary_files(path.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_periodic_save_keeps_previous_snapshot_and_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("database.json");
+        let database = PersistentDatabase::file_backed(&path);
+        database.add_or_update(value("world", json!(1)));
+        database.shutdown().unwrap();
+        let previous = fs::read(&path).unwrap();
+        database.add_or_update(value("world", json!(2)));
+
+        let error = database
+            .save_using(false, |_, _| anyhow::bail!("injected snapshot failure"))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("injected snapshot failure"));
+        assert_eq!(fs::read(&path).unwrap(), previous);
+        let preceding = PersistentDatabase::file_backed(&path);
+        preceding.load().unwrap();
+        assert_eq!(preceding.get("world").unwrap().json_payload, json!(1));
+        assert!(database.save_if_dirty().unwrap());
+        assert!(!database.save_if_dirty().unwrap());
+
+        let loaded = PersistentDatabase::file_backed(&path);
+        loaded.load().unwrap();
+        assert_eq!(loaded.get("world").unwrap().json_payload, json!(2));
+    }
+
+    #[test]
+    fn mutation_during_snapshot_remains_dirty_for_next_coalesced_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("database.json");
+        let database = PersistentDatabase::file_backed(&path);
+        database.add_or_update(value("world", json!(1)));
+        let saving = database.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let save = std::thread::spawn(move || {
+            saving
+                .save_using(false, |path, json| {
+                    started_tx.send(()).unwrap();
+                    continue_rx.recv().unwrap();
+                    atomic_write_with(path, |file| file.write_all(json.as_bytes()), sync_directory)
+                })
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        database.add_or_update(value("world", json!(2)));
+        continue_tx.send(()).unwrap();
+        save.join().unwrap();
+
+        assert!(database.save_if_dirty().unwrap());
+        assert!(!database.save_if_dirty().unwrap());
+        let loaded = PersistentDatabase::file_backed(&path);
+        loaded.load().unwrap();
+        assert_eq!(loaded.get("world").unwrap().json_payload, json!(2));
     }
 
     #[test]
