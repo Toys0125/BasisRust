@@ -118,8 +118,7 @@ pub(crate) async fn failure_reconnect_loop(
     connect_timeout: Duration,
     maintenance: MaintenanceOptions,
 ) {
-    let mut pending_since = HashMap::<usize, time::Instant>::new();
-    let mut retry_after = HashMap::<usize, (u32, time::Instant)>::new();
+    let mut reconnect_state = FailureReconnectState::default();
     let mut tick = time::interval(Duration::from_millis(250));
 
     loop {
@@ -138,29 +137,32 @@ pub(crate) async fn failure_reconnect_loop(
             }
 
             if client.connected.load(Ordering::Relaxed) {
-                pending_since.remove(&idx);
-                retry_after.remove(&idx);
+                reconnect_state.connected(idx);
                 continue;
             }
             if client.intentional_reconnect.load(Ordering::Relaxed) {
-                pending_since.remove(&idx);
+                reconnect_state.cancel_pending(idx);
                 continue;
             }
 
-            if client.in_use.load(Ordering::Relaxed) {
-                let started = pending_since.entry(idx).or_insert_with(time::Instant::now);
-                if started.elapsed() < connect_timeout {
+            match reconnect_state.observe(
+                idx,
+                client.in_use.load(Ordering::Relaxed),
+                time::Instant::now(),
+                connect_timeout,
+            ) {
+                ReconnectProgress::Connecting | ReconnectProgress::Backoff => continue,
+                ReconnectProgress::Failed { delay, timed_out } => {
+                    if timed_out {
+                        client.deactivate();
+                        warn!("client {idx} reconnect attempt timed out; recycling connection");
+                    } else {
+                        warn!("client {idx} reconnect attempt ended before authentication");
+                    }
+                    warn!("client {idx} will retry in {}s", delay.as_secs());
                     continue;
                 }
-                client.deactivate();
-                pending_since.remove(&idx);
-                warn!("client {idx} reconnect attempt timed out; recycling connection");
-            }
-            if retry_after
-                .get(&idx)
-                .is_some_and(|(_, deadline)| time::Instant::now() < *deadline)
-            {
-                continue;
+                ReconnectProgress::Ready => {}
             }
 
             let spawn_base = spawn_layout.base_for_client(idx);
@@ -175,8 +177,7 @@ pub(crate) async fn failure_reconnect_loop(
                     if replace_client_if_current(&clients, idx, &client, &new_client, &maintenance)
                         .await
                     {
-                        pending_since.insert(idx, time::Instant::now());
-                        retry_after.remove(&idx);
+                        reconnect_state.attempt_started(idx, time::Instant::now());
                         info!("failure reconnect started for client {idx}");
                     } else {
                         warn!("discarding stale failure reconnect for client {idx}");
@@ -184,11 +185,7 @@ pub(crate) async fn failure_reconnect_loop(
                     }
                 }
                 Err(err) => {
-                    let failures = retry_after
-                        .get(&idx)
-                        .map_or(1, |(failures, _)| failures.saturating_add(1));
-                    let delay = reconnect_retry_delay(failures);
-                    retry_after.insert(idx, (failures, time::Instant::now() + delay));
+                    let delay = reconnect_state.attempt_failed(idx, time::Instant::now());
                     warn!(
                         "failed to restart client {idx}; retrying in {}s: {err}",
                         delay.as_secs()
@@ -290,6 +287,77 @@ pub(crate) async fn random_reconnect_loop(
 async fn wait_for_shutdown(shutdown: &AtomicBool) {
     while !shutdown.load(Ordering::Relaxed) {
         time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[derive(Default)]
+struct FailureReconnectState {
+    pending_since: HashMap<usize, time::Instant>,
+    retry_after: HashMap<usize, (u32, time::Instant)>,
+}
+
+enum ReconnectProgress {
+    Connecting,
+    Backoff,
+    Failed { delay: Duration, timed_out: bool },
+    Ready,
+}
+
+impl FailureReconnectState {
+    fn connected(&mut self, index: usize) {
+        self.pending_since.remove(&index);
+        self.retry_after.remove(&index);
+    }
+
+    fn cancel_pending(&mut self, index: usize) {
+        self.pending_since.remove(&index);
+    }
+
+    fn attempt_started(&mut self, index: usize, now: time::Instant) {
+        self.pending_since.insert(index, now);
+    }
+
+    fn attempt_failed(&mut self, index: usize, now: time::Instant) -> Duration {
+        self.pending_since.remove(&index);
+        let failures = self
+            .retry_after
+            .get(&index)
+            .map_or(1, |(failures, _)| failures.saturating_add(1));
+        let delay = reconnect_retry_delay(failures);
+        self.retry_after.insert(index, (failures, now + delay));
+        delay
+    }
+
+    fn observe(
+        &mut self,
+        index: usize,
+        in_use: bool,
+        now: time::Instant,
+        connect_timeout: Duration,
+    ) -> ReconnectProgress {
+        if let Some(started) = self.pending_since.get(&index).copied() {
+            if in_use && now.saturating_duration_since(started) < connect_timeout {
+                return ReconnectProgress::Connecting;
+            }
+            let timed_out = in_use;
+            let delay = self.attempt_failed(index, now);
+            return ReconnectProgress::Failed { delay, timed_out };
+        }
+
+        if in_use {
+            // This covers clients that were already connecting when reliability monitoring began.
+            self.pending_since.insert(index, now);
+            return ReconnectProgress::Connecting;
+        }
+
+        if self
+            .retry_after
+            .get(&index)
+            .is_some_and(|(_, deadline)| now < *deadline)
+        {
+            return ReconnectProgress::Backoff;
+        }
+        ReconnectProgress::Ready
     }
 }
 
@@ -467,8 +535,9 @@ pub(crate) async fn disconnect_clients_in_batches(
 
 #[cfg(test)]
 mod tests {
-    use super::reconnect_retry_delay;
+    use super::{reconnect_retry_delay, FailureReconnectState, ReconnectProgress};
     use std::time::Duration;
+    use tokio::time::Instant;
 
     #[test]
     fn reconnect_retry_delay_grows_and_stays_bounded() {
@@ -477,5 +546,89 @@ mod tests {
         assert_eq!(reconnect_retry_delay(3), Duration::from_secs(4));
         assert_eq!(reconnect_retry_delay(7), Duration::from_secs(64));
         assert_eq!(reconnect_retry_delay(u32::MAX), Duration::from_secs(64));
+    }
+
+    #[test]
+    fn rejected_login_and_timeout_advance_backoff_once_with_spacing() {
+        let mut state = FailureReconnectState::default();
+        let start = Instant::now();
+        let connect_timeout = Duration::from_secs(5);
+
+        // BasisClient::start succeeded and installed a client, but login rejection deactivated it.
+        state.attempt_started(3, start);
+        let rejected_at = start + Duration::from_millis(100);
+        assert!(matches!(
+            state.observe(3, false, rejected_at, connect_timeout),
+            ReconnectProgress::Failed { delay, timed_out: false }
+                if delay == Duration::from_secs(1)
+        ));
+        assert!(matches!(
+            state.observe(
+                3,
+                false,
+                rejected_at + Duration::from_millis(250),
+                connect_timeout
+            ),
+            ReconnectProgress::Backoff
+        ));
+        let retry_at = rejected_at + Duration::from_secs(1);
+        assert!(matches!(
+            state.observe(3, false, retry_at, connect_timeout),
+            ReconnectProgress::Ready
+        ));
+
+        // A second accepted start that never authenticates times out and advances only once.
+        state.attempt_started(3, retry_at);
+        let timeout_at = retry_at + connect_timeout;
+        assert!(matches!(
+            state.observe(3, true, timeout_at, connect_timeout),
+            ReconnectProgress::Failed { delay, timed_out: true }
+                if delay == Duration::from_secs(2)
+        ));
+        assert!(matches!(
+            state.observe(
+                3,
+                false,
+                timeout_at + Duration::from_millis(250),
+                connect_timeout
+            ),
+            ReconnectProgress::Backoff
+        ));
+        assert!(matches!(
+            state.observe(
+                3,
+                false,
+                timeout_at + Duration::from_secs(2),
+                connect_timeout
+            ),
+            ReconnectProgress::Ready
+        ));
+    }
+
+    #[test]
+    fn only_observed_connection_resets_retry_backoff() {
+        let mut state = FailureReconnectState::default();
+        let start = Instant::now();
+        state.attempt_started(1, start);
+        assert!(matches!(
+            state.observe(1, false, start + Duration::from_millis(10), Duration::from_secs(5)),
+            ReconnectProgress::Failed { delay, .. } if delay == Duration::from_secs(1)
+        ));
+
+        // Merely starting another asynchronous client does not reset the failure history.
+        let second_start = start + Duration::from_secs(2);
+        state.attempt_started(1, second_start);
+        assert!(matches!(
+            state.observe(1, false, second_start + Duration::from_millis(10), Duration::from_secs(5)),
+            ReconnectProgress::Failed { delay, .. } if delay == Duration::from_secs(2)
+        ));
+
+        state.connected(1);
+        let third_start = start + Duration::from_secs(5);
+        state.attempt_started(1, third_start);
+        assert!(matches!(
+            state.observe(1, false, third_start + Duration::from_millis(10), Duration::from_secs(5)),
+            ReconnectProgress::Failed { delay, .. } if delay == Duration::from_secs(1)
+        ));
     }
 }
