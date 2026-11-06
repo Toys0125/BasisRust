@@ -20,7 +20,9 @@ and authentication-timer tasks and releases their resources.
 
 The live status view restores raw mode through an RAII guard, including when its
 loop unwinds. The guard also tracks cursor visibility and alternate-screen
-state if those modes are enabled. Shutdown reports signal-listener and
+state if those modes are enabled. Shutdown closes the live-view entry gate and
+waits for an active view to restore terminal state; it does not wait for a
+console thread blocked in Rustyline input. Shutdown reports signal-listener and
 worker-task failures as errors so the process exits with a failure status
 rather than reporting success after incomplete cleanup.
 
