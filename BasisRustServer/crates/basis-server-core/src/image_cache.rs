@@ -878,6 +878,69 @@ mod tests {
         payload
     }
 
+    #[test]
+    fn image_upload_validation_covers_all_data_opcodes_and_exact_lengths() {
+        let mut despawn = vec![OP_DESPAWN];
+        despawn.extend([1; 16]);
+        let mut animation = vec![OP_ANIMATION_SPAWN];
+        animation.extend([1; 16]);
+        animation.push(2);
+        animation.extend(4_i32.to_le_bytes());
+        animation.extend(1_i32.to_le_bytes());
+        animation.extend(0_i64.to_le_bytes());
+        let frames = [
+            spawn(1, 7, 1, 0.0),
+            chunk(1, 0, 4, OP_CHUNK),
+            chunk(1, 0, 0, OP_CHUNK),
+            transform(1, 0.0),
+            despawn,
+            animation.clone(),
+            chunk(1, 0, 4, OP_ANIMATION_CHUNK),
+            chunk(1, 0, 0, OP_ANIMATION_CHUNK),
+        ];
+        for frame in frames {
+            assert!(is_valid_image_upload(&frame), "valid opcode {}", frame[0]);
+            for end in 0..frame.len() {
+                assert!(
+                    !is_valid_image_upload(&frame[..end]),
+                    "opcode {} accepted a frame truncated at {end}",
+                    frame[0]
+                );
+            }
+            let mut extra = frame;
+            extra.push(0);
+            assert!(!is_valid_image_upload(&extra));
+        }
+        for opcode in [OP_CHUNK, OP_ANIMATION_CHUNK] {
+            for offset in [HEADER_BYTES, HEADER_BYTES + 4] {
+                let mut invalid = chunk(1, 0, 4, opcode);
+                invalid[offset..offset + 4].copy_from_slice(&(-1_i32).to_le_bytes());
+                assert!(!is_valid_image_upload(&invalid));
+            }
+        }
+        for (offset, value) in [
+            (HEADER_BYTES + 1, -1_i32),
+            (HEADER_BYTES + 5, 0),
+            (HEADER_BYTES + 5, -1),
+        ] {
+            let mut invalid = animation.clone();
+            invalid[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(!is_valid_image_upload(&invalid));
+        }
+        assert!(!is_valid_image_upload(&spawn(1, 7, 0, 0.0)));
+        assert!(!is_valid_image_upload(&spawn(1, 7, -1, 0.0)));
+        for opcode in [
+            5,
+            OP_SERVER_CACHE_STATE,
+            OP_SERVER_CACHE_OFFER,
+            OP_SERVER_CACHE_REQUEST,
+        ] {
+            let mut control = vec![opcode];
+            control.extend([1; 16]);
+            assert!(!is_valid_image_upload(&control));
+        }
+    }
+
     fn observe(
         cache: &mut ImageCache,
         owner: u16,
