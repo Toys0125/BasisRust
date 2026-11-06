@@ -16,6 +16,15 @@ pub trait BasisDeserialize: Sized {
     fn deserialize(reader: &mut NetReader<'_>) -> ReadResult<Self>;
 }
 
+fn write_u16_count(writer: &mut NetWriter, count: usize) -> WriteResult<()> {
+    let count = u16::try_from(count).map_err(|_| crate::io::NetWriteError::LengthOverflow {
+        length: count,
+        max: usize::from(u16::MAX),
+    })?;
+    writer.put_u16(count);
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BytesMessage {
     pub data: Vec<u8>,
@@ -440,7 +449,13 @@ impl LocalAvatarSyncMessage {
     ) -> WriteResult<()> {
         writer.put_bytes(&self.array);
         if has_additional_data {
-            writer.put_u8(self.additional_avatar_datas.len() as u8);
+            let count = u8::try_from(self.additional_avatar_datas.len()).map_err(|_| {
+                crate::io::NetWriteError::LengthOverflow {
+                    length: self.additional_avatar_datas.len(),
+                    max: usize::from(u8::MAX),
+                }
+            })?;
+            writer.put_u8(count);
             writer.put_u8(self.linked_avatar_index);
             for item in &self.additional_avatar_datas {
                 item.serialize(writer)?;
@@ -454,7 +469,13 @@ impl BasisSerialize for LocalAvatarSyncMessage {
     fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u8(self.data_quality_level);
         writer.put_bytes(&self.array);
-        writer.put_u8(self.additional_avatar_datas.len() as u8);
+        let count = u8::try_from(self.additional_avatar_datas.len()).map_err(|_| {
+            crate::io::NetWriteError::LengthOverflow {
+                length: self.additional_avatar_datas.len(),
+                max: usize::from(u8::MAX),
+            }
+        })?;
+        writer.put_u8(count);
         if !self.additional_avatar_datas.is_empty() {
             writer.put_u8(self.linked_avatar_index);
             for item in &self.additional_avatar_datas {
@@ -476,6 +497,13 @@ impl BasisDeserialize for LocalAvatarSyncMessage {
         };
         let array = reader.get_bytes(payload_len)?.to_vec();
         let count = reader.get_u8()? as usize;
+        let minimum_bytes = count.saturating_add(usize::from(count > 0));
+        if minimum_bytes > reader.remaining() {
+            return Err(crate::io::NetReadError::Underflow {
+                needed: minimum_bytes,
+                remaining: reader.remaining(),
+            });
+        }
         let linked_avatar_index = if count > 0 { reader.get_u8()? } else { 0 };
         let mut additional_avatar_datas = Vec::with_capacity(count);
         for _ in 0..count {
@@ -542,7 +570,7 @@ impl BasisSerialize for ServerMetaDataMessage {
         let (bitset, extras) =
             encode_permission_wire(&self.allowed_permissions, &self.denied_permissions);
         writer.put_bytes_with_length(&bitset)?;
-        writer.put_u16(extras.len() as u16);
+        write_u16_count(writer, extras.len())?;
         if !extras.is_empty() {
             writer.put_bytes_with_length(&compress_permission_extras(&extras))?;
         }
@@ -736,7 +764,7 @@ pub struct BasisMessageSupply {
 
 impl BasisSerialize for BasisMessageSupply {
     fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
-        writer.put_u16(self.descriptors.len() as u16);
+        write_u16_count(writer, self.descriptors.len())?;
         for descriptor in &self.descriptors {
             descriptor.serialize(writer)?;
         }
@@ -747,6 +775,14 @@ impl BasisSerialize for BasisMessageSupply {
 impl BasisDeserialize for BasisMessageSupply {
     fn deserialize(reader: &mut NetReader<'_>) -> ReadResult<Self> {
         let count = reader.get_u16()? as usize;
+        // Each descriptor needs five fixed bytes and an empty string prefix.
+        // Reject impossible counts before reserving memory.
+        if count > reader.remaining() / 7 {
+            return Err(crate::io::NetReadError::Underflow {
+                needed: count.saturating_mul(7),
+                remaining: reader.remaining(),
+            });
+        }
         let mut descriptors = Vec::with_capacity(count);
         for _ in 0..count {
             descriptors.push(BasisMessageDescriptor::deserialize(reader)?);
@@ -762,7 +798,7 @@ pub struct BasisMessageSubscribe {
 
 impl BasisSerialize for BasisMessageSubscribe {
     fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
-        writer.put_u16(self.ids.len() as u16);
+        write_u16_count(writer, self.ids.len())?;
         for id in &self.ids {
             writer.put_u16(*id);
         }
@@ -1038,7 +1074,7 @@ pub struct ServerUniqueIdMessages {
 
 impl BasisSerialize for ServerUniqueIdMessages {
     fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
-        writer.put_u16(self.messages.len() as u16);
+        write_u16_count(writer, self.messages.len())?;
         for message in &self.messages {
             message.serialize(writer)?;
         }
@@ -1180,7 +1216,7 @@ impl BasisSerialize for AvatarDataMessage {
         writer.put_u16(self.player_id);
         writer.put_u8(self.avatar_link_index);
         writer.put_u8(self.message_index);
-        writer.put_u16(self.recipients.len() as u16);
+        write_u16_count(writer, self.recipients.len())?;
         for recipient in &self.recipients {
             writer.put_u16(*recipient);
         }
@@ -1195,6 +1231,12 @@ impl BasisDeserialize for AvatarDataMessage {
         let avatar_link_index = reader.get_u8()?;
         let message_index = reader.get_u8()?;
         let count = reader.get_u16()? as usize;
+        if count > reader.remaining() / 2 {
+            return Err(crate::io::NetReadError::Underflow {
+                needed: count.saturating_mul(2),
+                remaining: reader.remaining(),
+            });
+        }
         let mut recipients = Vec::with_capacity(count);
         for _ in 0..count {
             recipients.push(reader.get_u16()?);
@@ -1287,6 +1329,12 @@ impl VoiceReceiversMessage {
         } else {
             reader.get_u8()? as usize
         };
+        if count > reader.remaining() / 2 {
+            return Err(crate::io::NetReadError::Underflow {
+                needed: count.saturating_mul(2),
+                remaining: reader.remaining(),
+            });
+        }
         let mut users = Vec::with_capacity(count);
         for _ in 0..count {
             users.push(reader.get_u16()?);
@@ -1443,7 +1491,7 @@ pub struct SceneDataMessage {
 impl BasisSerialize for SceneDataMessage {
     fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
         writer.put_u16(self.message_index);
-        writer.put_u16(self.recipients.len() as u16);
+        write_u16_count(writer, self.recipients.len())?;
         for recipient in &self.recipients {
             writer.put_u16(*recipient);
         }
@@ -1456,6 +1504,12 @@ impl BasisDeserialize for SceneDataMessage {
     fn deserialize(reader: &mut NetReader<'_>) -> ReadResult<Self> {
         let message_index = reader.get_u16()?;
         let count = reader.get_u16()? as usize;
+        if count > reader.remaining() / 2 {
+            return Err(crate::io::NetReadError::Underflow {
+                needed: count.saturating_mul(2),
+                remaining: reader.remaining(),
+            });
+        }
         let mut recipients = Vec::with_capacity(count);
         for _ in 0..count {
             recipients.push(reader.get_u16()?);
@@ -2077,7 +2131,7 @@ pub struct ServerLibraryMessage {
 
 impl BasisSerialize for ServerLibraryMessage {
     fn serialize(&self, writer: &mut NetWriter) -> WriteResult<()> {
-        writer.put_u16(self.items.len() as u16);
+        write_u16_count(writer, self.items.len())?;
         for item in &self.items {
             item.serialize(writer)?;
         }
@@ -2088,6 +2142,13 @@ impl BasisSerialize for ServerLibraryMessage {
 impl BasisDeserialize for ServerLibraryMessage {
     fn deserialize(reader: &mut NetReader<'_>) -> ReadResult<Self> {
         let count = reader.get_u16()? as usize;
+        // One mode byte plus two empty-string prefixes is the smallest item.
+        if count > reader.remaining() / 5 {
+            return Err(crate::io::NetReadError::Underflow {
+                needed: count.saturating_mul(5),
+                remaining: reader.remaining(),
+            });
+        }
         let mut items = Vec::with_capacity(count);
         for _ in 0..count {
             items.push(ServerLibraryItem::deserialize(reader)?);
@@ -3040,6 +3101,97 @@ mod tests {
             VoiceReceiversMessage {
                 users: vec![7, 300]
             }
+        );
+    }
+
+    #[test]
+    fn count_bearing_messages_reject_impossible_counts_before_parsing_entries() {
+        let malformed = [
+            // Each count claims 65,535 entries but contains no entry bytes.
+            vec![0xff, 0xff], // BasisMessageSubscribe
+            vec![0xff, 0xff], // BasisMessageSupply
+            vec![0xff, 0xff], // ServerLibraryMessage
+            vec![0xff, 0xff], // VoiceReceiversMessage (large count)
+        ];
+        let mut reader = NetReader::new(&malformed[0]);
+        assert!(BasisMessageSubscribe::deserialize(&mut reader).is_err());
+        let mut reader = NetReader::new(&malformed[1]);
+        assert!(BasisMessageSupply::deserialize(&mut reader).is_err());
+        let mut reader = NetReader::new(&malformed[2]);
+        assert!(ServerLibraryMessage::deserialize(&mut reader).is_err());
+        let mut reader = NetReader::new(&malformed[3]);
+        assert!(VoiceReceiversMessage::deserialize(&mut reader, true).is_err());
+
+        let mut avatar_data = NetWriter::new();
+        avatar_data.put_u16(1);
+        avatar_data.put_u8(2);
+        avatar_data.put_u8(3);
+        avatar_data.put_u16(u16::MAX);
+        assert!(
+            AvatarDataMessage::deserialize(&mut NetReader::new(avatar_data.as_slice())).is_err()
+        );
+
+        let mut scene_data = NetWriter::new();
+        scene_data.put_u16(1);
+        scene_data.put_u16(u16::MAX);
+        assert!(SceneDataMessage::deserialize(&mut NetReader::new(scene_data.as_slice())).is_err());
+    }
+
+    #[test]
+    fn count_serializers_reject_values_the_wire_field_cannot_represent() {
+        let mut writer = NetWriter::new();
+        let oversized = BasisMessageSubscribe {
+            ids: vec![1; usize::from(u16::MAX) + 1],
+        };
+        assert!(oversized.serialize(&mut writer).is_err());
+        assert!(writer.is_empty());
+
+        let oversized_avatar = LocalAvatarSyncMessage {
+            data_quality_level: BitQuality::High as u8,
+            array: Vec::new(),
+            additional_avatar_datas: vec![
+                AdditionalAvatarData {
+                    message_index: 1,
+                    data: Vec::new(),
+                };
+                usize::from(u8::MAX) + 1
+            ],
+            linked_avatar_index: 0,
+        };
+        assert!(oversized_avatar.serialize(&mut writer).is_err());
+    }
+
+    #[test]
+    fn maximum_wire_counts_round_trip_without_changing_their_encoding() {
+        let subscribe = BasisMessageSubscribe {
+            ids: (0..u16::MAX).collect(),
+        };
+        let mut writer = NetWriter::new();
+        subscribe.serialize(&mut writer).unwrap();
+        assert_eq!(&writer.as_slice()[..2], &u16::MAX.to_le_bytes());
+        assert_eq!(
+            BasisMessageSubscribe::deserialize(&mut NetReader::new(writer.as_slice())).unwrap(),
+            subscribe
+        );
+
+        let avatar = LocalAvatarSyncMessage {
+            data_quality_level: BitQuality::High as u8,
+            array: vec![0; BitQuality::High.payload_len()],
+            additional_avatar_datas: vec![
+                AdditionalAvatarData {
+                    // The wire omits the message index when data is empty.
+                    message_index: 0,
+                    data: Vec::new(),
+                };
+                usize::from(u8::MAX)
+            ],
+            linked_avatar_index: 3,
+        };
+        let mut writer = NetWriter::new();
+        avatar.serialize(&mut writer).unwrap();
+        assert_eq!(
+            LocalAvatarSyncMessage::deserialize(&mut NetReader::new(writer.as_slice())).unwrap(),
+            avatar
         );
     }
 
