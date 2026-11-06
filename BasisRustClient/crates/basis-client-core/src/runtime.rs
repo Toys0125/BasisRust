@@ -165,6 +165,7 @@ async fn run_internal(
         Arc::new(crate::scene::SceneSession::new(
             args.scene_data_bytes,
             args.scene_start_file.clone(),
+            args.clients.unwrap_or(config.client_count),
         ))
     });
     config.image_benchmark = image_options

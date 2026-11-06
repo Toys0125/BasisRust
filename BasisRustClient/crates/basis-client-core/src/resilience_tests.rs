@@ -108,7 +108,7 @@ async fn malformed_packet_diagnostics_preserve_prefix_ack_and_discard_suffix() {
     ] {
         client.handle_packet(&merged).await.unwrap();
     }
-    assert_eq!(client.packet_diagnostics.snapshot(), [1, 1, 2, 1, 4]);
+    assert_eq!(client.packet_diagnostics.snapshot(), [1, 1, 2, 1, 4, 0]);
     client.flush_acks().await.unwrap();
     let mut bytes = [0; 128];
     let len = time::timeout(Duration::from_secs(1), server.recv(&mut bytes))
@@ -132,7 +132,7 @@ async fn shared_receive_drop_diagnostics_preserve_reliable_prefix() {
     merged.extend_from_slice(&child);
     merged.push(0);
     shared_receiver_process_merged(&client, client.socket.as_raw_fd(), &merged);
-    assert_eq!(client.packet_diagnostics.snapshot(), [0, 0, 1, 0, 1]);
+    assert_eq!(client.packet_diagnostics.snapshot(), [0, 0, 1, 0, 1, 0]);
     assert!(client.ack_pending.load(Ordering::Relaxed));
     assert!(client
         .reliable_receive_state()

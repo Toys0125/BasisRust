@@ -10,7 +10,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -22,6 +22,8 @@ use tokio::{
 
 pub(crate) const MESSAGE_INDEX: u16 = 60000;
 const MAGIC: &[u8; 4] = b"BSCR";
+const SENDER_STATE_TTL: Duration = Duration::from_secs(10 * 60);
+const SENDER_EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 fn unix_micros() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -52,23 +54,36 @@ struct Metrics {
     malformed: u64,
     duplicates: u64,
     out_of_order: u64,
-    peers: HashSet<usize>,
-    last: HashMap<usize, u64>,
-    seen: HashMap<usize, BTreeSet<u64>>,
+    // Valid sender IDs are dense client indices below max_senders, so this
+    // cumulative coverage set grows only with the published client population.
+    covered_senders: HashSet<usize>,
+    senders: HashMap<usize, SenderState>,
+    next_expiry_sweep: Option<Instant>,
+    expiry_sweeps: u64,
     // Bounded log2 microsecond histogram; avoid retaining one sample per message.
     latency: [u64; 32],
     max_latency_us: u64,
 }
 #[derive(Debug)]
+struct SenderState {
+    highest: u64,
+    seen: BTreeSet<u64>,
+    last_seen: Instant,
+}
+#[derive(Debug)]
 pub(crate) struct SceneSession {
     size: usize,
+    max_senders: AtomicUsize,
     marker: Option<PathBuf>,
     metrics: StdMutex<Metrics>,
 }
 impl SceneSession {
-    pub(crate) fn new(size: usize, marker: Option<PathBuf>) -> Self {
+    pub(crate) fn new(size: usize, marker: Option<PathBuf>, client_count: usize) -> Self {
         Self {
             size,
+            // The observer tracks workload sender indices, so its state need only cover the
+            // configured client population (including the observer slot).
+            max_senders: AtomicUsize::new(client_count.max(1)),
             marker,
             metrics: StdMutex::new(Metrics::default()),
         }
@@ -77,6 +92,17 @@ impl SceneSession {
         self.marker.as_ref().is_none_or(|p| p.exists())
     }
     pub(crate) fn observe(&self, bytes: &[u8]) {
+        self.observe_at(bytes, Instant::now());
+    }
+    pub(crate) fn update_sender_capacity(&self, client_count: usize) {
+        self.max_senders
+            .fetch_max(client_count.max(1), Ordering::AcqRel);
+    }
+    #[cfg(test)]
+    pub(crate) fn sender_capacity(&self) -> usize {
+        self.max_senders.load(Ordering::Acquire)
+    }
+    fn observe_at(&self, bytes: &[u8], now: Instant) {
         if !self.active() {
             return;
         }
@@ -89,32 +115,56 @@ impl SceneSession {
             return;
         }
         let sender = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let max_senders = self.max_senders.load(Ordering::Acquire);
+        if sender == 0 || sender >= max_senders {
+            m.malformed += 1;
+            return;
+        }
         let seq = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
         let stamp = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
-        if bytes[4..] != script_payload(self.size, sender, seq, stamp)
-            || sender == 0
-            || stamp > unix_micros()
-        {
+        if bytes[4..] != script_payload(self.size, sender, seq, stamp) || stamp > unix_micros() {
             m.malformed += 1;
             return;
         }
         // Server peer IDs can change on reconnect and be reused by other senders.
         // The workload's stable sender index owns its sequence counter.
-        let highest = m.last.get(&sender).copied().unwrap_or(seq);
-        let seen = m.seen.entry(sender).or_default();
+        if m.next_expiry_sweep.is_none_or(|deadline| now >= deadline) {
+            m.senders.retain(|_, state| {
+                now.saturating_duration_since(state.last_seen) <= SENDER_STATE_TTL
+            });
+            m.next_expiry_sweep = Some(now + SENDER_EXPIRY_SWEEP_INTERVAL);
+            m.expiry_sweeps = m.expiry_sweeps.saturating_add(1);
+        }
+        if !m.senders.contains_key(&sender) && m.senders.len() >= max_senders {
+            if let Some(oldest) = m
+                .senders
+                .iter()
+                .min_by_key(|(_, state)| state.last_seen)
+                .map(|(sender, _)| *sender)
+            {
+                m.senders.remove(&oldest);
+            }
+        }
+        let state = m.senders.entry(sender).or_insert_with(|| SenderState {
+            highest: seq,
+            seen: BTreeSet::new(),
+            last_seen: now,
+        });
+        let highest = state.highest;
         // Keep a bounded 256-sequence replay window per sender. Older arrivals cannot
         // establish unique delivery, so they are excluded conservatively.
-        if seq.saturating_add(256) <= highest || !seen.insert(seq) {
+        if seq.saturating_add(256) <= highest || !state.seen.insert(seq) {
             m.duplicates += 1;
             return;
         }
         let newest = highest.max(seq);
-        seen.retain(|s| s.saturating_add(256) > newest);
+        state.seen.retain(|s| s.saturating_add(256) > newest);
+        state.last_seen = now;
+        state.highest = newest;
+        m.covered_senders.insert(sender);
         if seq < highest {
             m.out_of_order += 1;
         }
-        m.last.insert(sender, newest);
-        m.peers.insert(sender);
         m.received += 1;
         let latency = unix_micros().saturating_sub(stamp);
         m.max_latency_us = m.max_latency_us.max(latency);
@@ -138,7 +188,7 @@ impl SceneSession {
             }
             0
         };
-        let csv = format!("metric,value\nwindow_seconds,{seconds:.6}\nsent_messages,{}\nexpected_observer_messages,{}\nreceived_messages,{}\nreceived_bytes,{}\nobserved_senders,{}\nsend_errors,{}\nbackpressure_skips,{}\nmalformed_messages,{}\nduplicate_messages,{}\nout_of_order_messages,{}\nlatency_p50_upper_us,{}\nlatency_p95_upper_us,{}\nlatency_p99_upper_us,{}\nlatency_max_us,{}\n", m.sent, m.expected, m.received, m.received * self.size as u64, m.peers.len(), m.send_errors, m.backpressure, m.malformed, m.duplicates, m.out_of_order, quantile(50), quantile(95), quantile(99), m.max_latency_us);
+        let csv = format!("metric,value\nwindow_seconds,{seconds:.6}\nsent_messages,{}\nexpected_observer_messages,{}\nreceived_messages,{}\nreceived_bytes,{}\nobserved_senders,{}\nsend_errors,{}\nbackpressure_skips,{}\nmalformed_messages,{}\nduplicate_messages,{}\nout_of_order_messages,{}\nlatency_p50_upper_us,{}\nlatency_p95_upper_us,{}\nlatency_p99_upper_us,{}\nlatency_max_us,{}\n", m.sent, m.expected, m.received, m.received * self.size as u64, m.covered_senders.len(), m.send_errors, m.backpressure, m.malformed, m.duplicates, m.out_of_order, quantile(50), quantile(95), quantile(99), m.max_latency_us);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -253,7 +303,7 @@ mod tests {
     use super::*;
     #[test]
     fn scene_observer_rejects_corruption_and_counts_coverage_and_replays() {
-        let session = SceneSession::new(64, None);
+        let session = SceneSession::new(64, None, 2);
         let mut bytes = vec![7, 0];
         bytes.extend_from_slice(&MESSAGE_INDEX.to_le_bytes());
         bytes.extend(script_payload(64, 1, 10, unix_micros()));
@@ -263,13 +313,13 @@ mod tests {
         session.observe(&bytes);
         let m = session.metrics.lock().unwrap();
         assert_eq!(
-            (m.received, m.duplicates, m.malformed, m.peers.len()),
+            (m.received, m.duplicates, m.malformed, m.senders.len()),
             (1, 1, 1, 1)
         );
     }
     #[test]
     fn reordered_unique_messages_count_once_and_old_replays_are_excluded() {
-        let session = SceneSession::new(24, None);
+        let session = SceneSession::new(24, None, 2);
         for seq in [2, 1, 2, 300, 1] {
             let mut bytes = vec![7, 0];
             bytes.extend_from_slice(&MESSAGE_INDEX.to_le_bytes());
@@ -278,11 +328,11 @@ mod tests {
         }
         let m = session.metrics.lock().unwrap();
         assert_eq!((m.received, m.duplicates, m.out_of_order), (3, 2, 1));
-        assert!(m.seen[&1].len() <= 256);
+        assert!(m.senders[&1].seen.len() <= 256);
     }
     #[test]
     fn reconnect_and_peer_id_reuse_preserve_sender_coverage_and_replay_windows() {
-        let session = SceneSession::new(24, None);
+        let session = SceneSession::new(24, None, 4);
         for (peer, sender, seq) in [(7u16, 1, 300), (8, 1, 301), (8, 1, 300), (7, 2, 1)] {
             let mut bytes = peer.to_le_bytes().to_vec();
             bytes.extend_from_slice(&MESSAGE_INDEX.to_le_bytes());
@@ -290,8 +340,90 @@ mod tests {
             session.observe(&bytes);
         }
         let m = session.metrics.lock().unwrap();
-        assert_eq!((m.received, m.duplicates, m.peers.len()), (3, 1, 2));
-        assert_eq!(m.last[&1], 301);
-        assert_eq!(m.last[&2], 1);
+        assert_eq!((m.received, m.duplicates, m.senders.len()), (3, 1, 2));
+        assert_eq!(m.senders[&1].highest, 301);
+        assert_eq!(m.senders[&2].highest, 1);
+    }
+
+    #[test]
+    fn out_of_range_scene_senders_cannot_displace_replay_state_or_inflate_metrics() {
+        let session = SceneSession::new(24, None, 2);
+        for (sender, seq) in [
+            (1, 1),
+            (2, 1),
+            (1, 2),
+            (3, 1),
+            (u32::MAX as usize, 1),
+            (1, 1),
+        ] {
+            let mut bytes = vec![7, 0];
+            bytes.extend_from_slice(&MESSAGE_INDEX.to_le_bytes());
+            bytes.extend(script_payload(24, sender, seq, unix_micros()));
+            session.observe(&bytes);
+        }
+        let m = session.metrics.lock().unwrap();
+        assert_eq!(m.senders.len(), 1);
+        assert!(m.senders.contains_key(&1));
+        assert_eq!(m.senders[&1].highest, 2);
+        assert_eq!((m.received, m.malformed, m.duplicates), (2, 3, 1));
+        assert_eq!(m.covered_senders.len(), 1);
+        assert_eq!(m.expiry_sweeps, 1);
+    }
+
+    #[test]
+    fn client_population_growth_tracks_partial_additions_without_eviction() {
+        let session = SceneSession::new(24, None, 2);
+        let now = Instant::now();
+        let observe = |sender, seq, at| {
+            let mut bytes = vec![7, 0];
+            bytes.extend_from_slice(&MESSAGE_INDEX.to_le_bytes());
+            bytes.extend(script_payload(24, sender, seq, unix_micros()));
+            session.observe_at(&bytes, at);
+        };
+        observe(1, 1, now);
+
+        // AddClients may publish a partial first batch, then another partial batch.
+        session.update_sender_capacity(3);
+        observe(2, 1, now + Duration::from_millis(1));
+        session.update_sender_capacity(4);
+        observe(3, 1, now + Duration::from_millis(2));
+
+        let m = session.metrics.lock().unwrap();
+        assert_eq!(m.senders.len(), 3);
+        assert!(m.senders.contains_key(&1));
+        assert!(m.senders.contains_key(&2));
+        assert!(m.senders.contains_key(&3));
+        assert_eq!(m.covered_senders.len(), 3);
+    }
+
+    #[test]
+    fn expired_replay_state_is_swept_on_schedule_but_coverage_is_cumulative() {
+        let session = SceneSession::new(24, None, 3);
+        let now = Instant::now();
+        let observe = |sender, seq, at| {
+            let mut bytes = vec![7, 0];
+            bytes.extend_from_slice(&MESSAGE_INDEX.to_le_bytes());
+            bytes.extend(script_payload(24, sender, seq, unix_micros()));
+            session.observe_at(&bytes, at);
+        };
+        observe(1, 9, now);
+        observe(2, 1, now + Duration::from_millis(1));
+        assert_eq!(
+            session.metrics.lock().unwrap().next_expiry_sweep,
+            Some(now + SENDER_EXPIRY_SWEEP_INTERVAL)
+        );
+        assert_eq!(session.metrics.lock().unwrap().expiry_sweeps, 1);
+
+        // Advance beyond both the sender TTL and the next maintenance sweep without sleeping.
+        let after_expiry = now + SENDER_STATE_TTL + SENDER_EXPIRY_SWEEP_INTERVAL;
+        observe(2, 2, after_expiry);
+
+        let m = session.metrics.lock().unwrap();
+        assert_eq!(m.received, 3);
+        assert_eq!(m.senders.len(), 1);
+        assert!(!m.senders.contains_key(&1));
+        assert!(m.senders.contains_key(&2));
+        assert_eq!(m.covered_senders.len(), 2);
+        assert_eq!(m.expiry_sweeps, 2);
     }
 }
