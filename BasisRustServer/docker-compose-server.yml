@@ -54,10 +54,11 @@ services:
     environment:
       SetPort: 4296
       EnableConsole: "false"
+      HealthCheckPort: ${BASIS_HEALTH_PORT:-10666}
       BASIS_SERVER_PASSWORD: ${BASIS_SERVER_PASSWORD:?Set a non-empty server password}
     ports:
       - "4296:4296/udp"
-      - "10666:10666/tcp"
+      - "${BASIS_HEALTH_PORT:-10666}:${BASIS_HEALTH_PORT:-10666}/tcp"
     volumes:
       - ./data/initialresources:/app/initialresources
       - ./data/defaultlibrary:/app/defaultlibrary

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{env, fs, path::Path};
+use std::{env, fs, io::Write, path::Path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u8)]
@@ -366,6 +366,16 @@ impl ServerConfig {
         Ok(())
     }
 
+    /// Validate settings that must be supported before startup can proceed.
+    pub fn validate_startup(&self) -> Result<()> {
+        self.validate_auth()?;
+        anyhow::ensure!(
+            !self.api_enabled,
+            "ApiEnabled=true is not supported: this server build does not provide the API service; set ApiEnabled=false"
+        );
+        Ok(())
+    }
+
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if path.exists() {
             let text = fs::read_to_string(path)
@@ -397,8 +407,7 @@ impl ServerConfig {
         self.serialize(serializer)?;
         xml.push('\n');
 
-        fs::write(path, xml).with_context(|| format!("writing config {}", path.display()))?;
-        Ok(())
+        atomic_write(path, xml.as_bytes())
     }
 
     pub fn process_environment_overrides(&mut self) -> Result<()> {
@@ -796,7 +805,7 @@ impl ServerConfig {
         );
         let mut proposed = self.clone();
         proposed.set_field(name, value)?;
-        proposed.validate_auth()?;
+        proposed.validate_startup()?;
         *self = proposed;
         Ok(())
     }
@@ -844,6 +853,69 @@ impl ServerConfig {
         *self = serde_json::from_value(serialized)?;
         Ok(())
     }
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_with(path, |file| file.write_all(bytes))
+}
+
+fn atomic_write_with(
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    let resolved_path = resolve_config_path(path)
+        .with_context(|| format!("resolving config {}", path.display()))?;
+    let path = resolved_path.as_path();
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".basis-config-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .with_context(|| format!("creating temporary config in {}", parent.display()))?;
+    write(temporary.as_file_mut())
+        .with_context(|| format!("writing temporary config for {}", path.display()))?;
+
+    if let Ok(metadata) = fs::metadata(path) {
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())
+            .with_context(|| format!("preserving config permissions for {}", path.display()))?;
+    }
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .with_context(|| format!("syncing temporary config for {}", path.display()))?;
+
+    // tempfile's persist performs an overwrite-capable same-directory replace
+    // on Windows and Unix. A failed write/replace leaves the old config intact.
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replacing config {}", path.display()))?;
+    Ok(())
+}
+
+fn resolve_config_path(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let mut resolved = path.to_path_buf();
+    for _ in 0..40 {
+        match fs::symlink_metadata(&resolved) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = fs::read_link(&resolved)?;
+                resolved = if target.is_absolute() {
+                    target
+                } else {
+                    resolved.parent().unwrap_or(Path::new(".")).join(target)
+                };
+            }
+            Ok(_) => return Ok(resolved),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(resolved),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::other("too many config symlinks"))
 }
 
 #[cfg(test)]
@@ -1382,5 +1454,70 @@ mod tests {
         assert!(xml.ends_with("\n</Configuration>\n"));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_save_atomically_replaces_and_reloads_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.xml");
+        let mut config = ServerConfig {
+            use_auth: false,
+            ..ServerConfig::default()
+        };
+        config.save(&path).unwrap();
+        config.server_name = "updated server".into();
+        config.save(&path).unwrap();
+
+        let loaded = ServerConfig::load_or_create(&path).unwrap();
+        assert_eq!(loaded.server_name, "updated server");
+        assert!(!loaded.use_auth);
+    }
+
+    #[test]
+    fn failed_config_write_preserves_previous_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.xml");
+        let previous = b"<Configuration><UseAuth>false</UseAuth></Configuration>\n";
+        std::fs::write(&path, previous).unwrap();
+
+        let error = atomic_write_with(&path, |_file| {
+            Err(std::io::Error::other("injected config write failure"))
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("writing temporary config"));
+        assert_eq!(std::fs::read(&path).unwrap(), previous);
+        assert!(ServerConfig::load_or_create(&path)
+            .unwrap()
+            .validate_auth()
+            .is_ok());
+    }
+
+    #[test]
+    fn startup_rejects_unsupported_api_but_accepts_auth_and_public_modes() {
+        let protected = ServerConfig {
+            password: "configured password".into(),
+            ..ServerConfig::default()
+        };
+        protected.validate_startup().unwrap();
+
+        let public = ServerConfig {
+            use_auth: false,
+            ..ServerConfig::default()
+        };
+        public.validate_startup().unwrap();
+
+        let unsupported_api = ServerConfig {
+            api_enabled: true,
+            use_auth: false,
+            ..ServerConfig::default()
+        };
+        let error = unsupported_api.validate_startup().unwrap_err().to_string();
+        assert!(error.contains("ApiEnabled=true"));
+        assert!(error.contains("set ApiEnabled=false"));
+
+        let mut live = public.clone();
+        assert!(live.set_live_field("ApiEnabled", "true").is_err());
+        assert!(!live.api_enabled);
     }
 }
