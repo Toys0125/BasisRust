@@ -5,6 +5,7 @@ use basis_protocol::{
 };
 use basis_transport::{DeliveryMethod, PeerId, TransportHandle};
 use dashmap::{mapref::entry::Entry, DashMap};
+use parking_lot::Mutex;
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use tracing::{info, warn};
 
@@ -33,6 +34,8 @@ struct P2pSession {
 
 #[derive(Clone, Default)]
 pub struct P2pBroker {
+    // Serializes multi-map lifecycle transitions. Never held across an await.
+    lifecycle: Arc<Mutex<()>>,
     sessions: Arc<DashMap<String, P2pSession>>,
     peer_sessions: Arc<DashMap<PeerId, HashSet<String>>>,
     offloaded_pairs: Arc<DashMap<u64, ()>>,
@@ -183,21 +186,29 @@ impl P2pBroker {
     }
 
     pub async fn remove_peer(&self, transport: &TransportHandle, peer: PeerId) {
-        let Some((_, tokens)) = self.peer_sessions.remove(&peer) else {
-            return;
+        let notifications = {
+            let _lifecycle = self.lifecycle.lock();
+            let Some((_, tokens)) = self.peer_sessions.remove(&peer) else {
+                return;
+            };
+            let mut notifications = Vec::with_capacity(tokens.len());
+            for token in tokens {
+                let Some((_, session)) = self.sessions.remove(&token) else {
+                    continue;
+                };
+                let other = if session.initiator_peer_id == peer {
+                    session.target_peer_id
+                } else {
+                    session.initiator_peer_id
+                };
+                self.untrack_session(&session, &token);
+                notifications.push((other, token));
+            }
+            notifications
         };
-        for token in tokens {
-            let Some(session) = self.sessions.get(&token).map(|entry| entry.clone()) else {
-                continue;
-            };
-            let other = if session.initiator_peer_id == peer {
-                session.target_peer_id
-            } else {
-                session.initiator_peer_id
-            };
+        for (other, token) in notifications {
             self.send_sub(transport, other, channels::P2P_SUB_CANCEL, &token, peer)
                 .await;
-            self.remove_session(&token);
         }
     }
 
@@ -263,19 +274,6 @@ impl P2pBroker {
         {
             return;
         }
-        if self.peer_sessions.get(&sender).is_some_and(|sessions| {
-            sessions.len() >= MAX_SESSIONS_PER_PEER && !sessions.contains(&message.session_token)
-        }) {
-            self.send_sub(
-                transport,
-                sender,
-                channels::P2P_SUB_CANCEL,
-                &message.session_token,
-                message.other_player_id,
-            )
-            .await;
-            return;
-        }
         if !is_authenticated(message.other_player_id) {
             self.send_sub(
                 transport,
@@ -298,7 +296,7 @@ impl P2pBroker {
             initiator_link_up: false,
             target_link_up: false,
         };
-        if !self.claim_session(&message.session_token, session) {
+        if !self.claim_session(&message.session_token, session, &is_authenticated) {
             // Tokens identify one live pair. Claim atomically so simultaneous
             // colliding requests cannot replace its owner or bookkeeping.
             self.send_sub(
@@ -311,8 +309,6 @@ impl P2pBroker {
             .await;
             return;
         }
-        self.track_peer_session(sender, &message.session_token);
-        self.track_peer_session(message.other_player_id, &message.session_token);
         self.send_sub_with_key(
             transport,
             message.other_player_id,
@@ -427,18 +423,29 @@ impl P2pBroker {
             .await;
     }
 
-    fn remove_session(&self, token: &str) {
-        let Some((_, session)) = self.sessions.remove(token) else {
-            return;
-        };
-        self.untrack_session(&session, token);
-    }
-
-    fn claim_session(&self, token: &str, session: P2pSession) -> bool {
+    /// Atomically admit a live pair and publish both peer-index entries.
+    fn claim_session<F>(&self, token: &str, session: P2pSession, is_authenticated: F) -> bool
+    where
+        F: Fn(PeerId) -> bool,
+    {
+        let _lifecycle = self.lifecycle.lock();
+        let initiator = session.initiator_peer_id;
+        let target = session.target_peer_id;
+        if !is_authenticated(initiator)
+            || !is_authenticated(target)
+            || self
+                .peer_sessions
+                .get(&initiator)
+                .is_some_and(|tokens| tokens.len() >= MAX_SESSIONS_PER_PEER)
+        {
+            return false;
+        }
         match self.sessions.entry(token.to_string()) {
             Entry::Occupied(_) => false,
             Entry::Vacant(entry) => {
                 entry.insert(session);
+                self.track_peer_session(initiator, token);
+                self.track_peer_session(target, token);
                 true
             }
         }
@@ -450,6 +457,7 @@ impl P2pBroker {
         sender: PeerId,
         other: PeerId,
     ) -> Option<P2pSession> {
+        let _lifecycle = self.lifecycle.lock();
         let session = self
             .sessions
             .remove_if(token, |_, session| session.authorizes(sender, other))?
@@ -683,7 +691,7 @@ mod tests {
             let start = start.clone();
             std::thread::spawn(move || {
                 start.wait();
-                broker.claim_session("collision", session(initiator, target))
+                broker.claim_session("collision", session(initiator, target), |_| true)
             })
         });
         start.wait();
@@ -732,6 +740,90 @@ mod tests {
             }
         }
         transport.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_token_reuse_and_cleanup_keep_peer_indexes_consistent() {
+        const ROUNDS: usize = 2000;
+        let (transport, _events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let broker = P2pBroker::default();
+        let phase = Arc::new(std::sync::Barrier::new(3));
+        let requester = {
+            let broker = broker.clone();
+            let transport = transport.clone();
+            let phase = phase.clone();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                for _ in 0..ROUNDS {
+                    phase.wait();
+                    runtime.block_on(broker.handle_request(
+                        &transport,
+                        1,
+                        BasisP2PSignalMessage {
+                            other_player_id: 2,
+                            session_token: "reuse".into(),
+                            ephemeral_public_key: None,
+                        },
+                        |_| true,
+                    ));
+                    phase.wait();
+                }
+            })
+        };
+        let cleaner = {
+            let broker = broker.clone();
+            let transport = transport.clone();
+            let phase = phase.clone();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                for round in 0..ROUNDS {
+                    phase.wait();
+                    if round % 2 == 0 {
+                        let _ = broker.remove_session_if_authorized("reuse", 1, 2);
+                    } else {
+                        runtime.block_on(
+                            broker.remove_peer(&transport, if round % 4 == 1 { 1 } else { 2 }),
+                        );
+                    }
+                    phase.wait();
+                }
+            })
+        };
+        let mut inconsistent = 0;
+        for _ in 0..ROUNDS {
+            // Both workers are parked at the next phase while the fixture and
+            // invariant snapshots are accessed; no assertion races a writer.
+            broker.sessions.clear();
+            broker.peer_sessions.clear();
+            broker.sessions.insert("reuse".into(), session(1, 2));
+            broker.track_peer_session(1, "reuse");
+            broker.track_peer_session(2, "reuse");
+            phase.wait();
+            phase.wait();
+            let live = broker.sessions.contains_key("reuse");
+            let tracked_a = broker
+                .peer_sessions
+                .get(&1)
+                .is_some_and(|tokens| tokens.contains("reuse"));
+            let tracked_b = broker
+                .peer_sessions
+                .get(&2)
+                .is_some_and(|tokens| tokens.contains("reuse"));
+            inconsistent += usize::from(live != tracked_a || live != tracked_b);
+        }
+        requester.join().unwrap();
+        cleaner.join().unwrap();
+        transport.shutdown();
+        assert_eq!(
+            inconsistent, 0,
+            "session claims and cleanup must update both peer indexes atomically"
+        );
     }
 
     #[tokio::test]
@@ -786,6 +878,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_rechecks_participant_authentication_before_claim() {
+        let (transport, _events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let broker = P2pBroker::default();
+        let target_checks = std::sync::atomic::AtomicUsize::new(0);
+        broker
+            .handle_request(
+                &transport,
+                1,
+                BasisP2PSignalMessage {
+                    other_player_id: 2,
+                    session_token: "disconnect-race".into(),
+                    ephemeral_public_key: None,
+                },
+                |peer| {
+                    peer != 2
+                        || target_checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                },
+            )
+            .await;
+        // The target disconnects after the optimistic lookup, before admission.
+        let claimed = broker.sessions.contains_key("disconnect-race");
+        transport.shutdown();
+        assert!(
+            !claimed,
+            "a stale authentication result must not admit a new session"
+        );
+        assert!(broker.peer_sessions.is_empty());
+    }
+
+    #[tokio::test]
     async fn destructive_signals_reach_only_the_registered_counterpart() {
         for sub in [
             channels::P2P_SUB_CANCEL,
@@ -802,9 +926,7 @@ mod tests {
                 let (_outsider_socket, outsider) =
                     connected_signal_peer(&transport, &mut events).await;
                 let broker = P2pBroker::default();
-                broker.claim_session("routing", session(a.peer_id(), b.peer_id()));
-                broker.track_peer_session(a.peer_id(), "routing");
-                broker.track_peer_session(b.peer_id(), "routing");
+                broker.claim_session("routing", session(a.peer_id(), b.peer_id()), |_| true);
                 for (sender, other) in [
                     (outsider.peer_id(), b.peer_id()),
                     (a.peer_id(), outsider.peer_id()),

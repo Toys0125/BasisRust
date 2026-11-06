@@ -427,6 +427,56 @@ fn registry_subscribe_event(peer: PeerId, session: PeerSession) -> ServerEvent {
     }
 }
 
+#[tokio::test]
+async fn p2p_requests_reject_a_closing_target_before_metadata_cleanup() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let mut initiator = Client::connect(&state, "p2p-live-initiator").await;
+    let _target = Client::connect(&state, "p2p-closing-target").await;
+    let (initiator_peer, initiator_session) = session_for_uuid(&state, "p2p-live-initiator");
+    let (target_peer, target_session) = session_for_uuid(&state, "p2p-closing-target");
+    let lease = target_session.try_read_lease().unwrap();
+    request_disconnect(&state, &target_session, "closing P2P target")
+        .await
+        .unwrap();
+    assert!(
+        state.authenticated_peers.contains_key(&target_peer),
+        "held lease must defer metadata cleanup"
+    );
+    let mut writer = NetWriter::new();
+    writer.put_u8(channels::P2P_SUB_REQUEST);
+    basis_protocol::messages::BasisP2PSignalMessage {
+        other_player_id: target_peer,
+        session_token: "closing-target".into(),
+        ephemeral_public_key: None,
+    }
+    .serialize(&mut writer)
+    .unwrap();
+    crate::handle_message(
+        &state,
+        initiator_peer,
+        Some(&initiator_session),
+        channels::P2P,
+        DeliveryMethod::ReliableOrdered,
+        Bytes::copy_from_slice(writer.as_slice()),
+        false,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let response = initiator
+        .receive(|channel, _| channel == channels::P2P)
+        .await;
+    drop(lease);
+    assert_eq!(
+        response[0],
+        channels::P2P_SUB_CANCEL,
+        "stale metadata must not arm a new P2P session"
+    );
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
 async fn wait_for_disconnect_cleanups(state: &ServerState) {
     let tasks = std::mem::take(&mut *state.disconnect_tasks.lock());
     for task in tasks {
