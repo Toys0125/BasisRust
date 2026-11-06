@@ -639,6 +639,8 @@ struct PeerState {
 struct SessionReadGate {
     state: parking_lot::Mutex<SessionReadGateState>,
     drained: Notify,
+    ordered_cleanup_pending: AtomicBool,
+    ordered_callback_active: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -853,15 +855,125 @@ impl PeerState {
 
     fn clear_ordered_reorder(&self) {
         self.read_gate.close_admission();
-        // Realtime ordered handlers run while the receive cursor is locked to preserve
-        // per-channel callback order. A handler may close its own session, so cleanup must
-        // never wait recursively on that cursor. Closing admission makes any retained state
-        // unreachable to new packets; the PeerState drop releases it if this lock is busy.
-        if let Some(mut receive) = self.remote_ordered_sequence.try_lock() {
+        self.read_gate
+            .ordered_cleanup_pending
+            .store(true, Ordering::Release);
+        self.flush_ordered_reorder_cleanup();
+    }
+
+    fn flush_ordered_reorder_cleanup(&self) {
+        loop {
+            if !self
+                .read_gate
+                .ordered_cleanup_pending
+                .load(Ordering::Acquire)
+            {
+                return;
+            }
+            let Some(mut receive) = self.remote_ordered_sequence.try_lock() else {
+                // The ordered receive guard flushes this flag after dropping its cursor.
+                return;
+            };
+            if !self
+                .read_gate
+                .ordered_cleanup_pending
+                .swap(false, Ordering::AcqRel)
+            {
+                return;
+            }
             receive.clear();
+            *self.incoming_fragments.lock() = IncomingFragmentState::default();
+            self.ordered_reorder_active.store(false, Ordering::Release);
+            drop(receive);
+            // A concurrent close can set the flag while the cursor is held. Loop once more
+            // so that a request cannot be stranded between the final check and unlock.
         }
-        *self.incoming_fragments.lock() = IncomingFragmentState::default();
-        self.ordered_reorder_active.store(false, Ordering::Release);
+    }
+}
+
+/// Owns the ordered receive cursor and services cleanup requested reentrantly by a callback
+/// after releasing the cursor. Cleanup never waits for a callback or spawns a background task.
+struct OrderedReceiveGuard<'a> {
+    peer: &'a PeerState,
+    receive: Option<parking_lot::MutexGuard<'a, HashMap<u8, OrderedReceiveState>>>,
+}
+
+impl<'a> OrderedReceiveGuard<'a> {
+    fn lock(peer: &'a PeerState) -> Self {
+        Self {
+            peer,
+            receive: Some(peer.remote_ordered_sequence.lock()),
+        }
+    }
+
+    fn route_realtime(
+        &mut self,
+        handle: &TransportHandle,
+        event: &ServerEvent,
+        expected: &'a Arc<PeerState>,
+    ) -> bool {
+        let ServerEvent::Message { peer, .. } = event else {
+            return false;
+        };
+        if *peer != expected.id
+            || expected.read_gate.is_closed()
+            || !handle.is_current_peer_state(*peer, expected)
+        {
+            return false;
+        }
+        let Some(handler) = handle.realtime_handler.read().clone() else {
+            return false;
+        };
+
+        expected
+            .read_gate
+            .ordered_callback_active
+            .store(true, Ordering::Release);
+        let callback_guard = OrderedCallbackGuard(&expected.read_gate.ordered_callback_active);
+        drop(self.receive.take());
+        let consumed = handler(
+            event,
+            PeerSession {
+                peer: *peer,
+                state: expected.clone(),
+            },
+        );
+        self.receive = Some(expected.remote_ordered_sequence.lock());
+        drop(callback_guard);
+        consumed
+    }
+}
+
+struct OrderedCallbackGuard<'a>(&'a AtomicBool);
+
+impl Drop for OrderedCallbackGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl std::ops::Deref for OrderedReceiveGuard<'_> {
+    type Target = HashMap<u8, OrderedReceiveState>;
+
+    fn deref(&self) -> &Self::Target {
+        self.receive
+            .as_deref()
+            .expect("ordered receive guard is held")
+    }
+}
+
+impl std::ops::DerefMut for OrderedReceiveGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.receive
+            .as_deref_mut()
+            .expect("ordered receive guard is held")
+    }
+}
+
+impl Drop for OrderedReceiveGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.receive.take());
+        self.peer.flush_ordered_reorder_cleanup();
     }
 }
 
@@ -3851,32 +3963,44 @@ fn admit_reliable_ordered(
     event: ServerEvent,
     fragment: Option<IncomingFragment>,
 ) -> Result<()> {
-    if !handle.is_current_peer_state(peer_id, peer) {
+    if peer
+        .read_gate
+        .ordered_callback_active
+        .load(Ordering::Acquire)
+        || !handle.is_current_peer_state(peer_id, peer)
+    {
         return Ok(());
     }
-    let mut receive = peer.remote_ordered_sequence.lock();
-    if peer.read_gate.is_closed() || !handle.is_current_peer_state(peer_id, peer) {
+    let mut receive = OrderedReceiveGuard::lock(peer);
+    if peer
+        .read_gate
+        .ordered_callback_active
+        .load(Ordering::Acquire)
+        || peer.read_gate.is_closed()
+        || !handle.is_current_peer_state(peer_id, peer)
+    {
         return Ok(());
     }
-    let state = receive.entry(channel_id).or_default();
-    if state.is_committed(sequence) || state.future.contains_key(&sequence) {
-        queue_ack(peer, channel_id, sequence);
-        #[cfg(test)]
-        handle
-            .test_ordered_duplicate_count
-            .fetch_add(1, Ordering::Relaxed);
-        if handle.extended_statistics_enabled() {
+    let distance = {
+        let state = receive.entry(channel_id).or_default();
+        if state.is_committed(sequence) || state.future.contains_key(&sequence) {
+            queue_ack(peer, channel_id, sequence);
+            #[cfg(test)]
             handle
-                .stats
-                .ordered_reorder_duplicates
+                .test_ordered_duplicate_count
                 .fetch_add(1, Ordering::Relaxed);
+            if handle.extended_statistics_enabled() {
+                handle
+                    .stats
+                    .ordered_reorder_duplicates
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            // Only committed history may be re-ACKed. An initial wrapped value of
+            // MAX_SEQUENCE - 1 is not a duplicate of the initial expected 0.
+            return Ok(());
         }
-        // Only values in committed history may be re-ACKed. In particular, an initial
-        // wrapped value of MAX_SEQUENCE - 1 is not a duplicate of the initial expected 0.
-        return Ok(());
-    }
-
-    let distance = relative_sequence(sequence, state.expected);
+        relative_sequence(sequence, state.expected)
+    };
     if distance == 0 {
         if let Some(fragment) = fragment {
             let ServerEvent::Message { payload, .. } = event else {
@@ -3913,6 +4037,7 @@ fn admit_reliable_ordered(
                 }
                 Err(FragmentInsertError::Budget(_, _)) => return Ok(()),
                 Ok(None) => {
+                    let state = receive.entry(channel_id).or_default();
                     state.commit(sequence);
                     queue_ack(peer, channel_id, sequence);
                     drain_ordered_state(
@@ -3921,15 +4046,28 @@ fn admit_reliable_ordered(
                         peer_id,
                         peer,
                         channel_id,
-                        state,
+                        &mut receive,
                         MAX_ORDERED_DRAIN_PER_PEER_PER_PASS,
                     )?;
                 }
                 Ok(Some((payload, budgets))) => {
                     let event =
                         ordered_event_with_payload(peer_id, peer, channel_id, payload.clone());
-                    if deliver_ordered_event(
-                        handle, tx, peer_id, peer, channel_id, sequence, state, event,
+                    let realtime_consumed = receive.route_realtime(handle, &event, peer);
+                    if peer.read_gate.is_closed() || !handle.is_current_peer_state(peer_id, peer) {
+                        return Ok(());
+                    }
+                    let state = receive.entry(channel_id).or_default();
+                    if deliver_ordered_event_with_realtime(
+                        handle,
+                        tx,
+                        peer_id,
+                        peer,
+                        channel_id,
+                        sequence,
+                        state,
+                        event,
+                        realtime_consumed,
                     )? {
                         queue_ack(peer, channel_id, sequence);
                         drain_ordered_state(
@@ -3938,10 +4076,12 @@ fn admit_reliable_ordered(
                             peer_id,
                             peer,
                             channel_id,
-                            state,
+                            &mut receive,
                             MAX_ORDERED_DRAIN_PER_PEER_PER_PASS,
                         )?;
-                    } else {
+                    } else if !peer.read_gate.is_closed()
+                        && handle.is_current_peer_state(peer_id, peer)
+                    {
                         state.future.insert(
                             sequence,
                             RetainedOrderedMessage {
@@ -3960,10 +4100,23 @@ fn admit_reliable_ordered(
                 .store(has_buffered, Ordering::Release);
             return Ok(());
         }
-        // Keep the channel lock across callback and event admission so concurrent UDP workers
-        // cannot publish sequence N+1 before N.
-        if deliver_ordered_event(
-            handle, tx, peer_id, peer, channel_id, sequence, state, event,
+        // The guard temporarily releases the cursor around realtime callbacks. While the
+        // callback runs, ordered admission is gated so no later sequence can overtake it.
+        let realtime_consumed = receive.route_realtime(handle, &event, peer);
+        if peer.read_gate.is_closed() || !handle.is_current_peer_state(peer_id, peer) {
+            return Ok(());
+        }
+        let state = receive.entry(channel_id).or_default();
+        if deliver_ordered_event_with_realtime(
+            handle,
+            tx,
+            peer_id,
+            peer,
+            channel_id,
+            sequence,
+            state,
+            event,
+            realtime_consumed,
         )? {
             drain_ordered_state(
                 handle,
@@ -3971,7 +4124,7 @@ fn admit_reliable_ordered(
                 peer_id,
                 peer,
                 channel_id,
-                state,
+                &mut receive,
                 MAX_ORDERED_DRAIN_PER_PEER_PER_PASS,
             )?;
             let has_buffered = receive.values().any(|state| !state.future.is_empty());
@@ -3979,6 +4132,7 @@ fn admit_reliable_ordered(
                 .store(has_buffered, Ordering::Release);
         }
     } else if distance > 0 && distance as usize <= MAX_ORDERED_REORDER_AHEAD {
+        let state = receive.entry(channel_id).or_default();
         if state.future.len() >= MAX_ORDERED_REORDER_AHEAD {
             #[cfg(test)]
             handle
@@ -4039,6 +4193,7 @@ fn admit_reliable_ordered(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn deliver_ordered_event(
     handle: &TransportHandle,
     tx: &mpsc::Sender<ServerEvent>,
@@ -4049,14 +4204,38 @@ fn deliver_ordered_event(
     state: &mut OrderedReceiveState,
     event: ServerEvent,
 ) -> Result<bool> {
+    let realtime_consumed = handle.route_realtime(&event, peer);
+    deliver_ordered_event_with_realtime(
+        handle,
+        tx,
+        peer_id,
+        peer,
+        channel_id,
+        sequence,
+        state,
+        event,
+        realtime_consumed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deliver_ordered_event_with_realtime(
+    handle: &TransportHandle,
+    tx: &mpsc::Sender<ServerEvent>,
+    peer_id: PeerId,
+    peer: &Arc<PeerState>,
+    channel_id: u8,
+    sequence: u16,
+    state: &mut OrderedReceiveState,
+    event: ServerEvent,
+    realtime_consumed: bool,
+) -> Result<bool> {
     let admission = handle.ordered_admission.read().clone();
     if let Some(queues) = admission {
-        // Realtime consumers take ownership without an application admission lease.
-        let consumed = handle.route_realtime(&event, peer);
         if peer.read_gate.is_closed() || !handle.is_current_peer_state(peer_id, peer) {
             return Ok(false);
         }
-        if consumed {
+        if realtime_consumed {
             state.commit(sequence);
             queue_ack(peer, channel_id, sequence);
             return Ok(true);
@@ -4104,17 +4283,16 @@ fn deliver_ordered_event(
             return Err(TransportError::EventChannelClosed)
         }
     };
-    let consumed = handle.route_realtime(&event, peer);
     if peer.read_gate.is_closed() || !handle.is_current_peer_state(peer_id, peer) {
         return Ok(false);
     }
-    if permit.is_none() && !consumed {
+    if permit.is_none() && !realtime_consumed {
         // Full queue and no realtime owner: leave cursor and ACK bitmap unchanged.
         return Ok(false);
     }
     state.commit(sequence);
     queue_ack(peer, channel_id, sequence);
-    if let Some(permit) = permit.filter(|_| !consumed) {
+    if let Some(permit) = permit.filter(|_| !realtime_consumed) {
         permit.send(event);
     }
     Ok(true)
@@ -4138,20 +4316,24 @@ fn ordered_event_with_payload(
     }
 }
 
-fn drain_ordered_state(
+fn drain_ordered_state<'a>(
     handle: &TransportHandle,
     tx: &mpsc::Sender<ServerEvent>,
     peer_id: PeerId,
-    peer: &Arc<PeerState>,
+    peer: &'a Arc<PeerState>,
     channel_id: u8,
-    state: &mut OrderedReceiveState,
+    receive: &mut OrderedReceiveGuard<'a>,
     max_messages: usize,
 ) -> Result<usize> {
     let mut drained = 0;
     while drained < max_messages {
-        let sequence = state.expected;
-        let Some(retained) = state.future.remove(&sequence) else {
-            break;
+        let (sequence, retained) = {
+            let state = receive.entry(channel_id).or_default();
+            let sequence = state.expected;
+            let Some(retained) = state.future.remove(&sequence) else {
+                break;
+            };
+            (sequence, retained)
         };
         let (payload, budgets) = if let Some(fragment) = retained.fragment {
             let Some(budget) = retained._budgets.into_iter().next() else {
@@ -4166,6 +4348,7 @@ fn drain_ordered_state(
                 &peer.reorder_usage,
             ) {
                 Ok(None) => {
+                    let state = receive.entry(channel_id).or_default();
                     state.commit(sequence);
                     drained += 1;
                     if handle.extended_statistics_enabled() {
@@ -4178,7 +4361,7 @@ fn drain_ordered_state(
                 }
                 Ok(Some(assembled)) => assembled,
                 Err(FragmentInsertError::Limit(payload, budget)) => {
-                    state.future.insert(
+                    receive.entry(channel_id).or_default().future.insert(
                         sequence,
                         RetainedOrderedMessage {
                             payload,
@@ -4192,7 +4375,7 @@ fn drain_ordered_state(
                     break;
                 }
                 Err(FragmentInsertError::Invalid(payload, budget)) => {
-                    state.future.insert(
+                    receive.entry(channel_id).or_default().future.insert(
                         sequence,
                         RetainedOrderedMessage {
                             payload,
@@ -4203,7 +4386,7 @@ fn drain_ordered_state(
                     return Err(TransportError::InvalidFragment(peer_id));
                 }
                 Err(FragmentInsertError::Budget(payload, budget)) => {
-                    state.future.insert(
+                    receive.entry(channel_id).or_default().future.insert(
                         sequence,
                         RetainedOrderedMessage {
                             payload,
@@ -4218,17 +4401,32 @@ fn drain_ordered_state(
             (retained.payload, retained._budgets)
         };
         let event = ordered_event_with_payload(peer_id, peer, channel_id, payload.clone());
-        if !deliver_ordered_event(
-            handle, tx, peer_id, peer, channel_id, sequence, state, event,
+        let realtime_consumed = receive.route_realtime(handle, &event, peer);
+        if peer.read_gate.is_closed() || !handle.is_current_peer_state(peer_id, peer) {
+            break;
+        }
+        let state = receive.entry(channel_id).or_default();
+        if !deliver_ordered_event_with_realtime(
+            handle,
+            tx,
+            peer_id,
+            peer,
+            channel_id,
+            sequence,
+            state,
+            event,
+            realtime_consumed,
         )? {
-            state.future.insert(
-                sequence,
-                RetainedOrderedMessage {
-                    payload,
-                    fragment: None,
-                    _budgets: budgets,
-                },
-            );
+            if !peer.read_gate.is_closed() && handle.is_current_peer_state(peer_id, peer) {
+                state.future.insert(
+                    sequence,
+                    RetainedOrderedMessage {
+                        payload,
+                        fragment: None,
+                        _budgets: budgets,
+                    },
+                );
+            }
             break;
         }
         drop(budgets);
@@ -4250,19 +4448,40 @@ fn drain_ordered_peer(
     peer: &Arc<PeerState>,
     max_messages: usize,
 ) -> Result<usize> {
-    if !peer.ordered_reorder_active.load(Ordering::Acquire)
+    if peer
+        .read_gate
+        .ordered_callback_active
+        .load(Ordering::Acquire)
+        || !peer.ordered_reorder_active.load(Ordering::Acquire)
         || !handle.is_current_peer_state(peer_id, peer)
     {
         return Ok(0);
     }
-    let mut receive = peer.remote_ordered_sequence.lock();
+    let mut receive = OrderedReceiveGuard::lock(peer);
+    if peer
+        .read_gate
+        .ordered_callback_active
+        .load(Ordering::Acquire)
+        || peer.read_gate.is_closed()
+    {
+        return Ok(0);
+    }
     let mut remaining = max_messages;
     let mut drained = 0;
-    for (channel_id, state) in receive.iter_mut() {
+    let channels = receive.keys().copied().collect::<Vec<_>>();
+    for channel_id in channels {
         if remaining == 0 {
             break;
         }
-        let count = drain_ordered_state(handle, tx, peer_id, peer, *channel_id, state, remaining)?;
+        let count = drain_ordered_state(
+            handle,
+            tx,
+            peer_id,
+            peer,
+            channel_id,
+            &mut receive,
+            remaining,
+        )?;
         drained += count;
         remaining -= count;
     }
@@ -5314,10 +5533,7 @@ async fn reliable_dispatch_loop(handle: TransportHandle, tx: mpsc::Sender<Server
                     Err(TransportError::EventChannelClosed) => {
                         // No consumer can receive already-ACKed buffered messages. Drop them
                         // on receiver shutdown so retained global budget is released.
-                        peer_state.remote_ordered_sequence.lock().clear();
-                        peer_state
-                            .ordered_reorder_active
-                            .store(false, Ordering::Release);
+                        peer_state.clear_ordered_reorder();
                     }
                     Err(TransportError::InvalidFragment(_)) => {
                         let session = PeerSession {
@@ -8345,6 +8561,7 @@ mod tests {
         handle.by_addr.insert(peer.addr, peer.id);
         let callback_handle = handle.clone();
         handle.set_realtime_handler(Some(Arc::new(move |_, session| {
+            assert!(session.state.remote_ordered_sequence.try_lock().is_some());
             assert!(callback_handle.close_session_admission(&session));
             true
         })));
@@ -8377,6 +8594,103 @@ mod tests {
         .expect("ordered callback task must finish")
         .unwrap();
         assert!(peer.read_gate.is_closed());
+    }
+
+    #[tokio::test]
+    async fn reentrant_session_close_releases_buffered_ordered_budget_after_cursor_unlock() {
+        let (mut handle, tx, _events) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 8, 1)
+                .await
+                .unwrap();
+        handle.shutdown();
+        handle.reorder_budget = Arc::new(ReorderBudget {
+            usage: parking_lot::Mutex::new(ReorderBudgetUsage::default()),
+            limits: ReorderBudgetLimits {
+                packets: 1,
+                bytes: 1_024,
+                peer_packets: 1,
+                peer_bytes: 1_024,
+            },
+        });
+        let old_peer = test_peer_state(0);
+        handle.peers.insert(old_peer.id, old_peer.clone());
+        handle.by_addr.insert(old_peer.addr, old_peer.id);
+
+        let callback_handle = handle.clone();
+        handle.set_realtime_handler(Some(Arc::new(move |_, session| {
+            assert!(callback_handle.close_session_admission(&session));
+            true
+        })));
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let first = build_outbound_packet(
+            &old_peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"first",
+        );
+        let second = build_outbound_packet(
+            &old_peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"buffered",
+        );
+        process_packet(&handle, &tx, old_peer.addr, &second.bytes)
+            .await
+            .unwrap();
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 1);
+        assert!(old_peer.remote_ordered_sequence.lock()[&channel_id]
+            .future
+            .contains_key(&1));
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            process_packet(&handle, &tx, old_peer.addr, &first.bytes),
+        )
+        .await
+        .expect("reentrant cleanup must not block receive")
+        .unwrap();
+        assert!(old_peer.read_gate.is_closed());
+        assert!(handle.peers.contains_key(&old_peer.id));
+        assert!(old_peer.remote_ordered_sequence.lock().is_empty());
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 0);
+        assert!(!ack_bit(
+            &old_peer.outgoing_acks.lock()[&channel_id].bits,
+            0
+        ));
+
+        // Retaining the closed PeerState must not retain its global budget reservation.
+        // A distinct peer can immediately consume the entire one-packet shared budget.
+        let new_addr = loopback_addr(4297);
+        let mut new_peer = test_peer_state(1);
+        Arc::get_mut(&mut new_peer).unwrap().addr = new_addr;
+        handle.peers.insert(new_peer.id, new_peer.clone());
+        handle.by_addr.insert(new_addr, new_peer.id);
+        let _ = build_outbound_packet(
+            &new_peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"new-first",
+        );
+        let new_second = build_outbound_packet(
+            &new_peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"new-buffered",
+        );
+        process_packet(&handle, &tx, new_addr, &new_second.bytes)
+            .await
+            .unwrap();
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 1);
+        assert!(old_peer.remote_ordered_sequence.lock().is_empty());
+        assert_eq!(
+            old_peer
+                .reorder_usage
+                .retained_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+        handle.shutdown();
     }
 
     #[tokio::test]
