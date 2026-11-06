@@ -181,7 +181,7 @@ async fn scene_waits_for_admission_without_delaying_first_send_by_workload_inter
             clients.clone(),
             Arc::new(AtomicBool::new(false)),
             stop.clone(),
-            Arc::new(crate::scene::SceneSession::new(32, None)),
+            Arc::new(crate::scene::SceneSession::new(32, None, 2)),
             Duration::from_secs(60),
             reliable,
         ));
@@ -3026,7 +3026,7 @@ async fn shared_receive_keeps_scene_reliable_only_for_scene_observers() {
 
     let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let mut observer = test_client(1, server.local_addr().unwrap()).await;
-    let session = Arc::new(crate::scene::SceneSession::new(24, None));
+    let session = Arc::new(crate::scene::SceneSession::new(24, None, 2));
     Arc::get_mut(&mut observer).unwrap().scene_session = Some(session.clone());
     let wire = scene_packet(1);
     let mut compact = vec![PacketProperty::CompactMerged as u8, 0x40, wire.len() as u8];
@@ -3271,25 +3271,38 @@ async fn batch_publish_preserves_dense_indices_and_notifies_complete_snapshot() 
         shared: true,
         refresh: refresh.clone(),
     };
+    let scene_session = crate::scene::SceneSession::new(24, None, 1);
     let batch = vec![
         test_client(0, server_addr).await,
         test_client(1, server_addr).await,
         test_client(2, server_addr).await,
     ];
     let notified = refresh.notified();
-    publish_client_batch(&managed, 0, &batch, &maintenance)
+    publish_client_batch(&managed, 0, &batch, &maintenance, Some(&scene_session))
         .await
         .unwrap();
     time::timeout(Duration::from_secs(1), notified)
         .await
         .unwrap();
+    assert_eq!(scene_session.sender_capacity(), 3);
+    let partial_addition = vec![test_client(3, server_addr).await];
+    publish_client_batch(
+        &managed,
+        3,
+        &partial_addition,
+        &maintenance,
+        Some(&scene_session),
+    )
+    .await
+    .unwrap();
+    assert_eq!(scene_session.sender_capacity(), 4);
     let snapshot = managed.lock().await;
     assert_eq!(
         snapshot
             .iter()
             .map(|client| client.index)
             .collect::<Vec<_>>(),
-        vec![0, 1, 2]
+        vec![0, 1, 2, 3]
     );
 }
 
