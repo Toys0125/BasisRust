@@ -574,8 +574,8 @@ impl ServerState {
 
     /// Start with an explicit configuration file path and application-registered storage backends.
     ///
-    /// The configured backend is initialized once at startup. If initialization
-    /// fails, the server continues with player storage unavailable.
+    /// The configured backend is initialized once at startup. Initialization
+    /// failures stop startup so enabled storage is never silently unavailable.
     pub async fn start_with_config_path_and_storage_registry(
         mut config: ServerConfig,
         base_dir: &Path,
@@ -615,23 +615,18 @@ impl ServerState {
         };
 
         let player_storage = if config.storage_enabled {
-            let backend = config.storage_backend.as_str();
-            match registry
-                .create(
-                    backend,
-                    StorageBackendContext {
-                        base_dir: base_dir.to_path_buf(),
-                        config: config.clone(),
-                    },
-                )
-                .await
-            {
-                Ok(storage) => Some(storage),
-                Err(error) => {
-                    warn!("Cilbox server storage disabled: {error:#}");
-                    None
-                }
-            }
+            Some(
+                registry
+                    .create(
+                        config.storage_backend.as_str(),
+                        StorageBackendContext {
+                            base_dir: base_dir.to_path_buf(),
+                            config: config.clone(),
+                        },
+                    )
+                    .await
+                    .context("initializing configured player storage")?,
+            )
         } else {
             None
         };
@@ -6803,6 +6798,31 @@ mod tests {
         // Legitimate owner removal still works.
         assert!(ownership.remove_if_owner("owned-object", authenticated_peer));
         assert!(!ownership.remove_if_owner("owned-object", authenticated_peer));
+    }
+
+    #[tokio::test]
+    async fn configured_storage_initialization_failure_stops_server_startup() {
+        let mut registry = StorageBackendRegistry::new();
+        registry
+            .register("unavailable", |_| async {
+                anyhow::bail!("database is intentionally offline")
+            })
+            .unwrap();
+        let config = ServerConfig {
+            storage_enabled: true,
+            storage_backend: "unavailable".into(),
+            has_file_support: false,
+            set_port: 0,
+            override_auto_discovery_of_ipv: true,
+            ipv4_address: "127.0.0.1".into(),
+            ..ServerConfig::default()
+        };
+        let base_dir = std::env::temp_dir();
+        let error = ServerState::start_with_storage_registry(config, &base_dir, registry)
+            .await
+            .err()
+            .expect("storage initialization failures must stop startup");
+        assert!(format!("{error:#}").contains("database is intentionally offline"));
     }
 
     #[tokio::test]

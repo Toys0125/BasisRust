@@ -17,8 +17,16 @@ In the server XML configuration, set:
 ```
 
 Choose `file`, `memory`, or `sql` (requires the `sql-storage` Cargo
-feature). Existing paths, PostgreSQL initialization/fallback, and limits are
-unchanged. `file` transparently uses memory when `HasFileSupport` is false.
+feature). PostgreSQL connection and setup failures stop SQL backend startup by
+default, preventing new writes from going to a separate local database. To
+explicitly allow local SQLite fallback during a remote outage, set
+`BASIS_STORAGE_ALLOW_SQLITE_FALLBACK=true` in the server process environment.
+Only the literal values `true` and `false` are accepted (case-insensitive); an
+invalid value stops SQL backend startup. Fallback data is separate from the
+remote database, so use this option only when that split is intentional.
+PostgreSQL accounting/schema initialization failures always stop startup, even
+when fallback is enabled. With no remote URL, SQL continues to use local SQLite.
+`file` transparently uses memory when `HasFileSupport` is false.
 The selected backend is constructed once at startup; changing its name needs
 a restart. The built-in SQL backend retains main's one-time legacy player-file
 import into SQLite; selecting other backends does not automatically migrate
