@@ -23,12 +23,14 @@ fn valid_http_address(url: &str, strict_link: bool) -> bool {
     }) {
         return false;
     }
-    let Some(without_scheme) = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-    else {
+    let Some(scheme_end) = url.find("://") else {
         return false;
     };
+    let scheme = &url[..scheme_end];
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let without_scheme = &url[scheme_end + 3..];
     let authority = without_scheme.split(['/', '?', '#']).next().unwrap_or("");
     if authority.is_empty() || authority.contains('@') {
         return false;
@@ -237,6 +239,13 @@ mod tests {
     fn links_reject_spoofing_and_invisible_hosts() {
         assert!(validate(ContentShareType::Link, "https://basisvr.com/").is_some());
         for url in [
+            "HTTPS://BASISVR.COM/",
+            "HtTp://example.com/path",
+            "hTtPs://example.com/path",
+        ] {
+            assert!(validate(ContentShareType::Link, url).is_some(), "{url}");
+        }
+        for url in [
             "https://trusted.com@evil.com",
             "https://0x7f.1",
             "https://evil.com\\@trusted.com",
@@ -244,6 +253,8 @@ mod tests {
             "javascript:alert(1)",
             "https://2130706433",
             "http://abc.123",
+            "ftp://example.com/file",
+            "javascript://example.com/",
         ] {
             assert!(validate(ContentShareType::Link, url).is_none(), "{url}");
         }
