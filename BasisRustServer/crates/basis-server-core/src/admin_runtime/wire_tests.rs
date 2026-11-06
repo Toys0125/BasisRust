@@ -1013,14 +1013,14 @@ async fn client_packets_verify_snapshot_gate_queries_mutes_and_live_permission_u
         .receive(|c, p| c == channels::ADMIN && admin_mode(p, AdminRequestMode::GetPermissions))
         .await;
     assert_eq!(NetReader::new(&snapshot[1..]).get_i32().unwrap(), 3);
-    ordinary
+    staff
         .admin(AdminRequestMode::QueryPermission, |w| {
             w.put_u16(peer_by_uuid(&state, "staff").unwrap());
             w.put_u8(1);
             w.put_string("MODERATOR").unwrap();
         })
         .await;
-    let query = ordinary
+    let query = staff
         .receive(|c, p| {
             c == channels::ADMIN && admin_mode(p, AdminRequestMode::QueryPermissionResult)
         })
@@ -1087,6 +1087,118 @@ async fn client_packets_verify_snapshot_gate_queries_mutes_and_live_permission_u
         0,
         "live refresh should grant the permissions.view bit"
     );
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn permission_queries_allow_self_and_require_view_for_other_users() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    state.permissions.add_user_to_group("staff", "moderator");
+    state
+        .permissions
+        .add_user_to_group("staff-query", "moderator");
+    let mut ordinary = Client::connect(&state, "ordinary-query").await;
+    let mut staff = Client::connect(&state, "staff-query").await;
+    let ordinary_id = peer_by_uuid(&state, "ordinary-query").unwrap();
+    let staff_id = peer_by_uuid(&state, "staff-query").unwrap();
+
+    ordinary
+        .admin(AdminRequestMode::QueryPermission, |w| {
+            w.put_u16(staff_id);
+            w.put_u8(1);
+            w.put_string("moderator").unwrap();
+        })
+        .await;
+    let denied = ordinary
+        .receive(|c, p| {
+            c == channels::ADMIN && admin_mode(p, AdminRequestMode::QueryPermissionResult)
+        })
+        .await;
+    let mut reader = NetReader::new(&denied[1..]);
+    assert_eq!(reader.get_u16().unwrap(), staff_id);
+    assert_eq!(reader.get_u8().unwrap(), 1);
+    assert_eq!(reader.get_string().unwrap(), "moderator");
+    assert!(!reader.get_bool().unwrap());
+    assert!(!reader.get_bool().unwrap());
+
+    state
+        .permissions
+        .add_user_to_group("ordinary-query", "self-check");
+    ordinary
+        .admin(AdminRequestMode::QueryPermission, |w| {
+            w.put_u16(ordinary_id);
+            w.put_u8(1);
+            w.put_string("self-check").unwrap();
+        })
+        .await;
+    let self_result = ordinary
+        .receive(|c, p| {
+            c == channels::ADMIN && admin_mode(p, AdminRequestMode::QueryPermissionResult)
+        })
+        .await;
+    let mut reader = NetReader::new(&self_result[1..]);
+    assert_eq!(reader.get_u16().unwrap(), ordinary_id);
+    assert_eq!(reader.get_u8().unwrap(), 1);
+    assert_eq!(reader.get_string().unwrap(), "self-check");
+    assert!(reader.get_bool().unwrap());
+    assert!(reader.get_bool().unwrap());
+
+    // Duplicate online UUID spellings still resolve to one authenticated identity.
+    let canonical_uuid = "550E8400-E29B-41D4-A716-446655440000";
+    let compact_alias = "550E8400E29B41D4A716446655440000";
+    let mut canonical = Client::connect(&state, canonical_uuid).await;
+    let _alias = Client::connect(&state, compact_alias).await;
+    let alias_id = peer_by_uuid(&state, compact_alias).unwrap();
+    state
+        .permissions
+        .add_user_to_group(compact_alias, "alias-self");
+    canonical
+        .admin(AdminRequestMode::QueryPermission, |w| {
+            w.put_u16(alias_id);
+            w.put_u8(1);
+            w.put_string("alias-self").unwrap();
+        })
+        .await;
+    let alias_result = canonical
+        .receive(|c, p| {
+            c == channels::ADMIN && admin_mode(p, AdminRequestMode::QueryPermissionResult)
+        })
+        .await;
+    let mut reader = NetReader::new(&alias_result[1..]);
+    assert_eq!(reader.get_u16().unwrap(), alias_id);
+    assert_eq!(reader.get_u8().unwrap(), 1);
+    assert_eq!(reader.get_string().unwrap(), "alias-self");
+    assert!(reader.get_bool().unwrap());
+    assert!(reader.get_bool().unwrap());
+
+    state.permissions.add_user_node(
+        "ordinary-query",
+        basis_server_permissions::nodes::PROTECTION,
+    );
+    staff
+        .admin(AdminRequestMode::QueryPermission, |w| {
+            w.put_u16(ordinary_id);
+            w.put_u8(0);
+            w.put_string(basis_server_permissions::nodes::PROTECTION)
+                .unwrap();
+        })
+        .await;
+    let admin_result = staff
+        .receive(|c, p| {
+            c == channels::ADMIN && admin_mode(p, AdminRequestMode::QueryPermissionResult)
+        })
+        .await;
+    let mut reader = NetReader::new(&admin_result[1..]);
+    assert_eq!(reader.get_u16().unwrap(), ordinary_id);
+    assert_eq!(reader.get_u8().unwrap(), 0);
+    assert_eq!(
+        reader.get_string().unwrap(),
+        basis_server_permissions::nodes::PROTECTION
+    );
+    assert!(reader.get_bool().unwrap());
+    assert!(reader.get_bool().unwrap());
+
     state.shutdown().await.unwrap();
     let _ = shutdown.send(());
 }

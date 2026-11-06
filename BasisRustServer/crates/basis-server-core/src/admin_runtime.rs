@@ -572,15 +572,32 @@ async fn handle_query(state: &ServerState, peer: PeerId, reader: &mut NetReader<
         return Ok(());
     }
     let valid = !value.trim().is_empty() && value.encode_utf16().count() <= 128;
-    let uuid = valid.then(|| peer_uuid(state, target)).flatten();
-    let found = uuid.is_some();
-    let held = uuid.is_some_and(|uuid| {
-        if kind == 1 {
-            state.permissions.is_in_group(&uuid, &value)
+    let (found, held) = if valid {
+        if let (Some(requester), Some(target_peer)) = (
+            state.authenticated_peers.get(&peer),
+            state.authenticated_peers.get(&target),
+        ) {
+            let requester_uuid = requester.metadata.player_uuid.as_str();
+            let target_uuid = target_peer.metadata.player_uuid.as_str();
+            let is_self = same_permission_identity(requester_uuid, target_uuid);
+            let can_query = is_self
+                || state.permissions.has(
+                    requester_uuid,
+                    basis_server_permissions::nodes::PERMISSIONS_VIEW,
+                );
+            let held = can_query
+                && if kind == 1 {
+                    state.permissions.is_in_group(target_uuid, &value)
+                } else {
+                    state.permissions.has(target_uuid, &value)
+                };
+            (can_query, held)
         } else {
-            state.permissions.has(&uuid, &value)
+            (false, false)
         }
-    });
+    } else {
+        (false, false)
+    };
     let mut writer = NetWriter::new();
     AdminRequest {
         mode: AdminRequestMode::QueryPermissionResult,
@@ -592,6 +609,16 @@ async fn handle_query(state: &ServerState, peer: PeerId, reader: &mut NetReader<
     writer.put_bool(held);
     writer.put_bool(found);
     send_admin_payload_to_peer(state, peer, writer.into_vec()).await
+}
+
+fn same_permission_identity(left: &str, right: &str) -> bool {
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    match (uuid::Uuid::parse_str(left), uuid::Uuid::parse_str(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => basis_protocol::permissions::ordinal_ignore_case_equal(left, right),
+    }
 }
 
 fn sanitize_display_name(name: &str) -> String {
