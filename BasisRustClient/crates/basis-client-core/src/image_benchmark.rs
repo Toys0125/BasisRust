@@ -666,16 +666,15 @@ fn read_7bit_len(data: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-fn event_scene_payload(network_id: u16, recipients: &[u16], event: &[u8]) -> Vec<u8> {
+fn event_scene_payload(network_id: u16, recipients: &[u16], event: &[u8]) -> Result<Vec<u8>> {
     let mut writer = NetWriter::new();
     SceneDataMessage {
         message_index: network_id,
         recipients: recipients.to_vec(),
         payload: event.to_vec(),
     }
-    .serialize(&mut writer)
-    .unwrap();
-    writer.as_slice().to_vec()
+    .serialize(&mut writer)?;
+    Ok(writer.as_slice().to_vec())
 }
 
 async fn send_image(
@@ -683,7 +682,7 @@ async fn send_image(
     session: Arc<ImageBenchmarkSession>,
     recipients: Vec<u16>,
     owner_id: u16,
-) {
+) -> Result<()> {
     let owner = client.index;
     let image_id = session.ids[owner];
     let mut spawn = Vec::with_capacity(72);
@@ -704,7 +703,7 @@ async fn send_image(
             .load(std::sync::atomic::Ordering::Acquire),
         &recipients,
         &spawn,
-    );
+    )?;
     if client
         .send_reliable_ordered(channels::SCENE, &payload)
         .await
@@ -736,7 +735,7 @@ async fn send_image(
                 .load(std::sync::atomic::Ordering::Acquire),
             &recipients,
             &chunk,
-        );
+        )?;
         if client
             .send_reliable_ordered(channels::SCENE, &payload)
             .await
@@ -752,7 +751,10 @@ async fn send_image(
         time::sleep_until(time::Instant::from_std(next)).await;
     }
     session.metrics.lock().unwrap().uploads_done += 1;
-    let _ = session.log("progress");
+    if let Err(err) = session.log("progress") {
+        tracing::warn!("failed to write image benchmark progress: {err:#}");
+    }
+    Ok(())
 }
 
 pub async fn run_workload(
@@ -794,7 +796,9 @@ pub async fn run_workload(
         )));
     }
     for sender in senders {
-        let _ = sender.await;
+        sender
+            .await
+            .context("image benchmark sender task panicked")??;
     }
     loop {
         let progress = session.snapshot("progress");
@@ -807,7 +811,9 @@ pub async fn run_workload(
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             bail!("shutdown during live image transfer");
         }
-        let _ = session.log("progress");
+        if let Err(err) = session.log("progress") {
+            tracing::warn!("failed to write image benchmark progress: {err:#}");
+        }
         time::timeout(Duration::from_secs(1), session.notify.notified())
             .await
             .ok();
@@ -838,7 +844,7 @@ pub async fn run_workload(
                     .load(std::sync::atomic::Ordering::Acquire),
                 &[recipient],
                 &request,
-            );
+            )?;
             client
                 .send_reliable_ordered(channels::SCENE, &payload)
                 .await?;
@@ -851,7 +857,9 @@ pub async fn run_workload(
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             bail!("shutdown during image cache replay");
         }
-        let _ = session.log("progress");
+        if let Err(err) = session.log("progress") {
+            tracing::warn!("failed to write image benchmark progress: {err:#}");
+        }
         time::timeout(Duration::from_secs(1), session.notify.notified())
             .await
             .ok();
@@ -896,6 +904,16 @@ mod tests {
         cache_recipients: usize,
         cache_marker: &Path,
     ) -> Arc<ImageBenchmarkSession> {
+        let output = std::env::temp_dir().join(format!("{}.jsonl", uuid::Uuid::new_v4()));
+        session_with_output(clients, cache_recipients, cache_marker, output)
+    }
+
+    fn session_with_output(
+        clients: usize,
+        cache_recipients: usize,
+        cache_marker: &Path,
+        output_path: PathBuf,
+    ) -> Arc<ImageBenchmarkSession> {
         let image =
             std::env::temp_dir().join(format!("basis-image-bench-{}.jpg", uuid::Uuid::new_v4()));
         std::fs::write(&image, fixture()).unwrap();
@@ -904,7 +922,7 @@ mod tests {
             ip: "127.0.0.1".into(),
             port: 4296,
             image_path: image.clone(),
-            output_path: std::env::temp_dir().join(format!("{}.jsonl", uuid::Uuid::new_v4())),
+            output_path,
             live_start_file: PathBuf::new(),
             cache_start_file: cache_marker.to_path_buf(),
             clients,
@@ -1005,6 +1023,18 @@ mod tests {
         assert_eq!(logged["event"], "live_complete");
         assert_eq!(logged["live_completed"], progress.live_expected);
         let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn benchmark_log_reports_filesystem_failures() {
+        let blocker =
+            std::env::temp_dir().join(format!("basis-bench-blocker-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let marker =
+            std::env::temp_dir().join(format!("basis-bench-marker-{}", uuid::Uuid::new_v4()));
+        let session = session_with_output(4, 1, &marker, blocker.join("events.jsonl"));
+        assert!(session.log("progress").is_err());
+        let _ = std::fs::remove_file(blocker);
     }
 
     #[test]

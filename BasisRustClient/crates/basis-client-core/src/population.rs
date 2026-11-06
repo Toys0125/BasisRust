@@ -119,10 +119,14 @@ pub(crate) async fn failure_reconnect_loop(
     maintenance: MaintenanceOptions,
 ) {
     let mut pending_since = HashMap::<usize, time::Instant>::new();
+    let mut retry_after = HashMap::<usize, (u32, time::Instant)>::new();
     let mut tick = time::interval(Duration::from_millis(250));
 
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = tick.tick() => {},
+            _ = wait_for_shutdown(&shutdown) => break,
+        }
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
@@ -135,6 +139,7 @@ pub(crate) async fn failure_reconnect_loop(
 
             if client.connected.load(Ordering::Relaxed) {
                 pending_since.remove(&idx);
+                retry_after.remove(&idx);
                 continue;
             }
             if client.intentional_reconnect.load(Ordering::Relaxed) {
@@ -151,6 +156,12 @@ pub(crate) async fn failure_reconnect_loop(
                 pending_since.remove(&idx);
                 warn!("client {idx} reconnect attempt timed out; recycling connection");
             }
+            if retry_after
+                .get(&idx)
+                .is_some_and(|(_, deadline)| time::Instant::now() < *deadline)
+            {
+                continue;
+            }
 
             let spawn_base = spawn_layout.base_for_client(idx);
             let result = match ready_message(&config, spawn_base) {
@@ -165,13 +176,24 @@ pub(crate) async fn failure_reconnect_loop(
                         .await
                     {
                         pending_since.insert(idx, time::Instant::now());
+                        retry_after.remove(&idx);
                         info!("failure reconnect started for client {idx}");
                     } else {
                         warn!("discarding stale failure reconnect for client {idx}");
                         new_client.disconnect().await;
                     }
                 }
-                Err(err) => warn!("failed to restart client {idx}: {err}"),
+                Err(err) => {
+                    let failures = retry_after
+                        .get(&idx)
+                        .map_or(1, |(failures, _)| failures.saturating_add(1));
+                    let delay = reconnect_retry_delay(failures);
+                    retry_after.insert(idx, (failures, time::Instant::now() + delay));
+                    warn!(
+                        "failed to restart client {idx}; retrying in {}s: {err}",
+                        delay.as_secs()
+                    );
+                }
             }
         }
     }
@@ -220,10 +242,12 @@ pub(crate) async fn random_reconnect_loop(
     maintenance: MaintenanceOptions,
 ) {
     let min_secs = reconnect_min_secs.max(1);
-    let max_secs = reconnect_max_secs.max(min_secs);
+    // Avoid overflowing Tokio's sleep deadline or leaving the client in a long, uninterruptible
+    // wait when callers provide an accidental extreme value.
+    let max_secs = reconnect_max_secs.max(min_secs).min(3600);
     loop {
-        let delay_secs = rand::thread_rng().gen_range(min_secs..=max_secs);
-        time::sleep(Duration::from_secs(delay_secs)).await;
+        let delay_secs = rand::thread_rng().gen_range(min_secs.min(max_secs)..=max_secs);
+        sleep_or_shutdown(Duration::from_secs(delay_secs), &shutdown).await;
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
@@ -235,7 +259,10 @@ pub(crate) async fn random_reconnect_loop(
         let old = { clients.lock().await[idx].clone() };
         old.intentional_reconnect.store(true, Ordering::Relaxed);
         old.disconnect().await;
-        time::sleep(Duration::from_secs(3)).await;
+        sleep_or_shutdown(Duration::from_secs(3), &shutdown).await;
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let spawn_base = spawn_layout.base_for_client(idx);
         let result = match ready_message(&config, spawn_base) {
             Ok(ready) => {
@@ -258,6 +285,16 @@ pub(crate) async fn random_reconnect_loop(
             }
         }
     }
+}
+
+async fn wait_for_shutdown(shutdown: &AtomicBool) {
+    while !shutdown.load(Ordering::Relaxed) {
+        time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn reconnect_retry_delay(failures: u32) -> Duration {
+    Duration::from_secs(1u64 << failures.saturating_sub(1).min(6))
 }
 
 pub(crate) async fn sleep_or_shutdown(duration: Duration, shutdown: &AtomicBool) {
@@ -425,5 +462,20 @@ pub(crate) async fn disconnect_clients_in_batches(
         if batch_number + 1 < snapshot.len().div_ceil(batch_size) && !delay.is_zero() {
             time::sleep(delay).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reconnect_retry_delay;
+    use std::time::Duration;
+
+    #[test]
+    fn reconnect_retry_delay_grows_and_stays_bounded() {
+        assert_eq!(reconnect_retry_delay(1), Duration::from_secs(1));
+        assert_eq!(reconnect_retry_delay(2), Duration::from_secs(2));
+        assert_eq!(reconnect_retry_delay(3), Duration::from_secs(4));
+        assert_eq!(reconnect_retry_delay(7), Duration::from_secs(64));
+        assert_eq!(reconnect_retry_delay(u32::MAX), Duration::from_secs(64));
     }
 }
