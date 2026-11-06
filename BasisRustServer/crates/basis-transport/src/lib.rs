@@ -200,6 +200,11 @@ impl OrderedAdmissionState {
 pub const DEFAULT_WINDOW_SIZE: usize = 128;
 pub const MAX_SEQUENCE: u16 = 32768;
 const MAX_PENDING_RELIABLE_PER_PEER: usize = 4096;
+const MAX_QUEUED_RELIABLE_PACKETS_PER_PEER: usize = 8192;
+const MAX_QUEUED_RELIABLE_BYTES_PER_PEER: usize = 8 * 1024 * 1024;
+const MAX_PENDING_DATAGRAM_BYTES_PER_PEER: usize = 6 * 1024 * 1024;
+const MAX_PENDING_DATAGRAMS_PER_PEER: usize = MAX_PENDING_RELIABLE_PER_PEER + 256;
+const TIMEOUT_SCAN_BUDGET: u32 = 2048;
 const MAX_ORDERED_REORDER_BYTES_GLOBAL: usize = 64 * 1024 * 1024;
 const MAX_ORDERED_REORDER_PACKETS_GLOBAL: usize = 65_536;
 const MAX_ORDERED_REORDER_BYTES_PER_PEER: usize = 512 * 1024;
@@ -255,6 +260,8 @@ pub enum TransportError {
     StaleAdmission,
     #[error("invalid reliable fragment sequence from peer {0}")]
     InvalidFragment(PeerId),
+    #[error("peer reliable send queue is full")]
+    ReliableQueueFull,
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;
@@ -623,10 +630,13 @@ struct PeerState {
     /// this holds at most one batch, bounded by MAX_PENDING_RELIABLE_PER_PEER reliable packets
     /// plus dirty ACKs for at most 256 channel IDs.
     pending_datagrams: parking_lot::Mutex<VecDeque<Vec<u8>>>,
+    pending_datagram_bytes: AtomicUsize,
     /// The dispatcher and retransmit loop share one peer send queue. A nonblocking try-lock
     /// gives one loop exclusive ownership for a peer turn without making either loop wait.
     reliable_send_turn: parking_lot::Mutex<()>,
     outgoing_reliable: parking_lot::Mutex<HashMap<u8, VecDeque<OutgoingReliable>>>,
+    queued_reliable_bytes: AtomicUsize,
+    queued_reliable_packets: AtomicUsize,
     outgoing_acks: parking_lot::Mutex<HashMap<u8, AckState>>,
     /// Set whenever this peer has queued payloads, in-flight packets, or dirty ACKs. The
     /// dispatch loop skips peers without it, so a settled server stops paying per-peer polling cost.
@@ -2263,8 +2273,11 @@ impl TransportHandle {
                 pending_reliable: parking_lot::Mutex::new(HashMap::new()),
                 pending_total: AtomicUsize::new(0),
                 pending_datagrams: parking_lot::Mutex::new(VecDeque::new()),
+                pending_datagram_bytes: AtomicUsize::new(0),
                 reliable_send_turn: parking_lot::Mutex::new(()),
                 outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
+                queued_reliable_bytes: AtomicUsize::new(0),
+                queued_reliable_packets: AtomicUsize::new(0),
                 outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
                 reliable_active: AtomicBool::new(false),
                 confirmed_mtu: AtomicUsize::new(MAX_MERGED_PACKET_SIZE),
@@ -2406,19 +2419,22 @@ impl TransportHandle {
             return Ok(());
         };
         if is_reliable_delivery(delivery) {
-            enqueue_reliable_payload(&state, channel, delivery, payload);
-            return Ok(());
+            return enqueue_reliable_payload(&state, channel, delivery, payload)
+                .then_some(())
+                .ok_or(TransportError::ReliableQueueFull);
         }
         let built = build_outbound_packet(&state, channel, delivery, payload);
         if let Some((channel_id, sequence)) = built.reliable_key {
             // A retained copy is required for retransmit, so this path still copies once.
-            record_pending_reliable(
+            if !record_pending_reliable(
                 &state,
                 channel_id,
                 sequence,
                 built.bytes.clone(),
                 Some(&self.stats),
-            );
+            ) {
+                return Err(TransportError::ReliableQueueFull);
+            }
         }
         self.send_raw_to(&built.bytes, state.addr).await?;
         Ok(())
@@ -2442,18 +2458,21 @@ impl TransportHandle {
         }
         let state = &session.state;
         if is_reliable_delivery(delivery) {
-            enqueue_reliable_payload(state, channel, delivery, payload);
-            return Ok(());
+            return enqueue_reliable_payload(state, channel, delivery, payload)
+                .then_some(())
+                .ok_or(TransportError::ReliableQueueFull);
         }
         let built = build_outbound_packet(state, channel, delivery, payload);
         if let Some((channel_id, sequence)) = built.reliable_key {
-            record_pending_reliable(
+            if !record_pending_reliable(
                 state,
                 channel_id,
                 sequence,
                 built.bytes.clone(),
                 Some(&self.stats),
-            );
+            ) {
+                return Err(TransportError::ReliableQueueFull);
+            }
         }
         self.send_raw_to(&built.bytes, state.addr).await?;
         Ok(())
@@ -2479,8 +2498,7 @@ impl TransportHandle {
             channel,
             DeliveryMethod::ReliableOrdered,
             payload,
-        );
-        true
+        )
     }
 
     pub async fn send_many(
@@ -2522,18 +2540,22 @@ impl TransportHandle {
         let mut outbound = Vec::with_capacity(packets.len());
         for (channel, delivery, payload) in packets {
             if is_reliable_delivery(*delivery) {
-                enqueue_reliable_payload(&state, *channel, *delivery, payload);
+                if !enqueue_reliable_payload(&state, *channel, *delivery, payload) {
+                    return Err(TransportError::ReliableQueueFull);
+                }
                 continue;
             }
             let built = build_outbound_packet(&state, *channel, *delivery, payload.as_ref());
             if let Some((channel_id, sequence)) = built.reliable_key {
-                record_pending_reliable(
+                if !record_pending_reliable(
                     &state,
                     channel_id,
                     sequence,
                     built.bytes.clone(),
                     Some(&self.stats),
-                );
+                ) {
+                    return Err(TransportError::ReliableQueueFull);
+                }
             }
             outbound.push(built.bytes);
         }
@@ -2751,18 +2773,22 @@ impl TransportHandle {
         let mut outbound = Vec::with_capacity(packets.len());
         for (channel, delivery, payload) in packets {
             if is_reliable_delivery(*delivery) {
-                enqueue_reliable_payload(&state, *channel, *delivery, payload);
+                if !enqueue_reliable_payload(&state, *channel, *delivery, payload) {
+                    return Err(TransportError::ReliableQueueFull);
+                }
                 continue;
             }
             let built = build_outbound_packet(&state, *channel, *delivery, payload);
             if let Some((channel_id, sequence)) = built.reliable_key {
-                record_pending_reliable(
+                if !record_pending_reliable(
                     &state,
                     channel_id,
                     sequence,
                     built.bytes.clone(),
                     Some(&self.stats),
-                );
+                ) {
+                    return Err(TransportError::ReliableQueueFull);
+                }
             }
             outbound.push(built.bytes);
         }
@@ -2923,40 +2949,6 @@ impl TransportHandle {
     }
 }
 
-/// The per-peer in-flight cap is only reached under overload or a stalled ACK stream, so the
-/// oldest-packet shedding loop stays out of the per-message reliable path. The caller holds
-/// the pending map lock for the whole shed.
-#[cold]
-fn shed_oldest_pending(state: &PeerState, pending: &mut HashMap<u8, VecDeque<PendingReliable>>) {
-    while state.pending_total.load(Ordering::Relaxed) >= MAX_PENDING_RELIABLE_PER_PEER {
-        // Shed exactly the single oldest in-flight packet rather than growing without bound.
-        // Inspect each queue front first; popping while searching would discard one packet from
-        // every non-empty channel and immediately desynchronize `pending_total`.
-        let oldest_channel = pending
-            .iter()
-            .filter_map(|(channel_id, queue)| {
-                queue.front().map(|item| (*channel_id, item.last_sent))
-            })
-            .min_by_key(|(_, last_sent)| *last_sent)
-            .map(|(channel_id, _)| channel_id);
-        let Some(oldest_channel) = oldest_channel else {
-            break;
-        };
-
-        let remove_channel = {
-            let queue = pending
-                .get_mut(&oldest_channel)
-                .expect("oldest pending channel disappeared while locked");
-            queue.pop_front();
-            queue.is_empty()
-        };
-        if remove_channel {
-            pending.remove(&oldest_channel);
-        }
-        state.pending_total.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 /// Record a freshly built reliable packet as in-flight. The built bytes are moved, not cloned:
 /// the merged datagram is assembled from this copy, so cloning here doubled both the
 /// allocation count and the memcpy volume on the reliable path.
@@ -2966,10 +2958,12 @@ fn record_pending_reliable(
     sequence: u16,
     bytes: Vec<u8>,
     stats: Option<&TransportStats>,
-) {
+) -> bool {
     let mut pending = state.pending_reliable.lock();
     if state.pending_total.load(Ordering::Relaxed) >= MAX_PENDING_RELIABLE_PER_PEER {
-        shed_oldest_pending(state, &mut pending);
+        // Never evict an unacknowledged packet to make room. Its sequence anchors the
+        // receiver's send window; silently deleting it can permanently stall that channel.
+        return false;
     }
     pending
         .entry(channel_id)
@@ -2985,6 +2979,7 @@ fn record_pending_reliable(
         stats.reliable_window_fills.fetch_add(1, Ordering::Relaxed);
     }
     state.reliable_active.store(true, Ordering::Release);
+    true
 }
 
 fn is_reliable_delivery(delivery: DeliveryMethod) -> bool {
@@ -3035,31 +3030,57 @@ fn enqueue_reliable_payload(
     channel: u8,
     delivery: DeliveryMethod,
     payload: &[u8],
-) {
+) -> bool {
+    if payload.len() > MAX_QUEUED_RELIABLE_BYTES_PER_PEER {
+        return false;
+    }
     let channel_id = DeliveryMethod::channel_id(channel, delivery);
     let mut outgoing = state.outgoing_reliable.lock();
-    let queue = outgoing.entry(channel_id).or_default();
-
-    if payload.len() + LITENETLIB_CHANNELED_HEADER_SIZE <= LITENETLIB_INITIAL_MTU
-        || !matches!(
+    let fragmented = payload.len() + LITENETLIB_CHANNELED_HEADER_SIZE > LITENETLIB_INITIAL_MTU
+        && matches!(
             delivery,
             DeliveryMethod::ReliableOrdered | DeliveryMethod::ReliableUnordered
-        )
+        );
+    let total_fragments = if fragmented {
+        payload.len().div_ceil(RELIABLE_FRAGMENT_PAYLOAD_SIZE)
+    } else {
+        1
+    };
+    if fragmented
+        && (payload.len() > MAX_RELIABLE_FRAGMENTED_MESSAGE_BYTES
+            || total_fragments > MAX_INCOMING_FRAGMENT_PARTS)
     {
+        cold_drop_oversized_reliable(total_fragments);
+        return false;
+    }
+    if state
+        .queued_reliable_bytes
+        .load(Ordering::Relaxed)
+        .saturating_add(payload.len())
+        > MAX_QUEUED_RELIABLE_BYTES_PER_PEER
+        || state
+            .queued_reliable_packets
+            .load(Ordering::Relaxed)
+            .saturating_add(total_fragments)
+            > MAX_QUEUED_RELIABLE_PACKETS_PER_PEER
+    {
+        return false;
+    }
+    let queue = outgoing.entry(channel_id).or_default();
+
+    if !fragmented {
         queue.push_back(OutgoingReliable {
             payload: payload.to_vec(),
             fragment: None,
         });
+        state
+            .queued_reliable_bytes
+            .fetch_add(payload.len(), Ordering::Relaxed);
+        state
+            .queued_reliable_packets
+            .fetch_add(1, Ordering::Relaxed);
         state.reliable_active.store(true, Ordering::Release);
-        return;
-    }
-
-    let total_fragments = payload.len().div_ceil(RELIABLE_FRAGMENT_PAYLOAD_SIZE);
-    if payload.len() > MAX_RELIABLE_FRAGMENTED_MESSAGE_BYTES
-        || total_fragments > MAX_INCOMING_FRAGMENT_PARTS
-    {
-        cold_drop_oversized_reliable(total_fragments);
-        return;
+        return true;
     }
 
     let fragment_id = state
@@ -3076,7 +3097,14 @@ fn enqueue_reliable_payload(
             }),
         });
     }
+    state
+        .queued_reliable_bytes
+        .fetch_add(payload.len(), Ordering::Relaxed);
+    state
+        .queued_reliable_packets
+        .fetch_add(total_fragments, Ordering::Relaxed);
     state.reliable_active.store(true, Ordering::Release);
+    true
 }
 
 fn build_queued_reliable_packet(
@@ -3786,24 +3814,38 @@ async fn process_packet_for_peer(
             let Some((_, peer)) = active_peer.as_ref() else {
                 return Ok(());
             };
-            *peer.last_seen.lock() = Instant::now();
-            if bytes.len() >= 3 {
-                let sequence = u16::from_le_bytes([bytes[1], bytes[2]]);
-                send_pong(handle, remote_addr, connection_number, sequence).await?;
+            if !is_valid_ping(bytes) {
+                return Ok(());
             }
+            *peer.last_seen.lock() = Instant::now();
+            let sequence = u16::from_le_bytes([bytes[1], bytes[2]]);
+            send_pong(handle, remote_addr, connection_number, sequence).await?;
+        }
+        PacketProperty::Pong => {
+            let Some((_, peer)) = active_peer.as_ref() else {
+                return Ok(());
+            };
+            if !is_valid_pong(bytes) {
+                return Ok(());
+            }
+            *peer.last_seen.lock() = Instant::now();
         }
         PacketProperty::Merged => {
             let Some((_, peer)) = active_peer.as_ref() else {
                 return Ok(());
             };
-            *peer.last_seen.lock() = Instant::now();
+            if !is_well_formed_merged(bytes) {
+                return Ok(());
+            }
             process_merged_packet(handle, tx, remote_addr, bytes, peer).await?;
         }
         PacketProperty::CompactMerged => {
             let Some((_, peer)) = active_peer.as_ref() else {
                 return Ok(());
             };
-            *peer.last_seen.lock() = Instant::now();
+            if !is_well_formed_compact_merged(bytes) {
+                return Ok(());
+            }
             process_compact_merged_packet(handle, tx, remote_addr, connection_number, bytes, peer)
                 .await?;
         }
@@ -3811,6 +3853,9 @@ async fn process_packet_for_peer(
             let Some((_, peer)) = active_peer.as_ref() else {
                 return Ok(());
             };
+            if !is_valid_mtu_check(bytes, peer.connection_number) {
+                return Ok(());
+            }
             *peer.last_seen.lock() = Instant::now();
             send_mtu_ok(handle, remote_addr, bytes).await?;
         }
@@ -3850,13 +3895,15 @@ async fn process_packet_for_peer(
         }
         PacketProperty::Ack => {
             if let Some((_, peer)) = active_peer.as_ref() {
+                if !is_valid_ack_packet(bytes) {
+                    return Ok(());
+                }
                 *peer.last_seen.lock() = Instant::now();
                 process_ack(peer, bytes, Some(&handle.stats));
             }
         }
         PacketProperty::Channeled | PacketProperty::Unreliable => {
             if let Some((peer_id, peer)) = active_peer.as_ref() {
-                *peer.last_seen.lock() = Instant::now();
                 if let Some((channel, delivery, payload, fragment)) =
                     parse_message_packet(property, bytes)
                 {
@@ -3889,6 +3936,7 @@ async fn process_packet_for_peer(
                     if reliable && u16::from_le_bytes([bytes[1], bytes[2]]) >= MAX_SEQUENCE {
                         return Ok(());
                     }
+                    *peer.last_seen.lock() = Instant::now();
                     let event = ServerEvent::Message {
                         peer: *peer_id,
                         session: PeerSession {
@@ -5584,6 +5632,119 @@ fn is_nested_merged_packet(bytes: &[u8]) -> bool {
     })
 }
 
+fn is_well_formed_merged(bytes: &[u8]) -> bool {
+    let mut position = 1usize;
+    let mut valid_packets = 0usize;
+    while position < bytes.len() {
+        if bytes.len() - position < 2 {
+            return false;
+        }
+        let size = u16::from_le_bytes([bytes[position], bytes[position + 1]]) as usize;
+        position += 2;
+        if size == 0 || size > bytes.len() - position {
+            return false;
+        }
+        let packet = &bytes[position..position + size];
+        if !is_nested_merged_packet(packet) {
+            if !is_valid_merged_packet(packet) {
+                return false;
+            }
+            valid_packets += 1;
+        }
+        position += size;
+    }
+    valid_packets > 0
+}
+
+fn is_well_formed_compact_merged(bytes: &[u8]) -> bool {
+    const LONG_LENGTH_FLAG: u8 = 0x80;
+    const RAW_PACKET_FLAG: u8 = 0x40;
+    const CHANNEL_MASK: u8 = 0x3f;
+    let mut position = 1usize;
+    let mut entries = 0usize;
+    while position < bytes.len() {
+        if bytes.len() - position < 2 {
+            return false;
+        }
+        let tag = bytes[position];
+        position += 1;
+        let raw = tag & RAW_PACKET_FLAG != 0;
+        if raw && tag & CHANNEL_MASK != 0 {
+            return false;
+        }
+        let length = if tag & LONG_LENGTH_FLAG != 0 {
+            if bytes.len() - position < 2 {
+                return false;
+            }
+            let length = u16::from_le_bytes([bytes[position], bytes[position + 1]]) as usize;
+            position += 2;
+            if length <= u8::MAX as usize {
+                return false;
+            }
+            length
+        } else {
+            let length = bytes[position] as usize;
+            position += 1;
+            length
+        };
+        if length > bytes.len() - position {
+            return false;
+        }
+        let payload = &bytes[position..position + length];
+        if raw
+            && (payload.len() < 4
+                || is_nested_merged_packet(payload)
+                || !matches!(
+                    payload
+                        .first()
+                        .and_then(|header| PacketProperty::from_byte(*header)),
+                    Some(PacketProperty::Ack | PacketProperty::Channeled)
+                )
+                || !is_valid_merged_packet(payload))
+        {
+            return false;
+        }
+        position += length;
+        entries += 1;
+    }
+    entries > 0
+}
+
+fn is_valid_ack_packet(bytes: &[u8]) -> bool {
+    if bytes.len() < LITENETLIB_CHANNELED_HEADER_SIZE {
+        return false;
+    }
+    let channel_id = bytes[3];
+    let sequenced = channel_id % 4 == DeliveryMethod::ReliableSequenced as u8;
+    let expected_size = if sequenced {
+        LITENETLIB_CHANNELED_HEADER_SIZE
+    } else {
+        LITENETLIB_CHANNELED_HEADER_SIZE + (DEFAULT_WINDOW_SIZE - 1) / 8 + 2
+    };
+    bytes.len() == expected_size && u16::from_le_bytes([bytes[1], bytes[2]]) < MAX_SEQUENCE
+}
+
+fn is_valid_ping(bytes: &[u8]) -> bool {
+    bytes.len() == 3
+}
+
+fn is_valid_pong(bytes: &[u8]) -> bool {
+    bytes.len() == 11
+}
+
+fn is_valid_mtu_check(bytes: &[u8], connection_number: u8) -> bool {
+    let Some(&size) = LITENETLIB_MTU_STEPS
+        .iter()
+        .find(|&&size| bytes.len() == size)
+    else {
+        return false;
+    };
+    bytes[0] == (PacketProperty::MtuCheck as u8 | (connection_number << 5))
+        && bytes[1..5] == (size as i32).to_le_bytes()
+        && bytes[13..size - 4].iter().all(|&byte| byte == 0)
+        && bytes[size - 4..] == (size as i32).to_le_bytes()
+}
+
 async fn process_compact_merged_packet(
     handle: &TransportHandle,
     tx: &mpsc::Sender<ServerEvent>,
@@ -5694,7 +5855,9 @@ fn is_valid_merged_packet(bytes: &[u8]) -> bool {
 }
 
 async fn timeout_loop(handle: TransportHandle, tx: mpsc::Sender<ServerEvent>) {
-    let mut tick = time::interval(Duration::from_secs(5));
+    let mut tick = time::interval(Duration::from_millis(200));
+    tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut cursor = 0u32;
     while !handle.shutdown.load(Ordering::Relaxed) {
         tick.tick().await;
         let now = Instant::now();
@@ -5703,24 +5866,23 @@ async fn timeout_loop(handle: TransportHandle, tx: mpsc::Sender<ServerEvent>) {
             .lock()
             .retain(|_, request| request.expires_at > now);
         handle.pre_auth_limiter.lock().cleanup(now);
-        let timed_out: Vec<_> = handle
-            .peers
-            .iter()
-            .filter_map(|peer| {
-                if now.duration_since(*peer.last_seen.lock()) > Duration::from_secs(30) {
-                    Some(peer.id)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for peer_id in timed_out {
+        for _ in 0..TIMEOUT_SCAN_BUDGET {
+            let peer_id = cursor as PeerId;
+            cursor = (cursor + 1) & u16::MAX as u32;
+            let expired = handle.peers.get(&peer_id).is_some_and(|peer| {
+                now.duration_since(*peer.last_seen.lock()) > Duration::from_secs(30)
+            });
+            if !expired {
+                continue;
+            }
             let lifecycle_senders = handle.lifecycle_senders();
             let disconnect_tx = lifecycle_senders
                 .as_ref()
                 .map_or(&tx, |senders| &senders.disconnects);
-            let Ok(permit) = disconnect_tx.reserve().await else {
-                return;
+            let permit = match disconnect_tx.try_reserve() {
+                Ok(permit) => permit,
+                Err(mpsc::error::TrySendError::Full(())) => continue,
+                Err(mpsc::error::TrySendError::Closed(())) => return,
             };
             let retired = {
                 let _allocation = handle.peer_allocation.lock();
@@ -5892,16 +6054,31 @@ async fn reliable_dispatch_loop(handle: TransportHandle, tx: mpsc::Sender<Server
             };
 
             if !newly_queued.is_empty() {
+                let released_bytes = newly_queued
+                    .iter()
+                    .map(|(_, payload)| payload.payload.len())
+                    .sum::<usize>();
+                peer_state
+                    .queued_reliable_bytes
+                    .fetch_sub(released_bytes, Ordering::Relaxed);
+                peer_state
+                    .queued_reliable_packets
+                    .fetch_sub(newly_queued.len(), Ordering::Relaxed);
                 for (channel_id, payload) in newly_queued {
                     let built = build_queued_reliable_packet(peer_state, channel_id, payload);
                     let bytes = built.bytes;
-                    record_pending_reliable(
+                    if !record_pending_reliable(
                         peer_state,
                         channel_id,
                         built.sequence,
                         bytes.clone(),
                         Some(&handle.stats),
-                    );
+                    ) {
+                        // The admission budget should make this unreachable. If a competing
+                        // producer fills the window, leave the original queued payload gone
+                        // and do not emit an untracked reliable packet.
+                        continue;
+                    }
                     builder.push(&bytes);
                 }
             }
@@ -6095,9 +6272,7 @@ impl MergedDatagramBuilder {
     ) -> bool {
         self.seal_datagram();
         if !self.datagrams.is_empty() {
-            peer.pending_datagrams
-                .lock()
-                .extend(self.datagrams.drain(..));
+            append_pending_datagrams(peer, self.datagrams.drain(..));
             peer.reliable_active.store(true, Ordering::Release);
         }
         retry_peer_datagrams(peer, handle, addr)
@@ -6106,9 +6281,7 @@ impl MergedDatagramBuilder {
     #[cfg(test)]
     fn flush_with(&mut self, peer: &PeerState, mut try_send: impl FnMut(&[u8]) -> bool) -> bool {
         self.seal_datagram();
-        peer.pending_datagrams
-            .lock()
-            .extend(self.datagrams.drain(..));
+        append_pending_datagrams(peer, self.datagrams.drain(..));
         peer_send_turn(peer, |datagram| Ok(try_send(datagram)))
     }
 }
@@ -6120,6 +6293,23 @@ fn retry_peer_datagrams(peer: &PeerState, handle: &TransportHandle, addr: Socket
     peer_send_turn(peer, |datagram| handle.try_send_raw_to(datagram, addr))
 }
 
+fn append_pending_datagrams(peer: &PeerState, datagrams: impl IntoIterator<Item = Vec<u8>>) {
+    let mut pending = peer.pending_datagrams.lock();
+    let mut bytes = peer.pending_datagram_bytes.load(Ordering::Relaxed);
+    for datagram in datagrams {
+        if pending.len() >= MAX_PENDING_DATAGRAMS_PER_PEER
+            || bytes.saturating_add(datagram.len()) > MAX_PENDING_DATAGRAM_BYTES_PER_PEER
+        {
+            // Reliable payloads have a retransmit copy in pending_reliable. Preserve the
+            // existing FIFO and shed only newly built transmissions under exceptional pressure.
+            continue;
+        }
+        bytes += datagram.len();
+        pending.push_back(datagram);
+    }
+    peer.pending_datagram_bytes.store(bytes, Ordering::Relaxed);
+}
+
 fn try_peer_send_turn(peer: &PeerState) -> Option<parking_lot::MutexGuard<'_, ()>> {
     peer.reliable_send_turn.try_lock()
 }
@@ -6129,7 +6319,13 @@ fn peer_send_turn(peer: &PeerState, mut try_send: impl FnMut(&[u8]) -> Result<bo
     while let Some(datagram) = pending.front() {
         match try_send(datagram) {
             Ok(true) | Err(_) => {
-                pending.pop_front();
+                if let Some(datagram) = pending.pop_front() {
+                    let _ = peer.pending_datagram_bytes.try_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |bytes| Some(bytes.saturating_sub(datagram.len())),
+                    );
+                }
             }
             Ok(false) => return false,
         }
@@ -7037,7 +7233,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_overflow_evicts_exactly_one_oldest_packet() {
+    fn pending_overflow_preserves_unacknowledged_packets() {
         let peer = test_peer_state(26);
         let base = Instant::now();
 
@@ -7069,7 +7265,7 @@ mod tests {
             actual_total,
             "the O(1) counter must stay equal to the actual queue population"
         );
-        assert_eq!(pending[&0].len(), DEFAULT_WINDOW_SIZE - 1);
+        assert_eq!(pending[&0].len(), DEFAULT_WINDOW_SIZE);
         for channel_id in 1..32u8 {
             assert_eq!(
                 pending[&channel_id].len(),
@@ -7077,7 +7273,7 @@ mod tests {
                 "searching for the oldest packet must not pop other channel fronts"
             );
         }
-        assert_eq!(pending[&250].len(), 1);
+        assert!(!pending.contains_key(&250));
     }
 
     #[test]
@@ -7088,6 +7284,137 @@ mod tests {
         queue_ack(&peer, channel_id, MAX_SEQUENCE);
         assert!(peer.outgoing_acks.lock().is_empty());
         assert!(!peer.reliable_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn control_validation_rejects_truncated_and_trailing_bytes() {
+        assert!(!is_valid_ping(&[PacketProperty::Ping as u8]));
+        assert!(!is_valid_ping(&[PacketProperty::Ping as u8, 1, 2, 3]));
+        assert!(is_valid_ping(&[PacketProperty::Ping as u8, 1, 2]));
+        assert!(!is_valid_pong(&[PacketProperty::Pong as u8; 10]));
+        assert!(is_valid_pong(&[PacketProperty::Pong as u8; 11]));
+
+        let mut mtu = vec![0; LITENETLIB_INITIAL_MTU];
+        mtu[0] = PacketProperty::MtuCheck as u8;
+        mtu[1..5].copy_from_slice(&(LITENETLIB_INITIAL_MTU as i32).to_le_bytes());
+        mtu[LITENETLIB_INITIAL_MTU - 4..]
+            .copy_from_slice(&(LITENETLIB_INITIAL_MTU as i32).to_le_bytes());
+        assert!(is_valid_mtu_check(&mtu, 0));
+        mtu.push(0);
+        assert!(!is_valid_mtu_check(&mtu, 0));
+
+        let valid_merged = [
+            PacketProperty::Merged as u8,
+            3,
+            0,
+            PacketProperty::Ping as u8,
+            1,
+            0,
+        ];
+        assert!(is_well_formed_merged(&valid_merged));
+        assert!(!is_well_formed_merged(&valid_merged[..5]));
+        let valid_compact = [PacketProperty::CompactMerged as u8, channels::CHAT, 1, 0x42];
+        assert!(is_well_formed_compact_merged(&valid_compact));
+        assert!(!is_well_formed_compact_merged(&valid_compact[..3]));
+    }
+
+    #[tokio::test]
+    async fn malformed_ping_does_not_refresh_peer_liveness() {
+        let (handle, tx, _events) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 4, 4)
+                .await
+                .unwrap();
+        let client = UdpSocket::bind(loopback_addr(0)).await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let peer_id = handle
+            .accept(&ConnectionRequest {
+                remote_addr: client_addr,
+                payload: Bytes::new(),
+                connection_number: 2,
+                connect_time: 42,
+                local_peer_id: 0,
+            })
+            .await
+            .unwrap();
+        let peer = handle.peers.get(&peer_id).unwrap().clone();
+        let old_seen = Instant::now() - Duration::from_secs(20);
+        *peer.last_seen.lock() = old_seen;
+
+        process_packet(&handle, &tx, client_addr, &[PacketProperty::Ping as u8, 1])
+            .await
+            .unwrap();
+        process_packet(
+            &handle,
+            &tx,
+            client_addr,
+            &[PacketProperty::Ping as u8 | (2 << 5), 1, 2, 3],
+        )
+        .await
+        .unwrap();
+        assert_eq!(*peer.last_seen.lock(), old_seen);
+
+        process_packet(
+            &handle,
+            &tx,
+            client_addr,
+            &[PacketProperty::Ping as u8 | (2 << 5), 1, 2],
+        )
+        .await
+        .unwrap();
+        assert!(*peer.last_seen.lock() > old_seen);
+        handle.shutdown();
+    }
+
+    #[test]
+    fn reliable_queue_and_pending_datagrams_obey_byte_budgets() {
+        let peer = test_peer_state(27);
+        let payload = vec![0x5a; LITENETLIB_INITIAL_MTU];
+        for _ in 0..(MAX_QUEUED_RELIABLE_BYTES_PER_PEER / payload.len()) {
+            assert!(enqueue_reliable_payload(
+                &peer,
+                channels::CHAT,
+                DeliveryMethod::ReliableSequenced,
+                &payload,
+            ));
+        }
+        assert_eq!(
+            peer.queued_reliable_bytes.load(Ordering::Relaxed),
+            MAX_QUEUED_RELIABLE_BYTES_PER_PEER
+        );
+        assert!(!enqueue_reliable_payload(
+            &peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableSequenced,
+            &[1],
+        ));
+
+        append_pending_datagrams(
+            &peer,
+            [vec![0; MAX_PENDING_DATAGRAM_BYTES_PER_PEER], vec![1]],
+        );
+        assert_eq!(
+            peer.pending_datagram_bytes.load(Ordering::Relaxed),
+            MAX_PENDING_DATAGRAM_BYTES_PER_PEER
+        );
+        assert_eq!(
+            peer.pending_datagrams
+                .lock()
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>(),
+            MAX_PENDING_DATAGRAM_BYTES_PER_PEER
+        );
+
+        let count_limited = test_peer_state(28);
+        append_pending_datagrams(
+            &count_limited,
+            (0..MAX_PENDING_DATAGRAMS_PER_PEER).map(|_| vec![0]),
+        );
+        append_pending_datagrams(&count_limited, [vec![1]]);
+        assert_eq!(
+            count_limited.pending_datagrams.lock().len(),
+            MAX_PENDING_DATAGRAMS_PER_PEER
+        );
     }
 
     /// Regression: ACKs are individual UDP datagrams, so any one of them can be dropped. If
@@ -8590,8 +8917,11 @@ mod tests {
             pending_reliable: parking_lot::Mutex::new(HashMap::new()),
             pending_total: AtomicUsize::new(0),
             pending_datagrams: parking_lot::Mutex::new(VecDeque::new()),
+            pending_datagram_bytes: AtomicUsize::new(0),
             reliable_send_turn: parking_lot::Mutex::new(()),
             outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
+            queued_reliable_bytes: AtomicUsize::new(0),
+            queued_reliable_packets: AtomicUsize::new(0),
             outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
             reliable_active: AtomicBool::new(false),
             confirmed_mtu: AtomicUsize::new(MAX_MERGED_PACKET_SIZE),
@@ -8803,13 +9133,15 @@ mod tests {
         drop(outgoing);
 
         peer.outgoing_reliable.lock().clear();
-        enqueue_reliable_payload(
+        peer.queued_reliable_bytes.store(0, Ordering::Relaxed);
+        peer.queued_reliable_packets.store(0, Ordering::Relaxed);
+        assert!(!enqueue_reliable_payload(
             &peer,
             channels::CHAT,
             DeliveryMethod::ReliableOrdered,
             &vec![1; MAX_RELIABLE_FRAGMENTED_MESSAGE_BYTES + 1],
-        );
-        assert!(peer.outgoing_reliable.lock()[&channel_id].is_empty());
+        ));
+        assert!(!peer.outgoing_reliable.lock().contains_key(&channel_id));
     }
 
     #[tokio::test]
@@ -12193,8 +12525,11 @@ mod tests {
             pending_reliable: parking_lot::Mutex::new(HashMap::new()),
             pending_total: AtomicUsize::new(0),
             pending_datagrams: parking_lot::Mutex::new(VecDeque::new()),
+            pending_datagram_bytes: AtomicUsize::new(0),
             reliable_send_turn: parking_lot::Mutex::new(()),
             outgoing_reliable: parking_lot::Mutex::new(HashMap::new()),
+            queued_reliable_bytes: AtomicUsize::new(0),
+            queued_reliable_packets: AtomicUsize::new(0),
             outgoing_acks: parking_lot::Mutex::new(HashMap::new()),
             reliable_active: AtomicBool::new(false),
             confirmed_mtu: AtomicUsize::new(MAX_MERGED_PACKET_SIZE),
