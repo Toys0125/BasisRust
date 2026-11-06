@@ -3909,7 +3909,7 @@ async fn handle_message(
             let request = OwnershipTransferMessage::deserialize(&mut reader)?;
             let current_owner = state
                 .ownership
-                .request_new_or_existing(&request.ownership_id, request.player_id);
+                .request_new_or_existing(&request.ownership_id, peer);
             let response = OwnershipTransferMessage {
                 player_id: current_owner,
                 ownership_id: request.ownership_id,
@@ -3950,10 +3950,7 @@ async fn handle_message(
         channels::REMOVE_CURRENT_OWNER_REQUEST => {
             let mut reader = NetReader::new(&payload);
             let request = OwnershipTransferMessage::deserialize(&mut reader)?;
-            if state
-                .ownership
-                .remove_if_owner(&request.ownership_id, request.player_id)
-            {
+            if state.ownership.remove_if_owner(&request.ownership_id, peer) {
                 let mut writer = NetWriter::new();
                 request.serialize(&mut writer)?;
                 state
@@ -4177,6 +4174,7 @@ async fn handle_message(
         }
         channels::P2P => {
             let peers = state.authenticated_peers.clone();
+            let transport = state.transport.clone();
             let direct_connect_allowed = state.config.read().nat_punch_enabled
                 && (!state.global_state.read().direct_connect_locked
                     || peer_has_permission(
@@ -4191,7 +4189,16 @@ async fn handle_message(
                     peer,
                     &payload,
                     direct_connect_allowed,
-                    move |id| peers.contains_key(&id),
+                    move |id| {
+                        // Metadata can outlive a closing connection while its
+                        // outstanding handlers drain; it alone is not admission.
+                        peers.get(&id).is_some_and(|peer| {
+                            peer.session.as_ref().is_some_and(|session| {
+                                transport.is_current_session(session)
+                                    && session.try_read_lease().is_some()
+                            })
+                        })
+                    },
                 )
                 .await;
         }
@@ -6761,6 +6768,38 @@ pub fn migrate_legacy_resource_dirs(base_dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn ownership_get_and_remove_authorize_authenticated_peer_not_payload_player() {
+        let ownership = OwnershipState::default();
+        let authenticated_peer = 17;
+        let spoofed_player_id = 29;
+
+        // GET creates ownership for the authenticated requester, even when the
+        // serialized player_id names another peer.
+        assert_eq!(
+            ownership.request_new_or_existing("new-object", authenticated_peer),
+            authenticated_peer
+        );
+        assert_eq!(
+            ownership.request_new_or_existing("new-object", spoofed_player_id),
+            authenticated_peer
+        );
+
+        ownership.switch_ownership("owned-object", authenticated_peer);
+        // A forged REMOVE cannot delete another peer's ownership.
+        assert!(!ownership.remove_if_owner("owned-object", spoofed_player_id));
+        let retained = ownership
+            .all()
+            .into_iter()
+            .map(|owner| owner.ownership_id)
+            .collect::<Vec<_>>();
+        assert!(retained.iter().any(|id| id == "new-object"));
+        assert!(retained.iter().any(|id| id == "owned-object"));
+        // Legitimate owner removal still works.
+        assert!(ownership.remove_if_owner("owned-object", authenticated_peer));
+        assert!(!ownership.remove_if_owner("owned-object", authenticated_peer));
+    }
+
     #[tokio::test]
     async fn configured_storage_initialization_failure_stops_server_startup() {
         let mut registry = StorageBackendRegistry::new();
@@ -7333,6 +7372,75 @@ mod tests {
                 ready.local_avatar_sync_message
             );
             assert_eq!(records.remaining(), 0);
+        }
+    }
+
+    #[test]
+    fn join_batches_round_trip_large_single_ready_records() {
+        // A first record is allowed to exceed the 32 KiB batching target.
+        // Exercise both compressible and incompressible avatar data through
+        // the pending-join producer, batch framing and protocol readers.
+        for avatar_len in [40_000, usize::from(u16::MAX)] {
+            for compressible in [true, false] {
+                let mut ready = test_ready_message();
+                let mut random = 0x1234_5678u32;
+                ready.client_avatar_change_message.byte_array = (0..avatar_len)
+                    .map(|_| {
+                        random ^= random << 13;
+                        random ^= random >> 17;
+                        random ^= random << 5;
+                        if compressible {
+                            0
+                        } else {
+                            random as u8
+                        }
+                    })
+                    .collect();
+                let payload = serialize_server_ready(2, &ready).unwrap();
+                assert!(payload.len() > ServerReadyBatchMessage::MAX_PAYLOAD_BYTES);
+                let mut state = JoinBroadcastState::default();
+                state.register_peer(test_connected_peer(1), vec![1]);
+                let mut peer = test_connected_peer(2);
+                peer.ready = ready.clone();
+                state.register_peer(peer, payload.clone());
+                // A following record must stay separate from the large one.
+                let other = test_connected_peer(3);
+                state.register_peer(
+                    other.clone(),
+                    serialize_server_ready(3, &other.ready).unwrap(),
+                );
+                state.mark_initial_history_queued(1);
+                let batches = state.take_batches(1);
+                assert_eq!(batches.len(), 2);
+                assert_eq!(batches[0].len(), 1);
+                let framed = frame_join_records(&batches[0]).unwrap();
+                if compressible {
+                    assert_eq!(framed[2], 1);
+                }
+                let mut reader = NetReader::new(&framed);
+                let batch = ServerReadyBatchMessage::deserialize(&mut reader).unwrap();
+                assert_eq!(reader.remaining(), 0);
+                assert_eq!(batch.count, 1);
+                assert_eq!(batch.payload, payload);
+                let mut raw = NetWriter::new();
+                raw.put_u16(1);
+                raw.put_bool(false);
+                raw.put_i32(payload.len() as i32);
+                raw.put_bytes(&payload);
+                assert_eq!(
+                    ServerReadyBatchMessage::deserialize(&mut NetReader::new(raw.as_slice()))
+                        .unwrap(),
+                    batch
+                );
+                let mut records = NetReader::new(&batch.payload);
+                assert_eq!(records.get_u16().unwrap(), 2);
+                let decoded = ReadyMessage::deserialize(&mut records).unwrap();
+                assert_eq!(
+                    decoded.client_avatar_change_message.byte_array,
+                    ready.client_avatar_change_message.byte_array
+                );
+                assert_eq!(records.remaining(), 0);
+            }
         }
     }
 

@@ -86,6 +86,54 @@ fn peer_uuid(state: &ServerState, peer: PeerId) -> Option<String> {
         .map(|p| p.metadata.player_uuid.clone())
 }
 
+fn moderation_peer_session_by_uuid(
+    state: &ServerState,
+    uuid: &str,
+) -> Option<(PeerId, PeerSession)> {
+    if let Some(peer) = peer_session_by_uuid(state, uuid) {
+        return Some(peer);
+    }
+    let uuid = basis_server_admin::normalize_identity(uuid);
+    state
+        .authenticated_peers
+        .iter()
+        .find(|entry| basis_server_admin::normalize_identity(&entry.metadata.player_uuid) == uuid)
+        .and_then(|entry| entry.session.clone().map(|session| (*entry.key(), session)))
+}
+
+fn moderation_peer_id_by_uuid(state: &ServerState, uuid: &str) -> Option<PeerId> {
+    peer_by_uuid(state, uuid).or_else(|| {
+        let uuid = basis_server_admin::normalize_identity(uuid);
+        state
+            .authenticated_peers
+            .iter()
+            .find(|entry| {
+                basis_server_admin::normalize_identity(&entry.metadata.player_uuid) == uuid
+            })
+            .map(|entry| *entry.key())
+    })
+}
+
+fn moderation_target_protected(state: &ServerState, identity: &str) -> bool {
+    let protection = basis_server_permissions::nodes::PROTECTION;
+    // Online checks use the resolved session's stored permission identity.
+    if moderation_peer_id_by_uuid(state, identity)
+        .is_some_and(|peer| has_protection_permission(state, peer))
+        || state.permissions.has(identity, protection)
+    {
+        return true;
+    }
+    let Ok(uuid) = uuid::Uuid::parse_str(identity) else {
+        return false;
+    };
+    // Offline permission records can still contain legacy UUID spellings.
+    // Protection from any equivalent record must survive an alias lookup.
+    state.permissions.snapshot().users.keys().any(|stored| {
+        uuid::Uuid::parse_str(stored).is_ok_and(|candidate| candidate == uuid)
+            && state.permissions.has(stored, protection)
+    })
+}
+
 pub(super) fn is_text_muted(state: &ServerState, peer: PeerId) -> bool {
     peer_uuid(state, peer).is_some_and(|uuid| state.moderation.mute_state(&uuid).1)
 }
@@ -270,18 +318,16 @@ pub(super) async fn handle_request(
                 Err("UUID invalid")
             } else if reason.is_empty() {
                 Err("Reason invalid")
-            } else if let Some((target, target_session)) = peer_session_by_uuid(state, &uuid) {
+            } else if let Some((target, target_session)) =
+                moderation_peer_session_by_uuid(state, &uuid)
+            {
                 match target_session.try_read_lease() {
                     None => Err("Player not found"),
                     Some(target_lease) if !state.transport.is_current_session(&target_session) => {
                         drop(target_lease);
                         Err("Player not found")
                     }
-                    Some(target_lease)
-                        if state
-                            .permissions
-                            .has(&uuid, basis_server_permissions::nodes::PROTECTION) =>
-                    {
+                    Some(target_lease) if moderation_target_protected(state, &uuid) => {
                         drop(target_lease);
                         Err("Target is protected")
                     }
@@ -329,10 +375,7 @@ pub(super) async fn handle_request(
             let muted = reader.get_bool()?;
             if uuid.trim().is_empty() {
                 send_admin_text(state, peer, "UUID invalid").await?;
-            } else if state
-                .permissions
-                .has(&uuid, basis_server_permissions::nodes::PROTECTION)
-            {
+            } else if moderation_target_protected(state, &uuid) {
                 send_admin_text(state, peer, "Target is protected").await?;
             } else {
                 if mode == AdminRequestMode::SetVoiceMute {
@@ -483,7 +526,7 @@ pub(super) async fn broadcast_locomotion_policy(state: &ServerState) {
 }
 
 async fn send_mute_to_target(state: &ServerState, uuid: &str) -> Result<()> {
-    if let Some(target) = peer_by_uuid(state, uuid) {
+    if let Some(target) = moderation_peer_id_by_uuid(state, uuid) {
         let (voice, text) = state.moderation.mute_state(uuid);
         let mut writer = NetWriter::new();
         AdminRequest {
