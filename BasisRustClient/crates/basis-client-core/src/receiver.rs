@@ -36,6 +36,13 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 #[cfg(target_os = "linux")]
+const SHARED_RECEIVE_BATCH_CAPACITY: usize = 64;
+#[cfg(target_os = "linux")]
+const SHARED_RECEIVE_BATCH_MAX_PACKETS: usize = 1024;
+#[cfg(target_os = "linux")]
+const SHARED_RECEIVE_BATCH_MAX_BYTES: usize = 1024 * 1024;
+
+#[cfg(target_os = "linux")]
 pub(crate) static SHARED_RECEIVE_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
@@ -60,6 +67,54 @@ pub(crate) struct SharedReceiveRegistration {
     pub(crate) index: usize,
     pub(crate) fd: RawFd,
     pub(crate) client: Weak<BasisClient>,
+}
+
+#[cfg(target_os = "linux")]
+fn enqueue_shared_receive_batch(
+    batches: &mpsc::Sender<SharedReceiveBatch>,
+    batch: SharedReceiveBatch,
+) -> bool {
+    match batches.try_send(batch) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(batch))
+            if shared_batch_has_connection_control(&batch) =>
+        {
+            // These packets terminate or establish a connection and have no reliable
+            // retransmission contract. Let the async consumer drain a slot instead of shedding.
+            batches.blocking_send(batch).is_ok()
+        }
+        Err(mpsc::error::TrySendError::Full(batch)) => {
+            for packet in &batch.packets {
+                if let Some(client) = packet.client.upgrade() {
+                    client
+                        .packet_diagnostics
+                        .record(client.index, DropReason::SharedHandoffFull);
+                }
+            }
+            true
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn shared_batch_has_connection_control(batch: &SharedReceiveBatch) -> bool {
+    batch.packets.iter().any(|packet| {
+        packet
+            .offset
+            .checked_add(packet.len)
+            .and_then(|end| batch.data.get(packet.offset..end))
+            .and_then(|bytes| bytes.first())
+            .is_some_and(|byte| {
+                matches!(
+                    byte & 0x1f,
+                    value if value == PacketProperty::ConnectAccept as u8
+                        || value == PacketProperty::Disconnect as u8
+                        || value == PacketProperty::PeerNotFound as u8
+                        || value == PacketProperty::InvalidProtocol as u8
+                )
+            })
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -335,7 +390,7 @@ pub(crate) fn shared_receiver_process_compact<'a>(
 #[cfg(target_os = "linux")]
 pub(crate) fn run_shared_epoll_receiver(
     registrations: std_mpsc::Receiver<SharedReceiveRegistration>,
-    batches: mpsc::UnboundedSender<SharedReceiveBatch>,
+    batches: mpsc::Sender<SharedReceiveBatch>,
     shutdown: Arc<AtomicBool>,
 ) {
     let profile_packet_mix = std::env::var("BASIS_CLIENT_PROFILE_RX_MIX")
@@ -404,7 +459,7 @@ pub(crate) fn run_shared_epoll_receiver(
 
         let mut batch = Vec::with_capacity(ready as usize);
         let mut batch_data = Vec::with_capacity((ready as usize).saturating_mul(64));
-        for event in events.iter().take(ready as usize) {
+        'ready_events: for event in events.iter().take(ready as usize) {
             let index = (event.u64 >> 32) as usize;
             let fd = event.u64 as u32 as RawFd;
             let Some((registered_fd, registered_client)) = registered.get(&index) else {
@@ -464,6 +519,11 @@ pub(crate) fn run_shared_epoll_receiver(
                                 offset,
                                 len: packet.len(),
                             });
+                            if batch.len() >= SHARED_RECEIVE_BATCH_MAX_PACKETS
+                                || batch_data.len() >= SHARED_RECEIVE_BATCH_MAX_BYTES
+                            {
+                                break 'ready_events;
+                            }
                         }
                         continue;
                     }
@@ -501,6 +561,11 @@ pub(crate) fn run_shared_epoll_receiver(
                         offset,
                         len,
                     });
+                    if batch.len() >= SHARED_RECEIVE_BATCH_MAX_PACKETS
+                        || batch_data.len() >= SHARED_RECEIVE_BATCH_MAX_BYTES
+                    {
+                        break 'ready_events;
+                    }
                     continue;
                 }
                 if len == 0 {
@@ -518,12 +583,13 @@ pub(crate) fn run_shared_epoll_receiver(
             }
         }
         if !batch.is_empty()
-            && batches
-                .send(SharedReceiveBatch {
+            && !enqueue_shared_receive_batch(
+                &batches,
+                SharedReceiveBatch {
                     data: batch_data,
                     packets: batch,
-                })
-                .is_err()
+                },
+            )
         {
             unsafe { libc::close(epoll_fd) };
             return;
@@ -571,7 +637,8 @@ pub(crate) async fn shared_receive_loop(
     shutdown: Arc<AtomicBool>,
 ) {
     let (registration_tx, registration_rx) = std_mpsc::channel::<SharedReceiveRegistration>();
-    let (batch_tx, mut batch_rx) = mpsc::unbounded_channel::<SharedReceiveBatch>();
+    let (batch_tx, mut batch_rx) =
+        mpsc::channel::<SharedReceiveBatch>(SHARED_RECEIVE_BATCH_CAPACITY);
     let thread_shutdown = shutdown.clone();
     if let Err(err) = std::thread::Builder::new()
         .name("basis-shared-rx".to_string())
@@ -650,6 +717,126 @@ pub(crate) async fn shared_receive_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod shared_handoff_tests {
+    use super::*;
+    use basis_protocol::channels;
+    use basis_transport::DeliveryMethod;
+    use tokio::net::UdpSocket;
+
+    #[tokio::test]
+    async fn full_bounded_handoff_counts_drops_and_leaves_reliable_packet_unacked() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = crate::tests::test_client(1, server.local_addr().unwrap()).await;
+        let (sender, mut receiver) = mpsc::channel(1);
+        let reliable_channel =
+            DeliveryMethod::channel_id(channels::AUTH_IDENTITY, DeliveryMethod::ReliableOrdered);
+        let packet = [PacketProperty::Channeled as u8, 0, 0, reliable_channel];
+
+        assert!(shared_receiver_process_raw(&client, &packet));
+        assert!(enqueue_shared_receive_batch(
+            &sender,
+            SharedReceiveBatch {
+                data: packet.to_vec(),
+                packets: vec![SharedReceivePacket {
+                    index: client.index,
+                    fd: client.socket.as_raw_fd(),
+                    client: Arc::downgrade(&client),
+                    offset: 0,
+                    len: packet.len(),
+                }],
+            },
+        ));
+        let queued = receiver.recv().await.unwrap();
+        assert_eq!(queued.data, packet);
+
+        // Refill the one-slot queue before the overflow attempt. The discarded
+        // reliable packet must remain unacknowledged so the server can retransmit it.
+        assert!(enqueue_shared_receive_batch(
+            &sender,
+            SharedReceiveBatch {
+                data: packet.to_vec(),
+                packets: vec![SharedReceivePacket {
+                    index: client.index,
+                    fd: client.socket.as_raw_fd(),
+                    client: Arc::downgrade(&client),
+                    offset: 0,
+                    len: packet.len(),
+                }],
+            },
+        ));
+        assert!(enqueue_shared_receive_batch(
+            &sender,
+            SharedReceiveBatch {
+                data: packet.to_vec(),
+                packets: vec![SharedReceivePacket {
+                    index: client.index,
+                    fd: client.socket.as_raw_fd(),
+                    client: Arc::downgrade(&client),
+                    offset: 0,
+                    len: packet.len(),
+                }],
+            },
+        ));
+        assert_eq!(client.packet_diagnostics.snapshot()[5], 1);
+        assert!(!client.ack_pending.load(Ordering::Relaxed));
+        assert!(client
+            .reliable_receive_state()
+            .unwrap()
+            .ack_window(reliable_channel)
+            .is_none());
+        assert_eq!(receiver.recv().await.unwrap().data, packet);
+
+        let make_batch = |bytes: &[u8]| SharedReceiveBatch {
+            data: bytes.to_vec(),
+            packets: vec![SharedReceivePacket {
+                index: client.index,
+                fd: client.socket.as_raw_fd(),
+                client: Arc::downgrade(&client),
+                offset: 0,
+                len: bytes.len(),
+            }],
+        };
+        assert!(enqueue_shared_receive_batch(&sender, make_batch(&packet)));
+        let disconnect = [PacketProperty::Disconnect as u8];
+        let control_sender = sender.clone();
+        let control_batch = make_batch(&disconnect);
+        let control_send = tokio::task::spawn_blocking(move || {
+            enqueue_shared_receive_batch(&control_sender, control_batch)
+        });
+        assert_eq!(receiver.recv().await.unwrap().data, packet);
+        assert!(control_send.await.unwrap());
+        assert_eq!(receiver.recv().await.unwrap().data, disconnect);
+        assert_eq!(client.packet_diagnostics.snapshot()[5], 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_control_wait_returns_when_shutdown_closes_the_handoff() {
+        let (sender, receiver) = mpsc::channel(1);
+        let data = [PacketProperty::Channeled as u8];
+        let make_batch = |bytes: &[u8]| SharedReceiveBatch {
+            data: bytes.to_vec(),
+            packets: vec![SharedReceivePacket {
+                index: 0,
+                fd: -1,
+                client: Weak::new(),
+                offset: 0,
+                len: bytes.len(),
+            }],
+        };
+        assert!(enqueue_shared_receive_batch(&sender, make_batch(&data)));
+
+        let terminal = [PacketProperty::Disconnect as u8];
+        let control_sender = sender.clone();
+        let control_batch = make_batch(&terminal);
+        let control_send = tokio::task::spawn_blocking(move || {
+            enqueue_shared_receive_batch(&control_sender, control_batch)
+        });
+        drop(receiver);
+        assert!(!control_send.await.unwrap());
     }
 }
 

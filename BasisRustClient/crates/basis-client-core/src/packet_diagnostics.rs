@@ -8,12 +8,14 @@ pub(super) enum DropReason {
     ShortHeader,
     InvalidAckSize,
     InvalidMerged,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    SharedHandoffFull,
 }
 
 /// Fixed storage, saturating counts, and logarithmically sampled debug messages.
 #[derive(Debug, Default)]
 pub(super) struct PacketDiagnostics {
-    counts: [AtomicU64; 5],
+    counts: [AtomicU64; 6],
 }
 
 impl PacketDiagnostics {
@@ -40,7 +42,7 @@ impl PacketDiagnostics {
         }
     }
 
-    pub(super) fn snapshot(&self) -> [u64; 5] {
+    pub(super) fn snapshot(&self) -> [u64; 6] {
         self.counts
             .each_ref()
             .map(|value| value.load(Ordering::Relaxed))
