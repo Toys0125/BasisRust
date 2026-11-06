@@ -1,5 +1,5 @@
 <Configuration>
-  <Password>default_password</Password>
+  <Password/>
   <SetPort>4296</SetPort>
   <PeerLimit>65535</PeerLimit>
 </Configuration>

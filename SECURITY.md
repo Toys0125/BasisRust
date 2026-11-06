@@ -9,12 +9,17 @@ or exploit details in public issues; a public issue can ask for a private
 reporting route without disclosing them.
 
 `default_password`, `ApiEnabled=false`, and the zero scene-relay limit are
-compatibility defaults from BasisVR, not evidence of leaked operator secrets.
-Set a non-empty deployment password on server and clients. The server supports
+compatibility settings from BasisVR, not evidence of leaked operator secrets.
+The server no longer selects `default_password` automatically: new configs have
+authentication enabled and no password, so startup fails until an operator
+supplies a non-empty secret. Setting `Password` explicitly to `default_password`
+remains possible for compatibility, but should be limited to isolated parity
+testing. To intentionally run a public/passwordless server, explicitly set
+`UseAuth=false`. Set a non-empty deployment password on server and clients. The server supports
 `BASIS_SERVER_PASSWORD` (preferred) and legacy `Password` environment overrides;
-empty or non-Unicode password environment values stop startup. XML defaults and
-the flat schema remain compatible. An explicitly empty XML password retains
-legacy permissive behavior, so do not use it for protected deployments.
+empty or non-Unicode password environment values stop startup. XML fields and
+the flat schema remain compatible. An empty XML password now stops startup
+whenever authentication is enabled.
 
 See [configuration and deployment](BasisRustServer/README.md#configuration) for
 precedence, file paths and persistence. Environment settings avoid committing

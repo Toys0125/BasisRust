@@ -206,6 +206,14 @@ precedence over legacy `Password`. A supplied empty or non-Unicode password
 environment override stops startup without printing its value; it never becomes
 an empty-password bypass. No secret is generated automatically.
 
+Authentication starts enabled, but a new configuration has an empty password
+and startup fails until `Password` or `BASIS_SERVER_PASSWORD` supplies a
+non-empty value. Existing XML with an omitted or empty password also fails
+closed. To intentionally allow passwordless/public access, set
+`<UseAuth>false</UseAuth>` in XML (and leave the password environment variables
+unset). The known compatibility value `default_password` is accepted only when
+an operator explicitly supplies it in XML or an environment override.
+
 The default config path is `<executable-directory>/config/config.xml`, not the
 tracked top-level `Config.xml`. A relative `--config` is resolved under
 `--base-dir`; an absolute path is used directly. A missing file is created from
@@ -281,8 +289,8 @@ unset BASIS_SERVER_PASSWORD BASIS_UID BASIS_GID
 ```
 
 Compose requires a non-empty value. The image alone also accepts a mounted XML
-password or either supported password environment name; it preserves the default
-when none is provided. Never pass an empty `Password` value.
+password or either supported password environment name; without one, startup
+fails closed. Never pass an empty `Password` value.
 
 The container uses `--base-dir /app`, so the Compose mounts `./config:/app/config`
 and `./logs:/app/logs` match the runtime paths. Bind mounts under `./data/` provide

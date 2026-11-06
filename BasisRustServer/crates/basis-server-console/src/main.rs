@@ -816,6 +816,7 @@ async fn async_main(
     };
     let mut config = ServerConfig::load_or_create(&config_path)?;
     config.process_environment_overrides()?;
+    config.validate_auth()?;
     if args.no_console {
         config.enable_console = false;
     }
@@ -2053,6 +2054,7 @@ mod memory_reclaim_tests {
     async fn stopping_output_worker_does_not_wait_for_status_interval() {
         let config = ServerConfig {
             has_file_support: false,
+            use_auth: false,
             set_port: 0,
             ..ServerConfig::default()
         };

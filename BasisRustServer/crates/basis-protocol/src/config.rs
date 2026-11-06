@@ -260,7 +260,10 @@ impl Default for ServerConfig {
             override_auto_discovery_of_ipv: false,
             ipv4_address: "0.0.0.0".to_string(),
             ipv6_address: "::1".to_string(),
-            password: "default_password".to_string(),
+            // Never create a server that silently accepts the published
+            // compatibility credential. Operators must configure a secret or
+            // explicitly disable authentication for a public server.
+            password: String::new(),
             use_auth: true,
             use_auth_identity: true,
             basis_user_restriction_mode: BasisUserRestrictionMode::None,
@@ -354,6 +357,14 @@ impl ServerConfig {
     pub const LOGS_FOLDER_NAME: &'static str = "logs";
     pub const INITIAL_RESOURCES_FOLDER_NAME: &'static str = "initialresources";
     pub const DEFAULT_LIBRARY_FOLDER_NAME: &'static str = "defaultlibrary";
+
+    /// Reject unsafe authentication settings at startup and during live edits.
+    pub fn validate_auth(&self) -> Result<()> {
+        if self.use_auth && self.password.trim().is_empty() {
+            anyhow::bail!("authentication is enabled but Password is empty; set a non-empty Password or explicitly set UseAuth=false for a public server");
+        }
+        Ok(())
+    }
 
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if path.exists() {
@@ -783,7 +794,11 @@ impl ServerConfig {
             .any(|field| field.eq_ignore_ascii_case(name)),
             "{name} requires a server restart; edit the server XML configuration and restart"
         );
-        self.set_field(name, value)
+        let mut proposed = self.clone();
+        proposed.set_field(name, value)?;
+        proposed.validate_auth()?;
+        *self = proposed;
+        Ok(())
     }
 
     pub fn set_field(&mut self, name: &str, value: &str) -> Result<()> {
@@ -860,7 +875,10 @@ mod tests {
 
     #[test]
     fn storage_initialization_fields_reject_live_edits_without_mutating_config() {
-        let mut config = super::ServerConfig::default();
+        let mut config = super::ServerConfig {
+            use_auth: false,
+            ..super::ServerConfig::default()
+        };
         let before = serde_json::to_value(&config).unwrap();
         for (field, value) in [
             ("StorageEnabled", "false"),
@@ -885,6 +903,43 @@ mod tests {
             config.storage_backend, "sql",
             "offline/startup edits remain supported"
         );
+    }
+
+    #[test]
+    fn live_auth_edits_reject_invalid_transitions_without_mutating_saved_settings() {
+        let mut config = ServerConfig {
+            use_auth: false,
+            ..ServerConfig::default()
+        };
+        for password in ["", " \t "] {
+            config.set_live_field("Password", password).unwrap();
+            let before = config.clone();
+            assert!(config.set_live_field("useauth", "true").is_err());
+            assert_eq!(config, before);
+        }
+
+        config
+            .set_live_field("Password", "live-test-password")
+            .unwrap();
+        config.set_live_field("UseAuth", "true").unwrap();
+        for password in ["", " \t "] {
+            let before = config.clone();
+            assert!(config.set_live_field("password", password).is_err());
+            assert_eq!(config, before);
+        }
+
+        let dir = std::env::temp_dir().join(format!("basis-live-auth-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.xml");
+        config.save(&path).unwrap();
+        let restored = ServerConfig::load_or_create(&path).unwrap();
+        restored.validate_auth().unwrap();
+        assert!(restored.use_auth);
+        assert_eq!(restored.password, "live-test-password");
+
+        config.set_live_field("UseAuth", "false").unwrap();
+        config.set_live_field("Password", "").unwrap();
+        config.validate_auth().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1023,6 +1078,75 @@ mod tests {
         assert_eq!(config.password, "explicit-password");
     }
 
+    #[test]
+    fn auth_configuration_fails_closed_and_requires_an_explicit_choice() {
+        let default = ServerConfig::default();
+        assert!(default.use_auth);
+        assert!(default.password.is_empty());
+        assert!(default.validate_auth().is_err());
+
+        for xml in [
+            "<Configuration><Password/></Configuration>",
+            "<Configuration><Password>   </Password></Configuration>",
+            "<Configuration/>",
+        ] {
+            let config: ServerConfig = quick_xml::de::from_str(xml).unwrap();
+            assert!(config.validate_auth().is_err(), "XML: {xml}");
+        }
+
+        let public: ServerConfig = quick_xml::de::from_str(
+            "<Configuration><UseAuth>false</UseAuth><Password/></Configuration>",
+        )
+        .unwrap();
+        public.validate_auth().unwrap();
+        let saved = quick_xml::se::to_string(&public).unwrap();
+        let restored: ServerConfig = quick_xml::de::from_str(&saved).unwrap();
+        assert!(!restored.use_auth);
+        assert!(restored.password.is_empty());
+        restored.validate_auth().unwrap();
+
+        let explicit_default: ServerConfig = quick_xml::de::from_str(
+            "<Configuration><Password>default_password</Password></Configuration>",
+        )
+        .unwrap();
+        explicit_default.validate_auth().unwrap();
+
+        let mut config = ServerConfig::default();
+        config
+            .process_environment_overrides_with(|name| match name {
+                "BASIS_SERVER_PASSWORD" => Ok("".to_owned()),
+                _ => Err(env::VarError::NotPresent),
+            })
+            .unwrap_err();
+        assert!(config.password.is_empty());
+        assert!(config.use_auth);
+    }
+
+    #[test]
+    fn environment_password_overrides_xml_and_public_mode_is_explicit() {
+        let mut config: ServerConfig = quick_xml::de::from_str(
+            "<Configuration><Password>xml-secret</Password></Configuration>",
+        )
+        .unwrap();
+        config
+            .process_environment_overrides_with(|name| match name {
+                "BASIS_SERVER_PASSWORD" => Ok("environment-secret".to_owned()),
+                _ => Err(env::VarError::NotPresent),
+            })
+            .unwrap();
+        assert_eq!(config.password, "environment-secret");
+        config.validate_auth().unwrap();
+
+        let mut public: ServerConfig = quick_xml::de::from_str(
+            "<Configuration><UseAuth>false</UseAuth><Password/></Configuration>",
+        )
+        .unwrap();
+        public
+            .process_environment_overrides_with(|_| Err(env::VarError::NotPresent))
+            .unwrap();
+        public.validate_auth().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn non_unicode_password_environment_error_is_redacted() {
@@ -1044,7 +1168,7 @@ mod tests {
                 error.to_string(),
                 "server password environment override must be valid Unicode"
             );
-            assert_eq!(config.password, "default_password");
+            assert!(config.password.is_empty());
         }
     }
 
@@ -1053,7 +1177,7 @@ mod tests {
         let config = ServerConfig::default();
         assert_eq!(config.peer_limit, u16::MAX as i32);
         assert_eq!(config.set_port, 4296);
-        assert_eq!(config.password, "default_password");
+        assert!(config.password.is_empty());
         assert_eq!(config.config_version, ServerConfig::CURRENT_CONFIG_VERSION);
         assert_eq!(
             config.company_name,
@@ -1197,6 +1321,40 @@ mod tests {
         assert!(
             healed.contains("<HealthIncludeExtendedMetrics>false</HealthIncludeExtendedMetrics>")
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_config_migration_preserves_public_choice_and_requires_auth_password() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("basis-auth-migration-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.xml");
+
+        std::fs::write(
+            &path,
+            "<Configuration><ConfigVersion>16</ConfigVersion><Password/><UseAuth>false</UseAuth></Configuration>",
+        )
+        .unwrap();
+        let public = ServerConfig::load_or_create(&path).unwrap();
+        assert_eq!(public.config_version, ServerConfig::CURRENT_CONFIG_VERSION);
+        public.validate_auth().unwrap();
+
+        std::fs::write(
+            &path,
+            "<Configuration><ConfigVersion>16</ConfigVersion></Configuration>",
+        )
+        .unwrap();
+        let protected = ServerConfig::load_or_create(&path).unwrap();
+        assert_eq!(
+            protected.config_version,
+            ServerConfig::CURRENT_CONFIG_VERSION
+        );
+        assert!(protected.validate_auth().is_err());
 
         let _ = std::fs::remove_dir_all(dir);
     }
