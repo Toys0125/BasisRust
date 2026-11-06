@@ -209,6 +209,8 @@ const ORDERED_REORDER_ENTRY_OVERHEAD: usize = 128;
 const MAX_INCOMING_FRAGMENT_ASSEMBLIES: usize = 4;
 const MAX_INCOMING_FRAGMENT_BYTES_PER_PEER: usize = 128 * 1024;
 const MAX_INCOMING_FRAGMENT_PARTS: usize = 128;
+const MAX_RELIABLE_FRAGMENTED_MESSAGE_BYTES: usize =
+    MAX_INCOMING_FRAGMENT_PARTS * RELIABLE_FRAGMENT_PAYLOAD_SIZE;
 const MAX_ORDERED_DRAIN_PER_PEER_PER_PASS: usize = 256;
 const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 const SOCKET_TTL: u32 = 255;
@@ -851,7 +853,13 @@ impl PeerState {
 
     fn clear_ordered_reorder(&self) {
         self.read_gate.close_admission();
-        self.remote_ordered_sequence.lock().clear();
+        // Realtime ordered handlers run while the receive cursor is locked to preserve
+        // per-channel callback order. A handler may close its own session, so cleanup must
+        // never wait recursively on that cursor. Closing admission makes any retained state
+        // unreachable to new packets; the PeerState drop releases it if this lock is busy.
+        if let Some(mut receive) = self.remote_ordered_sequence.try_lock() {
+            receive.clear();
+        }
         *self.incoming_fragments.lock() = IncomingFragmentState::default();
         self.ordered_reorder_active.store(false, Ordering::Release);
     }
@@ -2745,8 +2753,8 @@ fn dequeue_reliable_window(
 #[cold]
 fn cold_drop_oversized_reliable(total_fragments: usize) {
     warn!(
-        "dropping reliable payload requiring {total_fragments} fragments; LiteNetLib limit is {}",
-        u16::MAX
+        "dropping reliable payload requiring {total_fragments} fragments; transport limit is {}",
+        MAX_INCOMING_FRAGMENT_PARTS
     );
 }
 
@@ -2775,7 +2783,9 @@ fn enqueue_reliable_payload(
     }
 
     let total_fragments = payload.len().div_ceil(RELIABLE_FRAGMENT_PAYLOAD_SIZE);
-    if total_fragments > u16::MAX as usize {
+    if payload.len() > MAX_RELIABLE_FRAGMENTED_MESSAGE_BYTES
+        || total_fragments > MAX_INCOMING_FRAGMENT_PARTS
+    {
         cold_drop_oversized_reliable(total_fragments);
         return;
     }
@@ -3849,7 +3859,9 @@ fn admit_reliable_ordered(
                     return Err(TransportError::InvalidFragment(peer_id));
                 }
                 Err(FragmentInsertError::Limit(_, _)) => {
-                    return Err(TransportError::InvalidFragment(peer_id));
+                    // Capacity can become available when another assembly completes. Leave
+                    // this sequence uncommitted and unACKed so LiteNetLib retransmits it.
+                    return Ok(());
                 }
                 Err(FragmentInsertError::Budget(_, _)) => return Ok(()),
                 Ok(None) => {
@@ -4126,7 +4138,10 @@ fn drain_ordered_state(
                             _budgets: vec![budget],
                         },
                     );
-                    return Err(TransportError::InvalidFragment(peer_id));
+                    // Preserve the expected fragment until capacity is released; a later
+                    // dispatch pass can retry it without treating resource pressure as bad
+                    // protocol data.
+                    break;
                 }
                 Err(FragmentInsertError::Invalid(payload, budget)) => {
                     state.future.insert(
@@ -4276,7 +4291,9 @@ fn admit_reliable_unordered(
                 return Err(TransportError::InvalidFragment(peer_id));
             }
             Err(FragmentInsertError::Limit(_, _)) => {
-                return Err(TransportError::InvalidFragment(peer_id));
+                // Keep the receive cursor and ACK unchanged while current assemblies use
+                // the peer's bounded budget. The sender will retry after capacity frees.
+                return Ok(());
             }
             Err(FragmentInsertError::Budget(_, _)) => return Ok(()),
             Ok(None) => {
@@ -8238,6 +8255,168 @@ mod tests {
         assert!(matches!(fifth, Err(FragmentInsertError::Limit(_, _))));
         assert_eq!(bounded.assemblies.len(), MAX_INCOMING_FRAGMENT_ASSEMBLIES);
         assert!(budget.snapshot().retained_bytes < MAX_ORDERED_REORDER_BYTES_GLOBAL);
+    }
+
+    #[test]
+    fn reliable_fragment_sender_matches_receiver_message_bounds() {
+        let peer = test_peer_state(0);
+        enqueue_reliable_payload(
+            &peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            &vec![1; MAX_RELIABLE_FRAGMENTED_MESSAGE_BYTES],
+        );
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let outgoing = peer.outgoing_reliable.lock();
+        assert_eq!(outgoing[&channel_id].len(), MAX_INCOMING_FRAGMENT_PARTS);
+        assert!(outgoing[&channel_id]
+            .iter()
+            .all(|packet| packet.fragment.is_some()));
+        drop(outgoing);
+
+        peer.outgoing_reliable.lock().clear();
+        enqueue_reliable_payload(
+            &peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            &vec![1; MAX_RELIABLE_FRAGMENTED_MESSAGE_BYTES + 1],
+        );
+        assert!(peer.outgoing_reliable.lock()[&channel_id].is_empty());
+    }
+
+    #[tokio::test]
+    async fn ordered_realtime_handler_can_close_its_session_reentrantly() {
+        let (handle, tx, _events) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 4, 1)
+                .await
+                .unwrap();
+        handle.shutdown();
+        let peer = test_peer_state(0);
+        handle.peers.insert(peer.id, peer.clone());
+        handle.by_addr.insert(peer.addr, peer.id);
+        let callback_handle = handle.clone();
+        handle.set_realtime_handler(Some(Arc::new(move |_, session| {
+            assert!(callback_handle.close_session_admission(&session));
+            true
+        })));
+
+        let event = ServerEvent::Message {
+            peer: peer.id,
+            session: PeerSession {
+                peer: peer.id,
+                state: peer.clone(),
+            },
+            channel: channels::CHAT,
+            delivery: DeliveryMethod::ReliableOrdered,
+            payload: Bytes::from_static(b"reentrant-close"),
+        };
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking({
+                let handle = handle.clone();
+                let tx = tx.clone();
+                let peer = peer.clone();
+                move || {
+                    admit_reliable_ordered(&handle, &tx, peer.id, &peer, channel_id, 0, event, None)
+                }
+            }),
+        )
+        .await
+        .expect("session cleanup from the ordered callback must not deadlock")
+        .expect("ordered callback task must finish")
+        .unwrap();
+        assert!(peer.read_gate.is_closed());
+    }
+
+    #[tokio::test]
+    async fn ordered_fragment_capacity_pressure_is_retryable() {
+        let (handle, tx, _events) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 4, 1)
+                .await
+                .unwrap();
+        handle.shutdown();
+        let peer = test_peer_state(0);
+        handle.peers.insert(peer.id, peer.clone());
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let budget = &handle.reorder_budget;
+        for id in 0..MAX_INCOMING_FRAGMENT_ASSEMBLIES as u16 {
+            peer.incoming_fragments
+                .lock()
+                .insert(
+                    channel_id,
+                    IncomingFragment {
+                        id,
+                        part: 0,
+                        total: 2,
+                    },
+                    Bytes::from_static(b"x"),
+                    budget.try_reserve(&peer.reorder_usage, 1).unwrap(),
+                    budget,
+                    &peer.reorder_usage,
+                )
+                .unwrap();
+        }
+        let event = || ServerEvent::Message {
+            peer: peer.id,
+            session: PeerSession {
+                peer: peer.id,
+                state: peer.clone(),
+            },
+            channel: channels::CHAT,
+            delivery: DeliveryMethod::ReliableOrdered,
+            payload: Bytes::from_static(b"x"),
+        };
+        let fragment = Some(IncomingFragment {
+            id: 99,
+            part: 0,
+            total: 2,
+        });
+        admit_reliable_ordered(
+            &handle,
+            &tx,
+            peer.id,
+            &peer,
+            channel_id,
+            0,
+            event(),
+            fragment,
+        )
+        .unwrap();
+        assert_eq!(peer.remote_ordered_sequence.lock()[&channel_id].expected, 0);
+        assert!(!peer.outgoing_acks.lock().contains_key(&channel_id));
+
+        peer.incoming_fragments
+            .lock()
+            .insert(
+                channel_id,
+                IncomingFragment {
+                    id: 0,
+                    part: 1,
+                    total: 2,
+                },
+                Bytes::from_static(b"y"),
+                budget.try_reserve(&peer.reorder_usage, 1).unwrap(),
+                budget,
+                &peer.reorder_usage,
+            )
+            .unwrap();
+        admit_reliable_ordered(
+            &handle,
+            &tx,
+            peer.id,
+            &peer,
+            channel_id,
+            0,
+            event(),
+            fragment,
+        )
+        .unwrap();
+        assert_eq!(peer.remote_ordered_sequence.lock()[&channel_id].expected, 1);
+        assert!(peer.outgoing_acks.lock()[&channel_id].dirty);
     }
 
     #[tokio::test]
