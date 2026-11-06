@@ -6810,6 +6810,7 @@ mod tests {
             })
             .unwrap();
         let config = ServerConfig {
+            password: "storage-startup-test-password".into(),
             storage_enabled: true,
             storage_backend: "unavailable".into(),
             has_file_support: false,
