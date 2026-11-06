@@ -197,6 +197,17 @@ impl Drop for PlayerFileGuard<'_> {
     }
 }
 
+#[derive(Debug)]
+struct PlayerStorageQuotaExceeded;
+
+impl std::fmt::Display for PlayerStorageQuotaExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("global player storage quota exceeded")
+    }
+}
+
+impl std::error::Error for PlayerStorageQuotaExceeded {}
+
 impl PlayerStorage {
     pub fn new(root: Option<PathBuf>) -> Result<Self> {
         if let Some(root) = &root {
@@ -351,10 +362,9 @@ impl PlayerStorage {
             .context("player storage accounting mismatch")?
             .checked_add(bytes.len())
             .context("player storage size overflow")?;
-        anyhow::ensure!(
-            quota_allows(used, next, max_total_bytes),
-            "global player storage quota exceeded"
-        );
+        if !quota_allows(used, next, max_total_bytes) {
+            return Err(PlayerStorageQuotaExceeded.into());
+        }
         // Persist the recovery marker before changing data. If any step fails or
         // the process exits, the next operation rebuilds the ledger from files.
         self.write_file_usage(used, true)?;
@@ -431,9 +441,10 @@ impl PlayerStorage {
         if let Some(next) = updated {
             if self.root.is_some() {
                 if let Err(error) = self.save_account(owner, &next, total_limit) {
-                    reply.status = if error.to_string().contains("quota exceeded") {
+                    reply.status = if error.downcast_ref::<PlayerStorageQuotaExceeded>().is_some() {
                         StorageStatus::Full
                     } else {
+                        tracing::warn!(%owner, error = %error, "player storage save failed");
                         StorageStatus::Unavailable
                     };
                     reply.used = record.used() as i32;
