@@ -781,6 +781,7 @@ impl ServerState {
         }
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         state.workers.lock().extend([
+            spawn_database_snapshot_loop(state.database.clone(), state.shutdown.clone()),
             spawn_leave_broadcast_loop(state.clone()),
             spawn_image_replay_loop(state.clone()),
             spawn_content_expiry_loop(state.clone()),
@@ -1249,6 +1250,39 @@ impl ServerState {
             }
         }
     }
+}
+
+const DATABASE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
+
+fn spawn_database_snapshot_loop(
+    database: PersistentDatabase,
+    shutdown: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut snapshots = tokio::time::interval_at(
+            tokio::time::Instant::now() + DATABASE_SNAPSHOT_INTERVAL,
+            DATABASE_SNAPSHOT_INTERVAL,
+        );
+        snapshots.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut shutdown_checks = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                _ = snapshots.tick() => {
+                    let database = database.clone();
+                    match tokio::task::spawn_blocking(move || database.save_if_dirty()).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => error!("periodic world database snapshot failed: {error:#}"),
+                        Err(error) => error!("periodic world database snapshot task failed: {error}"),
+                    }
+                }
+                _ = shutdown_checks.tick() => {
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn is_p2p_offload_channel(channel: u8) -> bool {
