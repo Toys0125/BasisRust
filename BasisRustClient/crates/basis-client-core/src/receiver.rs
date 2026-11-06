@@ -224,6 +224,15 @@ pub(crate) fn shared_receiver_process_merged<'a>(
         let packet = &bytes[pos..pos + size];
         pos += size;
         let property = packet.first().copied().unwrap_or_default() & 0x1f;
+        if matches!(
+            PacketProperty::from_byte(packet.first().copied().unwrap_or_default()),
+            Some(PacketProperty::Merged | PacketProperty::CompactMerged)
+        ) {
+            client
+                .packet_diagnostics
+                .record(client.index, DropReason::InvalidMerged);
+            return forward;
+        }
         if property == PacketProperty::Unreliable as u8 {
             if packet.len() < 2 {
                 client.record_unparsed_packet(packet);

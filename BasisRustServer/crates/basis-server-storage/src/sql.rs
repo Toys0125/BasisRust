@@ -40,12 +40,24 @@ pub struct SqlPlayerStorage {
 }
 
 impl SqlPlayerStorage {
-    /// Remote postgres:// / postgresql:// URLs use TLS-capable sqlx. If absent
-    /// or not connectable, use the durable local SQLite database instead.
+    /// Remote postgres:// / postgresql:// URLs use TLS-capable sqlx. An empty
+    /// connection string selects the durable local SQLite database.
     pub async fn connect(
         connection_string: &str,
         sqlite_path: Option<&Path>,
         table: &str,
+    ) -> Result<(Self, SqlBackend)> {
+        Self::connect_with_fallback(connection_string, sqlite_path, table, false).await
+    }
+
+    /// Connect to the configured SQL backend, optionally falling back to
+    /// SQLite only when a recognized remote URL cannot be reached. Schema and
+    /// accounting initialization failures always remain fatal.
+    pub async fn connect_with_fallback(
+        connection_string: &str,
+        sqlite_path: Option<&Path>,
+        table: &str,
+        allow_sqlite_fallback: bool,
     ) -> Result<(Self, SqlBackend)> {
         anyhow::ensure!(
             !table.is_empty() && table.len() <= 63 &&
@@ -53,29 +65,41 @@ impl SqlPlayerStorage {
             table.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
             "StorageSqlTable must be a SQL identifier containing only letters, numbers and underscores"
         );
-        if !connection_string.trim().is_empty()
-            && (connection_string.starts_with("postgres://")
-                || connection_string.starts_with("postgresql://"))
-        {
-            if let Ok(pool) = PgPoolOptions::new()
+        let connection_string = connection_string.trim();
+        if !connection_string.is_empty() {
+            anyhow::ensure!(
+                connection_string.starts_with("postgres://")
+                    || connection_string.starts_with("postgresql://"),
+                "unsupported SQL storage connection URL; expected postgres:// or postgresql://"
+            );
+            let pool = PgPoolOptions::new()
                 .max_connections(5)
                 .acquire_timeout(Duration::from_secs(3))
                 .connect(connection_string)
-                .await
-            {
-                accounting::init_postgres(&pool, table).await.context(
+                .await;
+            match pool {
+                Ok(pool) => {
+                    accounting::init_postgres(&pool, table).await.context(
                     "PostgreSQL connected, but player-storage accounting initialization failed; verify table, function, and trigger permissions"
                 )?;
-                return Ok((
-                    Self {
-                        pool: Pool::Postgres(pool),
-                        table: table.to_owned(),
-                        usage_table: accounting::usage_table(table),
-                        limits: Arc::new(Mutex::new(RateLimiter::default())),
-                        legacy_import: LegacyImportReport::default(),
-                    },
-                    SqlBackend::PostgreSql,
-                ));
+                    return Ok((
+                        Self {
+                            pool: Pool::Postgres(pool),
+                            table: table.to_owned(),
+                            usage_table: accounting::usage_table(table),
+                            limits: Arc::new(Mutex::new(RateLimiter::default())),
+                            legacy_import: LegacyImportReport::default(),
+                        },
+                        SqlBackend::PostgreSql,
+                    ));
+                }
+                Err(error) if !allow_sqlite_fallback => {
+                    return Err(error)
+                        .context("connecting to configured PostgreSQL player storage");
+                }
+                Err(_) => {
+                    tracing::warn!("PostgreSQL connection failed; operator enabled local SQLite fallback (data is separate)");
+                }
             }
         }
 
@@ -687,12 +711,25 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        let error = SqlPlayerStorage::connect(&url, None, &view)
+        let fallback_dir = tempfile::tempdir().unwrap();
+        let fallback_path = fallback_dir.path().join("must-not-be-created.sqlite3");
+        for allow_fallback in [false, true] {
+            let error = SqlPlayerStorage::connect_with_fallback(
+                &url,
+                Some(&fallback_path),
+                &view,
+                allow_fallback,
+            )
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("accounting initialization failed"));
+            assert!(error
+                .to_string()
+                .contains("accounting initialization failed"));
+            assert!(
+                !fallback_path.exists(),
+                "schema errors must never create SQLite, even with fallback enabled"
+            );
+        }
         sqlx::query(&format!("DROP VIEW {view}"))
             .execute(pool)
             .await
@@ -980,11 +1017,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreachable_remote_falls_back_to_sqlite() {
-        let (storage, backend) = SqlPlayerStorage::connect(
+    async fn unreachable_remote_fails_without_explicit_fallback() {
+        let result = SqlPlayerStorage::connect(
             "postgres://user:secret@127.0.0.1:1/db",
             None,
             "basis_storage",
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            format!("{:#}", result.unwrap_err()).contains("connecting to configured PostgreSQL")
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_remote_uses_sqlite_only_with_explicit_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fallback.sqlite3");
+        let (storage, backend) = SqlPlayerStorage::connect_with_fallback(
+            "postgres://user:secret@127.0.0.1:1/db",
+            Some(&path),
+            "basis_storage",
+            true,
         )
         .await
         .unwrap();
@@ -997,6 +1051,24 @@ mod tests {
                 .status,
             StorageStatus::Ok
         );
+        assert!(matches!(
+            storage
+                .admin(crate::admin::StorageAdminAction::Statistics)
+                .await
+                .unwrap(),
+            crate::admin::StorageAdminReply::Statistics {
+                backend: "sqlite",
+                records: 1,
+                bytes
+            } if bytes > 0
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_nonempty_connection_url_does_not_select_sqlite() {
+        let result = SqlPlayerStorage::connect("mysql://127.0.0.1/db", None, "basis_storage").await;
+        assert!(result.is_err());
+        assert!(format!("{:#}", result.unwrap_err()).contains("unsupported SQL storage"));
     }
 
     #[tokio::test]

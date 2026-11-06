@@ -787,6 +787,16 @@ impl BasisClient {
                     }
                     let entry = &bytes[pos..pos + size];
                     pos += size;
+                    if matches!(
+                        entry
+                            .first()
+                            .and_then(|byte| PacketProperty::from_byte(*byte)),
+                        Some(PacketProperty::Merged | PacketProperty::CompactMerged)
+                    ) {
+                        self.packet_diagnostics
+                            .record(self.index, DropReason::InvalidMerged);
+                        return Ok(());
+                    }
                     // Zero-alloc fast path for Unreliable entries: the entry
                     // is already length-validated, so dispatch directly like
                     // the CompactMerged arm. Anything else (Channeled/Ack for
