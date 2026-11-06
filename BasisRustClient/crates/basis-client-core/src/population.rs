@@ -18,6 +18,7 @@ pub(crate) async fn publish_client_batch(
     batch_start: usize,
     batch_clients: &[Arc<BasisClient>],
     maintenance: &MaintenanceOptions,
+    scene_session: Option<&crate::scene::SceneSession>,
 ) -> Result<()> {
     let mut managed = managed_clients.lock().await;
     if managed.len() != batch_start {
@@ -36,6 +37,11 @@ pub(crate) async fn publish_client_batch(
         ));
     }
     managed.extend(batch_clients.iter().cloned());
+    if let Some(session) = scene_session {
+        // Sender indices are dense client slots. Grow observer capacity before
+        // the published population becomes visible to the receive loop.
+        session.update_sender_capacity(managed.len());
+    }
     drop(managed);
     if maintenance.shared {
         maintenance.refresh.notify_one();
@@ -353,8 +359,14 @@ pub(crate) async fn add_clients(
                 end = batch_end.saturating_sub(1)
             ));
         }
-        if let Err(err) =
-            publish_client_batch(managed_clients, batch_start, &batch_clients, maintenance).await
+        if let Err(err) = publish_client_batch(
+            managed_clients,
+            batch_start,
+            &batch_clients,
+            maintenance,
+            config.scene_session.as_deref(),
+        )
+        .await
         {
             for client in batch_clients {
                 client.disconnect().await;

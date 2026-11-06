@@ -3271,25 +3271,38 @@ async fn batch_publish_preserves_dense_indices_and_notifies_complete_snapshot() 
         shared: true,
         refresh: refresh.clone(),
     };
+    let scene_session = crate::scene::SceneSession::new(24, None, 1);
     let batch = vec![
         test_client(0, server_addr).await,
         test_client(1, server_addr).await,
         test_client(2, server_addr).await,
     ];
     let notified = refresh.notified();
-    publish_client_batch(&managed, 0, &batch, &maintenance)
+    publish_client_batch(&managed, 0, &batch, &maintenance, Some(&scene_session))
         .await
         .unwrap();
     time::timeout(Duration::from_secs(1), notified)
         .await
         .unwrap();
+    assert_eq!(scene_session.sender_capacity(), 3);
+    let partial_addition = vec![test_client(3, server_addr).await];
+    publish_client_batch(
+        &managed,
+        3,
+        &partial_addition,
+        &maintenance,
+        Some(&scene_session),
+    )
+    .await
+    .unwrap();
+    assert_eq!(scene_session.sender_capacity(), 4);
     let snapshot = managed.lock().await;
     assert_eq!(
         snapshot
             .iter()
             .map(|client| client.index)
             .collect::<Vec<_>>(),
-        vec![0, 1, 2]
+        vec![0, 1, 2, 3]
     );
 }
 

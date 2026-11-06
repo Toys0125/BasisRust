@@ -753,8 +753,21 @@ mod shared_handoff_tests {
         let queued = receiver.recv().await.unwrap();
         assert_eq!(queued.data, packet);
 
-        // Saturation sheds this valid reliable packet. Since the receiver has not
-        // accepted it into its ACK window, the server can retransmit it.
+        // Refill the one-slot queue before the overflow attempt. The discarded
+        // reliable packet must remain unacknowledged so the server can retransmit it.
+        assert!(enqueue_shared_receive_batch(
+            &sender,
+            SharedReceiveBatch {
+                data: packet.to_vec(),
+                packets: vec![SharedReceivePacket {
+                    index: client.index,
+                    fd: client.socket.as_raw_fd(),
+                    client: Arc::downgrade(&client),
+                    offset: 0,
+                    len: packet.len(),
+                }],
+            },
+        ));
         assert!(enqueue_shared_receive_batch(
             &sender,
             SharedReceiveBatch {
@@ -775,6 +788,7 @@ mod shared_handoff_tests {
             .unwrap()
             .ack_window(reliable_channel)
             .is_none());
+        assert_eq!(receiver.recv().await.unwrap().data, packet);
 
         let make_batch = |bytes: &[u8]| SharedReceiveBatch {
             data: bytes.to_vec(),
@@ -797,6 +811,32 @@ mod shared_handoff_tests {
         assert!(control_send.await.unwrap());
         assert_eq!(receiver.recv().await.unwrap().data, disconnect);
         assert_eq!(client.packet_diagnostics.snapshot()[5], 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_control_wait_returns_when_shutdown_closes_the_handoff() {
+        let (sender, receiver) = mpsc::channel(1);
+        let data = [PacketProperty::Channeled as u8];
+        let make_batch = |bytes: &[u8]| SharedReceiveBatch {
+            data: bytes.to_vec(),
+            packets: vec![SharedReceivePacket {
+                index: 0,
+                fd: -1,
+                client: Weak::new(),
+                offset: 0,
+                len: bytes.len(),
+            }],
+        };
+        assert!(enqueue_shared_receive_batch(&sender, make_batch(&data)));
+
+        let terminal = [PacketProperty::Disconnect as u8];
+        let control_sender = sender.clone();
+        let control_batch = make_batch(&terminal);
+        let control_send = tokio::task::spawn_blocking(move || {
+            enqueue_shared_receive_batch(&control_sender, control_batch)
+        });
+        drop(receiver);
+        assert!(!control_send.await.unwrap());
     }
 }
 
