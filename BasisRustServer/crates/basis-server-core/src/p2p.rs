@@ -498,24 +498,44 @@ impl P2pBroker {
     ) {
         {
             let _lifecycle = self.lifecycle.lock();
-            let Some(mut session) = self.sessions.get_mut(&message.session_token) else {
-                return;
+            let pair = {
+                let Some(session) = self.sessions.get(&message.session_token) else {
+                    return;
+                };
+                if !session.authorizes(sender, message.other_player_id) {
+                    return;
+                }
+                pack_pair(session.initiator_peer_id, session.target_peer_id)
             };
-            if !session.authorizes(sender, message.other_player_id) {
-                return;
+            // LINK_LOST describes the shared direct peer link. Clear every token
+            // for this pair so housekeeping cannot resurrect an older link claim.
+            // Use the participant index, bounded by MAX_SESSIONS_PER_PEER.
+            let mut tokens = self
+                .peer_sessions
+                .get(&sender)
+                .map(|tokens| tokens.value().clone())
+                .unwrap_or_default();
+            tokens.insert(message.session_token.clone());
+            for token in tokens {
+                let Some(mut session) = self.sessions.get_mut(&token) else {
+                    continue;
+                };
+                if pack_pair(session.initiator_peer_id, session.target_peer_id) != pair {
+                    continue;
+                }
+                session.endpoint_a_internal = None;
+                session.endpoint_a_external = None;
+                session.endpoint_b_internal = None;
+                session.endpoint_b_external = None;
+                session.initiator_link_up = false;
+                session.target_link_up = false;
+                // A pending token must still receive ACCEPT before punching.
+                if session.state != SessionState::Awaiting {
+                    session.state = SessionState::ReadyForPunch;
+                }
+                session.offload_lease_deadline = None;
             }
-            session.endpoint_a_internal = None;
-            session.endpoint_a_external = None;
-            session.endpoint_b_internal = None;
-            session.endpoint_b_external = None;
-            session.initiator_link_up = false;
-            session.target_link_up = false;
-            session.state = SessionState::ReadyForPunch;
-            session.offload_lease_deadline = None;
-            self.offloaded_pairs.remove(&pack_pair(
-                session.initiator_peer_id,
-                session.target_peer_id,
-            ));
+            self.offloaded_pairs.remove(&pair);
         }
         self.send_sub(
             transport,
@@ -1109,6 +1129,55 @@ mod tests {
         assert!(broker.sessions.is_empty());
         assert!(broker.peer_sessions.is_empty());
         assert!(!broker.is_offloaded(a.peer_id(), b.peer_id()));
+        transport.shutdown();
+    }
+
+    #[tokio::test]
+    async fn link_lost_cannot_be_undone_by_another_token_for_the_same_pair() {
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (_a_socket, a) = connected_signal_peer(&transport, &mut events).await;
+        let (_b_socket, b) = connected_signal_peer(&transport, &mut events).await;
+        let broker = P2pBroker::default();
+        let now = tokio::time::Instant::now();
+        for token in ["first-link", "second-link"] {
+            let mut linked = session(a.peer_id(), b.peer_id());
+            linked.state = SessionState::Punched;
+            linked.initiator_link_up = true;
+            linked.target_link_up = true;
+            linked.offload_lease_deadline = Some(now + OFFLOAD_LEASE);
+            assert!(broker.claim_session(token, linked, |_| true));
+        }
+        assert!(broker.claim_session("pending-link", session(a.peer_id(), b.peer_id()), |_| true));
+        broker
+            .offloaded_pairs
+            .insert(pack_pair(a.peer_id(), b.peer_id()), ());
+        broker
+            .handle_signal(
+                &transport,
+                a.peer_id(),
+                &encode_signal(channels::P2P_SUB_LINK_LOST, b.peer_id(), "first-link"),
+                true,
+                |_| true,
+            )
+            .await;
+        assert!(!broker.is_offloaded(a.peer_id(), b.peer_id()));
+        broker.maintain_lifecycle(&transport, now).await;
+        assert!(
+            !broker.is_offloaded(a.peer_id(), b.peer_id()),
+            "housekeeping must not restore a lost direct link"
+        );
+        for token in ["first-link", "second-link"] {
+            let session = broker.sessions.get(token).unwrap();
+            assert!(!session.initiator_link_up && !session.target_link_up);
+            assert_eq!(session.state, SessionState::ReadyForPunch);
+            assert!(session.offload_lease_deadline.is_none());
+        }
+        assert_eq!(
+            broker.sessions.get("pending-link").unwrap().state,
+            SessionState::Awaiting
+        );
         transport.shutdown();
     }
 

@@ -1391,15 +1391,24 @@ fn spawn_p2p_lifecycle_loop(state: ServerState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut shutdown_checks = tokio::time::interval(Duration::from_millis(100));
         loop {
-            interval.tick().await;
-            if state.shutdown.load(Ordering::Relaxed) {
-                break;
+            tokio::select! {
+                _ = interval.tick() => {
+                    if state.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    state
+                        .p2p_broker
+                        .maintain_lifecycle(&state.transport, tokio::time::Instant::now())
+                        .await;
+                }
+                _ = shutdown_checks.tick() => {
+                    if state.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
             }
-            state
-                .p2p_broker
-                .maintain_lifecycle(&state.transport, tokio::time::Instant::now())
-                .await;
         }
     })
 }
