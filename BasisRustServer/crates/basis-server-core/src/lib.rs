@@ -781,7 +781,6 @@ impl ServerState {
         }
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         state.workers.lock().extend([
-            spawn_database_snapshot_loop(state.database.clone(), state.shutdown.clone()),
             spawn_leave_broadcast_loop(state.clone()),
             spawn_image_replay_loop(state.clone()),
             spawn_content_expiry_loop(state.clone()),
@@ -794,6 +793,7 @@ impl ServerState {
                 lifecycle_events,
                 shutdown_rx,
             )),
+            spawn_database_snapshot_loop(state.database.clone(), state.shutdown.clone()),
         ]);
         Ok((state, shutdown_tx))
     }
@@ -7209,6 +7209,52 @@ mod tests {
         .unwrap()
         .is_none());
         assert_eq!(open, [false, false, false]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_database_snapshot_worker_persists_dirty_state_and_stops() {
+        let path =
+            std::env::temp_dir().join(format!("basis-periodic-{}.json", uuid::Uuid::new_v4()));
+        let database = PersistentDatabase::file_backed(&path);
+        database.add_or_update(basis_server_storage::BasisData {
+            name: "periodic".into(),
+            json_payload: serde_json::json!(1),
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker = spawn_database_snapshot_loop(database.clone(), shutdown.clone());
+        tokio::task::yield_now().await;
+        tokio::time::advance(DATABASE_SNAPSHOT_INTERVAL - Duration::from_millis(1)).await;
+        assert!(
+            !path.exists(),
+            "dirty updates must wait for the snapshot interval"
+        );
+        database.add_or_update(basis_server_storage::BasisData {
+            name: "periodic".into(),
+            json_payload: serde_json::json!(2),
+        });
+        tokio::time::advance(Duration::from_millis(1)).await;
+        // The save uses a real blocking filesystem task. Resume time so a broken
+        // worker fails the timeout rather than depending on paused-clock scheduling.
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the periodic worker must save without a shutdown call");
+        let restored = PersistentDatabase::file_backed(&path);
+        restored.load().unwrap();
+        assert_eq!(
+            restored.get("periodic").unwrap().json_payload,
+            serde_json::json!(2)
+        );
+        shutdown.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("the snapshot worker must stop promptly")
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
