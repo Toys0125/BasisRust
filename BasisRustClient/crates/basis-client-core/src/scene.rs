@@ -115,12 +115,14 @@ impl SceneSession {
             return;
         }
         let sender = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let max_senders = self.max_senders.load(Ordering::Acquire);
+        if sender == 0 || sender >= max_senders {
+            m.malformed += 1;
+            return;
+        }
         let seq = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
         let stamp = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
-        if bytes[4..] != script_payload(self.size, sender, seq, stamp)
-            || sender == 0
-            || stamp > unix_micros()
-        {
+        if bytes[4..] != script_payload(self.size, sender, seq, stamp) || stamp > unix_micros() {
             m.malformed += 1;
             return;
         }
@@ -133,7 +135,6 @@ impl SceneSession {
             m.next_expiry_sweep = Some(now + SENDER_EXPIRY_SWEEP_INTERVAL);
             m.expiry_sweeps = m.expiry_sweeps.saturating_add(1);
         }
-        let max_senders = self.max_senders.load(Ordering::Acquire);
         if !m.senders.contains_key(&sender) && m.senders.len() >= max_senders {
             if let Some(oldest) = m
                 .senders
@@ -160,9 +161,7 @@ impl SceneSession {
         state.seen.retain(|s| s.saturating_add(256) > newest);
         state.last_seen = now;
         state.highest = newest;
-        if sender < max_senders {
-            m.covered_senders.insert(sender);
-        }
+        m.covered_senders.insert(sender);
         if seq < highest {
             m.out_of_order += 1;
         }
@@ -347,21 +346,28 @@ mod tests {
     }
 
     #[test]
-    fn scene_sender_state_is_bounded_and_evicts_least_recent_sender() {
+    fn out_of_range_scene_senders_cannot_displace_replay_state_or_inflate_metrics() {
         let session = SceneSession::new(24, None, 2);
-        for (sender, seq) in [(1, 1), (2, 1), (1, 2), (3, 1)] {
+        for (sender, seq) in [
+            (1, 1),
+            (2, 1),
+            (1, 2),
+            (3, 1),
+            (u32::MAX as usize, 1),
+            (1, 1),
+        ] {
             let mut bytes = vec![7, 0];
             bytes.extend_from_slice(&MESSAGE_INDEX.to_le_bytes());
             bytes.extend(script_payload(24, sender, seq, unix_micros()));
             session.observe(&bytes);
         }
         let m = session.metrics.lock().unwrap();
-        assert_eq!(m.senders.len(), 2);
+        assert_eq!(m.senders.len(), 1);
         assert!(m.senders.contains_key(&1));
-        assert!(m.senders.contains_key(&3));
-        assert!(!m.senders.contains_key(&2));
+        assert_eq!(m.senders[&1].highest, 2);
+        assert_eq!((m.received, m.malformed, m.duplicates), (2, 3, 1));
         assert_eq!(m.covered_senders.len(), 1);
-        assert!(m.covered_senders.len() <= 2);
+        assert_eq!(m.expiry_sweeps, 1);
     }
 
     #[test]
