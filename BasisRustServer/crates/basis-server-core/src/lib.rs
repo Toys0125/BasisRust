@@ -7356,6 +7356,75 @@ mod tests {
     }
 
     #[test]
+    fn join_batches_round_trip_large_single_ready_records() {
+        // A first record is allowed to exceed the 32 KiB batching target.
+        // Exercise both compressible and incompressible avatar data through
+        // the pending-join producer, batch framing and protocol readers.
+        for avatar_len in [40_000, usize::from(u16::MAX)] {
+            for compressible in [true, false] {
+                let mut ready = test_ready_message();
+                let mut random = 0x1234_5678u32;
+                ready.client_avatar_change_message.byte_array = (0..avatar_len)
+                    .map(|_| {
+                        random ^= random << 13;
+                        random ^= random >> 17;
+                        random ^= random << 5;
+                        if compressible {
+                            0
+                        } else {
+                            random as u8
+                        }
+                    })
+                    .collect();
+                let payload = serialize_server_ready(2, &ready).unwrap();
+                assert!(payload.len() > ServerReadyBatchMessage::MAX_PAYLOAD_BYTES);
+                let mut state = JoinBroadcastState::default();
+                state.register_peer(test_connected_peer(1), vec![1]);
+                let mut peer = test_connected_peer(2);
+                peer.ready = ready.clone();
+                state.register_peer(peer, payload.clone());
+                // A following record must stay separate from the large one.
+                let other = test_connected_peer(3);
+                state.register_peer(
+                    other.clone(),
+                    serialize_server_ready(3, &other.ready).unwrap(),
+                );
+                state.mark_initial_history_queued(1);
+                let batches = state.take_batches(1);
+                assert_eq!(batches.len(), 2);
+                assert_eq!(batches[0].len(), 1);
+                let framed = frame_join_records(&batches[0]).unwrap();
+                if compressible {
+                    assert_eq!(framed[2], 1);
+                }
+                let mut reader = NetReader::new(&framed);
+                let batch = ServerReadyBatchMessage::deserialize(&mut reader).unwrap();
+                assert_eq!(reader.remaining(), 0);
+                assert_eq!(batch.count, 1);
+                assert_eq!(batch.payload, payload);
+                let mut raw = NetWriter::new();
+                raw.put_u16(1);
+                raw.put_bool(false);
+                raw.put_i32(payload.len() as i32);
+                raw.put_bytes(&payload);
+                assert_eq!(
+                    ServerReadyBatchMessage::deserialize(&mut NetReader::new(raw.as_slice()))
+                        .unwrap(),
+                    batch
+                );
+                let mut records = NetReader::new(&batch.payload);
+                assert_eq!(records.get_u16().unwrap(), 2);
+                let decoded = ReadyMessage::deserialize(&mut records).unwrap();
+                assert_eq!(
+                    decoded.client_avatar_change_message.byte_array,
+                    ready.client_avatar_change_message.byte_array
+                );
+                assert_eq!(records.remaining(), 0);
+            }
+        }
+    }
+
+    #[test]
     fn join_batches_wait_for_initial_history_and_preserve_order() {
         let mut state = JoinBroadcastState::default();
         assert!(state
