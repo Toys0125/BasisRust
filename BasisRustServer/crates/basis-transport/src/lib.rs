@@ -641,6 +641,8 @@ struct SessionReadGate {
     drained: Notify,
     ordered_cleanup_pending: AtomicBool,
     ordered_callback_active: AtomicBool,
+    #[cfg(test)]
+    before_ordered_commit: parking_lot::Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 #[derive(Debug, Default)]
@@ -651,6 +653,27 @@ struct SessionReadGateState {
 }
 
 impl SessionReadGate {
+    fn with_open<T>(
+        &self,
+        is_current: impl FnOnce() -> bool,
+        action: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let gate = self.state.lock();
+        if gate.closed || !is_current() {
+            return None;
+        }
+        Some(action())
+    }
+
+    #[cfg(test)]
+    fn wait_before_ordered_commit(&self) {
+        let barrier = self.before_ordered_commit.lock().clone();
+        if let Some(barrier) = barrier {
+            barrier.wait();
+            barrier.wait();
+        }
+    }
+
     fn try_acquire(&self, peer: PeerId, state: &Arc<PeerState>) -> Option<PeerSessionReadLease> {
         let mut gate = self.state.lock();
         if gate.closed {
@@ -3984,7 +4007,16 @@ fn admit_reliable_ordered(
     let distance = {
         let state = receive.entry(channel_id).or_default();
         if state.is_committed(sequence) || state.future.contains_key(&sequence) {
-            queue_ack(peer, channel_id, sequence);
+            let acked = peer
+                .read_gate
+                .with_open(
+                    || handle.is_current_peer_state(peer_id, peer),
+                    || queue_ack(peer, channel_id, sequence),
+                )
+                .is_some();
+            if !acked {
+                return Ok(());
+            }
             #[cfg(test)]
             handle
                 .test_ordered_duplicate_count
@@ -4038,8 +4070,19 @@ fn admit_reliable_ordered(
                 Err(FragmentInsertError::Budget(_, _)) => return Ok(()),
                 Ok(None) => {
                     let state = receive.entry(channel_id).or_default();
-                    state.commit(sequence);
-                    queue_ack(peer, channel_id, sequence);
+                    if peer
+                        .read_gate
+                        .with_open(
+                            || handle.is_current_peer_state(peer_id, peer),
+                            || {
+                                state.commit(sequence);
+                                queue_ack(peer, channel_id, sequence);
+                            },
+                        )
+                        .is_none()
+                    {
+                        return Ok(());
+                    }
                     drain_ordered_state(
                         handle,
                         tx,
@@ -4069,7 +4112,6 @@ fn admit_reliable_ordered(
                         event,
                         realtime_consumed,
                     )? {
-                        queue_ack(peer, channel_id, sequence);
                         drain_ordered_state(
                             handle,
                             tx,
@@ -4079,19 +4121,27 @@ fn admit_reliable_ordered(
                             &mut receive,
                             MAX_ORDERED_DRAIN_PER_PEER_PER_PASS,
                         )?;
-                    } else if !peer.read_gate.is_closed()
-                        && handle.is_current_peer_state(peer_id, peer)
-                    {
-                        state.future.insert(
-                            sequence,
-                            RetainedOrderedMessage {
-                                payload,
-                                fragment: None,
-                                _budgets: budgets,
+                    } else if peer
+                        .read_gate
+                        .with_open(
+                            || handle.is_current_peer_state(peer_id, peer),
+                            || {
+                                state.future.insert(
+                                    sequence,
+                                    RetainedOrderedMessage {
+                                        payload,
+                                        fragment: None,
+                                        _budgets: budgets,
+                                    },
+                                );
+                                peer.ordered_reorder_active.store(true, Ordering::Release);
+                                queue_ack(peer, channel_id, sequence);
                             },
-                        );
-                        peer.ordered_reorder_active.store(true, Ordering::Release);
-                        queue_ack(peer, channel_id, sequence);
+                        )
+                        .is_some()
+                    {
+                        // The completed fragment remains retained because normal event
+                        // admission is currently full.
                     }
                 }
             }
@@ -4165,16 +4215,27 @@ fn admit_reliable_ordered(
             }
             return Ok(());
         };
-        state.future.insert(
-            sequence,
-            RetainedOrderedMessage {
-                payload,
-                fragment,
-                _budgets: vec![budget],
-            },
-        );
-        peer.ordered_reorder_active.store(true, Ordering::Release);
-        queue_ack(peer, channel_id, sequence);
+        if peer
+            .read_gate
+            .with_open(
+                || handle.is_current_peer_state(peer_id, peer),
+                || {
+                    state.future.insert(
+                        sequence,
+                        RetainedOrderedMessage {
+                            payload,
+                            fragment,
+                            _budgets: vec![budget],
+                        },
+                    );
+                    peer.ordered_reorder_active.store(true, Ordering::Release);
+                    queue_ack(peer, channel_id, sequence);
+                },
+            )
+            .is_none()
+        {
+            return Ok(());
+        }
         if handle.extended_statistics_enabled() {
             handle
                 .stats
@@ -4236,9 +4297,18 @@ fn deliver_ordered_event_with_realtime(
             return Ok(false);
         }
         if realtime_consumed {
-            state.commit(sequence);
-            queue_ack(peer, channel_id, sequence);
-            return Ok(true);
+            #[cfg(test)]
+            peer.read_gate.wait_before_ordered_commit();
+            return Ok(peer
+                .read_gate
+                .with_open(
+                    || handle.is_current_peer_state(peer_id, peer),
+                    || {
+                        state.commit(sequence);
+                        queue_ack(peer, channel_id, sequence);
+                    },
+                )
+                .is_some());
         }
         let channel = match &event {
             ServerEvent::Message { channel, .. } => *channel,
@@ -4259,16 +4329,22 @@ fn deliver_ordered_event_with_realtime(
                 return Err(TransportError::EventChannelClosed)
             }
         };
-        if peer.read_gate.is_closed() || !handle.is_current_peer_state(peer_id, peer) {
-            return Ok(false);
-        }
-        state.commit(sequence);
-        queue_ack(peer, channel_id, sequence);
-        permit.send(OrderedEvent {
-            event,
-            admission: Some(lease),
-        });
-        return Ok(true);
+        #[cfg(test)]
+        peer.read_gate.wait_before_ordered_commit();
+        return Ok(peer
+            .read_gate
+            .with_open(
+                || handle.is_current_peer_state(peer_id, peer),
+                || {
+                    state.commit(sequence);
+                    queue_ack(peer, channel_id, sequence);
+                    permit.send(OrderedEvent {
+                        event,
+                        admission: Some(lease),
+                    });
+                },
+            )
+            .is_some());
     }
     let ordered_sender = handle.ordered_event_sender.read().clone();
     let tx = ordered_sender.as_ref().unwrap_or(tx);
@@ -4290,12 +4366,21 @@ fn deliver_ordered_event_with_realtime(
         // Full queue and no realtime owner: leave cursor and ACK bitmap unchanged.
         return Ok(false);
     }
-    state.commit(sequence);
-    queue_ack(peer, channel_id, sequence);
-    if let Some(permit) = permit.filter(|_| !realtime_consumed) {
-        permit.send(event);
-    }
-    Ok(true)
+    #[cfg(test)]
+    peer.read_gate.wait_before_ordered_commit();
+    Ok(peer
+        .read_gate
+        .with_open(
+            || handle.is_current_peer_state(peer_id, peer),
+            || {
+                state.commit(sequence);
+                queue_ack(peer, channel_id, sequence);
+                if let Some(permit) = permit.filter(|_| !realtime_consumed) {
+                    permit.send(event);
+                }
+            },
+        )
+        .is_some())
 }
 
 fn ordered_event_with_payload(
@@ -4349,7 +4434,16 @@ fn drain_ordered_state<'a>(
             ) {
                 Ok(None) => {
                     let state = receive.entry(channel_id).or_default();
-                    state.commit(sequence);
+                    if peer
+                        .read_gate
+                        .with_open(
+                            || handle.is_current_peer_state(peer_id, peer),
+                            || state.commit(sequence),
+                        )
+                        .is_none()
+                    {
+                        break;
+                    }
                     drained += 1;
                     if handle.extended_statistics_enabled() {
                         handle
@@ -8690,6 +8784,109 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+        handle.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_close_wins_before_final_ordered_commit_ack_and_event() {
+        let (mut handle, tx, mut events) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 8, 1)
+                .await
+                .unwrap();
+        handle.shutdown();
+        handle.reorder_budget = Arc::new(ReorderBudget {
+            usage: parking_lot::Mutex::new(ReorderBudgetUsage::default()),
+            limits: ReorderBudgetLimits {
+                packets: 1,
+                bytes: 1_024,
+                peer_packets: 1,
+                peer_bytes: 1_024,
+            },
+        });
+        let old_peer = test_peer_state(0);
+        handle.peers.insert(old_peer.id, old_peer.clone());
+        handle.by_addr.insert(old_peer.addr, old_peer.id);
+        handle.set_realtime_handler(Some(Arc::new(|_, session| {
+            assert!(session.state.remote_ordered_sequence.try_lock().is_some());
+            false
+        })));
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let first = build_outbound_packet(
+            &old_peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"head",
+        );
+        let second = build_outbound_packet(
+            &old_peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"future",
+        );
+        process_packet(&handle, &tx, old_peer.addr, &second.bytes)
+            .await
+            .unwrap();
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 1);
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        *old_peer.read_gate.before_ordered_commit.lock() = Some(barrier.clone());
+        let worker_handle = handle.clone();
+        let worker_tx = tx.clone();
+        let worker_addr = old_peer.addr;
+        let first_packet = first.bytes;
+        let worker = tokio::spawn(async move {
+            process_packet(&worker_handle, &worker_tx, worker_addr, &first_packet).await
+        });
+
+        // The worker has passed the preliminary session check and callback, but has not yet
+        // entered the atomic final check/commit/ACK/event-admission section.
+        barrier.wait();
+        assert!(handle.close_session_admission(&handle.peer_session(old_peer.id).unwrap()));
+        barrier.wait();
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("receive must finish after close wins the final admission race")
+            .unwrap()
+            .unwrap();
+
+        assert!(handle.peers.contains_key(&old_peer.id));
+        assert!(old_peer.remote_ordered_sequence.lock().is_empty());
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 0);
+        assert_eq!(
+            old_peer
+                .reorder_usage
+                .retained_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(!ack_bit(
+            &old_peer.outgoing_acks.lock()[&channel_id].bits,
+            0
+        ));
+        assert!(events.try_recv().is_err());
+
+        let new_addr = loopback_addr(4297);
+        let mut new_peer = test_peer_state(1);
+        Arc::get_mut(&mut new_peer).unwrap().addr = new_addr;
+        handle.peers.insert(new_peer.id, new_peer.clone());
+        handle.by_addr.insert(new_addr, new_peer.id);
+        let _new_head = build_outbound_packet(
+            &new_peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"new-head",
+        );
+        let new_future = build_outbound_packet(
+            &new_peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"new-future",
+        );
+        process_packet(&handle, &tx, new_addr, &new_future.bytes)
+            .await
+            .unwrap();
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 1);
         handle.shutdown();
     }
 
