@@ -181,7 +181,7 @@ async fn scene_waits_for_admission_without_delaying_first_send_by_workload_inter
             clients.clone(),
             Arc::new(AtomicBool::new(false)),
             stop.clone(),
-            Arc::new(crate::scene::SceneSession::new(32, None)),
+            Arc::new(crate::scene::SceneSession::new(32, None, 2)),
             Duration::from_secs(60),
             reliable,
         ));
@@ -3026,7 +3026,7 @@ async fn shared_receive_keeps_scene_reliable_only_for_scene_observers() {
 
     let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let mut observer = test_client(1, server.local_addr().unwrap()).await;
-    let session = Arc::new(crate::scene::SceneSession::new(24, None));
+    let session = Arc::new(crate::scene::SceneSession::new(24, None, 2));
     Arc::get_mut(&mut observer).unwrap().scene_session = Some(session.clone());
     let wire = scene_packet(1);
     let mut compact = vec![PacketProperty::CompactMerged as u8, 0x40, wire.len() as u8];
