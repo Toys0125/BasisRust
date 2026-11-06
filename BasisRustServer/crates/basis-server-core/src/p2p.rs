@@ -6,11 +6,13 @@ use basis_protocol::{
 use basis_transport::{DeliveryMethod, PeerId, TransportHandle};
 use dashmap::{mapref::entry::Entry, DashMap};
 use parking_lot::Mutex;
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Instant};
 use tracing::{info, warn};
 
 const MAX_SESSIONS_PER_PEER: usize = 4096;
 const MAX_SESSION_TOKEN_LEN: usize = 64;
+const INTRODUCTION_BURST: u8 = 4;
+const INTRODUCTION_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SessionState {
@@ -30,6 +32,8 @@ struct P2pSession {
     endpoint_b_external: Option<SocketAddr>,
     initiator_link_up: bool,
     target_link_up: bool,
+    introduction_window_started: Instant,
+    introduction_sends_in_window: u8,
 }
 
 #[derive(Clone, Default)]
@@ -114,12 +118,26 @@ impl P2pBroker {
         if token.is_empty() {
             return;
         }
+        self.remove_stale_sessions(transport);
         let Some(mut session) = self.sessions.get_mut(&token) else {
             warn!("[P2P] NAT request with unknown token {}", preview(&token));
             return;
         };
         if session.state < SessionState::ReadyForPunch {
             warn!("[P2P] NAT request before session ready {}", preview(&token));
+            return;
+        }
+        let is_initiator_endpoint = transport
+            .peer_addr(session.initiator_peer_id)
+            .is_some_and(|addr| same_endpoint(addr, remote_addr));
+        let is_target_endpoint = transport
+            .peer_addr(session.target_peer_id)
+            .is_some_and(|addr| same_endpoint(addr, remote_addr));
+        if !is_initiator_endpoint && !is_target_endpoint {
+            warn!(
+                "[P2P] NAT request endpoint does not match a session participant {}",
+                preview(&token)
+            );
             return;
         }
         // The Unity client retries introductions on a timer. Identify participants by
@@ -150,10 +168,20 @@ impl P2pBroker {
         let Some(b_external) = session.endpoint_b_external else {
             return;
         };
+        let now = Instant::now();
+        if now.duration_since(session.introduction_window_started) >= INTRODUCTION_WINDOW {
+            session.introduction_window_started = now;
+            session.introduction_sends_in_window = 0;
+        }
+        if session.introduction_sends_in_window >= INTRODUCTION_BURST {
+            return;
+        }
+        session.introduction_sends_in_window += 1;
         session.state = SessionState::Punched;
         drop(session);
 
-        let same_nat = a_external.ip() == b_external.ip();
+        let prediction_count = prediction_count(a_external, b_external);
+        let same_nat = prediction_count == 0;
         let same_host = same_nat && a_internal.ip() == b_internal.ip();
         let (a_internal, b_internal) = if same_host {
             (
@@ -165,7 +193,6 @@ impl P2pBroker {
         };
         // Introductions are unacknowledged UDP: retries need the full prediction window
         // too, because either peer may have missed the previous response.
-        let prediction_count = if same_nat { 0 } else { 32 };
         if let Err(err) = transport
             .send_nat_introduce(
                 a_internal,
@@ -210,6 +237,33 @@ impl P2pBroker {
             self.send_sub(transport, other, channels::P2P_SUB_CANCEL, &token, peer)
                 .await;
         }
+    }
+
+    /// Drop sessions whose authenticated transport participants have disconnected.
+    /// This also repairs offload/index state if a disconnect callback was missed.
+    fn remove_stale_sessions(&self, transport: &TransportHandle) {
+        let _lifecycle = self.lifecycle.lock();
+        let stale: Vec<_> = self
+            .sessions
+            .iter()
+            .filter_map(|entry| {
+                let session = entry.value();
+                (transport.peer_addr(session.initiator_peer_id).is_none()
+                    || transport.peer_addr(session.target_peer_id).is_none())
+                .then(|| (entry.key().clone(), session.clone()))
+            })
+            .collect();
+        for (token, session) in stale {
+            if self.sessions.remove(&token).is_some() {
+                self.untrack_session(&session, &token);
+            }
+        }
+        // Defensive repair for orphaned offload entries left by older lifecycle paths.
+        self.offloaded_pairs.retain(|pair, _| {
+            let initiator = (pair >> 32) as PeerId;
+            let target = *pair as PeerId;
+            transport.peer_addr(initiator).is_some() && transport.peer_addr(target).is_some()
+        });
     }
 
     async fn handle_link_up(
@@ -295,6 +349,8 @@ impl P2pBroker {
             endpoint_b_external: None,
             initiator_link_up: false,
             target_link_up: false,
+            introduction_window_started: Instant::now(),
+            introduction_sends_in_window: 0,
         };
         if !self.claim_session(&message.session_token, session, &is_authenticated) {
             // Tokens identify one live pair. Claim atomically so simultaneous
@@ -486,6 +542,8 @@ impl P2pBroker {
         if let Some(mut sessions) = self.peer_sessions.get_mut(&peer) {
             sessions.remove(token);
         }
+        self.peer_sessions
+            .remove_if(&peer, |_, sessions| sessions.is_empty());
     }
 
     async fn send_sub(
@@ -549,6 +607,28 @@ fn preview(token: &str) -> &str {
     token.get(..8).unwrap_or(token)
 }
 
+fn same_endpoint(a: SocketAddr, b: SocketAddr) -> bool {
+    fn normalized(addr: SocketAddr) -> (std::net::IpAddr, u16) {
+        match addr {
+            SocketAddr::V6(v6) => v6
+                .ip()
+                .to_ipv4_mapped()
+                .map(|ip| (ip.into(), v6.port()))
+                .unwrap_or(((*v6.ip()).into(), v6.port())),
+            SocketAddr::V4(v4) => ((*v4.ip()).into(), v4.port()),
+        }
+    }
+    normalized(a) == normalized(b)
+}
+
+fn prediction_count(a_external: SocketAddr, b_external: SocketAddr) -> u8 {
+    if a_external.ip() == b_external.ip() {
+        0
+    } else {
+        32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,16 +638,32 @@ mod tests {
 
     #[tokio::test]
     async fn introduction_retries_require_two_distinct_endpoints_and_can_resend() {
-        let (transport, _events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
-        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (a, a_peer) = connected_signal_peer(&transport, &mut events).await;
+        let (b, b_peer) = connected_signal_peer(&transport, &mut events).await;
         let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let a_addr = a.local_addr().unwrap();
         let b_addr = b.local_addr().unwrap();
         let token = "retry-test";
-        let broker = ready_broker(token);
+        let broker = ready_broker_for(token, a_peer.peer_id(), b_peer.peer_id());
+        broker
+            .handle_nat_introduction_request(
+                &transport,
+                other.local_addr().unwrap(),
+                other.local_addr().unwrap(),
+                token.into(),
+            )
+            .await;
+        {
+            let session = broker.sessions.get(token).unwrap();
+            assert_eq!(
+                session.endpoint_a_external, None,
+                "spoofed endpoint claimed a slot"
+            );
+            assert_eq!(session.endpoint_b_external, None);
+        }
         for _ in 0..2 {
             broker
                 .handle_nat_introduction_request(&transport, a_addr, a_addr, token.into())
@@ -622,16 +718,15 @@ mod tests {
 
     #[tokio::test]
     async fn introduction_retry_preserves_port_prediction_after_unconfirmed_response() {
-        let (transport, _events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
-        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        // Receive on both loopback IPs while presenting a distinct observed IP to the broker.
-        let b = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let (a, a_peer) = connected_signal_peer(&transport, &mut events).await;
+        let (b, b_peer) = connected_signal_peer(&transport, &mut events).await;
         let a_addr = a.local_addr().unwrap();
-        let b_addr = SocketAddr::from(([127, 0, 0, 2], b.local_addr().unwrap().port()));
+        let b_addr = b.local_addr().unwrap();
         let token = "prediction-retry-test";
-        let broker = ready_broker(token);
+        let broker = ready_broker_for(token, a_peer.peer_id(), b_peer.peer_id());
         broker
             .handle_nat_introduction_request(&transport, a_addr, a_addr, token.into())
             .await;
@@ -639,8 +734,8 @@ mod tests {
             .handle_nat_introduction_request(&transport, b_addr, b_addr, token.into())
             .await;
         // Discard the first unacknowledged responses, as if lost before either client used them.
-        receive_introduction(&a, b_addr, token, 32).await;
-        receive_introduction(&b, a_addr, token, 32).await;
+        receive_introduction(&a, b_addr, token, 0).await;
+        receive_introduction(&b, a_addr, token, 0).await;
         assert_eq!(
             broker.sessions.get(token).unwrap().state,
             SessionState::Punched
@@ -651,9 +746,90 @@ mod tests {
             broker
                 .handle_nat_introduction_request(&transport, address, address, token.into())
                 .await;
-            receive_introduction(&a, b_addr, token, 32).await;
-            receive_introduction(&b, a_addr, token, 32).await;
+            receive_introduction(&a, b_addr, token, 0).await;
+            receive_introduction(&b, a_addr, token, 0).await;
         }
+        transport.shutdown();
+    }
+
+    #[test]
+    fn prediction_window_preserves_cross_nat_compatibility() {
+        let a: SocketAddr = "192.0.2.10:1000".parse().unwrap();
+        let b: SocketAddr = "198.51.100.20:2000".parse().unwrap();
+        assert_eq!(prediction_count(a, b), 32);
+        assert_eq!(prediction_count(a, "192.0.2.10:2000".parse().unwrap()), 0);
+        assert!(same_endpoint(
+            "127.0.0.1:9000".parse().unwrap(),
+            "[::ffff:127.0.0.1]:9000".parse().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn introduction_burst_is_bounded_per_pair_and_retry_window_reopens() {
+        let (transport, mut events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (a, a_peer) = connected_signal_peer(&transport, &mut events).await;
+        let (b, b_peer) = connected_signal_peer(&transport, &mut events).await;
+        let a_addr = a.local_addr().unwrap();
+        let b_addr = b.local_addr().unwrap();
+        let token = "burst-test";
+        let broker = ready_broker_for(token, a_peer.peer_id(), b_peer.peer_id());
+        broker
+            .handle_nat_introduction_request(&transport, a_addr, a_addr, token.into())
+            .await;
+        for _ in 0..INTRODUCTION_BURST + 3 {
+            broker
+                .handle_nat_introduction_request(&transport, b_addr, b_addr, token.into())
+                .await;
+        }
+        assert_eq!(
+            broker
+                .sessions
+                .get(token)
+                .unwrap()
+                .introduction_sends_in_window,
+            4
+        );
+        for _ in 0..INTRODUCTION_BURST {
+            receive_introduction(&a, b_addr, token, 0).await;
+            receive_introduction(&b, a_addr, token, 0).await;
+        }
+        let mut packet = [0; 512];
+        assert!(timeout(Duration::from_millis(40), a.recv_from(&mut packet))
+            .await
+            .is_err());
+
+        tokio::time::sleep(INTRODUCTION_WINDOW).await;
+        broker
+            .handle_nat_introduction_request(&transport, a_addr, a_addr, token.into())
+            .await;
+        receive_introduction(&a, b_addr, token, 0).await;
+        receive_introduction(&b, a_addr, token, 0).await;
+        transport.shutdown();
+    }
+
+    #[tokio::test]
+    async fn stale_transport_participants_release_session_and_offload_indexes() {
+        let (transport, _events) = TransportHandle::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let broker = P2pBroker::default();
+        let mut stale = session(40, 41);
+        stale.state = SessionState::Punched;
+        stale.initiator_link_up = true;
+        stale.target_link_up = true;
+        broker.sessions.insert("stale".into(), stale);
+        broker.track_peer_session(40, "stale");
+        broker.track_peer_session(41, "stale");
+        broker.offloaded_pairs.insert(pack_pair(40, 41), ());
+
+        broker.remove_stale_sessions(&transport);
+
+        assert!(!broker.sessions.contains_key("stale"));
+        assert!(!broker.peer_sessions.contains_key(&40));
+        assert!(!broker.peer_sessions.contains_key(&41));
+        assert!(!broker.is_offloaded(40, 41));
         transport.shutdown();
     }
 
@@ -975,7 +1151,15 @@ mod tests {
         transport: &TransportHandle,
         events: &mut tokio::sync::mpsc::Receiver<ServerEvent>,
     ) -> (UdpSocket, PeerSession) {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        connected_signal_peer_at(transport, events, "127.0.0.1:0".parse().unwrap()).await
+    }
+
+    async fn connected_signal_peer_at(
+        transport: &TransportHandle,
+        events: &mut tokio::sync::mpsc::Receiver<ServerEvent>,
+        bind: SocketAddr,
+    ) -> (UdpSocket, PeerSession) {
+        let socket = UdpSocket::bind(bind).await.unwrap();
         let mut request = NetWriter::new();
         request.put_u8(PacketProperty::ConnectRequest as u8);
         request.put_i32(basis_protocol::version::LITENETLIB_PROTOCOL_ID);
@@ -1058,6 +1242,8 @@ mod tests {
             endpoint_b_external: None,
             initiator_link_up: false,
             target_link_up: false,
+            introduction_window_started: Instant::now(),
+            introduction_sends_in_window: 0,
         }
     }
 
@@ -1074,13 +1260,13 @@ mod tests {
         writer.as_slice().to_vec()
     }
 
-    fn ready_broker(token: &str) -> P2pBroker {
+    fn ready_broker_for(token: &str, initiator: PeerId, target: PeerId) -> P2pBroker {
         let broker = P2pBroker::default();
         broker.sessions.insert(
             token.into(),
             P2pSession {
-                initiator_peer_id: 0,
-                target_peer_id: 1,
+                initiator_peer_id: initiator,
+                target_peer_id: target,
                 state: SessionState::ReadyForPunch,
                 endpoint_a_internal: None,
                 endpoint_a_external: None,
@@ -1088,6 +1274,8 @@ mod tests {
                 endpoint_b_external: None,
                 initiator_link_up: false,
                 target_link_up: false,
+                introduction_window_started: Instant::now(),
+                introduction_sends_in_window: 0,
             },
         );
         broker
@@ -1107,11 +1295,14 @@ mod tests {
         assert_eq!(packet[0], basis_transport::PacketProperty::NatMessage as u8);
         let mut reader = NetReader::new(&packet[9..len]);
         for _ in 0..2 {
-            assert_eq!(reader.get_u8().unwrap(), 0); // IPv4
-            let std::net::IpAddr::V4(other_ip) = other.ip() else {
-                panic!("expected IPv4 test endpoint");
+            let address_family = reader.get_u8().unwrap();
+            let expected_family = if other.is_ipv4() { 0 } else { 1 };
+            assert_eq!(address_family, expected_family);
+            let expected_ip = match other.ip() {
+                std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+                std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
             };
-            assert_eq!(reader.get_bytes(4).unwrap(), other_ip.octets());
+            assert_eq!(reader.get_bytes(expected_ip.len()).unwrap(), expected_ip);
             assert_eq!(reader.get_u16().unwrap(), other.port());
         }
         assert_eq!(reader.get_string().unwrap(), token);
