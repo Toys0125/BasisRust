@@ -4179,6 +4179,7 @@ async fn handle_message(
         }
         channels::P2P => {
             let peers = state.authenticated_peers.clone();
+            let transport = state.transport.clone();
             let direct_connect_allowed = state.config.read().nat_punch_enabled
                 && (!state.global_state.read().direct_connect_locked
                     || peer_has_permission(
@@ -4193,7 +4194,16 @@ async fn handle_message(
                     peer,
                     &payload,
                     direct_connect_allowed,
-                    move |id| peers.contains_key(&id),
+                    move |id| {
+                        // Metadata can outlive a closing connection while its
+                        // outstanding handlers drain; it alone is not admission.
+                        peers.get(&id).is_some_and(|peer| {
+                            peer.session.as_ref().is_some_and(|session| {
+                                transport.is_current_session(session)
+                                    && session.try_read_lease().is_some()
+                            })
+                        })
+                    },
                 )
                 .await;
         }
