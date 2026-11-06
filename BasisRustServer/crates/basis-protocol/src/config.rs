@@ -358,7 +358,7 @@ impl ServerConfig {
     pub const INITIAL_RESOURCES_FOLDER_NAME: &'static str = "initialresources";
     pub const DEFAULT_LIBRARY_FOLDER_NAME: &'static str = "defaultlibrary";
 
-    /// Reject unsafe authentication settings before opening the server socket.
+    /// Reject unsafe authentication settings at startup and during live edits.
     pub fn validate_auth(&self) -> Result<()> {
         if self.use_auth && self.password.trim().is_empty() {
             anyhow::bail!("authentication is enabled but Password is empty; set a non-empty Password or explicitly set UseAuth=false for a public server");
@@ -794,7 +794,11 @@ impl ServerConfig {
             .any(|field| field.eq_ignore_ascii_case(name)),
             "{name} requires a server restart; edit the server XML configuration and restart"
         );
-        self.set_field(name, value)
+        let mut proposed = self.clone();
+        proposed.set_field(name, value)?;
+        proposed.validate_auth()?;
+        *self = proposed;
+        Ok(())
     }
 
     pub fn set_field(&mut self, name: &str, value: &str) -> Result<()> {
@@ -871,7 +875,10 @@ mod tests {
 
     #[test]
     fn storage_initialization_fields_reject_live_edits_without_mutating_config() {
-        let mut config = super::ServerConfig::default();
+        let mut config = super::ServerConfig {
+            use_auth: false,
+            ..super::ServerConfig::default()
+        };
         let before = serde_json::to_value(&config).unwrap();
         for (field, value) in [
             ("StorageEnabled", "false"),
@@ -896,6 +903,43 @@ mod tests {
             config.storage_backend, "sql",
             "offline/startup edits remain supported"
         );
+    }
+
+    #[test]
+    fn live_auth_edits_reject_invalid_transitions_without_mutating_saved_settings() {
+        let mut config = ServerConfig {
+            use_auth: false,
+            ..ServerConfig::default()
+        };
+        for password in ["", " \t "] {
+            config.set_live_field("Password", password).unwrap();
+            let before = config.clone();
+            assert!(config.set_live_field("useauth", "true").is_err());
+            assert_eq!(config, before);
+        }
+
+        config
+            .set_live_field("Password", "live-test-password")
+            .unwrap();
+        config.set_live_field("UseAuth", "true").unwrap();
+        for password in ["", " \t "] {
+            let before = config.clone();
+            assert!(config.set_live_field("password", password).is_err());
+            assert_eq!(config, before);
+        }
+
+        let dir = std::env::temp_dir().join(format!("basis-live-auth-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.xml");
+        config.save(&path).unwrap();
+        let restored = ServerConfig::load_or_create(&path).unwrap();
+        restored.validate_auth().unwrap();
+        assert!(restored.use_auth);
+        assert_eq!(restored.password, "live-test-password");
+
+        config.set_live_field("UseAuth", "false").unwrap();
+        config.set_live_field("Password", "").unwrap();
+        config.validate_auth().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
