@@ -582,7 +582,7 @@ impl ServerState {
         config_path: &Path,
         registry: StorageBackendRegistry,
     ) -> Result<(Self, oneshot::Sender<()>)> {
-        config.validate_auth()?;
+        config.validate_startup()?;
         // RejoinOnly's captured population is session-only; a restart unlocks it.
         if config.basis_user_restriction_mode == BasisUserRestrictionMode::RejoinOnly {
             config.basis_user_restriction_mode = BasisUserRestrictionMode::Normal;
@@ -7396,6 +7396,29 @@ mod tests {
                 "invalid auth must not create configuration files"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn shared_startup_rejects_unsupported_api_before_files_or_socket() {
+        let path =
+            std::env::temp_dir().join(format!("basis-unsupported-api-{}", uuid::Uuid::new_v4()));
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = ServerConfig {
+            use_auth: false,
+            api_enabled: true,
+            has_file_support: true,
+            set_port: socket.local_addr().unwrap().port(),
+            override_auto_discovery_of_ipv: true,
+            ipv4_address: "127.0.0.1".into(),
+            ..ServerConfig::default()
+        };
+
+        let error = ServerState::start(config, &path)
+            .await
+            .err()
+            .expect("unsupported API must fail startup");
+        assert!(error.to_string().contains("ApiEnabled=true"), "{error:#}");
+        assert!(!path.exists(), "startup rejection must not create files");
     }
 
     #[test]
