@@ -344,6 +344,91 @@ fn admin_mode(payload: &[u8], mode: AdminRequestMode) -> bool {
 }
 
 #[tokio::test]
+async fn uuid_aliases_cannot_bypass_online_or_offline_moderation_protection() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let mut staff = Client::connect(&state, "alias-test-moderator").await;
+    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    let _target = Client::connect(&state, uuid).await;
+    let (target, session) = session_for_uuid(&state, uuid);
+    state
+        .permissions
+        .add_user_to_group("alias-test-moderator", "moderator");
+    state
+        .permissions
+        .add_user_node(uuid, basis_server_permissions::nodes::PROTECTION);
+    for alias in [
+        "550E8400-E29B-41D4-A716-446655440000",
+        "550E8400E29B41D4A716446655440000",
+    ] {
+        for mode in [
+            AdminRequestMode::Kick,
+            AdminRequestMode::Ban,
+            AdminRequestMode::IpAndBan,
+            AdminRequestMode::SetVoiceMute,
+            AdminRequestMode::SetTextMute,
+        ] {
+            staff
+                .admin(mode, |writer| {
+                    writer.put_string(alias).unwrap();
+                    if matches!(
+                        mode,
+                        AdminRequestMode::SetVoiceMute | AdminRequestMode::SetTextMute
+                    ) {
+                        writer.put_bool(true);
+                    } else {
+                        writer.put_string("alias protection regression").unwrap();
+                    }
+                })
+                .await;
+            let reply = staff
+                .receive(|channel, payload| {
+                    channel == channels::ADMIN && admin_mode(payload, AdminRequestMode::Message)
+                })
+                .await;
+            let mut reader = NetReader::new(&reply[1..]);
+            assert_eq!(
+                reader.get_string().unwrap(),
+                "Target is protected",
+                "{mode:?}: {alias}"
+            );
+            assert!(state.authenticated_peers.contains_key(&target));
+            assert!(state.transport.is_current_session(&session));
+            assert!(!state.moderation.is_uuid_banned(uuid));
+            assert_eq!(state.moderation.mute_state(uuid), (false, false));
+        }
+    }
+    // Offline permissions may themselves use a legacy compact spelling.
+    let offline = "a50e8400-e29b-41d4-a716-446655440000";
+    state.permissions.add_user_node(
+        "A50E8400E29B41D4A716446655440000",
+        basis_server_permissions::nodes::PROTECTION,
+    );
+    for mode in [
+        AdminRequestMode::SetVoiceMute,
+        AdminRequestMode::SetTextMute,
+    ] {
+        staff
+            .admin(mode, |writer| {
+                writer.put_string(offline).unwrap();
+                writer.put_bool(true);
+            })
+            .await;
+        let reply = staff
+            .receive(|channel, payload| {
+                channel == channels::ADMIN && admin_mode(payload, AdminRequestMode::Message)
+            })
+            .await;
+        assert_eq!(
+            NetReader::new(&reply[1..]).get_string().unwrap(),
+            "Target is protected"
+        );
+        assert_eq!(state.moderation.mute_state(offline), (false, false));
+    }
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
 async fn voice_continues_while_avatar_input_is_blocked() {
     let (state, shutdown, _) = super::tests::test_server(false).await;
     let mut sender = Client::connect(&state, "voice-sender").await;

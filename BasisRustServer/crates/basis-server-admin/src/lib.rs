@@ -5,9 +5,29 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::Write,
+    net::IpAddr,
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+/// Canonicalizes UUID identities while leaving non-UUID Basis identities untouched.
+pub fn normalize_identity(identity: &str) -> String {
+    uuid::Uuid::parse_str(identity)
+        .map(|uuid| uuid.hyphenated().to_string())
+        .unwrap_or_else(|_| identity.to_owned())
+}
+
+/// Canonicalizes textual IP identities, including IPv4-mapped IPv6 addresses.
+pub fn normalize_ip(ip: &str) -> String {
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.to_string(),
+        Ok(IpAddr::V6(ip)) => ip
+            .to_ipv4_mapped()
+            .map(|mapped| mapped.to_string())
+            .unwrap_or_else(|| ip.to_string()),
+        Err(_) => ip.to_owned(),
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ModerationLists {
@@ -44,6 +64,15 @@ pub struct BannedPlayer {
     pub has_banned_ip: bool,
     #[serde(default)]
     pub time_of_ban: String,
+}
+
+impl BannedPlayer {
+    fn same_restriction(&self, other: &Self) -> bool {
+        self.uuid == other.uuid
+            && (uuid::Uuid::parse_str(&self.uuid).is_err()
+                || (self.has_banned_ip == other.has_banned_ip
+                    && (!self.has_banned_ip || self.banned_ip == other.banned_ip)))
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,30 +127,54 @@ impl ModerationLists {
         };
         let mut state = self.state.write();
         let mut banned_players: Vec<BannedPlayer> = Vec::new();
-        for player in
+        for mut player in
             read_xml::<BannedPlayersXml>(&paths.banned_players, "ArrayOfBannedPlayer")?.players
         {
-            if let Some(existing) = banned_players.iter_mut().find(|p| p.uuid == player.uuid) {
+            player.uuid = normalize_identity(&player.uuid);
+            if player.has_banned_ip {
+                player.banned_ip = normalize_ip(&player.banned_ip);
+            }
+            // UUID aliases may carry separate IP bans. Preserve those records
+            // across normalization and subsequent save/reload cycles.
+            if let Some(existing) = banned_players
+                .iter_mut()
+                .find(|p| p.same_restriction(&player))
+            {
                 *existing = player;
             } else {
                 banned_players.push(player);
             }
         }
         let mut muted_players: Vec<MutedPlayer> = Vec::new();
-        for player in
+        for mut player in
             read_xml::<MutedPlayersXml>(&paths.muted_players, "ArrayOfMutedPlayer")?.players
         {
+            player.uuid = normalize_identity(&player.uuid);
             if player.uuid.is_empty() || !(player.voice_muted || player.text_muted) {
                 continue;
             }
             if let Some(existing) = muted_players.iter_mut().find(|p| p.uuid == player.uuid) {
-                *existing = player;
+                if uuid::Uuid::parse_str(&player.uuid).is_ok() {
+                    // Combining spellings must not clear either restriction.
+                    existing.voice_muted |= player.voice_muted;
+                    existing.text_muted |= player.text_muted;
+                } else {
+                    *existing = player;
+                }
             } else {
                 muted_players.push(player);
             }
         }
-        let whitelist = read_line_list_with_fallback(&paths.whitelist, "BasisWhiteList.txt")?;
-        let blacklist = read_line_list_with_fallback(&paths.blacklist, "BasisBlackList.txt")?;
+        let whitelist: Vec<String> =
+            read_line_list_with_fallback(&paths.whitelist, "BasisWhiteList.txt")?
+                .into_iter()
+                .map(|identity| normalize_identity(&identity))
+                .collect();
+        let blacklist: Vec<String> =
+            read_line_list_with_fallback(&paths.blacklist, "BasisBlackList.txt")?
+                .into_iter()
+                .map(|identity| normalize_identity(&identity))
+                .collect();
         // Canonical files become the write target even when migrating legacy names.
         if !paths.banned_players.exists() {
             write_xml(&paths.banned_players, &BannedPlayersXml::default())?;
@@ -145,6 +198,7 @@ impl ModerationLists {
     }
 
     pub fn is_uuid_banned(&self, uuid: &str) -> bool {
+        let uuid = normalize_identity(uuid);
         self.state
             .read()
             .banned_players
@@ -152,6 +206,7 @@ impl ModerationLists {
             .any(|p| p.uuid == uuid)
     }
     pub fn is_ip_banned(&self, ip: &str) -> bool {
+        let ip = normalize_ip(ip);
         self.state
             .read()
             .banned_players
@@ -159,12 +214,15 @@ impl ModerationLists {
             .any(|p| p.has_banned_ip && p.banned_ip == ip)
     }
     pub fn is_whitelisted(&self, uuid: &str) -> bool {
-        self.state.read().whitelist.iter().any(|p| p == uuid)
+        let uuid = normalize_identity(uuid);
+        self.state.read().whitelist.iter().any(|p| p == &uuid)
     }
     pub fn is_blacklisted(&self, uuid: &str) -> bool {
-        self.state.read().blacklist.iter().any(|p| p == uuid)
+        let uuid = normalize_identity(uuid);
+        self.state.read().blacklist.iter().any(|p| p == &uuid)
     }
     pub fn mute_state(&self, uuid: &str) -> (bool, bool) {
+        let uuid = normalize_identity(uuid);
         self.state
             .read()
             .muted_players
@@ -181,6 +239,7 @@ impl ModerationLists {
     }
     fn set_mute(&self, uuid: &str, voice: bool, muted: bool) -> Result<()> {
         anyhow::ensure!(!uuid.trim().is_empty(), "UUID invalid");
+        let uuid = normalize_identity(uuid);
         let mut state = self.state.write();
         let mut players = state.muted_players.clone();
         let index = players
@@ -188,7 +247,7 @@ impl ModerationLists {
             .position(|p| p.uuid == uuid)
             .unwrap_or_else(|| {
                 players.push(MutedPlayer {
-                    uuid: uuid.to_owned(),
+                    uuid: uuid.clone(),
                     time_of_mute: utc_timestamp_string(),
                     ..MutedPlayer::default()
                 });
@@ -228,6 +287,7 @@ impl ModerationLists {
         if uuid.trim().is_empty() {
             return Ok(false);
         }
+        let uuid = normalize_identity(&uuid);
         let mut state = self.state.write();
         let mut values = if whitelist {
             state.whitelist.clone()
@@ -272,11 +332,11 @@ impl ModerationLists {
         reason: impl Into<String>,
         banned_ip: Option<String>,
     ) -> Result<()> {
-        let uuid = uuid.into();
+        let uuid = normalize_identity(&uuid.into());
         if uuid.trim().is_empty() {
             return Ok(());
         }
-        let banned_ip = banned_ip.unwrap_or_default();
+        let banned_ip = banned_ip.map(|ip| normalize_ip(&ip)).unwrap_or_default();
         let player = BannedPlayer {
             uuid,
             has_banned_ip: !banned_ip.trim().is_empty(),
@@ -285,7 +345,7 @@ impl ModerationLists {
             time_of_ban: utc_timestamp_string(),
         };
         self.change_bans(|players| {
-            if let Some(existing) = players.iter_mut().find(|p| p.uuid == player.uuid) {
+            if let Some(existing) = players.iter_mut().find(|p| p.same_restriction(&player)) {
                 *existing = player;
             } else {
                 players.push(player);
@@ -295,6 +355,7 @@ impl ModerationLists {
         .map(|_| ())
     }
     pub fn remove_ban(&self, uuid: &str) -> Result<bool> {
+        let uuid = normalize_identity(uuid);
         self.change_bans(|players| {
             let before = players.len();
             players.retain(|p| p.uuid != uuid);
@@ -302,13 +363,14 @@ impl ModerationLists {
         })
     }
     pub fn add_ip_ban(&self, ip: impl Into<String>) -> Result<()> {
-        let ip = ip.into();
+        let ip = normalize_ip(&ip.into());
         if ip.trim().is_empty() {
             return Ok(());
         }
         self.add_ban_with_details(format!("ip-ban:{ip}"), "IP banned", Some(ip))
     }
     pub fn remove_ip_ban(&self, ip: &str) -> Result<bool> {
+        let ip = normalize_ip(ip);
         self.change_bans(|players| {
             let before = players.len();
             players.retain(|p| !(p.has_banned_ip && p.banned_ip == ip));
@@ -667,6 +729,151 @@ mod tests {
         assert!(!reloaded_again.is_uuid_banned("user-c"));
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn moderation_normalizes_uuid_and_ip_spellings_across_lookups_and_storage() {
+        let dir = unique_temp_dir();
+        let lists = ModerationLists::file_backed(&dir).unwrap();
+        let uuid = "550E8400E29B41D4A716446655440000";
+        lists
+            .add_ban_with_details(
+                uuid,
+                "legacy UUID spelling",
+                Some("::ffff:192.0.2.7".to_owned()),
+            )
+            .unwrap();
+        lists.add_ip_ban("2001:0DB8:0:0:0:0:0:1").unwrap();
+
+        assert!(lists.is_uuid_banned("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(lists.is_uuid_banned("550E8400-E29B-41D4-A716-446655440000"));
+        assert!(lists.is_ip_banned("192.0.2.7"));
+        assert!(lists.is_ip_banned("::ffff:c000:207"));
+        assert!(lists.is_ip_banned("2001:db8::1"));
+        assert!(!lists.is_uuid_banned("550e8400-e29b-41d4-a716-446655440001"));
+        assert!(!lists.is_ip_banned("not an address"));
+
+        let persisted = fs::read_to_string(dir.join("banned_players.xml")).unwrap();
+        assert!(persisted.contains("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(persisted.contains("192.0.2.7"));
+        assert!(persisted.contains("2001:db8::1"));
+        assert!(!persisted.contains("::ffff"));
+
+        let reloaded = ModerationLists::file_backed(&dir).unwrap();
+        assert!(reloaded.is_uuid_banned(uuid));
+        assert!(reloaded.is_ip_banned("::ffff:192.0.2.7"));
+        assert!(reloaded.is_ip_banned("2001:0DB8:0:0:0:0:0:1"));
+        reloaded
+            .remove_ban("550E8400-E29B-41D4-A716-446655440000")
+            .unwrap();
+        assert!(!ModerationLists::file_backed(&dir)
+            .unwrap()
+            .is_uuid_banned(uuid));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reload_normalizes_legacy_moderation_records_and_preserves_non_uuid_keys() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("banned_players.xml"),
+            r#"<ArrayOfBannedPlayer>
+<BannedPlayer><UUID>550E8400E29B41D4A716446655440000</UUID><BannedIp>::ffff:192.0.2.9</BannedIp><Reason>legacy</Reason><HasBannedIp>true</HasBannedIp></BannedPlayer>
+<BannedPlayer><UUID>custom-basis-identity</UUID><Reason>legacy custom</Reason></BannedPlayer>
+</ArrayOfBannedPlayer>"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("muted_players.xml"),
+            r#"<ArrayOfMutedPlayer><MutedPlayer><UUID>550E8400E29B41D4A716446655440000</UUID><VoiceMuted>true</VoiceMuted></MutedPlayer></ArrayOfMutedPlayer>"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("BasisAllowList.txt"),
+            "550E8400E29B41D4A716446655440000\ncustom-basis-identity\n",
+        )
+        .unwrap();
+        fs::write(dir.join("BasisBanList.txt"), "custom-basis-identity\n").unwrap();
+
+        let lists = ModerationLists::file_backed(&dir).unwrap();
+        assert!(lists.is_uuid_banned("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(lists.is_uuid_banned("custom-basis-identity"));
+        assert!(lists.is_ip_banned("192.0.2.9"));
+        assert_eq!(
+            lists.mute_state("550e8400-e29b-41d4-a716-446655440000"),
+            (true, false)
+        );
+        assert!(lists.is_whitelisted("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(lists.is_whitelisted("custom-basis-identity"));
+        assert!(lists.is_blacklisted("custom-basis-identity"));
+
+        lists.add_ban("another-user").unwrap();
+        let persisted = fs::read_to_string(dir.join("banned_players.xml")).unwrap();
+        assert!(persisted.contains("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(persisted.contains("custom-basis-identity"));
+        assert!(persisted.contains("192.0.2.9"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ip_normalization_canonicalizes_native_ipv6_and_leaves_invalid_text_exact() {
+        assert_eq!(normalize_ip("2001:0DB8:0:0:0:0:0:1"), "2001:db8::1");
+        assert_eq!(normalize_ip("192.0.2.1"), "192.0.2.1");
+        assert_eq!(normalize_ip("invalid IP"), "invalid IP");
+        assert_eq!(normalize_identity("not-a-uuid"), "not-a-uuid");
+        assert_eq!(
+            normalize_identity(" 550e8400-e29b-41d4-a716-446655440000 "),
+            " 550e8400-e29b-41d4-a716-446655440000 "
+        );
+    }
+
+    #[test]
+    fn reload_preserves_all_restrictions_when_uuid_aliases_collide() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        fs::write(dir.join("banned_players.xml"), r#"<ArrayOfBannedPlayer>
+<BannedPlayer><UUID>550E8400E29B41D4A716446655440000</UUID><BannedIp>::ffff:192.0.2.1</BannedIp><HasBannedIp>true</HasBannedIp></BannedPlayer>
+<BannedPlayer><UUID>550e8400-e29b-41d4-a716-446655440000</UUID><BannedIp>192.0.2.2</BannedIp><HasBannedIp>true</HasBannedIp></BannedPlayer>
+</ArrayOfBannedPlayer>"#).unwrap();
+        fs::write(dir.join("muted_players.xml"), r#"<ArrayOfMutedPlayer>
+<MutedPlayer><UUID>550E8400E29B41D4A716446655440000</UUID><VoiceMuted>true</VoiceMuted></MutedPlayer>
+<MutedPlayer><UUID>550e8400-e29b-41d4-a716-446655440000</UUID><TextMuted>true</TextMuted></MutedPlayer>
+</ArrayOfMutedPlayer>"#).unwrap();
+        let lists = ModerationLists::file_backed(&dir).unwrap();
+        assert!(lists.is_uuid_banned(uuid));
+        assert!(lists.is_ip_banned("192.0.2.1"));
+        assert!(lists.is_ip_banned("::ffff:192.0.2.2"));
+        assert_eq!(lists.mute_state(uuid), (true, true));
+        lists
+            .add_ban_with_details(
+                "550E8400E29B41D4A716446655440000",
+                "new IP",
+                Some("192.0.2.3".into()),
+            )
+            .unwrap();
+        assert!(lists.is_ip_banned("192.0.2.1"));
+        assert!(lists.is_ip_banned("192.0.2.2"));
+        assert!(lists.is_ip_banned("192.0.2.3"));
+        // Force both lists to save, then verify another reload retains them.
+        lists.add_ban("other").unwrap();
+        lists.set_voice_mute("other", true).unwrap();
+        let reloaded = ModerationLists::file_backed(&dir).unwrap();
+        assert!(reloaded.is_ip_banned("192.0.2.1"));
+        assert!(reloaded.is_ip_banned("192.0.2.2"));
+        assert!(reloaded.is_ip_banned("192.0.2.3"));
+        assert_eq!(reloaded.mute_state(uuid), (true, true));
+        reloaded.remove_ip_ban("192.0.2.1").unwrap();
+        assert!(reloaded.is_uuid_banned(uuid));
+        assert!(reloaded.is_ip_banned("192.0.2.2"));
+        reloaded
+            .remove_ban("550E8400E29B41D4A716446655440000")
+            .unwrap();
+        assert!(!reloaded.is_uuid_banned(uuid));
+        assert!(!reloaded.is_ip_banned("192.0.2.2"));
+        assert!(!reloaded.is_ip_banned("192.0.2.3"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
