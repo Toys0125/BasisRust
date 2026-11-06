@@ -722,7 +722,7 @@ impl ServerState {
             database,
             player_storage,
             resources: ResourceState::default(),
-            net_ids: NetIdState::default(),
+            net_ids: NetIdState::with_reserved_name(image_cache::IMAGE_MANAGER_IDENTIFIER),
             ownership: OwnershipState::default(),
             content_share: ContentShareState::default(),
             pip: PipState::default(),

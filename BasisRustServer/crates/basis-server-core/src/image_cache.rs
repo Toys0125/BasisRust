@@ -793,6 +793,12 @@ fn read_spawn_header(payload: &[u8]) -> Option<(i32, usize)> {
         return None;
     }
     offset += length;
+    let width = read_i32(payload, offset)?;
+    let height = read_i32(payload, offset.checked_add(4)?)?;
+    let total_bytes = read_i32(payload, offset.checked_add(8)?)?;
+    if width <= 0 || height <= 0 || total_bytes < 0 {
+        return None;
+    }
     offset = offset.checked_add(12)?;
     let total_chunks = read_i32(payload, offset)?;
     Some((total_chunks, offset.checked_add(4)?))

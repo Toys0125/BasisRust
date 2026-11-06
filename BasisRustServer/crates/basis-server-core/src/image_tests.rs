@@ -271,6 +271,35 @@ fn scene_envelope(index: u16, recipients: &[u16], data: &[u8]) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn image_manager_namespace_is_reserved_before_client_registration_and_after_reset() {
+    let state = server().await;
+    let index = state
+        .net_ids
+        .find(image_cache::IMAGE_MANAGER_IDENTIFIER)
+        .expect("the server must reserve the image manager before any client registers names");
+    assert_eq!(
+        state.net_ids.add_or_find_for_peer("ordinary-scene", 1, 1),
+        Some((index + 1, false))
+    );
+    // Clients can discover the shared manager, but never create or own its entry.
+    for peer in [1, 2] {
+        assert_eq!(
+            state
+                .net_ids
+                .add_or_find_for_peer(image_cache::IMAGE_MANAGER_IDENTIFIER, peer, 0),
+            Some((index, true))
+        );
+    }
+    state.net_ids.reset();
+    assert_eq!(state.net_ids.find("ordinary-scene"), None);
+    assert_eq!(
+        state.net_ids.find(image_cache::IMAGE_MANAGER_IDENTIFIER),
+        Some(index)
+    );
+    state.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn upload_exemption_requires_reserved_namespace_and_valid_image_framing() {
     let state = server().await;
     add_peer(&state, 1);
@@ -297,6 +326,14 @@ async fn upload_exemption_requires_reserved_namespace_and_valid_image_framing() 
         &state,
         &scene_envelope(image_index, &[], &valid_spawn)
     ));
+    for (offset, value) in [(20, -1_i32), (24, -1), (28, -1), (20, 0), (24, 0)] {
+        let mut invalid_spawn = valid_spawn.clone();
+        invalid_spawn[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        assert!(!is_image_scene_upload(
+            &state,
+            &scene_envelope(image_index, &[], &invalid_spawn)
+        ));
+    }
 
     let truncated_chunk = [
         vec![2],
