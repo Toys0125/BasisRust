@@ -209,6 +209,8 @@ const ORDERED_REORDER_ENTRY_OVERHEAD: usize = 128;
 const MAX_INCOMING_FRAGMENT_ASSEMBLIES: usize = 4;
 const MAX_INCOMING_FRAGMENT_BYTES_PER_PEER: usize = 128 * 1024;
 const MAX_INCOMING_FRAGMENT_PARTS: usize = 128;
+const MAX_RELIABLE_FRAGMENTED_MESSAGE_BYTES: usize =
+    MAX_INCOMING_FRAGMENT_PARTS * RELIABLE_FRAGMENT_PAYLOAD_SIZE;
 const MAX_ORDERED_DRAIN_PER_PEER_PER_PASS: usize = 256;
 const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 const SOCKET_TTL: u32 = 255;
@@ -637,6 +639,10 @@ struct PeerState {
 struct SessionReadGate {
     state: parking_lot::Mutex<SessionReadGateState>,
     drained: Notify,
+    ordered_cleanup_pending: AtomicBool,
+    ordered_callback_active: AtomicBool,
+    #[cfg(test)]
+    before_ordered_commit: parking_lot::Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 #[derive(Debug, Default)]
@@ -647,6 +653,27 @@ struct SessionReadGateState {
 }
 
 impl SessionReadGate {
+    fn with_open<T>(
+        &self,
+        is_current: impl FnOnce() -> bool,
+        action: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let gate = self.state.lock();
+        if gate.closed || !is_current() {
+            return None;
+        }
+        Some(action())
+    }
+
+    #[cfg(test)]
+    fn wait_before_ordered_commit(&self) {
+        let barrier = self.before_ordered_commit.lock().clone();
+        if let Some(barrier) = barrier {
+            barrier.wait();
+            barrier.wait();
+        }
+    }
+
     fn try_acquire(&self, peer: PeerId, state: &Arc<PeerState>) -> Option<PeerSessionReadLease> {
         let mut gate = self.state.lock();
         if gate.closed {
@@ -851,9 +878,125 @@ impl PeerState {
 
     fn clear_ordered_reorder(&self) {
         self.read_gate.close_admission();
-        self.remote_ordered_sequence.lock().clear();
-        *self.incoming_fragments.lock() = IncomingFragmentState::default();
-        self.ordered_reorder_active.store(false, Ordering::Release);
+        self.read_gate
+            .ordered_cleanup_pending
+            .store(true, Ordering::Release);
+        self.flush_ordered_reorder_cleanup();
+    }
+
+    fn flush_ordered_reorder_cleanup(&self) {
+        loop {
+            if !self
+                .read_gate
+                .ordered_cleanup_pending
+                .load(Ordering::Acquire)
+            {
+                return;
+            }
+            let Some(mut receive) = self.remote_ordered_sequence.try_lock() else {
+                // The ordered receive guard flushes this flag after dropping its cursor.
+                return;
+            };
+            if !self
+                .read_gate
+                .ordered_cleanup_pending
+                .swap(false, Ordering::AcqRel)
+            {
+                return;
+            }
+            receive.clear();
+            *self.incoming_fragments.lock() = IncomingFragmentState::default();
+            self.ordered_reorder_active.store(false, Ordering::Release);
+            drop(receive);
+            // A concurrent close can set the flag while the cursor is held. Loop once more
+            // so that a request cannot be stranded between the final check and unlock.
+        }
+    }
+}
+
+/// Owns the ordered receive cursor and services cleanup requested reentrantly by a callback
+/// after releasing the cursor. Cleanup never waits for a callback or spawns a background task.
+struct OrderedReceiveGuard<'a> {
+    peer: &'a PeerState,
+    receive: Option<parking_lot::MutexGuard<'a, HashMap<u8, OrderedReceiveState>>>,
+}
+
+impl<'a> OrderedReceiveGuard<'a> {
+    fn lock(peer: &'a PeerState) -> Self {
+        Self {
+            peer,
+            receive: Some(peer.remote_ordered_sequence.lock()),
+        }
+    }
+
+    fn route_realtime(
+        &mut self,
+        handle: &TransportHandle,
+        event: &ServerEvent,
+        expected: &'a Arc<PeerState>,
+    ) -> bool {
+        let ServerEvent::Message { peer, .. } = event else {
+            return false;
+        };
+        if *peer != expected.id
+            || expected.read_gate.is_closed()
+            || !handle.is_current_peer_state(*peer, expected)
+        {
+            return false;
+        }
+        let Some(handler) = handle.realtime_handler.read().clone() else {
+            return false;
+        };
+
+        expected
+            .read_gate
+            .ordered_callback_active
+            .store(true, Ordering::Release);
+        let callback_guard = OrderedCallbackGuard(&expected.read_gate.ordered_callback_active);
+        drop(self.receive.take());
+        let consumed = handler(
+            event,
+            PeerSession {
+                peer: *peer,
+                state: expected.clone(),
+            },
+        );
+        self.receive = Some(expected.remote_ordered_sequence.lock());
+        drop(callback_guard);
+        consumed
+    }
+}
+
+struct OrderedCallbackGuard<'a>(&'a AtomicBool);
+
+impl Drop for OrderedCallbackGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl std::ops::Deref for OrderedReceiveGuard<'_> {
+    type Target = HashMap<u8, OrderedReceiveState>;
+
+    fn deref(&self) -> &Self::Target {
+        self.receive
+            .as_deref()
+            .expect("ordered receive guard is held")
+    }
+}
+
+impl std::ops::DerefMut for OrderedReceiveGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.receive
+            .as_deref_mut()
+            .expect("ordered receive guard is held")
+    }
+}
+
+impl Drop for OrderedReceiveGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.receive.take());
+        self.peer.flush_ordered_reorder_cleanup();
     }
 }
 
@@ -944,6 +1087,24 @@ struct IncomingFragment {
     total: u16,
 }
 
+fn buffered_fragment_parts(
+    receive: &OrderedReceiveGuard<'_>,
+    channel_id: u8,
+    fragment: IncomingFragment,
+) -> Vec<bool> {
+    let mut present = vec![false; fragment.total as usize];
+    if let Some(state) = receive.get(&channel_id) {
+        for retained in state.future.values() {
+            if let Some(buffered) = retained.fragment {
+                if buffered.id == fragment.id && buffered.total == fragment.total {
+                    present[buffered.part as usize] = true;
+                }
+            }
+        }
+    }
+    present
+}
+
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct IncomingFragmentKey {
     channel_id: u8,
@@ -956,15 +1117,20 @@ struct IncomingFragmentAssembly {
     parts: Vec<Option<Bytes>>,
     received: usize,
     bytes: usize,
+    reserved_bytes: usize,
     fragment_size: Option<usize>,
     _metadata_budget: ReorderBudgetToken,
     _budgets: Vec<ReorderBudgetToken>,
+    completion_budgets: Vec<Option<ReorderBudgetToken>>,
 }
 
 #[derive(Debug, Default)]
 struct IncomingFragmentState {
     assemblies: HashMap<IncomingFragmentKey, IncomingFragmentAssembly>,
+    /// Actual fragment payload bytes retained so far.
     bytes: usize,
+    /// Per-assembly completion capacity reserved against the peer limit.
+    reserved_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -975,6 +1141,22 @@ enum FragmentInsertError {
 }
 
 impl IncomingFragmentState {
+    fn take_completion_budget(
+        &mut self,
+        channel_id: u8,
+        fragment: IncomingFragment,
+    ) -> Option<ReorderBudgetToken> {
+        self.assemblies
+            .get_mut(&IncomingFragmentKey {
+                channel_id,
+                id: fragment.id,
+            })?
+            .completion_budgets
+            .get_mut(fragment.part as usize)?
+            .take()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn insert(
         &mut self,
         channel_id: u8,
@@ -983,6 +1165,7 @@ impl IncomingFragmentState {
         budget: ReorderBudgetToken,
         reorder_budget: &Arc<ReorderBudget>,
         peer_usage: &Arc<PeerReorderUsage>,
+        already_buffered_parts: &[bool],
     ) -> std::result::Result<Option<(Bytes, Vec<ReorderBudgetToken>)>, FragmentInsertError> {
         if fragment.total < 2
             || fragment.total as usize > MAX_INCOMING_FRAGMENT_PARTS
@@ -994,19 +1177,41 @@ impl IncomingFragmentState {
         {
             return Err(FragmentInsertError::Invalid(payload, budget));
         }
-        if self
-            .bytes
-            .checked_add(payload.len())
-            .is_none_or(|n| n > MAX_INCOMING_FRAGMENT_BYTES_PER_PEER)
-        {
-            return Err(FragmentInsertError::Limit(payload, budget));
-        }
         let key = IncomingFragmentKey {
             channel_id,
             id: fragment.id,
         };
+        let index = fragment.part as usize;
         if !self.assemblies.contains_key(&key) {
             if self.assemblies.len() >= MAX_INCOMING_FRAGMENT_ASSEMBLIES {
+                return Err(FragmentInsertError::Limit(payload, budget));
+            }
+            let final_part = fragment.part + 1 == fragment.total;
+            let minimum_message_bytes = if final_part {
+                1
+            } else {
+                (fragment.total as usize - 1)
+                    .saturating_mul(payload.len())
+                    .saturating_add(1)
+            };
+            if minimum_message_bytes > MAX_INCOMING_FRAGMENT_BYTES_PER_PEER {
+                return Err(FragmentInsertError::Invalid(payload, budget));
+            }
+            // A non-final part determines the full part size, so reserve the entire
+            // assembly up front. If the final part arrives first, temporarily reserve the
+            // peer budget until a non-final part reveals the actual chunk size.
+            let reserved_bytes = if final_part {
+                MAX_INCOMING_FRAGMENT_BYTES_PER_PEER
+            } else {
+                (fragment.total as usize)
+                    .saturating_mul(payload.len())
+                    .min(MAX_INCOMING_FRAGMENT_BYTES_PER_PEER)
+            };
+            if self
+                .reserved_bytes
+                .checked_add(reserved_bytes)
+                .is_none_or(|n| n > MAX_INCOMING_FRAGMENT_BYTES_PER_PEER)
+            {
                 return Err(FragmentInsertError::Limit(payload, budget));
             }
             let metadata_bytes =
@@ -1015,6 +1220,31 @@ impl IncomingFragmentState {
             else {
                 return Err(FragmentInsertError::Budget(payload, budget));
             };
+            let max_payload = LITENETLIB_MTU_STEPS[LITENETLIB_MTU_STEPS.len() - 1]
+                - LITENETLIB_FRAGMENTED_HEADER_SIZE;
+            let reserved_part_bytes = if final_part {
+                max_payload
+            } else {
+                payload.len()
+            };
+            let mut completion_budgets = std::iter::repeat_with(|| None)
+                .take(fragment.total as usize)
+                .collect::<Vec<_>>();
+            for (part_index, slot) in completion_budgets.iter_mut().enumerate() {
+                if part_index == index
+                    || already_buffered_parts
+                        .get(part_index)
+                        .copied()
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
+                let Some(reservation) = reorder_budget.try_reserve(peer_usage, reserved_part_bytes)
+                else {
+                    return Err(FragmentInsertError::Budget(payload, budget));
+                };
+                *slot = Some(reservation);
+            }
             self.assemblies.insert(
                 key.clone(),
                 IncomingFragmentAssembly {
@@ -1022,17 +1252,19 @@ impl IncomingFragmentState {
                     parts: vec![None; fragment.total as usize],
                     received: 0,
                     bytes: 0,
+                    reserved_bytes,
                     fragment_size: None,
                     _metadata_budget: metadata_budget,
                     _budgets: Vec::new(),
+                    completion_budgets,
                 },
             );
+            self.reserved_bytes += reserved_bytes;
         }
         let assembly = self.assemblies.get_mut(&key).unwrap();
         if assembly.total != fragment.total {
             return Err(FragmentInsertError::Invalid(payload, budget));
         }
-        let index = fragment.part as usize;
         if let Some(existing) = &assembly.parts[index] {
             if existing != &payload {
                 return Err(FragmentInsertError::Invalid(payload, budget));
@@ -1056,7 +1288,23 @@ impl IncomingFragmentState {
                 {
                     return Err(FragmentInsertError::Invalid(payload, budget));
                 }
+                let minimum_message_bytes = (assembly.total as usize - 1)
+                    .saturating_mul(payload.len())
+                    .saturating_add(1);
+                if minimum_message_bytes > MAX_INCOMING_FRAGMENT_BYTES_PER_PEER {
+                    return Err(FragmentInsertError::Invalid(payload, budget));
+                }
+                let reserved_bytes = (assembly.total as usize)
+                    .saturating_mul(payload.len())
+                    .min(MAX_INCOMING_FRAGMENT_BYTES_PER_PEER);
+                // A final-part-first assembly reserved the whole peer budget. Once the
+                // chunk size is known, release any excess for other channel assemblies.
+                self.reserved_bytes -= assembly.reserved_bytes - reserved_bytes;
+                assembly.reserved_bytes = reserved_bytes;
                 assembly.fragment_size = Some(payload.len());
+                for reservation in assembly.completion_budgets.iter_mut().flatten() {
+                    reservation.shrink_to_payload_bytes(payload.len());
+                }
             }
         } else if assembly
             .fragment_size
@@ -1064,16 +1312,30 @@ impl IncomingFragmentState {
         {
             return Err(FragmentInsertError::Invalid(payload, budget));
         }
+        if assembly
+            .bytes
+            .checked_add(payload.len())
+            .is_none_or(|n| n > MAX_INCOMING_FRAGMENT_BYTES_PER_PEER)
+        {
+            return Err(FragmentInsertError::Invalid(payload, budget));
+        }
         assembly.bytes += payload.len();
         self.bytes += payload.len();
         assembly.received += 1;
         assembly.parts[index] = Some(payload);
-        assembly._budgets.push(budget);
+        if let Some(mut reservation) = assembly.completion_budgets[index].take() {
+            drop(budget);
+            reservation.shrink_to_payload_bytes(assembly.parts[index].as_ref().unwrap().len());
+            assembly._budgets.push(reservation);
+        } else {
+            assembly._budgets.push(budget);
+        }
         if assembly.received != assembly.total as usize {
             return Ok(None);
         }
         let assembly = self.assemblies.remove(&key).unwrap();
         self.bytes -= assembly.bytes;
+        self.reserved_bytes -= assembly.reserved_bytes;
         let mut joined = Vec::with_capacity(assembly.bytes);
         for part in &assembly.parts {
             joined.extend_from_slice(part.as_ref().unwrap());
@@ -1201,6 +1463,24 @@ impl ReorderBudget {
             max_packets_per_peer: self.limits.peer_packets,
             max_bytes_per_peer: self.limits.peer_bytes,
         }
+    }
+}
+
+impl ReorderBudgetToken {
+    fn shrink_to_payload_bytes(&mut self, payload_bytes: usize) {
+        let Some(target_bytes) = payload_bytes.checked_add(ORDERED_REORDER_ENTRY_OVERHEAD) else {
+            return;
+        };
+        if target_bytes >= self.charged_bytes {
+            return;
+        }
+        let released = self.charged_bytes - target_bytes;
+        let mut usage = self.budget.usage.lock();
+        usage.retained_bytes -= released;
+        self.peer
+            .retained_bytes
+            .fetch_sub(released, Ordering::Relaxed);
+        self.charged_bytes = target_bytes;
     }
 }
 
@@ -2745,8 +3025,8 @@ fn dequeue_reliable_window(
 #[cold]
 fn cold_drop_oversized_reliable(total_fragments: usize) {
     warn!(
-        "dropping reliable payload requiring {total_fragments} fragments; LiteNetLib limit is {}",
-        u16::MAX
+        "dropping reliable payload requiring {total_fragments} fragments; transport limit is {}",
+        MAX_INCOMING_FRAGMENT_PARTS
     );
 }
 
@@ -2775,7 +3055,9 @@ fn enqueue_reliable_payload(
     }
 
     let total_fragments = payload.len().div_ceil(RELIABLE_FRAGMENT_PAYLOAD_SIZE);
-    if total_fragments > u16::MAX as usize {
+    if payload.len() > MAX_RELIABLE_FRAGMENTED_MESSAGE_BYTES
+        || total_fragments > MAX_INCOMING_FRAGMENT_PARTS
+    {
         cold_drop_oversized_reliable(total_fragments);
         return;
     }
@@ -3793,40 +4075,66 @@ fn admit_reliable_ordered(
     event: ServerEvent,
     fragment: Option<IncomingFragment>,
 ) -> Result<()> {
-    if !handle.is_current_peer_state(peer_id, peer) {
+    if peer
+        .read_gate
+        .ordered_callback_active
+        .load(Ordering::Acquire)
+        || !handle.is_current_peer_state(peer_id, peer)
+    {
         return Ok(());
     }
-    let mut receive = peer.remote_ordered_sequence.lock();
-    if peer.read_gate.is_closed() || !handle.is_current_peer_state(peer_id, peer) {
+    let mut receive = OrderedReceiveGuard::lock(peer);
+    if peer
+        .read_gate
+        .ordered_callback_active
+        .load(Ordering::Acquire)
+        || peer.read_gate.is_closed()
+        || !handle.is_current_peer_state(peer_id, peer)
+    {
         return Ok(());
     }
-    let state = receive.entry(channel_id).or_default();
-    if state.is_committed(sequence) || state.future.contains_key(&sequence) {
-        queue_ack(peer, channel_id, sequence);
-        #[cfg(test)]
-        handle
-            .test_ordered_duplicate_count
-            .fetch_add(1, Ordering::Relaxed);
-        if handle.extended_statistics_enabled() {
+    let distance = {
+        let state = receive.entry(channel_id).or_default();
+        if state.is_committed(sequence) || state.future.contains_key(&sequence) {
+            let acked = peer
+                .read_gate
+                .with_open(
+                    || handle.is_current_peer_state(peer_id, peer),
+                    || queue_ack(peer, channel_id, sequence),
+                )
+                .is_some();
+            if !acked {
+                return Ok(());
+            }
+            #[cfg(test)]
             handle
-                .stats
-                .ordered_reorder_duplicates
+                .test_ordered_duplicate_count
                 .fetch_add(1, Ordering::Relaxed);
+            if handle.extended_statistics_enabled() {
+                handle
+                    .stats
+                    .ordered_reorder_duplicates
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            // Only committed history may be re-ACKed. An initial wrapped value of
+            // MAX_SEQUENCE - 1 is not a duplicate of the initial expected 0.
+            return Ok(());
         }
-        // Only values in committed history may be re-ACKed. In particular, an initial
-        // wrapped value of MAX_SEQUENCE - 1 is not a duplicate of the initial expected 0.
-        return Ok(());
-    }
-
-    let distance = relative_sequence(sequence, state.expected);
+        relative_sequence(sequence, state.expected)
+    };
     if distance == 0 {
         if let Some(fragment) = fragment {
             let ServerEvent::Message { payload, .. } = event else {
                 return Ok(());
             };
-            let Some(budget) = handle
-                .reorder_budget
-                .try_reserve(&peer.reorder_usage, payload.len())
+            let mut incoming = peer.incoming_fragments.lock();
+            let Some(budget) = incoming
+                .take_completion_budget(channel_id, fragment)
+                .or_else(|| {
+                    handle
+                        .reorder_budget
+                        .try_reserve(&peer.reorder_usage, payload.len())
+                })
             else {
                 if handle.extended_statistics_enabled() {
                     handle
@@ -3836,62 +4144,130 @@ fn admit_reliable_ordered(
                 }
                 return Ok(());
             };
-            let inserted = peer.incoming_fragments.lock().insert(
+            let buffered_parts = buffered_fragment_parts(&receive, channel_id, fragment);
+            let inserted = incoming.insert(
                 channel_id,
                 fragment,
                 payload,
                 budget,
                 &handle.reorder_budget,
                 &peer.reorder_usage,
+                &buffered_parts,
             );
+            drop(incoming);
             match inserted {
                 Err(FragmentInsertError::Invalid(_, _)) => {
                     return Err(TransportError::InvalidFragment(peer_id));
                 }
                 Err(FragmentInsertError::Limit(_, _)) => {
-                    return Err(TransportError::InvalidFragment(peer_id));
+                    // Capacity can become available when another assembly completes. Leave
+                    // this sequence uncommitted and unACKed so LiteNetLib retransmits it.
+                    return Ok(());
                 }
                 Err(FragmentInsertError::Budget(_, _)) => return Ok(()),
                 Ok(None) => {
-                    state.commit(sequence);
-                    queue_ack(peer, channel_id, sequence);
+                    let state = receive.entry(channel_id).or_default();
+                    if peer
+                        .read_gate
+                        .with_open(
+                            || handle.is_current_peer_state(peer_id, peer),
+                            || {
+                                state.commit(sequence);
+                                queue_ack(peer, channel_id, sequence);
+                            },
+                        )
+                        .is_none()
+                    {
+                        return Ok(());
+                    }
                     drain_ordered_state(
                         handle,
                         tx,
                         peer_id,
                         peer,
                         channel_id,
-                        state,
+                        &mut receive,
                         MAX_ORDERED_DRAIN_PER_PEER_PER_PASS,
                     )?;
                 }
                 Ok(Some((payload, budgets))) => {
                     let event =
                         ordered_event_with_payload(peer_id, peer, channel_id, payload.clone());
-                    if deliver_ordered_event(
-                        handle, tx, peer_id, peer, channel_id, sequence, state, event,
-                    )? {
-                        queue_ack(peer, channel_id, sequence);
+                    let realtime_consumed = receive.route_realtime(handle, &event, peer);
+                    if peer.read_gate.is_closed() || !handle.is_current_peer_state(peer_id, peer) {
+                        return Ok(());
+                    }
+                    let state = receive.entry(channel_id).or_default();
+                    let delivery = deliver_ordered_event_with_realtime(
+                        handle,
+                        tx,
+                        peer_id,
+                        peer,
+                        channel_id,
+                        sequence,
+                        state,
+                        event,
+                        realtime_consumed,
+                    );
+                    let delivered = match delivery {
+                        Ok(delivered) => delivered,
+                        Err(TransportError::EventChannelClosed) => {
+                            if peer
+                                .read_gate
+                                .with_open(
+                                    || handle.is_current_peer_state(peer_id, peer),
+                                    || {
+                                        state.future.insert(
+                                            sequence,
+                                            RetainedOrderedMessage {
+                                                payload,
+                                                fragment: None,
+                                                _budgets: budgets,
+                                            },
+                                        );
+                                        peer.ordered_reorder_active.store(true, Ordering::Release);
+                                        queue_ack(peer, channel_id, sequence);
+                                    },
+                                )
+                                .is_some()
+                            {
+                                return Ok(());
+                            }
+                            return Ok(());
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    if delivered {
                         drain_ordered_state(
                             handle,
                             tx,
                             peer_id,
                             peer,
                             channel_id,
-                            state,
+                            &mut receive,
                             MAX_ORDERED_DRAIN_PER_PEER_PER_PASS,
                         )?;
-                    } else {
-                        state.future.insert(
-                            sequence,
-                            RetainedOrderedMessage {
-                                payload,
-                                fragment: None,
-                                _budgets: budgets,
+                    } else if peer
+                        .read_gate
+                        .with_open(
+                            || handle.is_current_peer_state(peer_id, peer),
+                            || {
+                                state.future.insert(
+                                    sequence,
+                                    RetainedOrderedMessage {
+                                        payload,
+                                        fragment: None,
+                                        _budgets: budgets,
+                                    },
+                                );
+                                peer.ordered_reorder_active.store(true, Ordering::Release);
+                                queue_ack(peer, channel_id, sequence);
                             },
-                        );
-                        peer.ordered_reorder_active.store(true, Ordering::Release);
-                        queue_ack(peer, channel_id, sequence);
+                        )
+                        .is_some()
+                    {
+                        // The completed fragment remains retained because normal event
+                        // admission is currently full.
                     }
                 }
             }
@@ -3900,10 +4276,23 @@ fn admit_reliable_ordered(
                 .store(has_buffered, Ordering::Release);
             return Ok(());
         }
-        // Keep the channel lock across callback and event admission so concurrent UDP workers
-        // cannot publish sequence N+1 before N.
-        if deliver_ordered_event(
-            handle, tx, peer_id, peer, channel_id, sequence, state, event,
+        // The guard temporarily releases the cursor around realtime callbacks. While the
+        // callback runs, ordered admission is gated so no later sequence can overtake it.
+        let realtime_consumed = receive.route_realtime(handle, &event, peer);
+        if peer.read_gate.is_closed() || !handle.is_current_peer_state(peer_id, peer) {
+            return Ok(());
+        }
+        let state = receive.entry(channel_id).or_default();
+        if deliver_ordered_event_with_realtime(
+            handle,
+            tx,
+            peer_id,
+            peer,
+            channel_id,
+            sequence,
+            state,
+            event,
+            realtime_consumed,
         )? {
             drain_ordered_state(
                 handle,
@@ -3911,7 +4300,7 @@ fn admit_reliable_ordered(
                 peer_id,
                 peer,
                 channel_id,
-                state,
+                &mut receive,
                 MAX_ORDERED_DRAIN_PER_PEER_PER_PASS,
             )?;
             let has_buffered = receive.values().any(|state| !state.future.is_empty());
@@ -3919,6 +4308,7 @@ fn admit_reliable_ordered(
                 .store(has_buffered, Ordering::Release);
         }
     } else if distance > 0 && distance as usize <= MAX_ORDERED_REORDER_AHEAD {
+        let state = receive.entry(channel_id).or_default();
         if state.future.len() >= MAX_ORDERED_REORDER_AHEAD {
             #[cfg(test)]
             handle
@@ -3951,16 +4341,27 @@ fn admit_reliable_ordered(
             }
             return Ok(());
         };
-        state.future.insert(
-            sequence,
-            RetainedOrderedMessage {
-                payload,
-                fragment,
-                _budgets: vec![budget],
-            },
-        );
-        peer.ordered_reorder_active.store(true, Ordering::Release);
-        queue_ack(peer, channel_id, sequence);
+        if peer
+            .read_gate
+            .with_open(
+                || handle.is_current_peer_state(peer_id, peer),
+                || {
+                    state.future.insert(
+                        sequence,
+                        RetainedOrderedMessage {
+                            payload,
+                            fragment,
+                            _budgets: vec![budget],
+                        },
+                    );
+                    peer.ordered_reorder_active.store(true, Ordering::Release);
+                    queue_ack(peer, channel_id, sequence);
+                },
+            )
+            .is_none()
+        {
+            return Ok(());
+        }
         if handle.extended_statistics_enabled() {
             handle
                 .stats
@@ -3979,6 +4380,7 @@ fn admit_reliable_ordered(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn deliver_ordered_event(
     handle: &TransportHandle,
     tx: &mpsc::Sender<ServerEvent>,
@@ -3989,17 +4391,50 @@ fn deliver_ordered_event(
     state: &mut OrderedReceiveState,
     event: ServerEvent,
 ) -> Result<bool> {
+    let realtime_consumed = handle.route_realtime(&event, peer);
+    deliver_ordered_event_with_realtime(
+        handle,
+        tx,
+        peer_id,
+        peer,
+        channel_id,
+        sequence,
+        state,
+        event,
+        realtime_consumed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deliver_ordered_event_with_realtime(
+    handle: &TransportHandle,
+    tx: &mpsc::Sender<ServerEvent>,
+    peer_id: PeerId,
+    peer: &Arc<PeerState>,
+    channel_id: u8,
+    sequence: u16,
+    state: &mut OrderedReceiveState,
+    event: ServerEvent,
+    realtime_consumed: bool,
+) -> Result<bool> {
     let admission = handle.ordered_admission.read().clone();
     if let Some(queues) = admission {
-        // Realtime consumers take ownership without an application admission lease.
-        let consumed = handle.route_realtime(&event, peer);
         if peer.read_gate.is_closed() || !handle.is_current_peer_state(peer_id, peer) {
             return Ok(false);
         }
-        if consumed {
-            state.commit(sequence);
-            queue_ack(peer, channel_id, sequence);
-            return Ok(true);
+        if realtime_consumed {
+            #[cfg(test)]
+            peer.read_gate.wait_before_ordered_commit();
+            return Ok(peer
+                .read_gate
+                .with_open(
+                    || handle.is_current_peer_state(peer_id, peer),
+                    || {
+                        state.commit(sequence);
+                        queue_ack(peer, channel_id, sequence);
+                    },
+                )
+                .is_some());
         }
         let channel = match &event {
             ServerEvent::Message { channel, .. } => *channel,
@@ -4020,16 +4455,22 @@ fn deliver_ordered_event(
                 return Err(TransportError::EventChannelClosed)
             }
         };
-        if peer.read_gate.is_closed() || !handle.is_current_peer_state(peer_id, peer) {
-            return Ok(false);
-        }
-        state.commit(sequence);
-        queue_ack(peer, channel_id, sequence);
-        permit.send(OrderedEvent {
-            event,
-            admission: Some(lease),
-        });
-        return Ok(true);
+        #[cfg(test)]
+        peer.read_gate.wait_before_ordered_commit();
+        return Ok(peer
+            .read_gate
+            .with_open(
+                || handle.is_current_peer_state(peer_id, peer),
+                || {
+                    state.commit(sequence);
+                    queue_ack(peer, channel_id, sequence);
+                    permit.send(OrderedEvent {
+                        event,
+                        admission: Some(lease),
+                    });
+                },
+            )
+            .is_some());
     }
     let ordered_sender = handle.ordered_event_sender.read().clone();
     let tx = ordered_sender.as_ref().unwrap_or(tx);
@@ -4044,20 +4485,28 @@ fn deliver_ordered_event(
             return Err(TransportError::EventChannelClosed)
         }
     };
-    let consumed = handle.route_realtime(&event, peer);
     if peer.read_gate.is_closed() || !handle.is_current_peer_state(peer_id, peer) {
         return Ok(false);
     }
-    if permit.is_none() && !consumed {
+    if permit.is_none() && !realtime_consumed {
         // Full queue and no realtime owner: leave cursor and ACK bitmap unchanged.
         return Ok(false);
     }
-    state.commit(sequence);
-    queue_ack(peer, channel_id, sequence);
-    if let Some(permit) = permit.filter(|_| !consumed) {
-        permit.send(event);
-    }
-    Ok(true)
+    #[cfg(test)]
+    peer.read_gate.wait_before_ordered_commit();
+    Ok(peer
+        .read_gate
+        .with_open(
+            || handle.is_current_peer_state(peer_id, peer),
+            || {
+                state.commit(sequence);
+                queue_ack(peer, channel_id, sequence);
+                if let Some(permit) = permit.filter(|_| !realtime_consumed) {
+                    permit.send(event);
+                }
+            },
+        )
+        .is_some())
 }
 
 fn ordered_event_with_payload(
@@ -4078,25 +4527,30 @@ fn ordered_event_with_payload(
     }
 }
 
-fn drain_ordered_state(
+fn drain_ordered_state<'a>(
     handle: &TransportHandle,
     tx: &mpsc::Sender<ServerEvent>,
     peer_id: PeerId,
-    peer: &Arc<PeerState>,
+    peer: &'a Arc<PeerState>,
     channel_id: u8,
-    state: &mut OrderedReceiveState,
+    receive: &mut OrderedReceiveGuard<'a>,
     max_messages: usize,
 ) -> Result<usize> {
     let mut drained = 0;
     while drained < max_messages {
-        let sequence = state.expected;
-        let Some(retained) = state.future.remove(&sequence) else {
-            break;
+        let (sequence, retained) = {
+            let state = receive.entry(channel_id).or_default();
+            let sequence = state.expected;
+            let Some(retained) = state.future.remove(&sequence) else {
+                break;
+            };
+            (sequence, retained)
         };
         let (payload, budgets) = if let Some(fragment) = retained.fragment {
             let Some(budget) = retained._budgets.into_iter().next() else {
                 break;
             };
+            let buffered_parts = buffered_fragment_parts(receive, channel_id, fragment);
             match peer.incoming_fragments.lock().insert(
                 channel_id,
                 fragment,
@@ -4104,9 +4558,20 @@ fn drain_ordered_state(
                 budget,
                 &handle.reorder_budget,
                 &peer.reorder_usage,
+                &buffered_parts,
             ) {
                 Ok(None) => {
-                    state.commit(sequence);
+                    let state = receive.entry(channel_id).or_default();
+                    if peer
+                        .read_gate
+                        .with_open(
+                            || handle.is_current_peer_state(peer_id, peer),
+                            || state.commit(sequence),
+                        )
+                        .is_none()
+                    {
+                        break;
+                    }
                     drained += 1;
                     if handle.extended_statistics_enabled() {
                         handle
@@ -4118,7 +4583,7 @@ fn drain_ordered_state(
                 }
                 Ok(Some(assembled)) => assembled,
                 Err(FragmentInsertError::Limit(payload, budget)) => {
-                    state.future.insert(
+                    receive.entry(channel_id).or_default().future.insert(
                         sequence,
                         RetainedOrderedMessage {
                             payload,
@@ -4126,10 +4591,13 @@ fn drain_ordered_state(
                             _budgets: vec![budget],
                         },
                     );
-                    return Err(TransportError::InvalidFragment(peer_id));
+                    // Preserve the expected fragment until capacity is released; a later
+                    // dispatch pass can retry it without treating resource pressure as bad
+                    // protocol data.
+                    break;
                 }
                 Err(FragmentInsertError::Invalid(payload, budget)) => {
-                    state.future.insert(
+                    receive.entry(channel_id).or_default().future.insert(
                         sequence,
                         RetainedOrderedMessage {
                             payload,
@@ -4140,7 +4608,7 @@ fn drain_ordered_state(
                     return Err(TransportError::InvalidFragment(peer_id));
                 }
                 Err(FragmentInsertError::Budget(payload, budget)) => {
-                    state.future.insert(
+                    receive.entry(channel_id).or_default().future.insert(
                         sequence,
                         RetainedOrderedMessage {
                             payload,
@@ -4155,17 +4623,51 @@ fn drain_ordered_state(
             (retained.payload, retained._budgets)
         };
         let event = ordered_event_with_payload(peer_id, peer, channel_id, payload.clone());
-        if !deliver_ordered_event(
-            handle, tx, peer_id, peer, channel_id, sequence, state, event,
-        )? {
-            state.future.insert(
-                sequence,
-                RetainedOrderedMessage {
-                    payload,
-                    fragment: None,
-                    _budgets: budgets,
-                },
-            );
+        let realtime_consumed = receive.route_realtime(handle, &event, peer);
+        if peer.read_gate.is_closed() || !handle.is_current_peer_state(peer_id, peer) {
+            break;
+        }
+        let state = receive.entry(channel_id).or_default();
+        let delivery = deliver_ordered_event_with_realtime(
+            handle,
+            tx,
+            peer_id,
+            peer,
+            channel_id,
+            sequence,
+            state,
+            event,
+            realtime_consumed,
+        );
+        let delivered = match delivery {
+            Ok(delivered) => delivered,
+            Err(TransportError::EventChannelClosed) => {
+                if !peer.read_gate.is_closed() && handle.is_current_peer_state(peer_id, peer) {
+                    receive.entry(channel_id).or_default().future.insert(
+                        sequence,
+                        RetainedOrderedMessage {
+                            payload,
+                            fragment: None,
+                            _budgets: budgets,
+                        },
+                    );
+                    peer.ordered_reorder_active.store(true, Ordering::Release);
+                }
+                return Err(TransportError::EventChannelClosed);
+            }
+            Err(err) => return Err(err),
+        };
+        if !delivered {
+            if !peer.read_gate.is_closed() && handle.is_current_peer_state(peer_id, peer) {
+                state.future.insert(
+                    sequence,
+                    RetainedOrderedMessage {
+                        payload,
+                        fragment: None,
+                        _budgets: budgets,
+                    },
+                );
+            }
             break;
         }
         drop(budgets);
@@ -4187,19 +4689,44 @@ fn drain_ordered_peer(
     peer: &Arc<PeerState>,
     max_messages: usize,
 ) -> Result<usize> {
-    if !peer.ordered_reorder_active.load(Ordering::Acquire)
+    if peer
+        .read_gate
+        .ordered_callback_active
+        .load(Ordering::Acquire)
+        || !peer.ordered_reorder_active.load(Ordering::Acquire)
         || !handle.is_current_peer_state(peer_id, peer)
     {
         return Ok(0);
     }
-    let mut receive = peer.remote_ordered_sequence.lock();
+    let mut receive = OrderedReceiveGuard::lock(peer);
+    if peer
+        .read_gate
+        .ordered_callback_active
+        .load(Ordering::Acquire)
+        || peer.read_gate.is_closed()
+    {
+        return Ok(0);
+    }
     let mut remaining = max_messages;
     let mut drained = 0;
-    for (channel_id, state) in receive.iter_mut() {
+    let channels = receive.keys().copied().collect::<Vec<_>>();
+    for channel_id in channels {
         if remaining == 0 {
             break;
         }
-        let count = drain_ordered_state(handle, tx, peer_id, peer, *channel_id, state, remaining)?;
+        let count = match drain_ordered_state(
+            handle,
+            tx,
+            peer_id,
+            peer,
+            channel_id,
+            &mut receive,
+            remaining,
+        ) {
+            Ok(count) => count,
+            Err(TransportError::EventChannelClosed) => continue,
+            Err(err) => return Err(err),
+        };
         drained += count;
         remaining -= count;
     }
@@ -4243,6 +4770,14 @@ fn admit_reliable_unordered(
         return Ok(());
     }
     if let Some(fragment) = fragment {
+        // Fragment assemblies reserve their full completion capacity before ACK. Keep
+        // fragmented ReliableUnordered admission at the channel's contiguous receive edge:
+        // otherwise a later message can reserve scarce bytes first and pin an earlier
+        // unACKed packet at the sender's window base. The wire delivery mode stays unordered;
+        // this only delays fragment ACKs until prior channel sequences are admitted.
+        if distance != 0 {
+            return Ok(());
+        }
         // A full consumer queue leaves this datagram unACKed; the sender retries it.
         let permit = match tx.try_reserve() {
             Ok(permit) => permit,
@@ -4257,26 +4792,35 @@ fn admit_reliable_unordered(
         else {
             return Ok(());
         };
-        let Some(budget) = handle
-            .reorder_budget
-            .try_reserve(&peer.reorder_usage, payload.len())
+        let mut incoming = peer.incoming_fragments.lock();
+        let Some(budget) = incoming
+            .take_completion_budget(channel_id, fragment)
+            .or_else(|| {
+                handle
+                    .reorder_budget
+                    .try_reserve(&peer.reorder_usage, payload.len())
+            })
         else {
             return Ok(());
         };
-        let inserted = peer.incoming_fragments.lock().insert(
+        let inserted = incoming.insert(
             channel_id,
             fragment,
             payload,
             budget,
             &handle.reorder_budget,
             &peer.reorder_usage,
+            &[],
         );
+        drop(incoming);
         match inserted {
             Err(FragmentInsertError::Invalid(_, _)) => {
                 return Err(TransportError::InvalidFragment(peer_id));
             }
             Err(FragmentInsertError::Limit(_, _)) => {
-                return Err(TransportError::InvalidFragment(peer_id));
+                // Keep the receive cursor and ACK unchanged while current assemblies use
+                // the peer's bounded budget. The sender will retry after capacity frees.
+                return Ok(());
             }
             Err(FragmentInsertError::Budget(_, _)) => return Ok(()),
             Ok(None) => {
@@ -5247,12 +5791,8 @@ async fn reliable_dispatch_loop(handle: TransportHandle, tx: mpsc::Sender<Server
                 ) {
                     Ok(_) => {}
                     Err(TransportError::EventChannelClosed) => {
-                        // No consumer can receive already-ACKed buffered messages. Drop them
-                        // on receiver shutdown so retained global budget is released.
-                        peer_state.remote_ordered_sequence.lock().clear();
-                        peer_state
-                            .ordered_reorder_active
-                            .store(false, Ordering::Release);
+                        // Preserve this live session and its bounded ordered backlog. Closing
+                        // one route must not invalidate read leases and sends for other routes.
                     }
                     Err(TransportError::InvalidFragment(_)) => {
                         let session = PeerSession {
@@ -8185,6 +8725,7 @@ mod tests {
                 budget.try_reserve(&peer, 1200).unwrap(),
                 &budget,
                 &peer,
+                &[],
             )
             .unwrap();
         let error = state.insert(
@@ -8198,6 +8739,7 @@ mod tests {
             budget.try_reserve(&peer, 1014).unwrap(),
             &budget,
             &peer,
+            &[],
         );
         assert!(
             matches!(error, Err(FragmentInsertError::Invalid(_, _))),
@@ -8220,6 +8762,7 @@ mod tests {
                     budget.try_reserve(&peer, 1).unwrap(),
                     &budget,
                     &peer,
+                    &[],
                 )
                 .unwrap();
         }
@@ -8234,10 +8777,825 @@ mod tests {
             budget.try_reserve(&peer, 1).unwrap(),
             &budget,
             &peer,
+            &[],
         );
         assert!(matches!(fifth, Err(FragmentInsertError::Limit(_, _))));
         assert_eq!(bounded.assemblies.len(), MAX_INCOMING_FRAGMENT_ASSEMBLIES);
         assert!(budget.snapshot().retained_bytes < MAX_ORDERED_REORDER_BYTES_GLOBAL);
+    }
+
+    #[test]
+    fn reliable_fragment_sender_matches_receiver_message_bounds() {
+        let peer = test_peer_state(0);
+        enqueue_reliable_payload(
+            &peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            &vec![1; MAX_RELIABLE_FRAGMENTED_MESSAGE_BYTES],
+        );
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let outgoing = peer.outgoing_reliable.lock();
+        assert_eq!(outgoing[&channel_id].len(), MAX_INCOMING_FRAGMENT_PARTS);
+        assert!(outgoing[&channel_id]
+            .iter()
+            .all(|packet| packet.fragment.is_some()));
+        drop(outgoing);
+
+        peer.outgoing_reliable.lock().clear();
+        enqueue_reliable_payload(
+            &peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            &vec![1; MAX_RELIABLE_FRAGMENTED_MESSAGE_BYTES + 1],
+        );
+        assert!(peer.outgoing_reliable.lock()[&channel_id].is_empty());
+    }
+
+    #[tokio::test]
+    async fn ordered_realtime_handler_can_close_its_session_reentrantly() {
+        let (handle, tx, _events) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 4, 1)
+                .await
+                .unwrap();
+        handle.shutdown();
+        let peer = test_peer_state(0);
+        handle.peers.insert(peer.id, peer.clone());
+        handle.by_addr.insert(peer.addr, peer.id);
+        let callback_handle = handle.clone();
+        handle.set_realtime_handler(Some(Arc::new(move |_, session| {
+            assert!(session.state.remote_ordered_sequence.try_lock().is_some());
+            assert!(callback_handle.close_session_admission(&session));
+            true
+        })));
+
+        let event = ServerEvent::Message {
+            peer: peer.id,
+            session: PeerSession {
+                peer: peer.id,
+                state: peer.clone(),
+            },
+            channel: channels::CHAT,
+            delivery: DeliveryMethod::ReliableOrdered,
+            payload: Bytes::from_static(b"reentrant-close"),
+        };
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking({
+                let handle = handle.clone();
+                let tx = tx.clone();
+                let peer = peer.clone();
+                move || {
+                    admit_reliable_ordered(&handle, &tx, peer.id, &peer, channel_id, 0, event, None)
+                }
+            }),
+        )
+        .await
+        .expect("session cleanup from the ordered callback must not deadlock")
+        .expect("ordered callback task must finish")
+        .unwrap();
+        assert!(peer.read_gate.is_closed());
+    }
+
+    #[tokio::test]
+    async fn reentrant_session_close_releases_buffered_ordered_budget_after_cursor_unlock() {
+        let (mut handle, tx, _events) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 8, 1)
+                .await
+                .unwrap();
+        handle.shutdown();
+        handle.reorder_budget = Arc::new(ReorderBudget {
+            usage: parking_lot::Mutex::new(ReorderBudgetUsage::default()),
+            limits: ReorderBudgetLimits {
+                packets: 1,
+                bytes: 1_024,
+                peer_packets: 1,
+                peer_bytes: 1_024,
+            },
+        });
+        let old_peer = test_peer_state(0);
+        handle.peers.insert(old_peer.id, old_peer.clone());
+        handle.by_addr.insert(old_peer.addr, old_peer.id);
+
+        let callback_handle = handle.clone();
+        handle.set_realtime_handler(Some(Arc::new(move |_, session| {
+            assert!(callback_handle.close_session_admission(&session));
+            true
+        })));
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let first = build_outbound_packet(
+            &old_peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"first",
+        );
+        let second = build_outbound_packet(
+            &old_peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"buffered",
+        );
+        process_packet(&handle, &tx, old_peer.addr, &second.bytes)
+            .await
+            .unwrap();
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 1);
+        assert!(old_peer.remote_ordered_sequence.lock()[&channel_id]
+            .future
+            .contains_key(&1));
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            process_packet(&handle, &tx, old_peer.addr, &first.bytes),
+        )
+        .await
+        .expect("reentrant cleanup must not block receive")
+        .unwrap();
+        assert!(old_peer.read_gate.is_closed());
+        assert!(handle.peers.contains_key(&old_peer.id));
+        assert!(old_peer.remote_ordered_sequence.lock().is_empty());
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 0);
+        assert!(!ack_bit(
+            &old_peer.outgoing_acks.lock()[&channel_id].bits,
+            0
+        ));
+
+        // Retaining the closed PeerState must not retain its global budget reservation.
+        // A distinct peer can immediately consume the entire one-packet shared budget.
+        let new_addr = loopback_addr(4297);
+        let mut new_peer = test_peer_state(1);
+        Arc::get_mut(&mut new_peer).unwrap().addr = new_addr;
+        handle.peers.insert(new_peer.id, new_peer.clone());
+        handle.by_addr.insert(new_addr, new_peer.id);
+        let _ = build_outbound_packet(
+            &new_peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"new-first",
+        );
+        let new_second = build_outbound_packet(
+            &new_peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"new-buffered",
+        );
+        process_packet(&handle, &tx, new_addr, &new_second.bytes)
+            .await
+            .unwrap();
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 1);
+        assert!(old_peer.remote_ordered_sequence.lock().is_empty());
+        assert_eq!(
+            old_peer
+                .reorder_usage
+                .retained_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+        handle.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_close_wins_before_final_ordered_commit_ack_and_event() {
+        let (mut handle, tx, mut events) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 8, 1)
+                .await
+                .unwrap();
+        handle.shutdown();
+        handle.reorder_budget = Arc::new(ReorderBudget {
+            usage: parking_lot::Mutex::new(ReorderBudgetUsage::default()),
+            limits: ReorderBudgetLimits {
+                packets: 1,
+                bytes: 1_024,
+                peer_packets: 1,
+                peer_bytes: 1_024,
+            },
+        });
+        let old_peer = test_peer_state(0);
+        handle.peers.insert(old_peer.id, old_peer.clone());
+        handle.by_addr.insert(old_peer.addr, old_peer.id);
+        handle.set_realtime_handler(Some(Arc::new(|_, session| {
+            assert!(session.state.remote_ordered_sequence.try_lock().is_some());
+            false
+        })));
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let first = build_outbound_packet(
+            &old_peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"head",
+        );
+        let second = build_outbound_packet(
+            &old_peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"future",
+        );
+        process_packet(&handle, &tx, old_peer.addr, &second.bytes)
+            .await
+            .unwrap();
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 1);
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        *old_peer.read_gate.before_ordered_commit.lock() = Some(barrier.clone());
+        let worker_handle = handle.clone();
+        let worker_tx = tx.clone();
+        let worker_addr = old_peer.addr;
+        let first_packet = first.bytes;
+        let worker = tokio::spawn(async move {
+            process_packet(&worker_handle, &worker_tx, worker_addr, &first_packet).await
+        });
+
+        // The worker has passed the preliminary session check and callback, but has not yet
+        // entered the atomic final check/commit/ACK/event-admission section.
+        barrier.wait();
+        assert!(handle.close_session_admission(&handle.peer_session(old_peer.id).unwrap()));
+        barrier.wait();
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("receive must finish after close wins the final admission race")
+            .unwrap()
+            .unwrap();
+
+        assert!(handle.peers.contains_key(&old_peer.id));
+        assert!(old_peer.remote_ordered_sequence.lock().is_empty());
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 0);
+        assert_eq!(
+            old_peer
+                .reorder_usage
+                .retained_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(!ack_bit(
+            &old_peer.outgoing_acks.lock()[&channel_id].bits,
+            0
+        ));
+        assert!(events.try_recv().is_err());
+
+        let new_addr = loopback_addr(4297);
+        let mut new_peer = test_peer_state(1);
+        Arc::get_mut(&mut new_peer).unwrap().addr = new_addr;
+        handle.peers.insert(new_peer.id, new_peer.clone());
+        handle.by_addr.insert(new_addr, new_peer.id);
+        let _new_head = build_outbound_packet(
+            &new_peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"new-head",
+        );
+        let new_future = build_outbound_packet(
+            &new_peer,
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            b"new-future",
+        );
+        process_packet(&handle, &tx, new_addr, &new_future.bytes)
+            .await
+            .unwrap();
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 1);
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ordered_fragment_capacity_pressure_is_retryable() {
+        let (handle, tx, _events) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 4, 1)
+                .await
+                .unwrap();
+        handle.shutdown();
+        let peer = test_peer_state(0);
+        handle.peers.insert(peer.id, peer.clone());
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let budget = &handle.reorder_budget;
+        for id in 0..MAX_INCOMING_FRAGMENT_ASSEMBLIES as u16 {
+            peer.incoming_fragments
+                .lock()
+                .insert(
+                    channel_id,
+                    IncomingFragment {
+                        id,
+                        part: 0,
+                        total: 2,
+                    },
+                    Bytes::from_static(b"x"),
+                    budget.try_reserve(&peer.reorder_usage, 1).unwrap(),
+                    budget,
+                    &peer.reorder_usage,
+                    &[],
+                )
+                .unwrap();
+        }
+        let event = || ServerEvent::Message {
+            peer: peer.id,
+            session: PeerSession {
+                peer: peer.id,
+                state: peer.clone(),
+            },
+            channel: channels::CHAT,
+            delivery: DeliveryMethod::ReliableOrdered,
+            payload: Bytes::from_static(b"x"),
+        };
+        let fragment = Some(IncomingFragment {
+            id: 99,
+            part: 0,
+            total: 2,
+        });
+        admit_reliable_ordered(
+            &handle,
+            &tx,
+            peer.id,
+            &peer,
+            channel_id,
+            0,
+            event(),
+            fragment,
+        )
+        .unwrap();
+        assert_eq!(peer.remote_ordered_sequence.lock()[&channel_id].expected, 0);
+        assert!(!peer.outgoing_acks.lock().contains_key(&channel_id));
+
+        peer.incoming_fragments
+            .lock()
+            .insert(
+                channel_id,
+                IncomingFragment {
+                    id: 0,
+                    part: 1,
+                    total: 2,
+                },
+                Bytes::from_static(b"y"),
+                budget.try_reserve(&peer.reorder_usage, 1).unwrap(),
+                budget,
+                &peer.reorder_usage,
+                &[],
+            )
+            .unwrap();
+        admit_reliable_ordered(
+            &handle,
+            &tx,
+            peer.id,
+            &peer,
+            channel_id,
+            0,
+            event(),
+            fragment,
+        )
+        .unwrap();
+        assert_eq!(peer.remote_ordered_sequence.lock()[&channel_id].expected, 1);
+        assert!(peer.outgoing_acks.lock()[&channel_id].dirty);
+    }
+
+    #[tokio::test]
+    async fn ordered_fragment_reserves_completion_reorder_capacity_globally_and_per_peer() {
+        for global in [false, true] {
+            for constrain_bytes in [false, true] {
+                let (mut handle, tx, mut events) =
+                    TransportHandle::bind_with_options(loopback_addr(0), true, true, 16, 1)
+                        .await
+                        .unwrap();
+                handle.shutdown();
+                let payload_bytes = 10;
+                let retained_bytes = 3 * (payload_bytes + ORDERED_REORDER_ENTRY_OVERHEAD)
+                    + (std::mem::size_of::<Option<Bytes>>() * 3 + ORDERED_REORDER_ENTRY_OVERHEAD);
+                handle.reorder_budget = ReorderBudget::with_limits(ReorderBudgetLimits {
+                    packets: if global && !constrain_bytes { 4 } else { 64 },
+                    bytes: if global && constrain_bytes {
+                        retained_bytes
+                    } else {
+                        1_000_000
+                    },
+                    peer_packets: if !global && !constrain_bytes { 4 } else { 64 },
+                    peer_bytes: if !global && constrain_bytes {
+                        retained_bytes
+                    } else {
+                        1_000_000
+                    },
+                });
+                let peer = test_peer_state(0);
+                let other_addr = loopback_addr(4297);
+                let mut other = test_peer_state(1);
+                Arc::get_mut(&mut other).unwrap().addr = other_addr;
+                handle.peers.insert(peer.id, peer.clone());
+                handle.peers.insert(other.id, other.clone());
+                handle.by_addr.insert(peer.addr, peer.id);
+                handle.by_addr.insert(other_addr, other.id);
+
+                let assembling_channel =
+                    DeliveryMethod::channel_id(channels::SCENE, DeliveryMethod::ReliableOrdered);
+                let blocked_channel =
+                    DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+                let packet = |channel_id: u8,
+                              sequence: u16,
+                              id: u16,
+                              part: Option<(u16, u16)>,
+                              payload: &[u8]| {
+                    let mut bytes = vec![
+                        PacketProperty::Channeled as u8 | if part.is_some() { 0x80 } else { 0 },
+                    ];
+                    bytes.extend_from_slice(&sequence.to_le_bytes());
+                    bytes.push(channel_id);
+                    if let Some((part, total)) = part {
+                        bytes.extend_from_slice(&id.to_le_bytes());
+                        bytes.extend_from_slice(&part.to_le_bytes());
+                        bytes.extend_from_slice(&total.to_le_bytes());
+                    }
+                    bytes.extend_from_slice(payload);
+                    bytes
+                };
+                for part in 0..3u16 {
+                    let bytes = packet(
+                        assembling_channel,
+                        part,
+                        77,
+                        Some((part, 3)),
+                        &[part as u8; 10],
+                    );
+                    process_packet(&handle, &tx, peer.addr, &bytes)
+                        .await
+                        .unwrap();
+                    if part == 0 {
+                        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 4);
+                        assert_eq!(
+                            handle.reorder_budget_snapshot().retained_bytes,
+                            retained_bytes
+                        );
+                        let blocked_addr = if global { other_addr } else { peer.addr };
+                        let blocked = packet(blocked_channel, 1, 0, None, b"blocked");
+                        process_packet(&handle, &tx, blocked_addr, &blocked)
+                            .await
+                            .unwrap();
+                        let blocked_peer = if global { &other } else { &peer };
+                        assert!(!blocked_peer
+                            .outgoing_acks
+                            .lock()
+                            .get(&blocked_channel)
+                            .is_some_and(|ack| ack_bit(&ack.bits, 1)));
+                    }
+                }
+                assert_eq!(handle.reorder_budget_snapshot().retained_packets, 0);
+                assert!(matches!(
+                    events.recv().await,
+                    Some(ServerEvent::Message { .. })
+                ));
+
+                // The blocked channel resumes as soon as the completed message releases both
+                // packet and byte reservations, including the shared global case.
+                let blocked_addr = if global { other_addr } else { peer.addr };
+                for sequence in 0..=1 {
+                    let bytes = packet(blocked_channel, sequence, 0, None, b"recovered");
+                    process_packet(&handle, &tx, blocked_addr, &bytes)
+                        .await
+                        .unwrap();
+                }
+                assert!(matches!(
+                    events.recv().await,
+                    Some(ServerEvent::Message { .. })
+                ));
+                handle.shutdown();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unordered_fragment_reordering_cannot_pin_sender_window_before_earlier_message() {
+        let (handle, tx, mut events) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 8, 1)
+                .await
+                .unwrap();
+        handle.shutdown();
+        let peer = test_peer_state(0);
+        handle.peers.insert(peer.id, peer.clone());
+        handle.by_addr.insert(peer.addr, peer.id);
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableUnordered);
+        // Sender emits 100 contiguous parts for A, then 100 for B. If B's sequence 100
+        // arrives first and is ACKed, its reservation can reject A's sequence 0 while that
+        // hole pins sequence 128 behind the sender's 128-packet window.
+        let sender = test_peer_state(9);
+        enqueue_reliable_payload(
+            &sender,
+            channels::CHAT,
+            DeliveryMethod::ReliableUnordered,
+            &vec![0x11; 100 * RELIABLE_FRAGMENT_PAYLOAD_SIZE],
+        );
+        enqueue_reliable_payload(
+            &sender,
+            channels::CHAT,
+            DeliveryMethod::ReliableUnordered,
+            &vec![0x22; 100 * RELIABLE_FRAGMENT_PAYLOAD_SIZE],
+        );
+        let queued = sender
+            .outgoing_reliable
+            .lock()
+            .get_mut(&channel_id)
+            .unwrap()
+            .drain(..)
+            .collect::<Vec<_>>();
+        let packets = queued
+            .into_iter()
+            .map(|queued| build_queued_reliable_packet(&sender, channel_id, queued).bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(packets.len(), 200);
+
+        let b_first = &packets[100];
+        process_packet(&handle, &tx, peer.addr, b_first)
+            .await
+            .unwrap();
+        assert!(!peer
+            .outgoing_acks
+            .lock()
+            .get(&channel_id)
+            .is_some_and(|ack| ack_bit(&ack.bits, 100)));
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 0);
+        assert_eq!(reliable_window_capacity(128, Some(0)), 0);
+
+        for packet in &packets[..100] {
+            process_packet(&handle, &tx, peer.addr, packet)
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            events.recv().await,
+            Some(ServerEvent::Message { .. })
+        ));
+        for packet in &packets[100..] {
+            process_packet(&handle, &tx, peer.addr, packet)
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            events.recv().await,
+            Some(ServerEvent::Message { .. })
+        ));
+        assert!(ack_bit(&peer.outgoing_acks.lock()[&channel_id].bits, 0));
+        assert!(ack_bit(
+            &peer.outgoing_acks.lock()[&channel_id].bits,
+            199 % DEFAULT_WINDOW_SIZE
+        ));
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 0);
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn closed_ordered_receiver_preserves_live_session_and_other_routes() {
+        let (handle, tx, mut events) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 8, 1)
+                .await
+                .unwrap();
+        handle.shutdown();
+        let peer = test_peer_state(0);
+        handle.peers.insert(peer.id, peer.clone());
+        handle.by_addr.insert(peer.addr, peer.id);
+        let (ordered_tx, ordered_rx) = mpsc::channel(1);
+        *handle.ordered_event_sender.write() = Some(ordered_tx);
+
+        let ordered_channel =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let token = handle
+            .reorder_budget
+            .try_reserve(&peer.reorder_usage, 8)
+            .unwrap();
+        peer.remote_ordered_sequence.lock().insert(
+            ordered_channel,
+            OrderedReceiveState {
+                future: HashMap::from([(
+                    0,
+                    RetainedOrderedMessage {
+                        payload: Bytes::from_static(b"retained"),
+                        fragment: None,
+                        _budgets: vec![token],
+                    },
+                )]),
+                ..OrderedReceiveState::default()
+            },
+        );
+        peer.ordered_reorder_active.store(true, Ordering::Release);
+        drop(ordered_rx);
+
+        drain_ordered_peer(&handle, &tx, peer.id, &peer, 8)
+            .expect("closed ordered receiver is isolated to its route");
+        assert!(handle.is_current_peer_state(peer.id, &peer));
+        assert!(!peer.read_gate.is_closed());
+        assert!(peer.ordered_reorder_active.load(Ordering::Acquire));
+        assert!(peer.remote_ordered_sequence.lock()[&ordered_channel]
+            .future
+            .contains_key(&0));
+        assert_eq!(handle.reorder_budget_snapshot().retained_packets, 1);
+
+        // The session remains usable for a different delivery route, and closing one
+        // ordered event consumer does not emit a false peer disconnect.
+        let unordered_channel =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableUnordered);
+        let mut packet = vec![PacketProperty::Channeled as u8];
+        packet.extend_from_slice(&0u16.to_le_bytes());
+        packet.push(unordered_channel);
+        packet.extend_from_slice(b"other-route");
+        process_packet(&handle, &tx, peer.addr, &packet)
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(ServerEvent::Message { .. })
+        ));
+        assert!(handle.peer_session(peer.id).is_some());
+        assert!(!peer.read_gate.is_closed());
+        assert!(events.try_recv().is_err());
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn fragment_reservations_prevent_channel_stalls_and_allow_128_parts() {
+        let (handle, tx, mut events) =
+            TransportHandle::bind_with_options(loopback_addr(0), true, true, 256, 1)
+                .await
+                .unwrap();
+        handle.shutdown();
+        let peer = test_peer_state(0);
+        handle.peers.insert(peer.id, peer.clone());
+        handle.by_addr.insert(peer.addr, peer.id);
+
+        let scene_channel =
+            DeliveryMethod::channel_id(channels::SCENE, DeliveryMethod::ReliableOrdered);
+        let chat_channel =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let part_bytes = 1_014;
+        let scene_payload = vec![0x31; 66 * part_bytes];
+        let chat_payload = vec![0x72; 66 * part_bytes];
+
+        let send_part =
+            |channel_id: u8, fragment_id: u16, part: usize, total: usize, body: &[u8]| {
+                let mut packet = Vec::with_capacity(LITENETLIB_FRAGMENTED_HEADER_SIZE + body.len());
+                packet.push(PacketProperty::Channeled as u8 | 0x80);
+                packet.extend_from_slice(&(part as u16).to_le_bytes());
+                packet.push(channel_id);
+                packet.extend_from_slice(&fragment_id.to_le_bytes());
+                packet.extend_from_slice(&(part as u16).to_le_bytes());
+                packet.extend_from_slice(&(total as u16).to_le_bytes());
+                packet.extend_from_slice(body);
+                packet
+            };
+        let receive_part = |channel_id: u8, fragment_id: u16, part: usize, body: &[u8]| {
+            let packet = send_part(channel_id, fragment_id, part, 66, body);
+            let handle = handle.clone();
+            let tx = tx.clone();
+            let remote_addr = peer.addr;
+            async move { process_packet(&handle, &tx, remote_addr, &packet).await }
+        };
+
+        // Reproduce the reported occupancy: retain 65 full-sized parts from one channel,
+        // then offer 64 from another. Its first part remains unACKed while the future parts
+        // are retained in the ordered window.
+        for part in 0..65 {
+            receive_part(
+                scene_channel,
+                11,
+                part,
+                &scene_payload[part * part_bytes..(part + 1) * part_bytes],
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            peer.incoming_fragments.lock().reserved_bytes,
+            66 * part_bytes
+        );
+        for part in 0..64 {
+            receive_part(
+                chat_channel,
+                22,
+                part,
+                &chat_payload[part * part_bytes..(part + 1) * part_bytes],
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(peer.incoming_fragments.lock().assemblies.len(), 1);
+        assert!(!ack_bit(&peer.outgoing_acks.lock()[&chat_channel].bits, 0));
+        assert!(ack_bit(&peer.outgoing_acks.lock()[&chat_channel].bits, 1));
+
+        // The admitted assembly has reserved enough capacity to finish. Once complete, its
+        // reservation is released and retransmitting the missing part unlocks the second.
+        receive_part(scene_channel, 11, 65, &scene_payload[65 * part_bytes..])
+            .await
+            .unwrap();
+        assert_eq!(peer.incoming_fragments.lock().reserved_bytes, 0);
+        assert!(matches!(
+            events.recv().await,
+            Some(ServerEvent::Message { payload, .. }) if payload.as_ref() == scene_payload
+        ));
+
+        receive_part(chat_channel, 22, 0, &chat_payload[..part_bytes])
+            .await
+            .unwrap();
+        for part in 64..66 {
+            receive_part(
+                chat_channel,
+                22,
+                part,
+                &chat_payload[part * part_bytes..(part + 1) * part_bytes],
+            )
+            .await
+            .unwrap();
+        }
+        assert!(matches!(
+            events.recv().await,
+            Some(ServerEvent::Message { payload, .. }) if payload.as_ref() == chat_payload
+        ));
+        assert_eq!(peer.incoming_fragments.lock().reserved_bytes, 0);
+
+        // Keep the normal sender/receiver maximum aligned: 128 initial-MTU fragments fit
+        // within the byte budget and reassemble through the same receive path.
+        let boundary_channel =
+            DeliveryMethod::channel_id(channels::AUTH_IDENTITY, DeliveryMethod::ReliableOrdered);
+        let boundary_payload = vec![0xA5; MAX_RELIABLE_FRAGMENTED_MESSAGE_BYTES];
+        for part in 0..MAX_INCOMING_FRAGMENT_PARTS {
+            let start = part * RELIABLE_FRAGMENT_PAYLOAD_SIZE;
+            let end = (start + RELIABLE_FRAGMENT_PAYLOAD_SIZE).min(boundary_payload.len());
+            let packet = send_part(
+                boundary_channel,
+                33,
+                part,
+                MAX_INCOMING_FRAGMENT_PARTS,
+                &boundary_payload[start..end],
+            );
+            // send_part encodes the same part sequence and metadata used by the wire.
+            process_packet(&handle, &tx, peer.addr, &packet)
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            events.recv().await,
+            Some(ServerEvent::Message { payload, .. }) if payload.as_ref() == boundary_payload
+        ));
+        assert!(peer.incoming_fragments.lock().assemblies.is_empty());
+        assert_eq!(peer.incoming_fragments.lock().reserved_bytes, 0);
+    }
+
+    #[test]
+    fn concurrent_fragment_starts_cannot_overbook_reservations_and_cleanup_releases_them() {
+        const WORKERS: usize = 8;
+        let peer = test_peer_state(0);
+        let reorder_budget = Arc::new(ReorderBudget::default());
+        let peer_usage = Arc::new(PeerReorderUsage::default());
+        let barrier = Arc::new(std::sync::Barrier::new(WORKERS));
+        let mut workers = Vec::new();
+        for worker in 0..WORKERS {
+            let peer = peer.clone();
+            let reorder_budget = reorder_budget.clone();
+            let peer_usage = peer_usage.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let channel_id = (worker as u8) * 4;
+                let payload = Bytes::from(vec![worker as u8; 1_014]);
+                let budget = reorder_budget
+                    .try_reserve(&peer_usage, payload.len())
+                    .unwrap();
+                barrier.wait();
+                peer.incoming_fragments.lock().insert(
+                    channel_id,
+                    IncomingFragment {
+                        id: worker as u16,
+                        part: 0,
+                        total: 66,
+                    },
+                    payload,
+                    budget,
+                    &reorder_budget,
+                    &peer_usage,
+                    &[],
+                )
+            }));
+        }
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Ok(None)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(FragmentInsertError::Limit(_, _))))
+                .count(),
+            WORKERS - 1
+        );
+        assert_eq!(peer.incoming_fragments.lock().assemblies.len(), 1);
+        assert_eq!(peer.incoming_fragments.lock().reserved_bytes, 66 * 1_014);
+
+        drop(results);
+        peer.clear_ordered_reorder();
+        assert!(peer.incoming_fragments.lock().assemblies.is_empty());
+        assert_eq!(peer.incoming_fragments.lock().reserved_bytes, 0);
+        assert_eq!(peer_usage.retained_bytes.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
