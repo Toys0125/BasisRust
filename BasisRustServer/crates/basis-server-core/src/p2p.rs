@@ -595,6 +595,10 @@ impl P2pBroker {
                 .peer_sessions
                 .get(&initiator)
                 .is_some_and(|tokens| tokens.len() >= MAX_SESSIONS_PER_PEER)
+            || self
+                .peer_sessions
+                .get(&target)
+                .is_some_and(|tokens| tokens.len() >= MAX_SESSIONS_PER_PEER)
         {
             return false;
         }
@@ -1179,6 +1183,41 @@ mod tests {
             SessionState::Awaiting
         );
         transport.shutdown();
+    }
+
+    #[test]
+    fn session_admission_bounds_both_participants_and_releases_capacity() {
+        for crowded_is_target in [false, true] {
+            let broker = P2pBroker::default();
+            let pair = |other| {
+                if crowded_is_target {
+                    (other, 1)
+                } else {
+                    (1, other)
+                }
+            };
+            for index in 0..MAX_SESSIONS_PER_PEER {
+                let (initiator, target) = pair(u16::try_from(index + 2).unwrap());
+                assert!(broker.claim_session(
+                    &format!("bounded-{index}"),
+                    session(initiator, target),
+                    |_| true
+                ));
+            }
+            let (initiator, target) = pair(5000);
+            assert!(!broker.claim_session("overflow", session(initiator, target), |_| true));
+            assert_eq!(broker.sessions.len(), MAX_SESSIONS_PER_PEER);
+            assert!(broker.peer_sessions.get(&5000).is_none());
+            let (first_initiator, first_target) = pair(2);
+            assert!(broker
+                .remove_session_if_authorized("bounded-0", first_initiator, first_target)
+                .is_some());
+            assert!(broker.claim_session("overflow", session(initiator, target), |_| true));
+            assert_eq!(
+                broker.peer_sessions.get(&1).unwrap().len(),
+                MAX_SESSIONS_PER_PEER
+            );
+        }
     }
 
     #[tokio::test]
