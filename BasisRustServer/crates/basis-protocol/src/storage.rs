@@ -1,6 +1,6 @@
 //! BasisVR server-storage channel 32 wire format.
 //! These length prefixes are raw u16 byte lengths, not LiteNetLib strings.
-use crate::{NetReader, NetWriter};
+use crate::{io::NetWriteError, NetReader, NetWriter};
 use unicode_general_category::{get_general_category, GeneralCategory};
 
 pub const MAX_NAME_BYTES: usize = 64;
@@ -133,7 +133,7 @@ pub fn read_request(data: &[u8]) -> Option<StorageRequest> {
     })
 }
 
-pub fn write_reply(reply: &StorageReply) -> Vec<u8> {
+pub fn write_reply(reply: &StorageReply) -> crate::io::WriteResult<Vec<u8>> {
     let mut writer = NetWriter::new();
     writer.put_u8(reply.op as u8);
     writer.put_u16(reply.id);
@@ -148,7 +148,12 @@ pub fn write_reply(reply: &StorageReply) -> Vec<u8> {
                     .expect("storage value <= 65535");
             }
             StorageOp::Keys => {
-                writer.put_u16(reply.keys.len() as u16);
+                let count =
+                    u16::try_from(reply.keys.len()).map_err(|_| NetWriteError::LengthOverflow {
+                        length: reply.keys.len(),
+                        max: usize::from(u16::MAX),
+                    })?;
+                writer.put_u16(count);
                 for key in &reply.keys {
                     writer
                         .put_bytes_with_length(key.as_bytes())
@@ -158,7 +163,7 @@ pub fn write_reply(reply: &StorageReply) -> Vec<u8> {
             _ => {}
         }
     }
-    writer.into_vec()
+    Ok(writer.into_vec())
 }
 
 #[cfg(test)]
@@ -224,7 +229,28 @@ mod tests {
             limit: 16384,
             value: vec![4, 5],
             keys: Vec::new(),
-        });
+        })
+        .unwrap();
         assert_eq!(bytes, [0, 7, 0, 0, 9, 0, 0, 0, 0, 64, 0, 0, 2, 0, 4, 5]);
+    }
+
+    #[test]
+    fn key_reply_rejects_entry_counts_that_do_not_fit_the_wire() {
+        let reply = StorageReply {
+            op: StorageOp::Keys,
+            id: 1,
+            status: StorageStatus::Ok,
+            used: 0,
+            limit: 0,
+            value: Vec::new(),
+            keys: vec![String::new(); usize::from(u16::MAX) + 1],
+        };
+        assert_eq!(
+            write_reply(&reply),
+            Err(NetWriteError::LengthOverflow {
+                length: usize::from(u16::MAX) + 1,
+                max: usize::from(u16::MAX),
+            })
+        );
     }
 }
