@@ -1253,6 +1253,29 @@ fn voice_config_defaults_are_disabled_and_conservative() {
 }
 
 #[test]
+fn config_debug_redacts_passwords_in_parsed_and_runtime_config() {
+    let raw = RawConfig {
+        password: Some("server-secret".to_string()),
+        avatar_password: Some("avatar-secret".to_string()),
+        ..RawConfig::default()
+    };
+    let raw_debug = format!("{raw:?}");
+    assert!(raw_debug.contains("<redacted>"));
+    assert!(!raw_debug.contains("server-secret"));
+    assert!(!raw_debug.contains("avatar-secret"));
+
+    let config = Config {
+        password: "server-secret".to_string(),
+        avatar_password: "avatar-secret".to_string(),
+        ..Config::default()
+    };
+    let config_debug = format!("{config:?}");
+    assert!(config_debug.contains("<redacted>"));
+    assert!(!config_debug.contains("server-secret"));
+    assert!(!config_debug.contains("avatar-secret"));
+}
+
+#[test]
 fn voice_config_parses_xml_fields() {
     let raw = quick_xml::de::from_str::<RawConfig>(
         r#"<Configuration>
