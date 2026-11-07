@@ -2,6 +2,7 @@
 use basis_server_health::{SceneBatchMetrics, UploadBudgetMetrics};
 mod shutdown;
 mod storage_commands;
+mod terminal_guard;
 
 const DIAGNOSTIC_TARGET: &str = "basis_server_console::diagnostics";
 
@@ -1066,9 +1067,15 @@ async fn async_main(
         worker_count,
     ));
     let console_running = running.clone();
-    let console_thread = config
-        .enable_console
-        .then(|| start_console_listener(server.clone(), config_path.clone(), console_running));
+    let terminal_view = Arc::new(terminal_guard::LiveViewCoordinator::new());
+    let console_thread = config.enable_console.then(|| {
+        start_console_listener(
+            server.clone(),
+            config_path.clone(),
+            console_running,
+            Arc::clone(&terminal_view),
+        )
+    });
     let status_interval = std::env::var("BASIS_STATUS_INTERVAL_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -1079,10 +1086,14 @@ async fn async_main(
             Ok(worker) => worker,
             Err(err) => {
                 watchdog.arm(shutdown::SHUTDOWN_TIMEOUT);
+                terminal_view.begin_shutdown();
                 running.store(false, Ordering::SeqCst);
+                terminal_view.wait_for_cleanup().await;
                 reclaim_task.abort();
                 request_shutdown(shutdown_tx);
-                let _ = server.shutdown().await;
+                if let Err(cleanup) = server.shutdown().await {
+                    warn!("startup failure cleanup failed: {cleanup:#}");
+                }
                 return Err(err.into());
             }
         };
@@ -1091,11 +1102,13 @@ async fn async_main(
     // discarded when the periodic branch wins select.
     let stop_signal = shutdown::stop_signal();
     tokio::pin!(stop_signal);
+    let mut signal_error = None;
     loop {
         tokio::select! {
             result = &mut stop_signal => {
                 if let Err(err) = result {
                     warn!("failed to listen for stop signal: {err}");
+                    signal_error = Some(err);
                 }
                 running.store(false, Ordering::SeqCst);
                 break;
@@ -1109,20 +1122,35 @@ async fn async_main(
         }
     }
     watchdog.arm(shutdown::SHUTDOWN_TIMEOUT);
+    terminal_view.begin_shutdown();
     running.store(false, Ordering::SeqCst);
+    terminal_view.wait_for_cleanup().await;
     reclaim_task.abort();
     let _ = output_stop.send(());
     request_shutdown(shutdown_tx);
     // Persistence runs before native joins. The independent watchdog covers
     // synchronous saves and runtime teardown that an async timeout cannot stop.
     let result = server.shutdown().await;
-    let _ = reclaim_task.await;
+    if let Err(err) = reclaim_task.await {
+        if !err.is_cancelled() {
+            return Err(err).context("memory reclaim task failed during shutdown");
+        }
+    }
     // Output can block in an OS sink too. Join only after persistence, while
     // the independent watchdog still covers a stalled writer.
-    let _ = tokio::task::spawn_blocking(move || output_thread.join()).await;
+    let output_join = tokio::task::spawn_blocking(move || output_thread.join())
+        .await
+        .context("joining console output worker task")?;
+    if output_join.is_err() {
+        return Err(anyhow::anyhow!(
+            "console output worker panicked during shutdown"
+        ));
+    }
     if let Some(thread) = console_thread {
-        if thread.is_finished() {
-            let _ = thread.join();
+        if thread.is_finished() && thread.join().is_err() {
+            return Err(anyhow::anyhow!(
+                "console input worker panicked during shutdown"
+            ));
         }
         // Rustyline's blocking stdin read cannot be cancelled portably. A still
         // waiting input thread is detached; it never delays process termination.
@@ -1132,6 +1160,9 @@ async fn async_main(
         Err(err) => warn!("server shutdown failed: {err:#}"),
     }
     result?;
+    if let Some(err) = signal_error {
+        return Err(err).context("stop signal listener failed");
+    }
     Ok(())
 }
 
@@ -1345,6 +1376,7 @@ fn start_console_listener(
     server: ServerState,
     config_path: PathBuf,
     running: Arc<AtomicBool>,
+    terminal_view: Arc<terminal_guard::LiveViewCoordinator>,
 ) -> thread::JoinHandle<()> {
     let runtime = tokio::runtime::Handle::current();
     thread::spawn(move || {
@@ -1360,13 +1392,14 @@ fn start_console_listener(
         {
             let server = server.clone();
             let status_running = running.clone();
+            let status_terminal_view = Arc::clone(&terminal_view);
             commands.insert(
                 "/status".to_string(),
                 Box::new(move |args| {
                     if args.first().is_some_and(|arg| {
                         arg.eq_ignore_ascii_case("live") || arg.eq_ignore_ascii_case("watch")
                     }) {
-                        run_live_status(&server, &status_running);
+                        run_live_status(&server, &status_running, &status_terminal_view);
                     } else if args.first().is_some_and(|arg| {
                         arg.eq_ignore_ascii_case("verbose") || arg.eq_ignore_ascii_case("-v")
                     }) {
@@ -1618,14 +1651,27 @@ fn config_field_requires_restart(field: &str) -> bool {
     .any(|candidate| candidate.eq_ignore_ascii_case(field))
 }
 
-fn run_live_status(server: &ServerState, running: &Arc<AtomicBool>) {
+fn run_live_status(
+    server: &ServerState,
+    running: &Arc<AtomicBool>,
+    terminal_view: &terminal_guard::LiveViewCoordinator,
+) {
+    let Some(view_guard) = terminal_view.begin_view(|| {
+        let mut terminal_guard = terminal_guard::TerminalGuard::new();
+        let _ = terminal_guard.enable_raw_mode();
+        Box::new(move || drop(terminal_guard))
+    }) else {
+        return;
+    };
     let mut stdout = io::stdout();
     let mut verbose = false;
     let mut rendered_rows = 0u16;
-    let raw_mode_enabled = terminal::enable_raw_mode().is_ok();
     println!();
 
     loop {
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
         if rendered_rows > 0 {
             move_to_render_start(&mut stdout, rendered_rows);
             clear_rendered_rows(&mut stdout, rendered_rows);
@@ -1654,6 +1700,7 @@ fn run_live_status(server: &ServerState, running: &Arc<AtomicBool>) {
         let _ = stdout.flush();
 
         match event::poll(std::time::Duration::from_millis(500)) {
+            Ok(true) if !running.load(Ordering::SeqCst) => break,
             Ok(true) => match event::read() {
                 Ok(Event::Key(key))
                     if matches!(
@@ -1684,9 +1731,7 @@ fn run_live_status(server: &ServerState, running: &Arc<AtomicBool>) {
         }
     }
 
-    if raw_mode_enabled {
-        let _ = terminal::disable_raw_mode();
-    }
+    drop(view_guard);
     println!();
 }
 
