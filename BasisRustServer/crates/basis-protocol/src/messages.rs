@@ -1090,6 +1090,7 @@ impl BasisSerialize for ServerUniqueIdMessages {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
     pub payload: Vec<u8>,
+    pub play_notification_sound: bool,
 }
 
 impl BasisSerialize for ChatMessage {
@@ -1097,15 +1098,20 @@ impl BasisSerialize for ChatMessage {
         let len = self.payload.len().min(512);
         writer.put_u16(len as u16);
         writer.put_bytes(&self.payload[..len]);
+        writer.put_bool(self.play_notification_sound);
         Ok(())
     }
 }
 
 impl BasisDeserialize for ChatMessage {
     fn deserialize(reader: &mut NetReader<'_>) -> ReadResult<Self> {
-        let len = (reader.get_u16()? as usize).min(512);
+        let wire_len = reader.get_u16()? as usize;
+        let len = wire_len.min(512);
+        let payload = reader.get_bytes(len)?.to_vec();
+        reader.get_bytes((wire_len - len).min(reader.remaining()))?;
         Ok(Self {
-            payload: reader.get_bytes(len)?.to_vec(),
+            payload,
+            play_notification_sound: reader.remaining() == 0 || reader.get_bool()?,
         })
     }
 }
@@ -3089,12 +3095,41 @@ mod tests {
     fn chat_uses_payload_length_not_basis_string() {
         let chat = ChatMessage {
             payload: b"hello".to_vec(),
+            play_notification_sound: true,
         };
         let mut writer = NetWriter::new();
         chat.serialize(&mut writer).unwrap();
-        assert_eq!(writer.as_slice(), &[5, 0, b'h', b'e', b'l', b'l', b'o']);
+        assert_eq!(writer.as_slice(), &[5, 0, b'h', b'e', b'l', b'l', b'o', 1]);
         let mut reader = NetReader::new(writer.as_slice());
         assert_eq!(ChatMessage::deserialize(&mut reader).unwrap(), chat);
+    }
+
+    #[test]
+    fn chat_preserves_sound_flag_and_defaults_missing_flag() {
+        for flag in [false, true] {
+            let wire = [1, 0, b'x', u8::from(flag)];
+            let chat = ChatMessage::deserialize(&mut NetReader::new(&wire)).unwrap();
+            assert_eq!(chat.play_notification_sound, flag);
+            let mut writer = NetWriter::new();
+            ServerChatMessage {
+                player_id: 7,
+                chat_message: chat,
+            }
+            .serialize(&mut writer)
+            .unwrap();
+            assert_eq!(writer.as_slice(), &[7, 0, 1, 0, b'x', u8::from(flag)]);
+        }
+        assert!(
+            ChatMessage::deserialize(&mut NetReader::new(&[0, 0]))
+                .unwrap()
+                .play_notification_sound
+        );
+        let mut oversized = vec![1, 2]; // 513 bytes
+        oversized.extend(vec![42; 513]);
+        oversized.push(0);
+        let chat = ChatMessage::deserialize(&mut NetReader::new(&oversized)).unwrap();
+        assert_eq!(chat.payload.len(), 512);
+        assert!(!chat.play_notification_sound);
     }
 
     #[test]
