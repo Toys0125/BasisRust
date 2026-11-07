@@ -1331,22 +1331,18 @@ fn send_image_payload(
     state: &ServerState,
     session: &PeerSession,
     pending: image_governor::PendingPayload,
-) {
-    let Some(message_index) = state.net_ids.find(image_cache::IMAGE_MANAGER_IDENTIFIER) else {
-        return;
-    };
+) -> Option<image_governor::PendingPayload> {
+    let message_index = state.net_ids.find(image_cache::IMAGE_MANAGER_IDENTIFIER)?;
     // An owner may leave while another peer's replay is queued. Clients already
     // removed that owner's cards; do not recreate them after the disconnect.
     if !state.authenticated_peers.contains_key(&pending.owner) {
-        return;
+        return None;
     }
     // Removal cancels the original image's payload handles before relaying its
     // despawn or recycling its owner ID. Hold the read guard through transport
     // admission so a previously drained pump batch cannot resurrect that image.
     let guard = pending.payload.read();
-    let Some(payload) = guard.as_ref() else {
-        return;
-    };
+    let payload = guard.as_ref()?;
     let message = ServerSceneDataMessage {
         player_id: pending.owner,
         scene_data_message: RemoteSceneDataMessage {
@@ -1357,7 +1353,7 @@ fn send_image_payload(
     let mut writer = NetWriter::new();
     if let Err(err) = message.serialize(&mut writer) {
         warn!("failed to serialize image cache replay: {err}");
-        return;
+        return None;
     }
     if state
         .transport
@@ -1367,11 +1363,35 @@ fn send_image_payload(
             .statistics
             .outbound_packets
             .fetch_add(1, Ordering::Relaxed);
+        None
+    } else if state.transport.is_current_session(session) {
+        drop(guard);
+        Some(pending)
+    } else {
+        None
     }
 }
 
+fn send_image_payloads(
+    state: &ServerState,
+    session: &PeerSession,
+    payloads: Vec<image_governor::PendingPayload>,
+) {
+    let mut pending = payloads.into_iter();
+    let mut rejected = Vec::new();
+    while let Some(payload) = pending.next() {
+        if let Some(retry) = send_image_payload(state, session, payload) {
+            rejected.push(retry);
+            rejected.extend(pending);
+            break;
+        }
+    }
+    state
+        .image_governor
+        .finish_replay_batch(session.peer_id(), session, rejected);
+}
+
 async fn deliver_image_cache_sends(state: &ServerState, sends: Vec<image_cache::CacheSend>) {
-    let mut replays = HashMap::<PeerId, (PeerSession, Vec<image_governor::PendingPayload>)>::new();
     for send in sends {
         let Some(session) = state
             .authenticated_peers
@@ -1384,26 +1404,35 @@ async fn deliver_image_cache_sends(state: &ServerState, sends: Vec<image_cache::
             owner: send.owner,
             payload: send.payload,
         };
-        if send.paced {
-            replays
-                .entry(send.recipient)
-                .or_insert_with(|| (session, Vec::new()))
-                .1
-                .push(pending);
-        } else {
-            send_image_payload(state, &session, pending);
+        let Some(_lease) = session.try_read_lease() else {
+            continue;
+        };
+        if !state.transport.is_current_session(&session) {
+            continue;
         }
-    }
-    for (peer, (session, payloads)) in replays {
-        let inline = state.image_governor.enqueue_replay(
-            peer,
-            session.clone(),
-            payloads,
-            &state.config.read(),
-            Instant::now(),
-        );
-        for pending in inline {
-            send_image_payload(state, &session, pending);
+        let config = state.config.read();
+        let now = Instant::now();
+        let ready = if send.paced {
+            state.image_governor.enqueue_replay(
+                send.recipient,
+                session.clone(),
+                vec![pending],
+                &config,
+                now,
+            )
+        } else {
+            state.image_governor.enqueue_inline(
+                send.recipient,
+                session.clone(),
+                vec![pending],
+                &config,
+                now,
+            )
+        };
+        drop(config);
+        drop(_lease);
+        if !ready.is_empty() {
+            send_image_payloads(state, &session, ready);
         }
     }
 }
@@ -1421,9 +1450,7 @@ fn spawn_image_replay_loop(state: ServerState) -> tokio::task::JoinHandle<()> {
                 .image_governor
                 .pump(&state.config.read(), Instant::now());
             for (session, payloads) in batches {
-                for pending in payloads {
-                    send_image_payload(&state, &session, pending);
-                }
+                send_image_payloads(&state, &session, payloads);
             }
         }
     })
@@ -3205,7 +3232,7 @@ async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: D
     state.message_subscriptions.remove(&peer);
     state.uplink_delta_states.remove(&peer);
     state.scene_egress.remove(&peer);
-    state.image_governor.remove_peer(peer);
+    state.image_governor.remove_peer(peer, session);
     state.image_cache.lock().remove_player(peer);
     state.jiggle_buckets.lock().remove(&peer);
     if !departed_uuid.is_empty() {
