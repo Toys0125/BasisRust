@@ -12,7 +12,7 @@
 #
 # Why musl on alpine rather than glibc on ubuntu:
 #   - Size. The image is ~14 MB of base plus the ~10 MB binary. On ubuntu:24.04 the base
-#     alone was ~85 MB, giving a ~98 MB image; on alpine:3.20 it is ~22 MB, and the
+#     alone was ~85 MB, giving a ~98 MB image; on alpine:3.22 it is ~22 MB, and the
 #     compressed pull drops from ~37 MB to ~9 MB.
 #   - Portability. The binaries are statically linked (no PT_INTERP, no DT_NEEDED), so
 #     one artifact runs on glibc and musl distros alike. The glibc builds were not just
@@ -27,7 +27,7 @@
 # break perf symbolisation and backtraces.
 
 ARG RUST_IMAGE=rust:1.95.0-alpine@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2
-ARG RUNTIME_IMAGE=alpine:3.20
+ARG RUNTIME_IMAGE=alpine:3.22@sha256:bfe7ceb9f09ec0566c48fb93356e45a47a00be5a1dd14fa5b909e7709c66b034
 
 FROM ${RUST_IMAGE} AS build
 

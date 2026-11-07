@@ -14,8 +14,9 @@ retain their tick and flush workers. See the
 
 ## Run
 
-Requires Rust 1.95 or later. The Docker builder uses the exact 1.95.0 release;
-see [prerequisites](../README.md#prerequisites).
+Requires Rust 1.95.0 or later. Both workspaces are checked on Rust 1.95.0 in PR
+CI; automated PGO release builds use Rust 1.99.0. See
+[prerequisites](../README.md#prerequisites).
 
 Optional native Linux x64 [qualified PGO builds](../docs/performance/server-pgo.md)
 train with the Rust client and require passing matched ordinary/PGO gates.
@@ -282,9 +283,11 @@ XML is private operator data. Ignore rules do not protect tracked sample edits.
 
 From `BasisRustServer/`, Docker builds use the pinned official
 [Rust 1.95.0 release](https://blog.rust-lang.org/2026/04/16/Rust-1.95.0/) and
-[Alpine image](https://hub.docker.com/_/rust) (`rust:1.95.0-alpine`).
-The multi-platform index digest is
-`sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2`;
+[Alpine image](https://hub.docker.com/_/rust) (`rust:1.95.0-alpine`). The
+runtime uses the official Alpine 3.22 image. Its multi-platform index digest is
+`sha256:bfe7ceb9f09ec0566c48fb93356e45a47a00be5a1dd14fa5b909e7709c66b034`;
+the Rust builder index digest is
+`sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2`.
 `--locked` preserves the dependency lockfile. CPU-only builds are the default.
 Docker daemon access and Compose are prerequisites for these commands.
 

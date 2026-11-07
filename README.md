@@ -8,7 +8,8 @@ for changes.
 ## Prerequisites
 
 - Rust/Cargo 1.95.0 or newer, installed with [rustup](https://rustup.rs/).
-  The server core declares Rust 1.95; the Docker builder pins 1.95.0.
+  Rust 1.95.0 is the tested minimum for both workspaces; PR CI checks that exact
+  toolchain. PGO release builds use Rust 1.99.0.
 - A native C/C++ compiler and linker for Cargo's native dependencies (on Debian/
   Ubuntu, `build-essential` and `pkg-config`). GPU support is opt-in.
 - Python 3 for the portable workload runner; Linux `taskset` only for CPU affinity.
