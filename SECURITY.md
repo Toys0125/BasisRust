@@ -1,12 +1,24 @@
 # Security guidance
 
 This repository has no published supported-release policy, dedicated security
-contact or guaranteed response time. Check the repository's
-[GitHub security page](https://github.com/Toys0125/BasisRust/security) for any
-reporting mechanism enabled by the maintainers. If private vulnerability
-reporting is available there, use it for sensitive details. Do not put credentials
-or exploit details in public issues; a public issue can ask for a private
-reporting route without disclosing them.
+contact or guaranteed response time. Private vulnerability reporting is currently
+disabled in the repository. Check the
+[GitHub security page](https://github.com/Toys0125/BasisRust/security) for changes
+and use GitHub's **Report a vulnerability** flow if it becomes available. Until
+then, do not put credentials, exploit details or other sensitive information in a
+public issue. Open a minimal public issue asking maintainers for a private contact
+route without describing the vulnerability. There is no guaranteed response time.
+
+## Dependency audits
+
+PR CI audits both Cargo lockfiles. It narrowly defers RustSec advisories
+RUSTSEC-2026-0194 and RUSTSEC-2026-0195 for quick-xml 0.38.4: the repository
+uses it to parse operator-controlled configuration and resource XML, and no
+`NsReader` is used for network input. Updating to quick-xml 0.41 requires API
+migrations in the client and permissions parsers, which are maintained in a
+separate workstream. CI does not suppress other advisory IDs; remove this
+deferral when those parser migrations land. The audit still displays the current
+unsoundness warnings for `anyhow` and `tokio`.
 
 `default_password`, `ApiEnabled=false`, and the zero scene-relay limit are
 compatibility settings from BasisVR, not evidence of leaked operator secrets.
