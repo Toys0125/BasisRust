@@ -50,11 +50,17 @@ struct ReplayJob<T> {
     bucket: Bucket,
 }
 
+struct RetryJob<T> {
+    target: T,
+    payloads: VecDeque<PendingPayload>,
+}
+
 // T is the recipient's transport session in production. Keeping it in the job
 // prevents queued data reaching a different connection that reuses the peer ID.
 pub(crate) struct ImageBandwidthGovernor<T> {
     egress: Mutex<HashMap<PeerId, Bucket>>,
     replays: Mutex<HashMap<PeerId, ReplayJob<T>>>,
+    retries: Mutex<HashMap<PeerId, RetryJob<T>>>,
     dropped_messages: AtomicU64,
     dropped_bytes: AtomicU64,
 }
@@ -64,6 +70,7 @@ impl<T> Default for ImageBandwidthGovernor<T> {
         Self {
             egress: Mutex::new(HashMap::new()),
             replays: Mutex::new(HashMap::new()),
+            retries: Mutex::new(HashMap::new()),
             dropped_messages: AtomicU64::new(0),
             dropped_bytes: AtomicU64::new(0),
         }
@@ -128,16 +135,43 @@ impl<T: Clone> ImageBandwidthGovernor<T> {
         Vec::new()
     }
 
+    /// Retain payloads that were removed by `pump` but refused by the transport queue.
+    /// These retries bypass download pacing because the payload was already selected by its
+    /// pump pass, or pacing was disabled for the original send.
+    pub fn retry_replay(&self, peer: PeerId, target: T, payloads: Vec<PendingPayload>) {
+        if payloads.is_empty() {
+            return;
+        }
+        let mut retries = self.retries.lock();
+        let job = retries.entry(peer).or_insert_with(|| RetryJob {
+            target: target.clone(),
+            payloads: VecDeque::new(),
+        });
+        job.target = target;
+        for payload in payloads {
+            job.payloads.push_back(payload);
+        }
+    }
+
     /// Take one pump pass; transport sends run after releasing the state lock.
     pub fn pump(&self, config: &ServerConfig, now: Instant) -> Vec<(T, Vec<PendingPayload>)> {
         let rate = f64::from(config.image_share_download_megabits_per_second) * MEGABITS_TO_BYTES;
+        let retries = std::mem::take(&mut *self.retries.lock());
+        let mut batches = retries
+            .into_iter()
+            .map(|(peer, job)| {
+                (
+                    peer,
+                    (job.target, job.payloads.into_iter().collect::<Vec<_>>()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         let mut replays = self.replays.lock();
         if rate <= 0.0 {
             replays.clear();
-            return Vec::new();
+            return batches.into_values().collect();
         }
-        let mut batches = Vec::new();
-        for job in replays.values_mut() {
+        for (&peer, job) in replays.iter_mut() {
             job.payloads.retain(|pending| pending.payload.len() > 0);
             if job.payloads.is_empty() {
                 continue;
@@ -156,22 +190,28 @@ impl<T: Clone> ImageBandwidthGovernor<T> {
                 batch.push(payload);
             }
             if !batch.is_empty() {
-                batches.push((job.target.clone(), batch));
+                batches
+                    .entry(peer)
+                    .or_insert_with(|| (job.target.clone(), Vec::new()))
+                    .1
+                    .extend(batch);
             }
             // Keep credit/debt after the queue empties. A new request must not
             // receive a fresh burst until the recipient disconnects.
         }
-        batches
+        batches.into_values().collect()
     }
 
     pub fn remove_peer(&self, peer: PeerId) {
         self.egress.lock().remove(&peer);
         self.replays.lock().remove(&peer);
+        self.retries.lock().remove(&peer);
     }
 
     pub fn reset(&self) {
         self.egress.lock().clear();
         self.replays.lock().clear();
+        self.retries.lock().clear();
         self.dropped_messages.store(0, Ordering::Relaxed);
         self.dropped_bytes.store(0, Ordering::Relaxed);
     }
@@ -185,12 +225,21 @@ impl<T: Clone> ImageBandwidthGovernor<T> {
 
     #[cfg(test)]
     pub(crate) fn queued_replay_bytes(&self) -> usize {
-        self.replays
+        let replay_bytes = self
+            .replays
             .lock()
             .values()
             .flat_map(|job| &job.payloads)
             .map(|pending| pending.payload.len())
-            .sum()
+            .sum::<usize>();
+        replay_bytes
+            + self
+                .retries
+                .lock()
+                .values()
+                .flat_map(|job| &job.payloads)
+                .map(|pending| pending.payload.len())
+                .sum::<usize>()
     }
 }
 
@@ -338,6 +387,29 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn transport_retries_survive_when_image_pacing_is_disabled_and_keep_order() {
+        let mut config = config();
+        config.image_share_download_megabits_per_second = 0;
+        let governor = ImageBandwidthGovernor::<u16>::default();
+        let now = Instant::now();
+        governor.retry_replay(7, 7, vec![payload(1, 1), payload(1, 2)]);
+        assert_eq!(governor.queued_replay_bytes(), 250_000);
+
+        let batches = governor.pump(&config, now);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].0, 7);
+        assert_eq!(
+            batches[0]
+                .1
+                .iter()
+                .map(|pending| pending.payload.read().as_ref().unwrap()[0])
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(governor.queued_replay_bytes(), 0);
     }
 
     #[test]

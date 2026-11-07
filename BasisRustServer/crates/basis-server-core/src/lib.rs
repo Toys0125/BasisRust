@@ -1331,22 +1331,18 @@ fn send_image_payload(
     state: &ServerState,
     session: &PeerSession,
     pending: image_governor::PendingPayload,
-) {
-    let Some(message_index) = state.net_ids.find(image_cache::IMAGE_MANAGER_IDENTIFIER) else {
-        return;
-    };
+) -> Option<image_governor::PendingPayload> {
+    let message_index = state.net_ids.find(image_cache::IMAGE_MANAGER_IDENTIFIER)?;
     // An owner may leave while another peer's replay is queued. Clients already
     // removed that owner's cards; do not recreate them after the disconnect.
     if !state.authenticated_peers.contains_key(&pending.owner) {
-        return;
+        return None;
     }
     // Removal cancels the original image's payload handles before relaying its
     // despawn or recycling its owner ID. Hold the read guard through transport
     // admission so a previously drained pump batch cannot resurrect that image.
     let guard = pending.payload.read();
-    let Some(payload) = guard.as_ref() else {
-        return;
-    };
+    let payload = guard.as_ref()?;
     let message = ServerSceneDataMessage {
         player_id: pending.owner,
         scene_data_message: RemoteSceneDataMessage {
@@ -1357,7 +1353,7 @@ fn send_image_payload(
     let mut writer = NetWriter::new();
     if let Err(err) = message.serialize(&mut writer) {
         warn!("failed to serialize image cache replay: {err}");
-        return;
+        return None;
     }
     if state
         .transport
@@ -1367,11 +1363,37 @@ fn send_image_payload(
             .statistics
             .outbound_packets
             .fetch_add(1, Ordering::Relaxed);
+        None
+    } else if state.transport.is_current_session(session) {
+        drop(guard);
+        Some(pending)
+    } else {
+        None
+    }
+}
+
+fn send_image_payloads(
+    state: &ServerState,
+    session: &PeerSession,
+    payloads: Vec<image_governor::PendingPayload>,
+) {
+    let mut pending = payloads.into_iter();
+    while let Some(payload) = pending.next() {
+        if let Some(retry) = send_image_payload(state, session, payload) {
+            let mut retry_batch = vec![retry];
+            retry_batch.extend(pending);
+            state
+                .image_governor
+                .retry_replay(session.peer_id(), session.clone(), retry_batch);
+            break;
+        }
     }
 }
 
 async fn deliver_image_cache_sends(state: &ServerState, sends: Vec<image_cache::CacheSend>) {
     let mut replays = HashMap::<PeerId, (PeerSession, Vec<image_governor::PendingPayload>)>::new();
+    let mut inline_sends =
+        HashMap::<PeerId, (PeerSession, Vec<image_governor::PendingPayload>)>::new();
     for send in sends {
         let Some(session) = state
             .authenticated_peers
@@ -1391,8 +1413,15 @@ async fn deliver_image_cache_sends(state: &ServerState, sends: Vec<image_cache::
                 .1
                 .push(pending);
         } else {
-            send_image_payload(state, &session, pending);
+            inline_sends
+                .entry(send.recipient)
+                .or_insert_with(|| (session, Vec::new()))
+                .1
+                .push(pending);
         }
+    }
+    for (_, (session, payloads)) in inline_sends {
+        send_image_payloads(state, &session, payloads);
     }
     for (peer, (session, payloads)) in replays {
         let inline = state.image_governor.enqueue_replay(
@@ -1402,9 +1431,7 @@ async fn deliver_image_cache_sends(state: &ServerState, sends: Vec<image_cache::
             &state.config.read(),
             Instant::now(),
         );
-        for pending in inline {
-            send_image_payload(state, &session, pending);
-        }
+        send_image_payloads(state, &session, inline);
     }
 }
 
@@ -1421,9 +1448,7 @@ fn spawn_image_replay_loop(state: ServerState) -> tokio::task::JoinHandle<()> {
                 .image_governor
                 .pump(&state.config.read(), Instant::now());
             for (session, payloads) in batches {
-                for pending in payloads {
-                    send_image_payload(&state, &session, pending);
-                }
+                send_image_payloads(&state, &session, payloads);
             }
         }
     })

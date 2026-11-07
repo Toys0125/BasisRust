@@ -2537,12 +2537,18 @@ impl TransportHandle {
             return Ok(0);
         };
 
+        let reliable_batch = packets
+            .iter()
+            .filter(|(_, delivery, _)| is_reliable_delivery(*delivery))
+            .map(|(channel, delivery, payload)| (*channel, *delivery, payload.as_ref()))
+            .collect::<Vec<_>>();
+        if !enqueue_reliable_batch(&state, &reliable_batch) {
+            return Err(TransportError::ReliableQueueFull);
+        }
+
         let mut outbound = Vec::with_capacity(packets.len());
         for (channel, delivery, payload) in packets {
             if is_reliable_delivery(*delivery) {
-                if !enqueue_reliable_payload(&state, *channel, *delivery, payload) {
-                    return Err(TransportError::ReliableQueueFull);
-                }
                 continue;
             }
             let built = build_outbound_packet(&state, *channel, *delivery, payload.as_ref());
@@ -2770,12 +2776,18 @@ impl TransportHandle {
             return Ok(());
         };
 
+        let reliable_batch = packets
+            .iter()
+            .filter(|(_, delivery, _)| is_reliable_delivery(*delivery))
+            .map(|(channel, delivery, payload)| (*channel, *delivery, *payload))
+            .collect::<Vec<_>>();
+        if !enqueue_reliable_batch(&state, &reliable_batch) {
+            return Err(TransportError::ReliableQueueFull);
+        }
+
         let mut outbound = Vec::with_capacity(packets.len());
         for (channel, delivery, payload) in packets {
             if is_reliable_delivery(*delivery) {
-                if !enqueue_reliable_payload(&state, *channel, *delivery, payload) {
-                    return Err(TransportError::ReliableQueueFull);
-                }
                 continue;
             }
             let built = build_outbound_packet(&state, *channel, *delivery, payload);
@@ -3031,78 +3043,99 @@ fn enqueue_reliable_payload(
     delivery: DeliveryMethod,
     payload: &[u8],
 ) -> bool {
-    if payload.len() > MAX_QUEUED_RELIABLE_BYTES_PER_PEER {
+    enqueue_reliable_batch(state, &[(channel, delivery, payload)])
+}
+
+/// Reserve both queue budgets for an entire same-peer reliable batch before publishing any
+/// payload or fragment. `outgoing_reliable` serializes the check-and-reserve with other
+/// producers, so a rejected batch leaves queue contents, counters, and fragment IDs untouched.
+fn enqueue_reliable_batch(state: &PeerState, packets: &[(u8, DeliveryMethod, &[u8])]) -> bool {
+    if packets.is_empty() {
+        return true;
+    }
+
+    let mut plan = Vec::with_capacity(packets.len());
+    let mut batch_bytes = 0usize;
+    let mut batch_packets = 0usize;
+    for &(channel, delivery, payload) in packets {
+        if !is_reliable_delivery(delivery) || payload.len() > MAX_QUEUED_RELIABLE_BYTES_PER_PEER {
+            return false;
+        }
+        let fragmented = payload.len() + LITENETLIB_CHANNELED_HEADER_SIZE > LITENETLIB_INITIAL_MTU
+            && matches!(
+                delivery,
+                DeliveryMethod::ReliableOrdered | DeliveryMethod::ReliableUnordered
+            );
+        let fragment_count = if fragmented {
+            payload.len().div_ceil(RELIABLE_FRAGMENT_PAYLOAD_SIZE)
+        } else {
+            1
+        };
+        if fragmented
+            && (payload.len() > MAX_RELIABLE_FRAGMENTED_MESSAGE_BYTES
+                || fragment_count > MAX_INCOMING_FRAGMENT_PARTS)
+        {
+            cold_drop_oversized_reliable(fragment_count);
+            return false;
+        }
+        batch_bytes = batch_bytes.saturating_add(payload.len());
+        batch_packets = batch_packets.saturating_add(fragment_count);
+        plan.push((
+            DeliveryMethod::channel_id(channel, delivery),
+            payload,
+            fragmented,
+            fragment_count,
+        ));
+    }
+    if batch_bytes > MAX_QUEUED_RELIABLE_BYTES_PER_PEER {
         return false;
     }
-    let channel_id = DeliveryMethod::channel_id(channel, delivery);
+
     let mut outgoing = state.outgoing_reliable.lock();
-    let fragmented = payload.len() + LITENETLIB_CHANNELED_HEADER_SIZE > LITENETLIB_INITIAL_MTU
-        && matches!(
-            delivery,
-            DeliveryMethod::ReliableOrdered | DeliveryMethod::ReliableUnordered
-        );
-    let total_fragments = if fragmented {
-        payload.len().div_ceil(RELIABLE_FRAGMENT_PAYLOAD_SIZE)
-    } else {
-        1
-    };
-    if fragmented
-        && (payload.len() > MAX_RELIABLE_FRAGMENTED_MESSAGE_BYTES
-            || total_fragments > MAX_INCOMING_FRAGMENT_PARTS)
-    {
-        cold_drop_oversized_reliable(total_fragments);
-        return false;
-    }
     if state
         .queued_reliable_bytes
         .load(Ordering::Relaxed)
-        .saturating_add(payload.len())
+        .saturating_add(batch_bytes)
         > MAX_QUEUED_RELIABLE_BYTES_PER_PEER
         || state
             .queued_reliable_packets
             .load(Ordering::Relaxed)
-            .saturating_add(total_fragments)
+            .saturating_add(batch_packets)
             > MAX_QUEUED_RELIABLE_PACKETS_PER_PEER
     {
         return false;
     }
-    let queue = outgoing.entry(channel_id).or_default();
 
-    if !fragmented {
-        queue.push_back(OutgoingReliable {
-            payload: payload.to_vec(),
-            fragment: None,
-        });
-        state
-            .queued_reliable_bytes
-            .fetch_add(payload.len(), Ordering::Relaxed);
-        state
-            .queued_reliable_packets
-            .fetch_add(1, Ordering::Relaxed);
-        state.reliable_active.store(true, Ordering::Release);
-        return true;
-    }
-
-    let fragment_id = state
-        .next_fragment_id
-        .fetch_add(1, Ordering::SeqCst)
-        .wrapping_add(1);
-    for (part, chunk) in payload.chunks(RELIABLE_FRAGMENT_PAYLOAD_SIZE).enumerate() {
-        queue.push_back(OutgoingReliable {
-            payload: chunk.to_vec(),
-            fragment: Some(ReliableFragment {
-                id: fragment_id,
-                part: part as u16,
-                total: total_fragments as u16,
-            }),
-        });
+    for (channel_id, payload, fragmented, fragment_count) in plan {
+        let queue = outgoing.entry(channel_id).or_default();
+        if !fragmented {
+            queue.push_back(OutgoingReliable {
+                payload: payload.to_vec(),
+                fragment: None,
+            });
+            continue;
+        }
+        let fragment_id = state
+            .next_fragment_id
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        for (part, chunk) in payload.chunks(RELIABLE_FRAGMENT_PAYLOAD_SIZE).enumerate() {
+            queue.push_back(OutgoingReliable {
+                payload: chunk.to_vec(),
+                fragment: Some(ReliableFragment {
+                    id: fragment_id,
+                    part: part as u16,
+                    total: fragment_count as u16,
+                }),
+            });
+        }
     }
     state
         .queued_reliable_bytes
-        .fetch_add(payload.len(), Ordering::Relaxed);
+        .fetch_add(batch_bytes, Ordering::Relaxed);
     state
         .queued_reliable_packets
-        .fetch_add(total_fragments, Ordering::Relaxed);
+        .fetch_add(batch_packets, Ordering::Relaxed);
     state.reliable_active.store(true, Ordering::Release);
     true
 }
@@ -7414,6 +7447,186 @@ mod tests {
         assert_eq!(
             count_limited.pending_datagrams.lock().len(),
             MAX_PENDING_DATAGRAMS_PER_PEER
+        );
+    }
+
+    #[tokio::test]
+    async fn reliable_batch_admission_is_atomic_for_both_public_batch_paths() {
+        let (handle, _events) = TransportHandle::bind(loopback_addr(0)).await.unwrap();
+        let peer_id = handle
+            .accept(&ConnectionRequest {
+                remote_addr: UdpSocket::bind(loopback_addr(0))
+                    .await
+                    .unwrap()
+                    .local_addr()
+                    .unwrap(),
+                payload: Bytes::new(),
+                connection_number: 0,
+                connect_time: 1,
+                local_peer_id: 0,
+            })
+            .await
+            .unwrap();
+        let peer = handle.peers.get(&peer_id).unwrap().clone();
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let initial_packets = MAX_QUEUED_RELIABLE_PACKETS_PER_PEER - 128;
+        {
+            let mut outgoing = peer.outgoing_reliable.lock();
+            let queue = outgoing.entry(channel_id).or_default();
+            queue.extend((0..initial_packets).map(|_| OutgoingReliable {
+                payload: vec![0],
+                fragment: None,
+            }));
+        }
+        peer.queued_reliable_bytes
+            .store(initial_packets, Ordering::Relaxed);
+        peer.queued_reliable_packets
+            .store(initial_packets, Ordering::Relaxed);
+        handle.set_extended_statistics_enabled(true);
+
+        let fragmented = vec![7; MAX_RELIABLE_FRAGMENTED_MESSAGE_BYTES];
+        let byte_batch = [
+            (
+                channels::CHAT,
+                DeliveryMethod::ReliableOrdered,
+                Bytes::from_static(b"first"),
+            ),
+            (
+                channels::CHAT,
+                DeliveryMethod::ReliableOrdered,
+                Bytes::copy_from_slice(&fragmented),
+            ),
+        ];
+        assert!(matches!(
+            handle.try_send_many_bytes(peer_id, &byte_batch),
+            Err(TransportError::ReliableQueueFull)
+        ));
+        let slice_batch = [
+            (
+                channels::CHAT,
+                DeliveryMethod::ReliableOrdered,
+                b"first".as_slice(),
+            ),
+            (
+                channels::CHAT,
+                DeliveryMethod::ReliableOrdered,
+                fragmented.as_slice(),
+            ),
+        ];
+        assert!(matches!(
+            handle.send_many_slices(peer_id, &slice_batch).await,
+            Err(TransportError::ReliableQueueFull)
+        ));
+        assert_eq!(
+            peer.queued_reliable_packets.load(Ordering::Relaxed),
+            initial_packets
+        );
+        assert_eq!(
+            peer.queued_reliable_bytes.load(Ordering::Relaxed),
+            initial_packets
+        );
+        assert_eq!(
+            peer.outgoing_reliable.lock()[&channel_id].len(),
+            initial_packets
+        );
+        assert_eq!(peer.next_fragment_id.load(Ordering::Relaxed), 0);
+        assert!(peer.next_reliable_sequence.lock().is_empty());
+        assert_eq!(handle.stats_snapshot().reliable_window_fills, 0);
+
+        let success_id = handle
+            .accept(&ConnectionRequest {
+                remote_addr: UdpSocket::bind(loopback_addr(0))
+                    .await
+                    .unwrap()
+                    .local_addr()
+                    .unwrap(),
+                payload: Bytes::new(),
+                connection_number: 0,
+                connect_time: 2,
+                local_peer_id: 0,
+            })
+            .await
+            .unwrap();
+        let small_fragment = vec![3; RELIABLE_FRAGMENT_PAYLOAD_SIZE + 7];
+        let success_batch = [
+            (
+                channels::CHAT,
+                DeliveryMethod::ReliableOrdered,
+                b"ok".as_slice(),
+            ),
+            (
+                channels::CHAT,
+                DeliveryMethod::ReliableOrdered,
+                small_fragment.as_slice(),
+            ),
+        ];
+        handle
+            .send_many_slices(success_id, &success_batch)
+            .await
+            .unwrap();
+        let success_bytes = [(
+            channels::CHAT,
+            DeliveryMethod::ReliableOrdered,
+            Bytes::from_static(b"next"),
+        )];
+        assert_eq!(
+            handle
+                .try_send_many_bytes(success_id, &success_bytes)
+                .unwrap(),
+            0
+        );
+        let success_peer = handle.peers.get(&success_id).unwrap().clone();
+        assert_eq!(
+            success_peer.total_queued() + success_peer.total_pending(),
+            4
+        );
+        assert_eq!(success_peer.next_fragment_id.load(Ordering::Relaxed), 1);
+        handle.shutdown();
+    }
+
+    #[test]
+    fn concurrent_reliable_batch_admission_never_exceeds_packet_budget() {
+        let peer = test_peer_state(29);
+        let channel_id =
+            DeliveryMethod::channel_id(channels::CHAT, DeliveryMethod::ReliableOrdered);
+        let initial_packets = MAX_QUEUED_RELIABLE_PACKETS_PER_PEER - 4;
+        {
+            let mut outgoing = peer.outgoing_reliable.lock();
+            let queue = outgoing.entry(channel_id).or_default();
+            queue.extend((0..initial_packets).map(|_| OutgoingReliable {
+                payload: vec![0],
+                fragment: None,
+            }));
+        }
+        peer.queued_reliable_bytes
+            .store(initial_packets, Ordering::Relaxed);
+        peer.queued_reliable_packets
+            .store(initial_packets, Ordering::Relaxed);
+
+        let successful = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..32 {
+                let peer = peer.clone();
+                let successful = &successful;
+                scope.spawn(move || {
+                    if enqueue_reliable_batch(
+                        &peer,
+                        &[(channels::CHAT, DeliveryMethod::ReliableOrdered, &[1])],
+                    ) {
+                        successful.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(successful.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            peer.queued_reliable_packets.load(Ordering::Relaxed),
+            MAX_QUEUED_RELIABLE_PACKETS_PER_PEER
+        );
+        assert_eq!(
+            peer.outgoing_reliable.lock()[&channel_id].len(),
+            MAX_QUEUED_RELIABLE_PACKETS_PER_PEER
         );
     }
 
