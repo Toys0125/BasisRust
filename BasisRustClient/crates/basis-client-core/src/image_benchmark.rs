@@ -772,34 +772,25 @@ pub async fn run_workload(
     let population = clients.lock().await.clone();
     let owner_peers = session.owner_peers.lock().unwrap().clone();
     let cache_first = session.options.clients - session.options.cache_recipients;
-    let mut senders = Vec::new();
+    let mut senders = tokio::task::JoinSet::new();
     for owner in 0..session.options.sharers {
         let mut recipients = Vec::new();
         for client in population
             .iter()
             .filter(|c| c.index != owner && c.index < cache_first)
         {
-            let peer_id = client
-                .remote_peer_id()
-                .await
-                .ok_or_else(|| anyhow::anyhow!("client {} missing peer id", client.index))?;
+            let Some(peer_id) = client.remote_peer_id().await else {
+                senders.shutdown().await;
+                bail!("client {} missing peer id", client.index);
+            };
             recipients.push(peer_id);
         }
         let me = population[owner].clone();
         let session_copy = session.clone();
         let owner_id = owner_peers[owner];
-        senders.push(tokio::spawn(send_image(
-            me,
-            session_copy,
-            recipients,
-            owner_id,
-        )));
+        senders.spawn(send_image(me, session_copy, recipients, owner_id));
     }
-    for sender in senders {
-        sender
-            .await
-            .context("image benchmark sender task panicked")??;
-    }
+    finish_image_senders(&mut senders).await?;
     loop {
         let progress = session.snapshot("progress");
         if progress.live_completed >= progress.live_expected {
@@ -868,9 +859,55 @@ pub async fn run_workload(
     Ok(())
 }
 
+async fn finish_image_senders(senders: &mut tokio::task::JoinSet<Result<()>>) -> Result<()> {
+    // Observe completion order so a failed task is not hidden behind another
+    // sender waiting for ACKs, and release all task-owned sockets/data on failure.
+    while let Some(result) = senders.join_next().await {
+        if let Err(err) = result
+            .context("image benchmark sender task panicked")
+            .and_then(|result| result)
+        {
+            senders.shutdown().await;
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_image_sender_aborts_and_joins_other_senders() {
+        struct ReleaseNotice(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for ReleaseNotice {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notice = ReleaseNotice(released.clone());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let mut senders = tokio::task::JoinSet::new();
+        senders.spawn(async move {
+            let _notice = notice;
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        ready.await.unwrap();
+        senders.spawn(async { bail!("injected sender failure") });
+
+        let err = time::timeout(Duration::from_secs(1), finish_image_senders(&mut senders))
+            .await
+            .expect("a failed sender must not wait for a blocked sender")
+            .unwrap_err();
+        assert!(err.to_string().contains("injected sender failure"));
+        assert!(senders.is_empty());
+        assert!(released.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[tokio::test]
     async fn image_sender_propagates_spawn_and_chunk_send_failures() {
