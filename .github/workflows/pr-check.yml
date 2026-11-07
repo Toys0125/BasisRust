@@ -61,7 +61,9 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
-          workspaces: "BasisRustClient -> target, BasisRustServer -> target"
+          workspaces: |
+            BasisRustClient -> target
+            BasisRustServer -> target
       - name: Check client workspace with default allocator
         run: cargo check --locked --manifest-path BasisRustClient/Cargo.toml --workspace --all-targets
       - name: Check client workspace without mimalloc
@@ -89,7 +91,9 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
-          workspaces: "BasisRustClient -> target, BasisRustServer -> target"
+          workspaces: |
+            BasisRustClient -> target
+            BasisRustServer -> target
       - name: Check Linux client core and tests
         run: cargo check --locked --manifest-path BasisRustClient/Cargo.toml -p basis-client-core --all-targets
       - name: Test Linux client core
@@ -114,7 +118,9 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
-          workspaces: "BasisRustClient -> target, BasisRustServer -> target"
+          workspaces: |
+            BasisRustClient -> target
+            BasisRustServer -> target
       - name: Test atomic database replacement and failure recovery
         run: cargo test --locked --manifest-path BasisRustServer/Cargo.toml -p basis-server-storage
 
@@ -150,7 +156,9 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
-          workspaces: "BasisRustClient -> target, BasisRustServer -> target"
+          workspaces: |
+            BasisRustClient -> target
+            BasisRustServer -> target
       - name: Check SQL-enabled workspace
         run: cargo check --locked --manifest-path BasisRustServer/Cargo.toml --workspace --all-targets --features basis-server-console/sql-storage
       - name: Test SQL-enabled workspace and SQLite fallback
@@ -218,7 +226,9 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
-          workspaces: "BasisRustClient -> target, BasisRustServer -> target"
+          workspaces: |
+            BasisRustClient -> target
+            BasisRustServer -> target
 
       - name: Cargo check
         if: matrix.workspace == 'false'
