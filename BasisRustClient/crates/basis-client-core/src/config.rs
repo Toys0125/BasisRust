@@ -143,7 +143,7 @@ impl Default for ClientOptions {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename = "Configuration", rename_all = "PascalCase")]
 pub struct Config {
     pub password: String,
@@ -184,7 +184,36 @@ pub struct Config {
     pub(crate) image_benchmark: Option<Arc<crate::image_benchmark::ImageBenchmarkSession>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("password", &"<redacted>")
+            .field("ip", &self.ip)
+            .field("port", &self.port)
+            .field("client_count", &self.client_count)
+            .field("company_name", &self.company_name)
+            .field("product_name", &self.product_name)
+            .field("avatar_password", &"<redacted>")
+            .field("avatar_url", &self.avatar_url)
+            .field("avatar_load_mode", &self.avatar_load_mode)
+            .field(
+                "persistence_upload_enabled",
+                &self.persistence_upload_enabled,
+            )
+            .field(
+                "persistence_upload_interval_seconds",
+                &self.persistence_upload_interval_seconds,
+            )
+            .field("voice_enabled", &self.voice_enabled)
+            .field("voice_audio_folder", &self.voice_audio_folder)
+            .field("voice_speaker_percent", &self.voice_speaker_percent)
+            .field("voice_hearing_distance", &self.voice_hearing_distance)
+            .field("voice_frame_duration_ms", &self.voice_frame_duration_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Default, Deserialize)]
 #[serde(rename = "Configuration", rename_all = "PascalCase")]
 pub(crate) struct RawConfig {
     pub(crate) password: Option<String>,
@@ -203,6 +232,38 @@ pub(crate) struct RawConfig {
     pub(crate) voice_speaker_percent: Option<String>,
     pub(crate) voice_hearing_distance: Option<String>,
     pub(crate) voice_frame_duration_ms: Option<String>,
+}
+
+impl std::fmt::Debug for RawConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawConfig")
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("ip", &self.ip)
+            .field("port", &self.port)
+            .field("client_count", &self.client_count)
+            .field("company_name", &self.company_name)
+            .field("product_name", &self.product_name)
+            .field(
+                "avatar_password",
+                &self.avatar_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("avatar_url", &self.avatar_url)
+            .field("avatar_load_mode", &self.avatar_load_mode)
+            .field(
+                "persistence_upload_enabled",
+                &self.persistence_upload_enabled,
+            )
+            .field(
+                "persistence_upload_interval_seconds",
+                &self.persistence_upload_interval_seconds,
+            )
+            .field("voice_enabled", &self.voice_enabled)
+            .field("voice_audio_folder", &self.voice_audio_folder)
+            .field("voice_speaker_percent", &self.voice_speaker_percent)
+            .field("voice_hearing_distance", &self.voice_hearing_distance)
+            .field("voice_frame_duration_ms", &self.voice_frame_duration_ms)
+            .finish()
+    }
 }
 
 impl Default for Config {
