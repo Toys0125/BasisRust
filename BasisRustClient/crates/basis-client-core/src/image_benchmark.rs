@@ -677,12 +677,24 @@ fn event_scene_payload(network_id: u16, recipients: &[u16], event: &[u8]) -> Res
     Ok(writer.as_slice().to_vec())
 }
 
+fn ensure_image_sender_connected(
+    client: &BasisClient,
+    session: &ImageBenchmarkSession,
+) -> Result<()> {
+    if !client.connected.load(std::sync::atomic::Ordering::Acquire) {
+        session.metrics.lock().unwrap().send_errors += 1;
+        bail!("image benchmark sender {} disconnected", client.index);
+    }
+    Ok(())
+}
+
 async fn send_image(
     client: Arc<BasisClient>,
     session: Arc<ImageBenchmarkSession>,
     recipients: Vec<u16>,
     owner_id: u16,
 ) -> Result<()> {
+    ensure_image_sender_connected(&client, &session)?;
     let owner = client.index;
     let image_id = session.ids[owner];
     let mut spawn = Vec::with_capacity(72);
@@ -711,6 +723,7 @@ async fn send_image(
         session.metrics.lock().unwrap().send_errors += 1;
         return Err(err).context("sending image benchmark spawn");
     }
+    ensure_image_sender_connected(&client, &session)?;
     let mut next = Instant::now()
         + fanout_pacing_duration(
             spawn.len(),
@@ -718,7 +731,9 @@ async fn send_image(
             session.options.egress_megabits_per_second,
         );
     for index in 0..session.chunks {
+        ensure_image_sender_connected(&client, &session)?;
         while client.pending_reliable.lock().await.len() >= 64 {
+            ensure_image_sender_connected(&client, &session)?;
             time::sleep(Duration::from_millis(20)).await;
         }
         let offset = index * CHUNK_BYTES;
@@ -743,6 +758,7 @@ async fn send_image(
             session.metrics.lock().unwrap().send_errors += 1;
             return Err(err).with_context(|| format!("sending image benchmark chunk {index}"));
         }
+        ensure_image_sender_connected(&client, &session)?;
         next += fanout_pacing_duration(
             chunk.len(),
             recipients.len(),
@@ -790,7 +806,7 @@ pub async fn run_workload(
         let owner_id = owner_peers[owner];
         senders.spawn(send_image(me, session_copy, recipients, owner_id));
     }
-    finish_image_senders(&mut senders).await?;
+    finish_image_senders(&mut senders, &shutdown).await?;
     loop {
         let progress = session.snapshot("progress");
         if progress.live_completed >= progress.live_expected {
@@ -859,10 +875,25 @@ pub async fn run_workload(
     Ok(())
 }
 
-async fn finish_image_senders(senders: &mut tokio::task::JoinSet<Result<()>>) -> Result<()> {
+async fn finish_image_senders(
+    senders: &mut tokio::task::JoinSet<Result<()>>,
+    shutdown: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
     // Observe completion order so a failed task is not hidden behind another
     // sender waiting for ACKs, and release all task-owned sockets/data on failure.
-    while let Some(result) = senders.join_next().await {
+    let mut stop_check = time::interval(Duration::from_millis(50));
+    while !senders.is_empty() {
+        let result = tokio::select! {
+            _ = stop_check.tick() => {
+                if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                    senders.shutdown().await;
+                    bail!("shutdown during image transfer");
+                }
+                continue;
+            }
+            result = senders.join_next() => result,
+        };
+        let Some(result) = result else { break };
         if let Err(err) = result
             .context("image benchmark sender task panicked")
             .and_then(|result| result)
@@ -877,6 +908,27 @@ async fn finish_image_senders(senders: &mut tokio::task::JoinSet<Result<()>>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn disconnected_image_sender_reports_failure_instead_of_upload_completion() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = crate::tests::test_client(0, server.local_addr().unwrap()).await;
+        client
+            .connected
+            .store(false, std::sync::atomic::Ordering::Release);
+        let session = session(4, 1, Path::new(""));
+        let result = time::timeout(
+            Duration::from_secs(2),
+            send_image(client, session.clone(), vec![101, 102], 100),
+        )
+        .await
+        .expect("a disconnected sender must return promptly")
+        .expect_err("a skipped send must not count as an upload");
+        assert!(result.to_string().contains("disconnected"));
+        assert_eq!(session.metrics.lock().unwrap().send_errors, 1);
+        assert_eq!(session.metrics.lock().unwrap().uploads_done, 0);
+        let _ = std::fs::remove_file(&session.options.output_path);
+    }
 
     #[tokio::test]
     async fn failed_image_sender_aborts_and_joins_other_senders() {
@@ -900,13 +952,47 @@ mod tests {
         ready.await.unwrap();
         senders.spawn(async { bail!("injected sender failure") });
 
-        let err = time::timeout(Duration::from_secs(1), finish_image_senders(&mut senders))
-            .await
-            .expect("a failed sender must not wait for a blocked sender")
-            .unwrap_err();
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let err = time::timeout(
+            Duration::from_secs(1),
+            finish_image_senders(&mut senders, &shutdown),
+        )
+        .await
+        .expect("a failed sender must not wait for a blocked sender")
+        .unwrap_err();
         assert!(err.to_string().contains("injected sender failure"));
         assert!(senders.is_empty());
         assert!(released.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_and_joins_blocked_image_senders() {
+        let resource = Arc::new(());
+        let held_resource = resource.clone();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let mut senders = tokio::task::JoinSet::new();
+        senders.spawn(async move {
+            let _resource = held_resource;
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        ready.await.unwrap();
+        let stop = shutdown.clone();
+        let waiter = tokio::spawn(async move {
+            let result = finish_image_senders(&mut senders, &stop).await;
+            (result, senders.is_empty())
+        });
+        tokio::task::yield_now().await;
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        let (result, empty) = time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("shutdown must interrupt blocked image senders")
+            .unwrap();
+        assert!(result.unwrap_err().to_string().contains("shutdown"));
+        assert!(empty);
+        assert_eq!(Arc::strong_count(&resource), 1);
     }
 
     #[tokio::test]
