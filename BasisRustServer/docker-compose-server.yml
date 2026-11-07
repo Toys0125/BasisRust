@@ -2,7 +2,7 @@ services:
   # Initialize only empty root-owned bind mounts created by Compose. Existing
   # directories and files retain their ownership; match their owner with BASIS_UID/GID.
   basis-rust-server-permissions:
-    image: alpine:3.20
+    image: alpine:3.22@sha256:bfe7ceb9f09ec0566c48fb93356e45a47a00be5a1dd14fa5b909e7709c66b034
     user: "0:0"
     network_mode: none
     environment:

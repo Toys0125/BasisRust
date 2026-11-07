@@ -10,6 +10,28 @@ permissions:
   contents: read
 
 jobs:
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      # The 0.38 quick-xml APIs here parse operator-controlled config/resource XML;
+      # no NsReader parses network input. Keep these two exact advisories visible
+      # as a narrow deferral until the separately owned config parsers can migrate.
+      - name: Audit client dependencies
+        run: cargo audit --file BasisRustClient/Cargo.lock --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+      - name: Audit server dependencies
+        run: cargo audit --file BasisRustServer/Cargo.lock --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+
   voice-benchmark-validation:
     name: Voice benchmark validation
     runs-on: ubuntu-24.04
@@ -34,7 +56,14 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: '1.95.0'
           components: clippy
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: |
+            BasisRustClient -> target
+            BasisRustServer -> target
       - name: Check client workspace with default allocator
         run: cargo check --locked --manifest-path BasisRustClient/Cargo.toml --workspace --all-targets
       - name: Check client workspace without mimalloc
@@ -57,7 +86,14 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: '1.95.0'
           components: clippy
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: |
+            BasisRustClient -> target
+            BasisRustServer -> target
       - name: Check Linux client core and tests
         run: cargo check --locked --manifest-path BasisRustClient/Cargo.toml -p basis-client-core --all-targets
       - name: Test Linux client core
@@ -77,6 +113,14 @@ jobs:
           persist-credentials: false
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95.0'
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: |
+            BasisRustClient -> target
+            BasisRustServer -> target
       - name: Test atomic database replacement and failure recovery
         run: cargo test --locked --manifest-path BasisRustServer/Cargo.toml -p basis-server-storage
 
@@ -85,7 +129,7 @@ jobs:
     runs-on: ubuntu-24.04
     services:
       postgres:
-        image: postgres:17
+        image: postgres:17@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f
         env:
           POSTGRES_USER: basis_test
           POSTGRES_PASSWORD: basis_test
@@ -107,7 +151,14 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: '1.95.0'
           components: clippy
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: |
+            BasisRustClient -> target
+            BasisRustServer -> target
       - name: Check SQL-enabled workspace
         run: cargo check --locked --manifest-path BasisRustServer/Cargo.toml --workspace --all-targets --features basis-server-console/sql-storage
       - name: Test SQL-enabled workspace and SQLite fallback
@@ -170,28 +221,35 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: '1.95.0'
           components: clippy
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          workspaces: |
+            BasisRustClient -> target
+            BasisRustServer -> target
 
       - name: Cargo check
         if: matrix.workspace == 'false'
-        run: cargo check --manifest-path ${{ matrix.manifest }} --all-targets
+        run: cargo check --locked --manifest-path ${{ matrix.manifest }} --all-targets
 
       - name: Cargo check workspace
         if: matrix.workspace == 'true'
-        run: cargo check --manifest-path ${{ matrix.manifest }} --workspace --all-targets ${{ matrix.features }}
+        run: cargo check --locked --manifest-path ${{ matrix.manifest }} --workspace --all-targets ${{ matrix.features }}
 
       - name: Cargo test
         if: matrix.workspace == 'false'
-        run: cargo test --manifest-path ${{ matrix.manifest }}
+        run: cargo test --locked --manifest-path ${{ matrix.manifest }}
 
       - name: Cargo test workspace
         if: matrix.workspace == 'true'
-        run: cargo test --manifest-path ${{ matrix.manifest }} --workspace ${{ matrix.features }}
+        run: cargo test --locked --manifest-path ${{ matrix.manifest }} --workspace ${{ matrix.features }}
 
       - name: Cargo clippy
         if: matrix.workspace == 'false'
-        run: cargo clippy --manifest-path ${{ matrix.manifest }} --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path ${{ matrix.manifest }} --all-targets -- -D warnings
 
       - name: Cargo clippy workspace
         if: matrix.workspace == 'true'
-        run: cargo clippy --manifest-path ${{ matrix.manifest }} --workspace --all-targets ${{ matrix.features }} -- -D warnings
+        run: cargo clippy --locked --manifest-path ${{ matrix.manifest }} --workspace --all-targets ${{ matrix.features }} -- -D warnings

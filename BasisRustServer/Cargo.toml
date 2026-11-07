@@ -45,7 +45,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 flate2 = "1"
 lz4_flex = "0.11"
 base64 = "0.22"
-zstd-safe = { version = "7.2.4", features = ["experimental"] }
+zstd-safe = { version = "7.4.0", features = ["experimental"] }
 parking_lot = "0.12"
 pollster = "0.4"
 quick-xml = { version = "0.38", features = ["serialize"] }
