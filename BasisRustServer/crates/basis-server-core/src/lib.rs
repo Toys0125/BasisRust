@@ -1378,22 +1378,20 @@ fn send_image_payloads(
     payloads: Vec<image_governor::PendingPayload>,
 ) {
     let mut pending = payloads.into_iter();
+    let mut rejected = Vec::new();
     while let Some(payload) = pending.next() {
         if let Some(retry) = send_image_payload(state, session, payload) {
-            let mut retry_batch = vec![retry];
-            retry_batch.extend(pending);
-            state
-                .image_governor
-                .retry_replay(session.peer_id(), session.clone(), retry_batch);
+            rejected.push(retry);
+            rejected.extend(pending);
             break;
         }
     }
+    state
+        .image_governor
+        .finish_replay_batch(session.peer_id(), session, rejected);
 }
 
 async fn deliver_image_cache_sends(state: &ServerState, sends: Vec<image_cache::CacheSend>) {
-    let mut replays = HashMap::<PeerId, (PeerSession, Vec<image_governor::PendingPayload>)>::new();
-    let mut inline_sends =
-        HashMap::<PeerId, (PeerSession, Vec<image_governor::PendingPayload>)>::new();
     for send in sends {
         let Some(session) = state
             .authenticated_peers
@@ -1406,32 +1404,36 @@ async fn deliver_image_cache_sends(state: &ServerState, sends: Vec<image_cache::
             owner: send.owner,
             payload: send.payload,
         };
-        if send.paced {
-            replays
-                .entry(send.recipient)
-                .or_insert_with(|| (session, Vec::new()))
-                .1
-                .push(pending);
-        } else {
-            inline_sends
-                .entry(send.recipient)
-                .or_insert_with(|| (session, Vec::new()))
-                .1
-                .push(pending);
+        let Some(_lease) = session.try_read_lease() else {
+            continue;
+        };
+        if !state.transport.is_current_session(&session) {
+            continue;
         }
-    }
-    for (_, (session, payloads)) in inline_sends {
-        send_image_payloads(state, &session, payloads);
-    }
-    for (peer, (session, payloads)) in replays {
-        let inline = state.image_governor.enqueue_replay(
-            peer,
-            session.clone(),
-            payloads,
-            &state.config.read(),
-            Instant::now(),
-        );
-        send_image_payloads(state, &session, inline);
+        let config = state.config.read();
+        let now = Instant::now();
+        let ready = if send.paced {
+            state.image_governor.enqueue_replay(
+                send.recipient,
+                session.clone(),
+                vec![pending],
+                &config,
+                now,
+            )
+        } else {
+            state.image_governor.enqueue_inline(
+                send.recipient,
+                session.clone(),
+                vec![pending],
+                &config,
+                now,
+            )
+        };
+        drop(config);
+        drop(_lease);
+        if !ready.is_empty() {
+            send_image_payloads(state, &session, ready);
+        }
     }
 }
 
@@ -3230,7 +3232,7 @@ async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: D
     state.message_subscriptions.remove(&peer);
     state.uplink_delta_states.remove(&peer);
     state.scene_egress.remove(&peer);
-    state.image_governor.remove_peer(peer);
+    state.image_governor.remove_peer(peer, session);
     state.image_cache.lock().remove_player(peer);
     state.jiggle_buckets.lock().remove(&peer);
     if !departed_uuid.is_empty() {
