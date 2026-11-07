@@ -15,10 +15,13 @@ PR CI audits both Cargo lockfiles. It narrowly defers RustSec advisories
 RUSTSEC-2026-0194 and RUSTSEC-2026-0195 for quick-xml 0.38.4: the repository
 uses it to parse operator-controlled configuration and resource XML, and no
 `NsReader` is used for network input. Updating to quick-xml 0.41 requires API
-migrations in the client and permissions parsers, which are maintained in a
-separate workstream. CI does not suppress other advisory IDs; remove this
-deferral when those parser migrations land. The audit still displays the current
-unsoundness warnings for `anyhow` and `tokio`.
+migrations in the client and permissions parsers. This migration is deferred
+while the inputs remain operator-controlled. CI does not suppress other advisory
+IDs; remove this deferral when those parser migrations land, and before accepting
+untrusted XML through these paths.
+
+Both lockfiles use patched `anyhow` 1.0.103 and Tokio 1.53.3 for
+RUSTSEC-2026-0190 and RUSTSEC-2026-0386 respectively.
 
 `default_password`, `ApiEnabled=false`, and the zero scene-relay limit are
 compatibility settings from BasisVR, not evidence of leaked operator secrets.
