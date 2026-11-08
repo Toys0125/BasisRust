@@ -492,6 +492,8 @@ pub struct ServerState {
     pub database: PersistentDatabase,
     pub player_storage: Option<Arc<dyn PlayerStorageBackend>>,
     pub resources: ResourceState,
+    // Keep resource commits and their reliable messages in the same order.
+    resource_operations: Arc<tokio::sync::Mutex<()>>,
     pub net_ids: NetIdState,
     pub ownership: OwnershipState,
     pub content_share: ContentShareState,
@@ -730,6 +732,7 @@ impl ServerState {
             voice_recipients: Arc::new(DashMap::new()),
             voice_recipient_sessions: Arc::new(DashMap::new()),
             message_subscriptions: Arc::new(DashMap::new()),
+            resource_operations: Arc::new(tokio::sync::Mutex::new(())),
             uplink_delta_states: Arc::new(DashMap::new()),
             scene_egress: Arc::new(DashMap::new()),
             upload_budget: Arc::new(upload_budget::UploadBudget::new(
@@ -3134,6 +3137,7 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
             .await
             .unwrap_or_else(|err| warn!("failed to replay net ids to peer {peer_id}: {err:#}"));
     }
+    let resource_operation = state.resource_operations.lock().await;
     for resource in state.resources.all_resources() {
         let mut resource = resource;
         if resource.load_strategy == 2 {
@@ -3155,6 +3159,7 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
             .await
             .unwrap_or_else(|err| warn!("failed to replay resource to peer {peer_id}: {err:#}"));
     }
+    drop(resource_operation);
     for ownership in state.ownership.all() {
         let mut writer = NetWriter::new();
         if let Err(err) = ownership.serialize(&mut writer) {
@@ -3280,6 +3285,7 @@ async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: D
             )
             .await;
     }
+    let resource_operation = state.resource_operations.lock().await;
     for unload in state
         .resources
         .remove_creator_non_persistent(&departed_uuid)
@@ -3298,6 +3304,7 @@ async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: D
             )
             .await;
     }
+    drop(resource_operation);
     if let Some(pip_destroy) = state.pip.remove_player(peer) {
         let mut writer = NetWriter::new();
         if let Err(err) = pip_destroy.serialize(&mut writer) {
@@ -3337,6 +3344,7 @@ async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: D
         }
         state.pending_leaves.lock().push(peer);
         if state.authenticated_peers.is_empty() {
+            let _resource_operation = state.resource_operations.lock().await;
             for unload in state.resources.reset_non_persistent() {
                 let mut writer = NetWriter::new();
                 if let Err(err) = unload.serialize(&mut writer) {
@@ -3911,6 +3919,7 @@ async fn handle_message(
             }
         }
         channels::LOAD_RESOURCE => {
+            let _resource_operation = state.resource_operations.lock().await;
             let mut reader = NetReader::new(&payload);
             let mut resource = LocalLoadResource::deserialize(&mut reader)?;
             let Some(peer_state) = state.authenticated_peers.get(&peer) else {
@@ -3953,6 +3962,7 @@ async fn handle_message(
             }
         }
         channels::UNLOAD_RESOURCE => {
+            let _resource_operation = state.resource_operations.lock().await;
             let mut reader = NetReader::new(&payload);
             let request = UnloadResource::deserialize(&mut reader)?;
             let is_moderator = has_protection_permission(state, peer);
@@ -3986,6 +3996,7 @@ async fn handle_message(
             }
         }
         channels::MODIFY_RESOURCE => {
+            let _resource_operation = state.resource_operations.lock().await;
             let mut reader = NetReader::new(&payload);
             let request = ModifyResource::deserialize(&mut reader)?;
             let is_moderator = has_protection_permission(state, peer);
@@ -5232,6 +5243,12 @@ fn has_protection_permission(state: &ServerState, peer: PeerId) -> bool {
 }
 
 async fn broadcast_spawn_preloaded(state: &ServerState, spawn: SpawnPreloadedMessage) {
+    let _resource_operation = state.resource_operations.lock().await;
+    broadcast_spawn_preloaded_locked(state, spawn).await;
+}
+
+// The caller holds resource_operations through both the commit and sends.
+async fn broadcast_spawn_preloaded_locked(state: &ServerState, spawn: SpawnPreloadedMessage) {
     if !state.resources.contains_resource(&spawn.loaded_net_id) {
         return;
     }

@@ -136,7 +136,7 @@ impl ResourceState {
     pub fn scene_unloads_except(&self, keep: Option<&str>) -> Vec<UnloadResource> {
         let mut resources = self.resources.write();
         if let Some(id) = keep {
-            if !resources.get(id).is_some_and(|resource| resource.mode == 1) {
+            if resources.get(id).is_none_or(|resource| resource.mode != 1) {
                 return Vec::new();
             }
         }
@@ -147,9 +147,6 @@ impl ResourceState {
             })
             .collect();
         let mut sessions = self.preload_sessions.write();
-        if keep.is_none() {
-            sessions.clear();
-        }
         scene_ids
             .into_iter()
             .filter_map(|id| {
@@ -894,7 +891,17 @@ mod tests {
         assert!(!state.preload_sessions.read().contains_key("old"));
         assert!(state.preload_sessions.read().contains_key("prop"));
         assert_eq!(state.all_scene_unloads().len(), 1);
-        assert!(state.preload_sessions.read().is_empty());
+        assert!(!state.preload_sessions.read().contains_key("new"));
+        assert!(state.preload_sessions.read().contains_key("prop"));
+        assert!(state
+            .mark_preload_ready(
+                1,
+                PreloadReadyMessage {
+                    loaded_net_id: "prop".into(),
+                    is_ready: true
+                }
+            )
+            .is_some());
         assert_eq!(state.all_resources(), vec![resource("prop", "alice")]);
         assert!(
             state.load_resource_with_limit(scene("next"), 1),

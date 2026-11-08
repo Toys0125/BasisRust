@@ -278,7 +278,7 @@ when changed. The health listener remains separate.
 | GET | `/api/worlds` | List scene worlds, flags and load strategy |
 | POST | `/api/worlds` | Load or predownload a world |
 | DELETE | `/api/worlds/{netId}` | Unload a world |
-| DELETE | `/api/worlds` | Clear all scenes and preload sessions |
+| DELETE | `/api/worlds` | Clear all scenes and their preload sessions |
 | POST | `/api/worlds/switch` | Announce and start a synchronized world switch |
 
 World loads accept `url` (HTTPS), `password`, optional `persistent` (default
@@ -295,7 +295,10 @@ optional `announceMessage` and `delay` (integer seconds, 0–300). The strategy 
 always synchronized. Delayed switches are cancelled on shutdown. Messages are
 limited to 512 UTF-16 code units and request bodies to 1 MiB. The API admits
 32 concurrent requests; excess requests receive 503. Requests time out after
-30 seconds. Responses use the BasisVR JSON envelopes (`players`, `worlds`,
+30 seconds. At most 32 delayed world switches may be pending; extra switches
+receive 503 before being announced or scheduled. URLs and decoded passwords
+must each fit the protocol limit of 65,534 UTF-8 bytes, or receive 400.
+Responses use the BasisVR JSON envelopes (`players`, `worlds`,
 `ok`, `netId`, `unloaded`, or `error`) and status codes 400/401/404/405/413
 for invalid input, authentication, missing resources, methods, and body limits.
 

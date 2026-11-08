@@ -51,6 +51,8 @@ const MAX_BODY_BYTES: usize = 1 << 20;
 const MAX_MESSAGE_LENGTH: usize = 512;
 const MAX_SWITCH_DELAY_SECONDS: i32 = 300;
 const MAX_CONCURRENT_REQUESTS: usize = 32;
+const MAX_PENDING_SWITCHES: usize = 32;
+const MAX_WIRE_STRING_BYTES: usize = u16::MAX as usize - 1;
 
 const LOAD_STRATEGY_IMMEDIATE: u8 = 0;
 const LOAD_STRATEGY_SYNCHRONIZED: u8 = 2;
@@ -381,26 +383,40 @@ async fn switch_world(State(runtime): State<RestApiRuntime>, request: Request) -
     };
     let resource = build_world_resource(&url, &password, persistent, LOAD_STRATEGY_SYNCHRONIZED);
     let net_id = resource.loaded_net_id.clone();
-    if !announce.is_empty() {
-        server_announce_all(&runtime.state, &announce).await;
-    }
     if delay > 0 {
         let state = runtime.state.clone();
         let net_id_for_task = net_id.clone();
         let mut tasks = runtime.delayed.lock().await;
         while tasks.try_join_next().is_some() {}
+        if tasks.len() >= MAX_PENDING_SWITCHES {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "too many pending world switches"})),
+            )
+                .into_response();
+        }
+        if !announce.is_empty() {
+            server_announce_all(&runtime.state, &announce).await;
+        }
         tasks.spawn(async move {
             info!("REST API switch world scheduled: {net_id_for_task} delay={delay}s");
             tokio::select! {
                 _ = wait_for_shutdown(state.shutdown.clone()) => return,
                 _ = tokio::time::sleep(Duration::from_secs(delay as u64)) => {}
             }
-            if let Err(err) = server_load_world(&state, resource).await {
-                tracing::warn!("REST API delayed switch world failed: {err:#}");
+            match server_load_world(&state, resource).await {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!("REST API delayed switch world was not admitted"),
+                Err(err) => tracing::warn!("REST API delayed switch world failed: {err:#}"),
             }
         });
-    } else if !matches!(server_load_world(&runtime.state, resource).await, Ok(true)) {
-        return internal_error();
+    } else {
+        if !announce.is_empty() {
+            server_announce_all(&runtime.state, &announce).await;
+        }
+        if !matches!(server_load_world(&runtime.state, resource).await, Ok(true)) {
+            return internal_error();
+        }
     }
     (
         StatusCode::OK,
@@ -467,6 +483,7 @@ pub(crate) async fn server_load_world(
     state: &ServerState,
     resource: LocalLoadResource,
 ) -> Result<bool> {
+    let _resource_operation = state.resource_operations.lock().await;
     if state.shutdown.load(Ordering::Acquire) {
         return Ok(false);
     }
@@ -502,13 +519,15 @@ pub(crate) async fn server_load_world(
             None,
         )
         .await;
-    if resource.load_strategy == LOAD_STRATEGY_SYNCHRONIZED {
-        if let Some(spawn) = state
-            .resources
-            .complete_empty_preload(&resource.loaded_net_id)
-        {
-            crate::broadcast_spawn_preloaded(state, spawn).await;
-        }
+    let spawn = (resource.load_strategy == LOAD_STRATEGY_SYNCHRONIZED)
+        .then(|| {
+            state
+                .resources
+                .complete_empty_preload(&resource.loaded_net_id)
+        })
+        .flatten();
+    if let Some(spawn) = spawn {
+        crate::broadcast_spawn_preloaded_locked(state, spawn).await;
     }
     info!(
         "REST API load world: {} strategy={} netId={}",
@@ -520,6 +539,7 @@ pub(crate) async fn server_load_world(
 /// Remove one mode-1 resource and broadcast the unload. Returns false when the
 /// ID is absent so the caller maps it to a structured 404.
 pub(crate) async fn server_unload_world(state: &ServerState, net_id: &str) -> Result<bool> {
+    let _resource_operation = state.resource_operations.lock().await;
     let Some(removed) = state
         .resources
         .unload_resource_if(net_id, |resource| resource.mode == 1)
@@ -545,8 +565,10 @@ pub(crate) async fn server_unload_world(state: &ServerState, net_id: &str) -> Re
 }
 
 /// Unload every scene (mode 1) resource, then broadcast `ClearAllScenes` as the
-/// C# control does. Clearing also cancels outstanding preload sessions.
+/// C# control does. Only removed scenes' preload sessions are cancelled;
+/// synchronized props remain registered and can still finish loading.
 pub(crate) async fn server_clear_worlds(state: &ServerState) -> Result<usize> {
+    let _resource_operation = state.resource_operations.lock().await;
     let unloads = state.resources.all_scene_unloads();
     let count = unloads.len();
     for unload in &unloads {
@@ -697,6 +719,14 @@ fn extract_url_password(
             .to_string(),
         None => fragment.unwrap_or_default(),
     };
+
+    for (field, length) in [("url", url.len()), ("password", password.len())] {
+        if length > MAX_WIRE_STRING_BYTES {
+            return Err(bad_request(&format!(
+                "{field} exceeds {MAX_WIRE_STRING_BYTES} UTF-8 bytes"
+            )));
+        }
+    }
 
     if url.is_empty() {
         return Err(bad_request("url must not be empty"));
@@ -1146,6 +1176,99 @@ mod tests {
                 StatusCode::BAD_REQUEST
             );
         }
+        state.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn world_changes_wait_for_prior_commits_and_sends() {
+        let (state, _shutdown, _) = fixture().await;
+        let old = build_world_resource("https://example.com/old", "pw", false, 0);
+        state.resources.load_resource(old.clone());
+        let new = build_world_resource("https://example.com/new", "pw", false, 0);
+        let guard = state.resource_operations.lock().await;
+        let clear = server_clear_worlds(&state);
+        let load = server_load_world(&state, new.clone());
+        tokio::pin!(clear, load);
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut clear)
+            .await
+            .is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut load)
+            .await
+            .is_err());
+        assert_eq!(state.resources.all_resources(), vec![old]);
+        drop(guard);
+        let (cleared, loaded) = tokio::join!(clear, load);
+        assert_eq!(cleared.unwrap(), 1);
+        assert!(loaded.unwrap());
+        assert_eq!(state.resources.all_resources(), vec![new]);
+        state.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_world_fields_fail_before_announcing_or_scheduling() {
+        let (state, _shutdown, runtime) = fixture().await;
+        for path in ["/api/worlds", "/api/worlds/switch"] {
+            for body in [
+                json!({"url":format!("https://example.com/{}", "x".repeat(MAX_WIRE_STRING_BYTES)),"password":"pw", "delay":300}),
+                json!({"url":"https://example.com/world", "password":"é".repeat(MAX_WIRE_STRING_BYTES / 2 + 1), "delay":300}),
+                json!({"url":format!("https://example.com/world#{}", BASE64_STANDARD.encode(vec![b'x'; MAX_WIRE_STRING_BYTES + 1])), "delay":300}),
+            ] {
+                assert_eq!(
+                    request(&runtime, "POST", path, &body.to_string()).await.0,
+                    StatusCode::BAD_REQUEST
+                );
+            }
+        }
+        assert!(runtime.delayed.lock().await.is_empty());
+        assert!(state.resources.all_resources().is_empty());
+        let prefix = "https://example.com/";
+        let url = format!(
+            "{prefix}{}",
+            "x".repeat(MAX_WIRE_STRING_BYTES - prefix.len())
+        );
+        assert!(extract_url_password(
+            &json!({"url":url,"password":"é".repeat(MAX_WIRE_STRING_BYTES / 2)})
+        )
+        .is_ok());
+        state.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delayed_switch_queue_is_bounded_and_releases_finished_slots() {
+        let (state, _shutdown, runtime) = fixture().await;
+        let body = r#"{"url":"https://example.com/new","password":"pw","delay":300}"#;
+        for _ in 0..MAX_PENDING_SWITCHES {
+            assert_eq!(
+                request(&runtime, "POST", "/api/worlds/switch", body)
+                    .await
+                    .0,
+                StatusCode::OK
+            );
+        }
+        assert_eq!(runtime.delayed.lock().await.len(), MAX_PENDING_SWITCHES);
+        assert_eq!(
+            request(&runtime, "POST", "/api/worlds/switch", body)
+                .await
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        {
+            let mut tasks = runtime.delayed.lock().await;
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+        }
+        assert_eq!(
+            request(&runtime, "POST", "/api/worlds/switch", body)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        {
+            let mut tasks = runtime.delayed.lock().await;
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+        }
+        assert!(state.resources.all_resources().is_empty());
         state.shutdown().await.unwrap();
     }
 
