@@ -19,6 +19,7 @@ mod image_tests;
 pub mod memory_reclaim;
 mod p2p;
 mod realtime;
+mod rest_api;
 mod scene_relay;
 mod upload_budget;
 
@@ -798,6 +799,12 @@ impl ServerState {
             // lifecycle tests intentionally control worker index zero.
             spawn_p2p_lifecycle_loop(state.clone()),
         ]);
+        if config.api_enabled && !config.api_key.is_empty() {
+            if let Err(error) = rest_api::start_rest_api_server(state.clone()).await {
+                let _ = state.shutdown().await;
+                return Err(error.context("starting REST management API"));
+            }
+        }
         Ok((state, shutdown_tx))
     }
 
@@ -4010,29 +4017,6 @@ async fn handle_message(
             let mut reader = NetReader::new(&payload);
             let ready = PreloadReadyMessage::deserialize(&mut reader)?;
             if let Some(spawn) = state.resources.mark_preload_ready(peer, ready) {
-                if let Some(resource) =
-                    state
-                        .resources
-                        .all_resources()
-                        .into_iter()
-                        .find(|resource| {
-                            resource.loaded_net_id == spawn.loaded_net_id && resource.mode == 1
-                        })
-                {
-                    let _ = resource;
-                    for unload in state.resources.all_scene_unloads() {
-                        let mut writer = NetWriter::new();
-                        unload.serialize(&mut writer)?;
-                        state
-                            .broadcast(
-                                channels::UNLOAD_RESOURCE,
-                                DeliveryMethod::ReliableOrdered,
-                                writer.as_slice(),
-                                None,
-                            )
-                            .await;
-                    }
-                }
                 broadcast_spawn_preloaded(state, spawn).await;
             }
         }
@@ -5248,6 +5232,27 @@ fn has_protection_permission(state: &ServerState, peer: PeerId) -> bool {
 }
 
 async fn broadcast_spawn_preloaded(state: &ServerState, spawn: SpawnPreloadedMessage) {
+    if !state.resources.contains_resource(&spawn.loaded_net_id) {
+        return;
+    }
+    for unload in state
+        .resources
+        .scene_unloads_except(Some(&spawn.loaded_net_id))
+    {
+        let mut writer = NetWriter::new();
+        if let Err(err) = unload.serialize(&mut writer) {
+            warn!("failed to serialize synchronized scene unload: {err}");
+            continue;
+        }
+        state
+            .broadcast(
+                channels::UNLOAD_RESOURCE,
+                DeliveryMethod::ReliableOrdered,
+                writer.as_slice(),
+                None,
+            )
+            .await;
+    }
     let mut writer = NetWriter::new();
     if let Err(err) = spawn.serialize(&mut writer) {
         warn!("failed to serialize broadcast_spawn_preloaded: {err}");
@@ -6414,6 +6419,9 @@ fn spawn_content_expiry_loop(state: ServerState) -> tokio::task::JoinHandle<()> 
             if state.shutdown.load(Ordering::Relaxed) {
                 break;
             }
+            for spawn in state.resources.timed_out_preloads() {
+                broadcast_spawn_preloaded(&state, spawn).await;
+            }
             let (leave, delete) = {
                 let config = state.config.read();
                 (
@@ -7545,26 +7553,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_startup_rejects_unsupported_api_before_files_or_socket() {
+    async fn shared_startup_leaves_api_disabled_when_key_is_empty() {
         let path =
-            std::env::temp_dir().join(format!("basis-unsupported-api-{}", uuid::Uuid::new_v4()));
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            std::env::temp_dir().join(format!("basis-empty-api-key-{}", uuid::Uuid::new_v4()));
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = ServerConfig {
             use_auth: false,
             api_enabled: true,
-            has_file_support: true,
-            set_port: socket.local_addr().unwrap().port(),
+            api_host: "127.0.0.1".into(),
+            api_port: socket.local_addr().unwrap().port(),
+            has_file_support: false,
+            set_port: 0,
             override_auto_discovery_of_ipv: true,
             ipv4_address: "127.0.0.1".into(),
             ..ServerConfig::default()
         };
 
-        let error = ServerState::start(config, &path)
+        let (server, _shutdown_tx) = ServerState::start(config, &path)
             .await
-            .err()
-            .expect("unsupported API must fail startup");
-        assert!(error.to_string().contains("ApiEnabled=true"), "{error:#}");
-        assert!(!path.exists(), "startup rejection must not create files");
+            .expect("an empty API key disables the listener");
+        server.shutdown().await.unwrap();
+        assert!(!path.exists());
     }
 
     #[test]

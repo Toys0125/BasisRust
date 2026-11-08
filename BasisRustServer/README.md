@@ -249,10 +249,64 @@ non-empty deployment passwords on clients. `ApiEnabled=false` and
 `MaxSceneRelayMegabitsPerSecondPerPlayer=0` remain upstream defaults. Operators
 can set relay limits.
 
-The API service is not implemented in this server build, so startup rejects
-`ApiEnabled=true` with an actionable error. The Docker image health endpoint
-defaults to TCP port 10666. When changing it in Docker Compose, set
+The optional REST management API uses `ApiEnabled`, `ApiHost`, `ApiPort`, and
+`ApiKey`. It starts only when enabled with a nonempty key, matching BasisVR.
+The Docker image health endpoint defaults to TCP port 10666. When changing it in Docker Compose, set
 `BASIS_HEALTH_PORT` so the service, health check, and published port stay aligned.
+
+### REST management API
+
+Configure these XML fields and restart the server:
+
+```xml
+<ApiEnabled>true</ApiEnabled>
+<ApiHost>localhost</ApiHost>
+<ApiPort>10667</ApiPort>
+<ApiKey>replace-with-a-long-random-secret</ApiKey>
+```
+
+Every request requires `Authorization: Bearer <ApiKey>`. The API defaults to
+loopback HTTP; use an HTTPS reverse proxy for remote access. An invalid host
+or an occupied API port fails server startup. These four fields require a restart
+when changed. The health listener remains separate.
+
+| Method | Path | Operation |
+| --- | --- | --- |
+| POST | `/api/announce` | Broadcast `{"message":"Hello"}` |
+| POST | `/api/announce/{uuid}` | Send a message to one player |
+| GET | `/api/players` | List netId, UUID, display name, platform and position |
+| GET | `/api/worlds` | List scene worlds, flags and load strategy |
+| POST | `/api/worlds` | Load or predownload a world |
+| DELETE | `/api/worlds/{netId}` | Unload a world |
+| DELETE | `/api/worlds` | Clear all scenes and preload sessions |
+| POST | `/api/worlds/switch` | Announce and start a synchronized world switch |
+
+World loads accept `url` (HTTPS), `password`, optional `persistent` (default
+false), and `strategy`: `"immediate"`/`0`, `"synchronized"`/`2`, or
+`"predownload"`/`3`. A password may instead be embedded in a URL fragment
+(`https://host/world#password`, including Base64 fragments); an explicit
+`password` takes precedence. Predownload broadcasts to current players without
+adding a loaded world or replaying it to later joiners. Worlds belong to
+`server` and are admin locked. Synchronized loads replace previous scenes when
+clients finish preloading, or immediately if no players are connected.
+
+Switch requests accept the same URL, password and persistence fields, plus
+optional `announceMessage` and `delay` (integer seconds, 0–300). The strategy is
+always synchronized. Delayed switches are cancelled on shutdown. Messages are
+limited to 512 UTF-16 code units and request bodies to 1 MiB. The API admits
+32 concurrent requests; excess requests receive 503. Requests time out after
+30 seconds. Responses use the BasisVR JSON envelopes (`players`, `worlds`,
+`ok`, `netId`, `unloaded`, or `error`) and status codes 400/401/404/405/413
+for invalid input, authentication, missing resources, methods, and body limits.
+
+```sh
+curl -H "Authorization: Bearer $BASIS_API_KEY" http://localhost:10667/api/players
+curl -H "Authorization: Bearer $BASIS_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"url":"https://host/world","password":"world-password","announceMessage":"Switching worlds","delay":10}' \
+  http://localhost:10667/api/worlds/switch
+```
+
+### Upload budget
 
 `MaxUploadBytesPerSecondPerPlayer` defaults to `131072` (128 KiB/s) for each
 authenticated connection before fanout. Set the same XML/environment field to

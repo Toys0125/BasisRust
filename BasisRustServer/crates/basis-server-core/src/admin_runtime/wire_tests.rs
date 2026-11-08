@@ -344,6 +344,168 @@ fn admin_mode(payload: &[u8], mode: AdminRequestMode) -> bool {
 }
 
 #[tokio::test]
+async fn rest_api_announcements_players_and_world_switch_reach_connected_clients() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn http(
+        address: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> serde_json::Value {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer wire-test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+    }
+
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    {
+        let mut config = state.config.write();
+        config.api_host = "127.0.0.1".into();
+        config.api_port = 0;
+        config.api_key = "wire-test".into();
+    }
+    let address = crate::rest_api::start_rest_api_server(state.clone())
+        .await
+        .unwrap();
+    let mut client = Client::connect(&state, "rest-player").await;
+    let players = http(address, "GET", "/api/players", "").await;
+    assert_eq!(players["players"].as_array().unwrap().len(), 1);
+    assert_eq!(players["players"][0]["uuid"], "rest-player");
+    assert_eq!(players["players"][0]["displayName"], "Original");
+    assert_eq!(players["players"][0]["platform"], "linux");
+    assert_eq!(
+        players["players"][0]["netId"],
+        peer_by_uuid(&state, "rest-player").unwrap()
+    );
+
+    http(
+        address,
+        "POST",
+        "/api/announce",
+        r#"{"message":"Everyone"}"#,
+    )
+    .await;
+    let broadcast = client
+        .receive(|channel, payload| {
+            channel == channels::ADMIN && admin_mode(payload, AdminRequestMode::MessageAll)
+        })
+        .await;
+    assert_eq!(
+        NetReader::new(&broadcast[1..]).get_string().unwrap(),
+        "Everyone"
+    );
+    http(
+        address,
+        "POST",
+        "/api/announce/rest-player",
+        r#"{"message":"Just you"}"#,
+    )
+    .await;
+    let direct = client
+        .receive(|channel, payload| {
+            channel == channels::ADMIN && admin_mode(payload, AdminRequestMode::Message)
+        })
+        .await;
+    assert_eq!(
+        NetReader::new(&direct[1..]).get_string().unwrap(),
+        "Just you"
+    );
+
+    let old = http(
+        address,
+        "POST",
+        "/api/worlds",
+        r#"{"url":"https://example.com/old","password":"pw"}"#,
+    )
+    .await;
+    let loaded = client
+        .receive(|channel, _| channel == channels::LOAD_RESOURCE)
+        .await;
+    let resource = LocalLoadResource::deserialize(&mut NetReader::new(&loaded)).unwrap();
+    assert_eq!(resource.loaded_net_id, old["netId"]);
+    assert_eq!(resource.load_strategy, 0);
+    assert!(resource.is_admin_locked);
+
+    let new = http(
+        address,
+        "POST",
+        "/api/worlds/switch",
+        r#"{"url":"https://example.com/new","password":"pw","announceMessage":"Switch now"}"#,
+    )
+    .await;
+    client
+        .receive(|channel, payload| {
+            channel == channels::ADMIN && admin_mode(payload, AdminRequestMode::MessageAll)
+        })
+        .await;
+    let preload = client
+        .receive(|channel, _| channel == channels::LOAD_RESOURCE)
+        .await;
+    let resource = LocalLoadResource::deserialize(&mut NetReader::new(&preload)).unwrap();
+    assert_eq!(resource.loaded_net_id, new["netId"]);
+    assert_eq!(resource.load_strategy, 2);
+    assert_eq!(
+        state.resources.all_resources().len(),
+        2,
+        "old scene stays until readiness"
+    );
+    let mut writer = NetWriter::new();
+    PreloadReadyMessage {
+        loaded_net_id: resource.loaded_net_id.clone(),
+        is_ready: true,
+    }
+    .serialize(&mut writer)
+    .unwrap();
+    client
+        .send(channels::PRELOAD_READY, writer.as_slice(), true)
+        .await;
+    let unload = client
+        .receive(|channel, _| channel == channels::UNLOAD_RESOURCE)
+        .await;
+    assert_eq!(
+        UnloadResource::deserialize(&mut NetReader::new(&unload))
+            .unwrap()
+            .loaded_net_id,
+        old["netId"]
+    );
+    let spawn = client
+        .receive(|channel, _| channel == channels::SPAWN_PRELOADED)
+        .await;
+    assert_eq!(
+        SpawnPreloadedMessage::deserialize(&mut NetReader::new(&spawn))
+            .unwrap()
+            .loaded_net_id,
+        resource.loaded_net_id
+    );
+    assert_eq!(state.resources.all_resources().len(), 1);
+    assert_eq!(
+        state.resources.all_resources()[0].loaded_net_id,
+        resource.loaded_net_id
+    );
+
+    http(
+        address,
+        "DELETE",
+        &format!("/api/worlds/{}", resource.loaded_net_id),
+        "",
+    )
+    .await;
+    client
+        .receive(|channel, _| channel == channels::UNLOAD_RESOURCE)
+        .await;
+    assert!(state.resources.all_resources().is_empty());
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
 async fn uuid_aliases_cannot_bypass_online_or_offline_moderation_protection() {
     let (state, shutdown, _) = super::tests::test_server(false).await;
     let mut staff = Client::connect(&state, "alias-test-moderator").await;
