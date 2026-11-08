@@ -128,17 +128,30 @@ impl ResourceState {
     }
 
     pub fn all_scene_unloads(&self) -> Vec<UnloadResource> {
-        let scene_ids: Vec<String> = self
-            .resources
-            .read()
-            .iter()
-            .filter_map(|(id, resource)| (resource.mode == 1).then_some(id.clone()))
-            .collect();
+        self.scene_unloads_except(None)
+    }
+
+    /// Complete a scene switch without unloading the scene being spawned.
+    /// A stale spawn signal must never clear the current scenes.
+    pub fn scene_unloads_except(&self, keep: Option<&str>) -> Vec<UnloadResource> {
         let mut resources = self.resources.write();
+        if let Some(id) = keep {
+            if resources.get(id).is_none_or(|resource| resource.mode != 1) {
+                return Vec::new();
+            }
+        }
+        let scene_ids: Vec<String> = resources
+            .iter()
+            .filter_map(|(id, resource)| {
+                (resource.mode == 1 && Some(id.as_str()) != keep).then_some(id.clone())
+            })
+            .collect();
+        let mut sessions = self.preload_sessions.write();
         scene_ids
             .into_iter()
             .filter_map(|id| {
                 resources.remove(&id).map(|resource| {
+                    sessions.remove(&id);
                     self.note_resource_removed(&resource.uuid_of_creator);
                     UnloadResource {
                         mode: resource.mode,
@@ -178,6 +191,10 @@ impl ResourceState {
 
     pub fn all_resources(&self) -> Vec<ResourceManagementMessage> {
         self.resources.read().values().cloned().collect()
+    }
+
+    pub fn contains_resource(&self, id: &str) -> bool {
+        self.resources.read().contains_key(id)
     }
 
     pub fn remove_creator_non_persistent(&self, creator: &str) -> Vec<UnloadResource> {
@@ -251,6 +268,17 @@ impl ResourceState {
         } else {
             None
         }
+    }
+
+    pub fn complete_empty_preload(&self, id: &str) -> Option<SpawnPreloadedMessage> {
+        let mut sessions = self.preload_sessions.write();
+        if sessions.get(id)?.total_peer_count != 0 {
+            return None;
+        }
+        sessions.remove(id);
+        Some(SpawnPreloadedMessage {
+            loaded_net_id: id.to_owned(),
+        })
     }
 
     pub fn remove_preload_peer(&self, peer_id: u16) -> Vec<SpawnPreloadedMessage> {
@@ -839,6 +867,77 @@ mod tests {
             .is_none());
         assert!(state.load_resource_with_limit(resource("two", "alice"), 1));
         assert_eq!(state.creator_counts.read().get("bob"), Some(&1));
+    }
+
+    #[test]
+    fn scene_clear_cancels_preloads_and_switch_keeps_destination() {
+        let state = ResourceState::default();
+        let scene = |id: &str| LocalLoadResource {
+            mode: 1,
+            ..resource(id, "server")
+        };
+        assert!(state.start_preload(scene("old"), &[1], 3));
+        assert!(state.start_preload(scene("new"), &[1], 3));
+        assert!(state.start_preload(resource("prop", "alice"), &[1], 3));
+        assert!(state.scene_unloads_except(Some("missing")).is_empty());
+        assert_eq!(
+            state.scene_unloads_except(Some("new")),
+            vec![UnloadResource {
+                loaded_net_id: "old".into(),
+                mode: 1
+            }]
+        );
+        assert!(state.preload_sessions.read().contains_key("new"));
+        assert!(!state.preload_sessions.read().contains_key("old"));
+        assert!(state.preload_sessions.read().contains_key("prop"));
+        assert_eq!(state.all_scene_unloads().len(), 1);
+        assert!(!state.preload_sessions.read().contains_key("new"));
+        assert!(state.preload_sessions.read().contains_key("prop"));
+        assert!(state
+            .mark_preload_ready(
+                1,
+                PreloadReadyMessage {
+                    loaded_net_id: "prop".into(),
+                    is_ready: true
+                }
+            )
+            .is_some());
+        assert_eq!(state.all_resources(), vec![resource("prop", "alice")]);
+        assert!(
+            state.load_resource_with_limit(scene("next"), 1),
+            "creator accounting is released"
+        );
+    }
+
+    #[test]
+    fn empty_and_timed_out_preloads_complete_once_and_unloads_cancel_them() {
+        let state = ResourceState::default();
+        assert!(state.start_preload(resource("empty", "alice"), &[], 3));
+        assert!(state.complete_empty_preload("empty").is_some());
+        assert!(state.complete_empty_preload("empty").is_none());
+        assert!(state.start_preload(resource("timeout", "alice"), &[1], 3));
+        assert!(state.complete_empty_preload("timeout").is_none());
+        state
+            .preload_sessions
+            .write()
+            .get_mut("timeout")
+            .unwrap()
+            .started_at = Instant::now() - Duration::from_secs(301);
+        let spawns = state.timed_out_preloads();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].loaded_net_id, "timeout");
+        assert!(state.timed_out_preloads().is_empty());
+        assert!(state.start_preload(resource("removed", "alice"), &[1], 3));
+        state.unload_resource("removed").unwrap();
+        assert!(state
+            .mark_preload_ready(
+                1,
+                PreloadReadyMessage {
+                    loaded_net_id: "removed".into(),
+                    is_ready: true
+                }
+            )
+            .is_none());
     }
 
     #[test]

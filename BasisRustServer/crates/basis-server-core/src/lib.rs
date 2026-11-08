@@ -19,6 +19,7 @@ mod image_tests;
 pub mod memory_reclaim;
 mod p2p;
 mod realtime;
+mod rest_api;
 mod scene_relay;
 mod upload_budget;
 
@@ -491,6 +492,8 @@ pub struct ServerState {
     pub database: PersistentDatabase,
     pub player_storage: Option<Arc<dyn PlayerStorageBackend>>,
     pub resources: ResourceState,
+    // Keep resource commits and their reliable messages in the same order.
+    resource_operations: Arc<tokio::sync::Mutex<()>>,
     pub net_ids: NetIdState,
     pub ownership: OwnershipState,
     pub content_share: ContentShareState,
@@ -729,6 +732,7 @@ impl ServerState {
             voice_recipients: Arc::new(DashMap::new()),
             voice_recipient_sessions: Arc::new(DashMap::new()),
             message_subscriptions: Arc::new(DashMap::new()),
+            resource_operations: Arc::new(tokio::sync::Mutex::new(())),
             uplink_delta_states: Arc::new(DashMap::new()),
             scene_egress: Arc::new(DashMap::new()),
             upload_budget: Arc::new(upload_budget::UploadBudget::new(
@@ -798,6 +802,12 @@ impl ServerState {
             // lifecycle tests intentionally control worker index zero.
             spawn_p2p_lifecycle_loop(state.clone()),
         ]);
+        if config.api_enabled && !config.api_key.is_empty() {
+            if let Err(error) = rest_api::start_rest_api_server(state.clone()).await {
+                let _ = state.shutdown().await;
+                return Err(error.context("starting REST management API"));
+            }
+        }
         Ok((state, shutdown_tx))
     }
 
@@ -3127,6 +3137,7 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
             .await
             .unwrap_or_else(|err| warn!("failed to replay net ids to peer {peer_id}: {err:#}"));
     }
+    let resource_operation = state.resource_operations.lock().await;
     for resource in state.resources.all_resources() {
         let mut resource = resource;
         if resource.load_strategy == 2 {
@@ -3148,6 +3159,7 @@ async fn replay_late_join_state(state: &ServerState, peer_id: PeerId) {
             .await
             .unwrap_or_else(|err| warn!("failed to replay resource to peer {peer_id}: {err:#}"));
     }
+    drop(resource_operation);
     for ownership in state.ownership.all() {
         let mut writer = NetWriter::new();
         if let Err(err) = ownership.serialize(&mut writer) {
@@ -3273,6 +3285,7 @@ async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: D
             )
             .await;
     }
+    let resource_operation = state.resource_operations.lock().await;
     for unload in state
         .resources
         .remove_creator_non_persistent(&departed_uuid)
@@ -3291,6 +3304,7 @@ async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: D
             )
             .await;
     }
+    drop(resource_operation);
     if let Some(pip_destroy) = state.pip.remove_player(peer) {
         let mut writer = NetWriter::new();
         if let Err(err) = pip_destroy.serialize(&mut writer) {
@@ -3330,6 +3344,7 @@ async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: D
         }
         state.pending_leaves.lock().push(peer);
         if state.authenticated_peers.is_empty() {
+            let _resource_operation = state.resource_operations.lock().await;
             for unload in state.resources.reset_non_persistent() {
                 let mut writer = NetWriter::new();
                 if let Err(err) = unload.serialize(&mut writer) {
@@ -3904,6 +3919,7 @@ async fn handle_message(
             }
         }
         channels::LOAD_RESOURCE => {
+            let _resource_operation = state.resource_operations.lock().await;
             let mut reader = NetReader::new(&payload);
             let mut resource = LocalLoadResource::deserialize(&mut reader)?;
             let Some(peer_state) = state.authenticated_peers.get(&peer) else {
@@ -3946,6 +3962,7 @@ async fn handle_message(
             }
         }
         channels::UNLOAD_RESOURCE => {
+            let _resource_operation = state.resource_operations.lock().await;
             let mut reader = NetReader::new(&payload);
             let request = UnloadResource::deserialize(&mut reader)?;
             let is_moderator = has_protection_permission(state, peer);
@@ -3979,6 +3996,7 @@ async fn handle_message(
             }
         }
         channels::MODIFY_RESOURCE => {
+            let _resource_operation = state.resource_operations.lock().await;
             let mut reader = NetReader::new(&payload);
             let request = ModifyResource::deserialize(&mut reader)?;
             let is_moderator = has_protection_permission(state, peer);
@@ -4010,29 +4028,6 @@ async fn handle_message(
             let mut reader = NetReader::new(&payload);
             let ready = PreloadReadyMessage::deserialize(&mut reader)?;
             if let Some(spawn) = state.resources.mark_preload_ready(peer, ready) {
-                if let Some(resource) =
-                    state
-                        .resources
-                        .all_resources()
-                        .into_iter()
-                        .find(|resource| {
-                            resource.loaded_net_id == spawn.loaded_net_id && resource.mode == 1
-                        })
-                {
-                    let _ = resource;
-                    for unload in state.resources.all_scene_unloads() {
-                        let mut writer = NetWriter::new();
-                        unload.serialize(&mut writer)?;
-                        state
-                            .broadcast(
-                                channels::UNLOAD_RESOURCE,
-                                DeliveryMethod::ReliableOrdered,
-                                writer.as_slice(),
-                                None,
-                            )
-                            .await;
-                    }
-                }
                 broadcast_spawn_preloaded(state, spawn).await;
             }
         }
@@ -5248,6 +5243,33 @@ fn has_protection_permission(state: &ServerState, peer: PeerId) -> bool {
 }
 
 async fn broadcast_spawn_preloaded(state: &ServerState, spawn: SpawnPreloadedMessage) {
+    let _resource_operation = state.resource_operations.lock().await;
+    broadcast_spawn_preloaded_locked(state, spawn).await;
+}
+
+// The caller holds resource_operations through both the commit and sends.
+async fn broadcast_spawn_preloaded_locked(state: &ServerState, spawn: SpawnPreloadedMessage) {
+    if !state.resources.contains_resource(&spawn.loaded_net_id) {
+        return;
+    }
+    for unload in state
+        .resources
+        .scene_unloads_except(Some(&spawn.loaded_net_id))
+    {
+        let mut writer = NetWriter::new();
+        if let Err(err) = unload.serialize(&mut writer) {
+            warn!("failed to serialize synchronized scene unload: {err}");
+            continue;
+        }
+        state
+            .broadcast(
+                channels::UNLOAD_RESOURCE,
+                DeliveryMethod::ReliableOrdered,
+                writer.as_slice(),
+                None,
+            )
+            .await;
+    }
     let mut writer = NetWriter::new();
     if let Err(err) = spawn.serialize(&mut writer) {
         warn!("failed to serialize broadcast_spawn_preloaded: {err}");
@@ -6414,6 +6436,9 @@ fn spawn_content_expiry_loop(state: ServerState) -> tokio::task::JoinHandle<()> 
             if state.shutdown.load(Ordering::Relaxed) {
                 break;
             }
+            for spawn in state.resources.timed_out_preloads() {
+                broadcast_spawn_preloaded(&state, spawn).await;
+            }
             let (leave, delete) = {
                 let config = state.config.read();
                 (
@@ -7545,26 +7570,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_startup_rejects_unsupported_api_before_files_or_socket() {
+    async fn shared_startup_leaves_api_disabled_when_key_is_empty() {
         let path =
-            std::env::temp_dir().join(format!("basis-unsupported-api-{}", uuid::Uuid::new_v4()));
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            std::env::temp_dir().join(format!("basis-empty-api-key-{}", uuid::Uuid::new_v4()));
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = ServerConfig {
             use_auth: false,
             api_enabled: true,
-            has_file_support: true,
-            set_port: socket.local_addr().unwrap().port(),
+            api_host: "127.0.0.1".into(),
+            api_port: socket.local_addr().unwrap().port(),
+            has_file_support: false,
+            set_port: 0,
             override_auto_discovery_of_ipv: true,
             ipv4_address: "127.0.0.1".into(),
             ..ServerConfig::default()
         };
 
-        let error = ServerState::start(config, &path)
+        let (server, _shutdown_tx) = ServerState::start(config, &path)
             .await
-            .err()
-            .expect("unsupported API must fail startup");
-        assert!(error.to_string().contains("ApiEnabled=true"), "{error:#}");
-        assert!(!path.exists(), "startup rejection must not create files");
+            .expect("an empty API key disables the listener");
+        server.shutdown().await.unwrap();
+        assert!(!path.exists());
     }
 
     #[test]

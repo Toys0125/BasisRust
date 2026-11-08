@@ -373,10 +373,6 @@ impl ServerConfig {
     /// Validate settings that must be supported before startup can proceed.
     pub fn validate_startup(&self) -> Result<()> {
         self.validate_auth()?;
-        anyhow::ensure!(
-            !self.api_enabled,
-            "ApiEnabled=true is not supported: this server build does not provide the API service; set ApiEnabled=false"
-        );
         Ok(())
     }
 
@@ -801,7 +797,11 @@ impl ServerConfig {
                 "StorageEnabled",
                 "StorageBackend",
                 "StorageConnectionString",
-                "StorageSqlTable"
+                "StorageSqlTable",
+                "ApiEnabled",
+                "ApiHost",
+                "ApiPort",
+                "ApiKey"
             ]
             .iter()
             .any(|field| field.eq_ignore_ascii_case(name)),
@@ -1548,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_rejects_unsupported_api_but_accepts_auth_and_public_modes() {
+    fn startup_accepts_api_auth_and_public_modes_but_api_changes_require_restart() {
         let protected = ServerConfig {
             password: "configured password".into(),
             ..ServerConfig::default()
@@ -1561,17 +1561,26 @@ mod tests {
         };
         public.validate_startup().unwrap();
 
-        let unsupported_api = ServerConfig {
+        let enabled_api = ServerConfig {
             api_enabled: true,
             use_auth: false,
             ..ServerConfig::default()
         };
-        let error = unsupported_api.validate_startup().unwrap_err().to_string();
-        assert!(error.contains("ApiEnabled=true"));
-        assert!(error.contains("set ApiEnabled=false"));
+        enabled_api.validate_startup().unwrap();
 
         let mut live = public.clone();
         assert!(live.set_live_field("ApiEnabled", "true").is_err());
         assert!(!live.api_enabled);
+        for (name, value) in [
+            ("ApiHost", "0.0.0.0"),
+            ("ApiPort", "10668"),
+            ("ApiKey", "secret"),
+        ] {
+            assert!(live
+                .set_live_field(name, value)
+                .unwrap_err()
+                .to_string()
+                .contains("restart"));
+        }
     }
 }
