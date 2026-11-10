@@ -166,21 +166,19 @@ impl VideoClipCache {
                     }
                 }
             }
-            OP_POSE => {
-                if payload.len() == 49 {
-                    if let Some(e) = self.entries.get_mut(&id) {
-                        let mut offer = e.offer.to_vec();
-                        offer[23..55].copy_from_slice(&payload[17..49]);
-                        e.offer = Bytes::from(offer);
-                    }
+            OP_POSE if payload.len() == 49 => {
+                if let Some(e) = self.entries.get_mut(&id) {
+                    let mut offer = e.offer.to_vec();
+                    offer[23..55].copy_from_slice(&payload[17..49]);
+                    e.offer = Bytes::from(offer);
                 }
             }
-            OP_REMOVE => {
+            OP_REMOVE
                 if self.entries.get(&id).is_some_and(|e| {
                     e.owner == owner || (!e.protected && !config.content_removal_locked)
-                }) {
-                    self.remove(&id);
-                }
+                }) =>
+            {
+                self.remove(&id);
             }
             OP_CACHE_CATALOG if to_server => {
                 self.ready.insert(owner);
