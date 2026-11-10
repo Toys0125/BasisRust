@@ -49,14 +49,19 @@ struct Session {
     last_key: Option<Instant>,
     dropping_video: bool,
     frame_sequence: u32,
-    frame_targets: Vec<PeerId>,
+    frame_targets: Vec<PeerSession>,
 }
 #[derive(Default)]
 pub(crate) struct Ledger {
     sessions: HashMap<PeerId, Session>,
     dropped_chunks: u64,
 }
-type Actions = Vec<(PeerId, u16, Vec<u8>)>;
+struct Action {
+    recipient: PeerSession,
+    plugin_id: u16,
+    payload: Vec<u8>,
+}
+type Actions = Vec<Action>;
 fn payload(sub: u8, write: impl FnOnce(&mut NetWriter)) -> Vec<u8> {
     let mut w = NetWriter::new();
     w.put_u8(sub);
@@ -69,13 +74,19 @@ fn subscribed(state: &ServerState, peer: PeerId, id: u16) -> bool {
         .get(&peer)
         .is_some_and(|s| s.contains(&id))
 }
-fn control(actions: &mut Actions, to: PeerId, bytes: Vec<u8>) {
-    actions.push((to, CONTROL_ID, bytes));
+fn control(state: &ServerState, actions: &mut Actions, to: PeerId, bytes: Vec<u8>) {
+    if let Some(recipient) = state.transport.peer_session(to) {
+        actions.push(Action {
+            recipient,
+            plugin_id: CONTROL_ID,
+            payload: bytes,
+        });
+    }
 }
 fn broadcast(state: &ServerState, actions: &mut Actions, except: PeerId, bytes: Vec<u8>) {
     for peer in state.authenticated_peers.iter() {
         if *peer.key() != except {
-            control(actions, *peer.key(), bytes.clone());
+            control(state, actions, *peer.key(), bytes.clone());
         }
     }
 }
@@ -86,11 +97,12 @@ fn announce(sharer: PeerId, s: &Session) -> Vec<u8> {
         s.pose.serialize(w).expect("fixed pose");
     })
 }
-fn refuse(actions: &mut Actions, peer: PeerId, reason: u8) {
-    control(actions, peer, payload(REFUSED, |w| w.put_u8(reason)));
+fn refuse(state: &ServerState, actions: &mut Actions, peer: PeerId, reason: u8) {
+    control(state, actions, peer, payload(REFUSED, |w| w.put_u8(reason)));
 }
-fn viewers(actions: &mut Actions, peer: PeerId, s: &Session) {
+fn send_viewer_count(state: &ServerState, actions: &mut Actions, peer: PeerId, s: &Session) {
     control(
+        state,
         actions,
         peer,
         payload(VIEWERS, |w| {
@@ -98,17 +110,23 @@ fn viewers(actions: &mut Actions, peer: PeerId, s: &Session) {
         }),
     );
 }
-fn key(actions: &mut Actions, sharer: PeerId, s: &mut Session, force: bool) {
+fn request_keyframe(
+    state: &ServerState,
+    actions: &mut Actions,
+    sharer: PeerId,
+    s: &mut Session,
+    force: bool,
+) {
     let now = Instant::now();
     if force
         || s.last_key
             .is_none_or(|last| now.duration_since(last) >= Duration::from_millis(500))
     {
         s.last_key = Some(now);
-        control(actions, sharer, payload(KEYFRAME, |_| {}));
+        control(state, actions, sharer, payload(KEYFRAME, |_| {}));
     }
 }
-fn end(state: &ServerState, ledger: &mut Ledger, actions: &mut Actions, sharer: PeerId) {
+fn end_session(state: &ServerState, ledger: &mut Ledger, actions: &mut Actions, sharer: PeerId) {
     if ledger.sessions.remove(&sharer).is_some() {
         broadcast(
             state,
@@ -119,28 +137,24 @@ fn end(state: &ServerState, ledger: &mut Ledger, actions: &mut Actions, sharer: 
     }
 }
 async fn flush(state: &ServerState, actions: Actions) {
-    // Capture connection incarnations before the first await; ids may be recycled during sends.
-    let sends: Vec<_> = actions
-        .into_iter()
-        .filter_map(|(peer, id, bytes)| {
-            if !subscribed(state, peer, id) {
-                return None;
-            }
-            let session = state.transport.peer_session(peer)?;
-            let mut w = NetWriter::with_capacity(bytes.len() + 2);
-            w.put_u16(id);
-            w.put_bytes(&bytes);
-            Some((session, w.into_vec()))
-        })
-        .collect();
-    for (session, bytes) in sends {
+    for action in actions {
+        // Effects retain the connection selected by the transition. Never resolve a
+        // queued recipient ID to a replacement connection when applying the effect.
+        if !state.transport.is_current_session(&action.recipient)
+            || !subscribed(state, action.recipient.peer_id(), action.plugin_id)
+        {
+            continue;
+        }
+        let mut writer = NetWriter::with_capacity(action.payload.len() + 2);
+        writer.put_u16(action.plugin_id);
+        writer.put_bytes(&action.payload);
         if let Err(err) = state
             .transport
             .send_session(
-                &session,
+                &action.recipient,
                 channels::PLUGIN_RELIABLE,
                 DeliveryMethod::ReliableOrdered,
-                &bytes,
+                writer.as_slice(),
             )
             .await
         {
@@ -151,16 +165,18 @@ async fn flush(state: &ServerState, actions: Actions) {
 pub(crate) async fn subscribed_peer(state: &ServerState, peer: PeerId) {
     let actions = {
         let ledger = state.screen_share.lock();
-        let mut a = vec![(
+        let mut a = Vec::new();
+        control(
+            state,
+            &mut a,
             peer,
-            CONTROL_ID,
             payload(POLICY, |w| {
                 w.put_bool(state.config.read().screen_share_locked)
             }),
-        )];
+        );
         for (&sharer, s) in &ledger.sessions {
             if sharer != peer {
-                control(&mut a, peer, announce(sharer, s));
+                control(state, &mut a, peer, announce(sharer, s));
             }
         }
         a
@@ -171,10 +187,11 @@ pub(crate) async fn remove_peer(state: &ServerState, peer: PeerId) {
     let actions = {
         let mut ledger = state.screen_share.lock();
         let mut a = Vec::new();
-        end(state, &mut ledger, &mut a, peer);
+        end_session(state, &mut ledger, &mut a, peer);
         for (&sharer, s) in &mut ledger.sessions {
+            s.frame_targets.retain(|target| target.peer_id() != peer);
             if s.viewers.remove(&peer).is_some() {
-                viewers(&mut a, sharer, s);
+                send_viewer_count(state, &mut a, sharer, s);
             }
         }
         a
@@ -196,11 +213,7 @@ pub(crate) async fn handle(state: &ServerState, peer: PeerId, id: u16, bytes: &[
         ) {
             return Ok(());
         }
-        {
-            let mut config = state.config.write();
-            config.screen_share_locked = locked;
-            config.save(&state.config_path)?;
-        }
+        state.config.write().screen_share_locked = locked;
         let actions = {
             let mut ledger = state.screen_share.lock();
             let mut a = Vec::new();
@@ -218,8 +231,8 @@ pub(crate) async fn handle(state: &ServerState, peer: PeerId, id: u16, bytes: &[
                         sharer,
                         basis_server_permissions::nodes::MODERATION_GLOBAL_LOCK,
                     ) {
-                        refuse(&mut a, sharer, REFUSED_LOCKED);
-                        end(state, &mut ledger, &mut a, sharer);
+                        refuse(state, &mut a, sharer, REFUSED_LOCKED);
+                        end_session(state, &mut ledger, &mut a, sharer);
                     }
                 }
             }
@@ -242,6 +255,28 @@ pub(crate) async fn handle(state: &ServerState, peer: PeerId, id: u16, bytes: &[
                 None,
             )
             .await;
+        // Persistence is secondary to the live moderation action. A full disk or
+        // invalid path must not leave existing streams active under a locked policy.
+        let persistence_error = {
+            let config = state.config.read();
+            if config.has_file_support {
+                config.save(&state.config_path).err()
+            } else {
+                None
+            }
+        };
+        if let Some(err) = persistence_error {
+            warn!("screen share policy applied but configuration save failed: {err:#}");
+            if let Err(report_err) = send_admin_text(
+                state,
+                peer,
+                "Screen sharing policy applied, but saving the configuration failed.",
+            )
+            .await
+            {
+                warn!("failed to report screen share persistence error: {report_err:#}");
+            }
+        }
         return Ok(());
     }
     let actions = {
@@ -252,7 +287,7 @@ pub(crate) async fn handle(state: &ServerState, peer: PeerId, id: u16, bytes: &[
                 let parsed =
                     StreamInfo::read(&mut r).and_then(|info| Ok((info, ScreenPose::read(&mut r)?)));
                 match parsed {
-                    Err(_) => refuse(&mut a, peer, REFUSED_INVALID),
+                    Err(_) => refuse(state, &mut a, peer, REFUSED_INVALID),
                     Ok((info, pose)) => {
                         let config = state.config.read();
                         if !peer_has_permission(
@@ -260,7 +295,7 @@ pub(crate) async fn handle(state: &ServerState, peer: PeerId, id: u16, bytes: &[
                             peer,
                             basis_server_permissions::nodes::SCREEN_SHARE,
                         ) {
-                            refuse(&mut a, peer, REFUSED_NO_PERMISSION);
+                            refuse(state, &mut a, peer, REFUSED_NO_PERMISSION);
                         } else if config.screen_share_locked
                             && !peer_has_permission(
                                 state,
@@ -268,12 +303,12 @@ pub(crate) async fn handle(state: &ServerState, peer: PeerId, id: u16, bytes: &[
                                 basis_server_permissions::nodes::MODERATION_GLOBAL_LOCK,
                             )
                         {
-                            refuse(&mut a, peer, REFUSED_LOCKED);
+                            refuse(state, &mut a, peer, REFUSED_LOCKED);
                         } else if !ledger.sessions.contains_key(&peer)
                             && config.screen_share_max_concurrent > 0
                             && ledger.sessions.len() >= config.screen_share_max_concurrent as usize
                         {
-                            refuse(&mut a, peer, REFUSED_TOO_MANY);
+                            refuse(state, &mut a, peer, REFUSED_TOO_MANY);
                         } else {
                             let s = ledger.sessions.entry(peer).or_insert_with(|| Session {
                                 info: info.clone(),
@@ -292,6 +327,7 @@ pub(crate) async fn handle(state: &ServerState, peer: PeerId, id: u16, bytes: &[
                                 v.needs_key = true;
                             }
                             control(
+                                state,
                                 &mut a,
                                 peer,
                                 payload(ACCEPTED, |w| {
@@ -306,7 +342,7 @@ pub(crate) async fn handle(state: &ServerState, peer: PeerId, id: u16, bytes: &[
                     }
                 }
             }
-            STOP => end(state, &mut ledger, &mut a, peer),
+            STOP => end_session(state, &mut ledger, &mut a, peer),
             INFO => {
                 if let Some(s) = ledger.sessions.get_mut(&peer) {
                     let info = StreamInfo::read(&mut r)?;
@@ -340,13 +376,14 @@ pub(crate) async fn handle(state: &ServerState, peer: PeerId, id: u16, bytes: &[
                         let changed = if watching {
                             let changed = !s.viewers.contains_key(&peer);
                             s.viewers.entry(peer).or_default();
-                            key(&mut a, sharer, s, changed);
+                            request_keyframe(state, &mut a, sharer, s, changed);
                             changed
                         } else {
+                            s.frame_targets.retain(|target| target.peer_id() != peer);
                             s.viewers.remove(&peer).is_some()
                         };
                         if changed {
-                            viewers(&mut a, sharer, s);
+                            send_viewer_count(state, &mut a, sharer, s);
                         }
                     }
                 }
@@ -356,7 +393,7 @@ pub(crate) async fn handle(state: &ServerState, peer: PeerId, id: u16, bytes: &[
                 if let Some(s) = ledger.sessions.get_mut(&sharer) {
                     if let Some(v) = s.viewers.get_mut(&peer) {
                         v.needs_key = true;
-                        key(&mut a, sharer, s, false);
+                        request_keyframe(state, &mut a, sharer, s, false);
                     }
                 }
             }
@@ -367,7 +404,13 @@ pub(crate) async fn handle(state: &ServerState, peer: PeerId, id: u16, bytes: &[
     flush(state, actions).await;
     Ok(())
 }
-fn drop_chunk(ledger: &mut Ledger, sharer: PeerId, h: &ChunkHeader, a: &mut Actions) {
+fn drop_chunk(
+    state: &ServerState,
+    ledger: &mut Ledger,
+    sharer: PeerId,
+    h: &ChunkHeader,
+    a: &mut Actions,
+) {
     ledger.dropped_chunks += 1;
     let s = ledger.sessions.get_mut(&sharer).expect("existing session");
     if h.kind != KIND_VIDEO {
@@ -383,7 +426,7 @@ fn drop_chunk(ledger: &mut Ledger, sharer: PeerId, h: &ChunkHeader, a: &mut Acti
     }
     if !s.dropping_video {
         s.dropping_video = true;
-        key(a, sharer, s, false);
+        request_keyframe(state, a, sharer, s, false);
     }
 }
 async fn media(state: &ServerState, peer: PeerId, bytes: &[u8]) -> Result<()> {
@@ -402,7 +445,7 @@ async fn media(state: &ServerState, peer: PeerId, bytes: &[u8]) -> Result<()> {
             bytes.len(),
             now,
         ) {
-            drop_chunk(&mut ledger, peer, &h, &mut a);
+            drop_chunk(state, &mut ledger, peer, &h, &mut a);
             a
         } else if s.viewers.is_empty() {
             a
@@ -421,6 +464,16 @@ async fn media(state: &ServerState, peer: PeerId, bytes: &[u8]) -> Result<()> {
                     {
                         continue;
                     }
+                    let Some(recipient) = state
+                        .authenticated_peers
+                        .get(&viewer)
+                        .and_then(|p| p.session.clone())
+                    else {
+                        continue;
+                    };
+                    if !state.transport.is_current_session(&recipient) {
+                        continue;
+                    }
                     let backlogged = state.transport.peer_channel_queued_count(
                         viewer,
                         channels::PLUGIN_RELIABLE,
@@ -428,7 +481,7 @@ async fn media(state: &ServerState, peer: PeerId, bytes: &[u8]) -> Result<()> {
                     ) > VIEWER_QUEUE_LIMIT;
                     if h.kind == KIND_AUDIO {
                         if !backlogged {
-                            targets.push(viewer);
+                            targets.push(recipient.clone());
                         }
                         continue;
                     }
@@ -449,11 +502,11 @@ async fn media(state: &ServerState, peer: PeerId, bytes: &[u8]) -> Result<()> {
                         }
                     }
                     if v.forwarding && v.sequence == h.sequence {
-                        targets.push(viewer);
+                        targets.push(recipient.clone());
                     }
                 }
                 if request_key {
-                    key(&mut a, peer, s, false);
+                    request_keyframe(state, &mut a, peer, s, false);
                 }
                 if h.kind == KIND_VIDEO {
                     s.frame_sequence = h.sequence;
@@ -467,7 +520,7 @@ async fn media(state: &ServerState, peer: PeerId, bytes: &[u8]) -> Result<()> {
                     (bytes.len() + 4) * targets.len(),
                     now,
                 ) {
-                    drop_chunk(&mut ledger, peer, &h, &mut a);
+                    drop_chunk(state, &mut ledger, peer, &h, &mut a);
                 } else {
                     if h.kind == KIND_VIDEO && h.index == 0 {
                         s.dropping_video = false;
@@ -477,7 +530,11 @@ async fn media(state: &ServerState, peer: PeerId, bytes: &[u8]) -> Result<()> {
                     w.put_bytes(bytes);
                     let data = w.into_vec();
                     for target in targets {
-                        a.push((target, MEDIA_ID, data.clone()));
+                        a.push(Action {
+                            recipient: target,
+                            plugin_id: MEDIA_ID,
+                            payload: data.clone(),
+                        });
                     }
                 }
             }
@@ -488,23 +545,6 @@ async fn media(state: &ServerState, peer: PeerId, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn add_descriptors(supply: &mut basis_protocol::messages::BasisMessageSupply) {
-    for (id, name) in [
-        (64, "basis.avatarhost"),
-        (CONTROL_ID, CONTROL_MESSAGE),
-        (MEDIA_ID, MEDIA_MESSAGE),
-    ] {
-        supply
-            .descriptors
-            .push(basis_protocol::messages::BasisMessageDescriptor {
-                id,
-                version: 1,
-                channel: channels::PLUGIN_RELIABLE,
-                flags: 1,
-                name: name.into(),
-            });
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;

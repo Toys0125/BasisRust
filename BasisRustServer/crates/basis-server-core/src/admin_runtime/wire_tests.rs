@@ -9,6 +9,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use tokio::net::UdpSocket;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+mod screen_share_regressions;
 mod week_sim;
 
 struct Client {
@@ -3023,6 +3024,7 @@ async fn v57_avatar_host_relay_validates_owners_and_serves_cached_ranges() {
 #[tokio::test]
 async fn v57_protection_settings_initial_sync_requires_capability_opt_in() {
     let (state, shutdown, _) = super::tests::test_server(false).await;
+    state.permissions.add_user_to_group("v57-opted", "admin");
     let mut opted = Client::connect_pending_with_capabilities(
         &state,
         "v57-opted",
@@ -3077,6 +3079,7 @@ async fn v57_capability_survives_signed_identity_admission() {
     state.config.write().use_auth_identity = true;
     let key = SigningKey::from_bytes(&[118; 32]);
     let did = client_did(&key);
+    state.permissions.add_user_to_group(&did, "admin");
     let mut client =
         Client::connect_pending_with_capabilities(&state, &did, &[], SERVER_VERSION, None, Some(2))
             .await;
@@ -3191,3 +3194,5 @@ async fn video_clip_cache_uses_private_server_addressing_and_direct_scene_replie
     let _ = shutdown.send(());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+mod v57_policy_regressions;

@@ -459,9 +459,11 @@ impl ImageCache {
         owners.insert(owner);
         let fair = cap / owners.len().max(1) as u64;
         let floor = if config.image_cache_minimum_per_owner_megabytes > 0 {
-            (config.image_cache_minimum_per_owner_megabytes as u64)
-                .saturating_mul(BYTES_PER_MEGABYTE)
-                .min(cap)
+            let configured = (config.image_cache_minimum_per_owner_megabytes as u64)
+                .saturating_mul(BYTES_PER_MEGABYTE);
+            let dimension = u64::from(config.image_max_resolution_k.clamp(1, 16)) * 1024;
+            let one_image = dimension.saturating_mul(dimension).saturating_mul(2);
+            configured.max(one_image).min(cap)
         } else {
             0
         };
@@ -882,6 +884,40 @@ mod tests {
             payload.extend_from_slice(&value.to_le_bytes());
         }
         payload
+    }
+
+    #[test]
+    fn resolution_raises_nonzero_owner_floor_but_never_exceeds_cache_capacity() {
+        let mut config = ServerConfig {
+            image_cache_max_megabytes: 512,
+            image_cache_minimum_per_owner_megabytes: 32,
+            image_max_resolution_k: 8,
+            ..ServerConfig::default()
+        };
+        let mut cache = ImageCache::default();
+        for owner in 1..=8 {
+            cache.observe(
+                owner,
+                &spawn(owner as u8, owner, 1, 0.0),
+                &[],
+                CachePeers {
+                    connected: &[],
+                    animation_allowed: &[],
+                },
+                true,
+                &config,
+            );
+        }
+        let cap = 512 * BYTES_PER_MEGABYTE;
+        assert_eq!(cache.owner_share(1, cap, &config), 128 * BYTES_PER_MEGABYTE);
+        config.image_max_resolution_k = 16;
+        assert_eq!(cache.owner_share(1, cap, &config), cap);
+        assert_eq!(
+            cache.owner_share(1, 64 * BYTES_PER_MEGABYTE, &config),
+            64 * BYTES_PER_MEGABYTE
+        );
+        config.image_cache_minimum_per_owner_megabytes = 0;
+        assert_eq!(cache.owner_share(1, cap, &config), 64 * BYTES_PER_MEGABYTE);
     }
 
     #[test]

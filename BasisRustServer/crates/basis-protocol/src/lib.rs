@@ -2,6 +2,7 @@ pub mod application;
 pub mod avatar;
 mod avatar_bundle_dictionary;
 pub mod avatar_delta;
+pub mod avatar_host;
 pub mod channels;
 pub mod config;
 pub mod did;
@@ -13,6 +14,7 @@ pub mod screen_share;
 pub mod server_info;
 pub mod storage;
 pub mod version;
+pub mod video_clip;
 
 pub use config::ServerConfig;
 pub use io::{NetReader, NetWriter};

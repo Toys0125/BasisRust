@@ -10,100 +10,121 @@ use basis_protocol::{
 const MAX_ENTRIES: usize = 256;
 const MAX_KEY_LENGTH: usize = 512;
 
-macro_rules! settings {
-    ($call:ident, $context:expr) => {
-        $call!(
-            $context,
-            "MaxSceneRelayMegabitsPerSecondPerPlayer",
-            "Relays",
-            max_scene_relay_megabits_per_second_per_player,
-            i32,
-            0,
-            100000
-        );
-        $call!(
-            $context,
-            "MaxLoadedResourcesPerPlayer",
-            "Per-player caps",
-            max_loaded_resources_per_player,
-            i32,
-            1,
-            1000000
-        );
-        $call!(
-            $context,
-            "MaxNetworkIdsPerPlayer",
-            "Per-player caps",
-            max_network_ids_per_player,
-            i32,
-            1,
-            65536
-        );
-        $call!(
-            $context,
-            "ScreenShareMaxKilobitsPerSecond",
-            "Screen share",
-            screen_share_max_kilobits_per_second,
-            i32,
-            500,
-            100000
-        );
-        $call!(
-            $context,
-            "ScreenShareEgressMegabitsPerSecond",
-            "Screen share",
-            screen_share_egress_megabits_per_second,
-            i32,
-            0,
-            100000
-        );
-        $call!(
-            $context,
-            "ScreenShareMaxConcurrent",
-            "Screen share",
-            screen_share_max_concurrent,
-            i32,
-            0,
-            1024
-        );
-        $call!(
-            $context,
-            "AvatarHostMaxMegabytes",
-            "Local avatar sharing",
-            avatar_host_max_megabytes,
-            i32,
-            0,
-            4096
-        );
-        $call!(
-            $context,
-            "AvatarHostCacheMegabytes",
-            "Local avatar sharing",
-            avatar_host_cache_megabytes,
-            i32,
-            0,
-            65536
-        );
+struct SettingDescriptor {
+    key: &'static str,
+    group: &'static str,
+    title: &'static str,
+    description: &'static str,
+    whole_number: bool,
+    min: f64,
+    max: f64,
+    get: fn(&ServerConfig) -> f64,
+    set: fn(&mut ServerConfig, f64),
+}
+macro_rules! integer_setting {
+    ($field:ident, $key:literal, $group:literal, $title:literal, $description:literal, $min:literal, $max:literal) => {
+        SettingDescriptor {
+            key: $key,
+            group: $group,
+            title: $title,
+            description: $description,
+            whole_number: true,
+            min: $min as f64,
+            max: $max as f64,
+            get: |config| config.$field as f64,
+            set: |config, value| config.$field = value as i32,
+        }
     };
 }
+const SETTINGS: &[SettingDescriptor] = &[
+    integer_setting!(
+        max_scene_relay_megabits_per_second_per_player,
+        "MaxSceneRelayMegabitsPerSecondPerPlayer",
+        "Relays",
+        "Scene relay bandwidth per player",
+        "Maximum scene relay megabits per second per player. Zero removes the limit.",
+        0,
+        100000
+    ),
+    integer_setting!(
+        max_loaded_resources_per_player,
+        "MaxLoadedResourcesPerPlayer",
+        "Per-player caps",
+        "Loaded resources per player",
+        "Maximum number of loaded resources owned by one player.",
+        1,
+        1000000
+    ),
+    integer_setting!(
+        max_network_ids_per_player,
+        "MaxNetworkIdsPerPlayer",
+        "Per-player caps",
+        "Network IDs per player",
+        "Maximum number of network identifiers allocated to one player.",
+        1,
+        65536
+    ),
+    integer_setting!(
+        screen_share_max_kilobits_per_second,
+        "ScreenShareMaxKilobitsPerSecond",
+        "Screen share",
+        "Screen share bitrate",
+        "Maximum kilobits per second for each screen sharer.",
+        500,
+        100000
+    ),
+    integer_setting!(
+        screen_share_egress_megabits_per_second,
+        "ScreenShareEgressMegabitsPerSecond",
+        "Screen share",
+        "Screen share outgoing bandwidth",
+        "Maximum megabits per second forwarded per screen session. Zero removes the limit.",
+        0,
+        100000
+    ),
+    integer_setting!(
+        screen_share_max_concurrent,
+        "ScreenShareMaxConcurrent",
+        "Screen share",
+        "Concurrent screen shares",
+        "Maximum active screen shares. Zero removes the limit.",
+        0,
+        1024
+    ),
+    integer_setting!(
+        avatar_host_max_megabytes,
+        "AvatarHostMaxMegabytes",
+        "Local avatar sharing",
+        "Avatar host range size",
+        "Maximum megabytes in one hosted-avatar range request. Zero disables hosting.",
+        0,
+        4096
+    ),
+    integer_setting!(
+        avatar_host_cache_megabytes,
+        "AvatarHostCacheMegabytes",
+        "Local avatar sharing",
+        "Avatar host cache size",
+        "Maximum megabytes retained in the hosted-avatar range cache. Zero disables caching.",
+        0,
+        65536
+    ),
+];
 
 pub(crate) fn encode(config: &ServerConfig) -> Result<Vec<u8>> {
     let mut writer = NetWriter::new();
     writer.put_u8(AdminRequestMode::GlobalGetProtectionSettings as u8);
-    writer.put_u16(8);
-    macro_rules! write {
-        ($c:expr, $key:literal, $group:literal, $field:ident, $kind:ident, $min:literal, $max:literal) => {
-            writer.put_string($key)?;
-            writer.put_string($group)?;
-            writer.put_string($key)?;
-            writer.put_string("")?;
-            writer.put_bool(stringify!($kind) != "f64");
-            writer.put_f64($min as f64);
-            writer.put_f64($max as f64);
-            writer.put_f64($c.$field as f64);
-        };
+    writer.put_u16(u16::try_from(SETTINGS.len())?);
+    for setting in SETTINGS {
+        writer.put_string(setting.key)?;
+        writer.put_string(setting.group)?;
+        writer.put_string(setting.title)?;
+        writer.put_string(setting.description)?;
+        writer.put_bool(setting.whole_number);
+        writer.put_f64(setting.min);
+        writer.put_f64(setting.max);
+        writer.put_f64((setting.get)(config));
     }
-    settings!(write, config);
     Ok(writer.into_vec())
 }
 
@@ -127,18 +148,15 @@ pub(crate) fn apply(config: &mut ServerConfig, changes: Vec<(String, f64)>) {
         if !value.is_finite() {
             continue;
         }
-        macro_rules! set {
-            ($c:expr, $key:literal, $group:literal, $field:ident, $kind:ident, $min:literal, $max:literal) => {
-                if key == $key {
-                    let mut value = value.clamp($min as f64, $max as f64);
-                    if stringify!($kind) != "f64" {
-                        value = value.round_ties_even();
-                    }
-                    $c.$field = value as $kind;
-                }
+        if let Some(setting) = SETTINGS.iter().find(|s| s.key == key) {
+            let value = value.clamp(setting.min, setting.max);
+            let value = if setting.whole_number {
+                value.round_ties_even()
+            } else {
+                value
             };
+            (setting.set)(config, value);
         }
-        settings!(set, config);
     }
 }
 
@@ -225,12 +243,14 @@ mod tests {
         let payload = encode(&config).unwrap();
         let mut reader = NetReader::new(&payload);
         assert_eq!(reader.get_u8().unwrap(), 99);
-        assert_eq!(reader.get_u16().unwrap(), 8);
-        for _ in 0..8 {
+        assert_eq!(reader.get_u16().unwrap() as usize, SETTINGS.len());
+        for descriptor in SETTINGS {
+            assert_eq!(reader.get_string().unwrap(), descriptor.key);
+            assert_eq!(reader.get_string().unwrap(), descriptor.group);
+            let title = reader.get_string().unwrap();
+            assert_eq!(title, descriptor.title);
+            assert_ne!(title, descriptor.key);
             assert!(!reader.get_string().unwrap().is_empty());
-            reader.get_string().unwrap();
-            reader.get_string().unwrap();
-            reader.get_string().unwrap();
             reader.get_bool().unwrap();
             let min = reader.get_f64().unwrap();
             let max = reader.get_f64().unwrap();

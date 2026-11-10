@@ -24,13 +24,25 @@ through `basis.screenshare.control` / `basis.screenshare.media`, video clip scen
 caching, and the expanded admin lock-state suffix and media limits. Plugin IDs are
 supplied in the registry manifest; clients subscribe before receiving plugin data.
 Avatar range requests validate ownership and bounds, share pending fetches, and
-use a bounded cache and outgoing queue. Backpressure can return the protocol's
-busy failure rather than retaining unlimited data. Video chunks use an ephemeral
-disk cache with paced replay; clean shutdown removes its files. A process crash
-can leave its cache directory behind for manual cleanup.
+use bounded caches and per-connection queues with fair request scheduling. Fetches
+become pending only when their owner command is retained; backpressure can return
+the protocol's busy failure. Multipart avatar and screen transfers retain the
+original connection identity across numeric ID reuse. Video locks are enforced
+before live uploads reach the cache or other clients.
+
+Video chunks use an ephemeral disk cache with paced replay and a bounded storage
+worker. Generation-checked offers and coalesced state notifications survive
+transport backpressure. Clean shutdown removes owned files; later instances can
+scavenge abandoned cache directories only after proving ownership, safe access
+permissions, and an unlocked ownership lease. Unrecognized or unsafe directories
+are left untouched. Raising image resolution also raises a nonzero per-owner image
+cache floor, capped by the total cache capacity.
 
 The protection editor advertises the eight settings backed by this Rust runtime;
 it does not advertise upstream protection knobs with no matching implementation.
+Initial settings and later coalesced updates go only to capability-enabled editors
+with configuration permission. Screen lock enforcement proceeds even if saving the
+configuration fails; disabling file support avoids persistence entirely.
 The headless client connects with the new protocol but does not generate screen
 or video media workloads. Validation uses Rust wire vectors and UDP loopback tests;
 a live Unity client interoperability run has not been performed.

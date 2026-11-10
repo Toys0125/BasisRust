@@ -19,7 +19,10 @@ mod image_governor;
 mod image_tests;
 pub mod memory_reclaim;
 mod p2p;
+mod plugin_catalog;
 mod protection_settings;
+mod protection_sync;
+mod queue_admission;
 mod realtime;
 mod scene_relay;
 mod screen_share;
@@ -515,6 +518,7 @@ pub struct ServerState {
     video_clip_cache: Arc<Mutex<video_clip::VideoClipCache>>,
     screen_share: Arc<Mutex<screen_share::Ledger>>,
     avatar_host: Arc<Mutex<avatar_host::Ledger>>,
+    protection_sync: Arc<Mutex<protection_sync::Pending>>,
     jiggle_buckets: Arc<Mutex<HashMap<PeerId, JiggleTokenBucket>>>,
     error_report_hashes: Arc<DashMap<String, HashSet<u64>>>,
     pub avatar_sync: AvatarSyncSystem,
@@ -749,6 +753,7 @@ impl ServerState {
             video_clip_cache: Arc::new(Mutex::new(video_clip::VideoClipCache::default())),
             screen_share: Arc::new(Mutex::new(screen_share::Ledger::default())),
             avatar_host: Arc::new(Mutex::new(avatar_host::Ledger::default())),
+            protection_sync: Arc::new(Mutex::new(protection_sync::Pending::default())),
             jiggle_buckets: Arc::new(Mutex::new(HashMap::new())),
             error_report_hashes: Arc::new(DashMap::new()),
             avatar_sync,
@@ -797,6 +802,7 @@ impl ServerState {
             spawn_image_replay_loop(state.clone()),
             spawn_video_clip_replay_loop(state.clone()),
             avatar_host::spawn_pump(state.clone()),
+            protection_sync::spawn_pump(state.clone()),
             spawn_content_expiry_loop(state.clone()),
             admin_runtime::spawn_permission_updates(state.clone()),
             tokio::spawn(event_loop(
@@ -1161,6 +1167,7 @@ impl ServerState {
         self.video_clip_cache.lock().reset();
         *self.screen_share.lock() = screen_share::Ledger::default();
         *self.avatar_host.lock() = avatar_host::Ledger::default();
+        protection_sync::reset(self);
         let final_save = self.flush_shutdown_state();
         if let Err(err) = &final_save {
             error!("final shutdown persistence failed: {err:#}");
@@ -1459,18 +1466,17 @@ async fn deliver_video_clip_cache_sends(state: &ServerState, sends: Vec<video_cl
         return;
     };
     for send in sends {
-        let Some(session) = state
-            .authenticated_peers
-            .get(&send.recipient)
-            .and_then(|p| p.session.clone())
-        else {
+        let Some(session) = send.recipient_session().cloned() else {
             continue;
         };
+        if send.requires_share_permission() && !video_clip_owner_may_share(state, send.owner()) {
+            continue;
+        }
         let message = ServerSceneDataMessage {
-            player_id: send.owner,
+            player_id: send.owner(),
             scene_data_message: RemoteSceneDataMessage {
                 message_index,
-                payload: send.payload.to_vec(),
+                payload: send.payload().to_vec(),
             },
         };
         let mut writer = NetWriter::new();
@@ -1478,18 +1484,42 @@ async fn deliver_video_clip_cache_sends(state: &ServerState, sends: Vec<video_cl
             warn!("failed to serialize video clip cache replay: {err}");
             continue;
         }
-        let mut cache = state.video_clip_cache.lock();
-        if !cache.valid(&send) {
-            continue;
-        }
-        // Hold cancellation validation through synchronous reliable queue admission.
-        if !state.transport.queue_reliable_ordered_session(
-            &session,
-            channels::DIRECT_SCENE_SERVER,
-            writer.as_slice(),
-        ) && state.transport.is_current_session(&session)
-        {
-            cache.retry(&send);
+        let overflow = {
+            let mut cache = state.video_clip_cache.lock();
+            if !cache.valid(&send) {
+                continue;
+            }
+            // Cancellation and the exact recipient remain valid through synchronous admission.
+            match queue_admission::reliable(
+                &state.transport,
+                &session,
+                channels::DIRECT_SCENE_SERVER,
+                writer.as_slice(),
+            ) {
+                queue_admission::Outcome::Queued => {
+                    cache.acknowledge(&send);
+                    false
+                }
+                queue_admission::Outcome::RecipientGone => false,
+                queue_admission::Outcome::Backpressured => {
+                    matches!(
+                        cache.retry(&send),
+                        video_clip::RetryOutcome::CapacityExceeded
+                    )
+                }
+            }
+        };
+        // A bounded control queue must fail explicitly rather than discard authoritative state.
+        if overflow {
+            if let Err(error) = request_disconnect(
+                state,
+                &session,
+                "Video cache control queue capacity reached",
+            )
+            .await
+            {
+                warn!("failed to retire backlogged video cache recipient: {error}");
+            }
         }
     }
 }
@@ -3051,6 +3081,7 @@ async fn finalize_accept(
         .await;
         return Ok(());
     };
+    state.video_clip_cache.lock().bind_session(session.clone());
     info!("peer connected: {peer_id}");
 
     let server_meta = ServerMetaDataMessage {
@@ -3081,7 +3112,7 @@ async fn finalize_accept(
     let mut registry_writer = NetWriter::new();
     registry_writer.put_u8(channels::REGISTRY_SUB_SUPPLY);
     let mut supply = core_message_supply();
-    screen_share::add_descriptors(&mut supply);
+    plugin_catalog::add_descriptors(&mut supply);
     supply.serialize(&mut registry_writer)?;
     state
         .transport
@@ -3335,6 +3366,7 @@ async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: D
     state.voice_recipients.remove(&peer);
     state.voice_recipient_sessions.remove(&peer);
     avatar_host::remove_peer(state, peer).await;
+    protection_sync::remove_peer(state, peer);
     screen_share::remove_peer(state, peer).await;
     state.message_subscriptions.remove(&peer);
     state.uplink_delta_states.remove(&peer);
@@ -4533,7 +4565,7 @@ async fn handle_message(
             if delivery == DeliveryMethod::ReliableOrdered {
                 let mut reader = NetReader::new(&payload);
                 let id = reader.get_u16()?;
-                if id == 64 {
+                if id == basis_protocol::avatar_host::MESSAGE_ID {
                     avatar_host::handle(state, peer, reader.remaining_slice()).await?;
                 } else if id == basis_protocol::screen_share::CONTROL_ID
                     || id == basis_protocol::screen_share::MEDIA_ID
@@ -4623,6 +4655,15 @@ async fn relay_scene_generic(
         state.net_ids.find(image_cache::IMAGE_MANAGER_IDENTIFIER) == Some(scene.message_index);
     let is_video_clip_traffic =
         state.net_ids.find(video_clip::CLIP_MANAGER_IDENTIFIER) == Some(scene.message_index);
+    // Live uploads must pass moderation before either cache observation or relay.
+    // The sender-supplied bypass flag is descriptive data, never authority.
+    if is_video_clip_traffic
+        && basis_protocol::video_clip::Opcode::from_payload(&scene.payload)
+            .is_some_and(|op| op.is_upload())
+        && !video_clip_owner_may_share(state, peer)
+    {
+        return Ok(());
+    }
     let allow_animation = !is_image_traffic || image_animation_allowed(state, peer);
     if is_image_traffic && matches!(scene.payload.first(), Some(6 | 7)) && !allow_animation {
         return Ok(());
@@ -4670,7 +4711,11 @@ async fn relay_scene_generic(
         );
         deliver_image_cache_sends(state, effects.sends).await;
     }
-    if is_video_clip_traffic && (allowed || matches!(scene.payload.first(), Some(3 | 5 | 8 | 9))) {
+    if is_video_clip_traffic
+        && (allowed
+            || basis_protocol::video_clip::Opcode::from_payload(&scene.payload)
+                .is_some_and(|op| op.is_cache_control()))
+    {
         let connected = state
             .authenticated_peers
             .iter()
@@ -5753,8 +5798,7 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
                 protection_settings::apply(&mut config, changes);
             }
             state.refresh_runtime_config();
-            let payload = protection_settings::encode(&state.config.read())?;
-            send_admin_payload_to_peer(state, peer, payload).await?;
+            broadcast_protection_settings(state).await?;
         }
         AdminRequestMode::GlobalToggleAvatarHosting => {
             toggle_simple_lock(
@@ -6531,11 +6575,7 @@ async fn send_initial_admin_state_to_peer(state: &ServerState, peer_id: PeerId) 
         encode_image_bandwidth_payload(&config),
         encode_i32_admin_state_payload(AdminRequestMode::GlobalGetPeerLimit, config.peer_limit),
     ];
-    if state
-        .authenticated_peers
-        .get(&peer_id)
-        .is_some_and(|peer| peer.capabilities & 2 != 0)
-    {
+    if protection_editor_eligible(state, peer_id) {
         match protection_settings::encode(&config) {
             Ok(payload) => payloads.push(payload),
             Err(error) => warn!("failed to encode initial protection settings: {error:#}"),
@@ -6548,6 +6588,46 @@ async fn send_initial_admin_state_to_peer(state: &ServerState, peer_id: PeerId) 
     if let Err(err) = state.transport.send_many(peer_id, &messages).await {
         warn!("failed to send initial admin state to peer {peer_id}: {err:#}");
     }
+}
+
+fn protection_editor_eligible(state: &ServerState, peer: PeerId) -> bool {
+    let opted_in = state
+        .authenticated_peers
+        .get(&peer)
+        .is_some_and(|p| p.capabilities & 2 != 0);
+    opted_in
+        && peer_has_permission(
+            state,
+            peer,
+            basis_server_permissions::nodes::CONFIGURATION_EDITOR,
+        )
+}
+
+async fn broadcast_protection_settings(state: &ServerState) -> Result<()> {
+    let payload = protection_settings::encode(&state.config.read())?;
+    // Freeze connection identities before any asynchronous send can allow ID reuse.
+    let sessions: Vec<_> = state
+        .authenticated_peers
+        .iter()
+        .filter_map(|p| {
+            let peer = *p.key();
+            let opted_in = p.capabilities & 2 != 0;
+            let session = p.session.clone();
+            drop(p);
+            (opted_in
+                && peer_has_permission(
+                    state,
+                    peer,
+                    basis_server_permissions::nodes::CONFIGURATION_EDITOR,
+                ))
+            .then_some(session)
+            .flatten()
+        })
+        .collect();
+    for session in sessions {
+        protection_sync::queue(state, session, payload.clone());
+    }
+    Ok(())
 }
 
 fn encode_lock_state_payload(locks: &GlobalState) -> Vec<u8> {
