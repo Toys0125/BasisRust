@@ -1932,6 +1932,22 @@ impl TransportHandle {
         self.peers.iter().map(|peer| peer.total_pending()).sum()
     }
 
+    /// Reliable packets queued for one peer/channel, used for screen viewer backpressure.
+    pub fn peer_channel_queued_count(
+        &self,
+        peer: PeerId,
+        channel: u8,
+        delivery: DeliveryMethod,
+    ) -> usize {
+        self.peers.get(&peer).map_or(0, |state| {
+            state
+                .outgoing_reliable
+                .lock()
+                .get(&DeliveryMethod::channel_id(channel, delivery))
+                .map_or(0, VecDeque::len)
+        })
+    }
+
     pub fn queued_reliable_count(&self) -> usize {
         self.peers.iter().map(|peer| peer.total_queued()).sum()
     }

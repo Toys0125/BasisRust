@@ -12,6 +12,29 @@ recipient turns. Avatar pose/delta input uses a separate thread; avatar downlink
 retain their tick and flush workers. See the
 [voice processing and load-test report](../docs/performance/voice-isolation.md).
 
+## BasisVR protocol v57
+
+Targets [BasisVR `2e6b44de394d`](https://github.com/BasisVR/Basis/tree/2e6b44de394d73a17ebba5a58ec4812464e120e8).
+The server advertises protocol 57 and retains the connection-bound DID login and
+sealed uplink introduced in 56. The headless client defaults to 57; its existing
+explicit v55 fallback remains available.
+
+The v57 integration adds avatar hosting through `basis.avatarhost`, screen sharing
+through `basis.screenshare.control` / `basis.screenshare.media`, video clip scene
+caching, and the expanded admin lock-state suffix and media limits. Plugin IDs are
+supplied in the registry manifest; clients subscribe before receiving plugin data.
+Avatar range requests validate ownership and bounds, share pending fetches, and
+use a bounded cache and outgoing queue. Backpressure can return the protocol's
+busy failure rather than retaining unlimited data. Video chunks use an ephemeral
+disk cache with paced replay; clean shutdown removes its files. A process crash
+can leave its cache directory behind for manual cleanup.
+
+The protection editor advertises the eight settings backed by this Rust runtime;
+it does not advertise upstream protection knobs with no matching implementation.
+The headless client connects with the new protocol but does not generate screen
+or video media workloads. Validation uses Rust wire vectors and UDP loopback tests;
+a live Unity client interoperability run has not been performed.
+
 ## Run
 
 Requires Rust 1.95.0 or later. Both workspaces are checked on Rust 1.95.0 in PR

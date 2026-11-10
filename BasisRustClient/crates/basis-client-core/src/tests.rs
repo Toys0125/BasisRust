@@ -924,11 +924,11 @@ async fn unreliable_voice_repeats_remain_counted() {
 }
 
 #[test]
-fn connection_payload_starts_with_v56_application_auth_key_and_ready() {
+fn connection_payload_starts_with_v57_application_auth_key_and_ready() {
     let config = Config::default();
     let ready = ready_message(&config, [0.0, 0.0, 0.0]).unwrap();
     let payload = build_connection_payload(&config, &ready, &[7; 32]).unwrap();
-    assert_eq!(SERVER_VERSION, 56);
+    assert_eq!(SERVER_VERSION, 57);
     assert_eq!(&payload[0..2], &SERVER_VERSION.to_le_bytes());
     assert_eq!(payload[2], 1);
     let auth_len = u16::from_le_bytes([payload[3], payload[4]]) as usize;
@@ -987,7 +987,7 @@ fn version_rejection(server: u16, client: u16, kind: u8, timestamp: i64) -> Vec<
 }
 
 #[tokio::test]
-async fn v56_client_retries_v55_only_on_matching_structured_version_rejection() {
+async fn v57_client_retries_v55_only_on_matching_structured_version_rejection() {
     let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let client = test_client(0, server.local_addr().unwrap()).await;
     client.connected.store(false, Ordering::Release);
@@ -1058,8 +1058,18 @@ async fn v55_fallback_rejects_unrelated_or_malformed_reasons() {
             0,
         ),
         version_rejection(55, 55, channels::REJECT_KIND_VERSION_MISMATCH, 0),
-        version_rejection(55, 56, channels::REJECT_KIND_PASSWORD_REJECTED, 0),
-        version_rejection(55, 56, channels::REJECT_KIND_VERSION_MISMATCH, 999),
+        version_rejection(
+            55,
+            SERVER_VERSION,
+            channels::REJECT_KIND_PASSWORD_REJECTED,
+            0,
+        ),
+        version_rejection(
+            55,
+            SERVER_VERSION,
+            channels::REJECT_KIND_VERSION_MISMATCH,
+            999,
+        ),
     ];
     for packet in &mismatches {
         assert!(
@@ -1068,7 +1078,12 @@ async fn v55_fallback_rejects_unrelated_or_malformed_reasons() {
         );
     }
     assert!(!is_v55_version_rejection(&[0, 0, 0]));
-    let invalid = version_rejection(55, 56, channels::REJECT_KIND_PASSWORD_REJECTED, 0);
+    let invalid = version_rejection(
+        55,
+        SERVER_VERSION,
+        channels::REJECT_KIND_PASSWORD_REJECTED,
+        0,
+    );
     client.handle_packet(&invalid).await.unwrap();
     assert_eq!(
         client.protocol_version.load(Ordering::Acquire),
@@ -1131,7 +1146,7 @@ fn open_client_datagram(key: &[u8; 32], packet: &[u8]) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn repeated_v56_challenges_cannot_restart_the_encryption_counter() {
+async fn repeated_v57_challenges_cannot_restart_the_encryption_counter() {
     let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let client = test_client(0, server.local_addr().unwrap()).await;
     let secret = x25519_dalek::StaticSecret::from([42u8; 32]);

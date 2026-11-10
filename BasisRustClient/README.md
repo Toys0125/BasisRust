@@ -17,7 +17,7 @@ This is a headless client implementation that mimics the behavior of the Basis V
 - Opt-in voice simulation from Ogg Opus files
 - Interactive console controls for voice, client scaling, and graceful shutdown
 - Automatic reconnection
-- v56 default with automatic v55 compatibility on a structured version rejection
+- v57 default with automatic v55 compatibility on a structured version rejection
 - Validated MTU-probe replies on Windows and the Linux shared receiver
 
 ## Running
@@ -86,7 +86,7 @@ switches override loaded values. Server PascalCase environment overrides and
 match the server. `BASIS_CLIENT_TOKIO_WORKERS` configures the client's runtime
 worker count only. See `--help` for CLI options.
 
-The client attempts Basis protocol **v56** first. If the server rejects that
+The client attempts Basis protocol **v57** first. If the server rejects that
 connection with an explicit, structured **v55 version mismatch**, the same client
 retries once with the v55 connection layout (no ephemeral key), then signs the
 original nonce-only DID challenge and sends unencrypted client packets. Other
@@ -94,7 +94,7 @@ rejections, including invalid passwords, do not trigger fallback. The retry
 stays on the same UDP socket and preserves the client's identity and ready state.
 Because the version rejection is unauthenticated and v55 lacks v56's encrypted
 uplink, this automatic downgrade is intended only for trusted v55 servers.
-Set `BASIS_CLIENT_DISABLE_V55_FALLBACK=1` to require v56 and reject attempts
+Set `BASIS_CLIENT_DISABLE_V55_FALLBACK=1` to require v57 and reject attempts
 to downgrade the connection.
 
 `AvatarPassword`, `AvatarUrl` and `AvatarLoadMode` are client values, not server

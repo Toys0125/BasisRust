@@ -9,6 +9,7 @@ pub mod io;
 pub mod login;
 pub mod messages;
 pub mod permissions;
+pub mod screen_share;
 pub mod server_info;
 pub mod storage;
 pub mod version;

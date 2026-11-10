@@ -197,6 +197,21 @@ pub struct ServerConfig {
     pub safe_display_names_forced: bool,
     pub content_removal_locked: bool,
     pub external_links_locked: bool,
+    pub avatar_hosting_locked: bool,
+    pub video_clips_locked: bool,
+    pub image_max_resolution_k: u8,
+    pub video_clip_max_megabytes: u16,
+    pub video_clip_max_per_player: u8,
+    pub video_clip_cache_enabled: bool,
+    pub video_clip_cache_max_megabytes: i32,
+    pub video_clip_cache_serve_megabytes_per_second: i32,
+    pub video_clip_cache_directory: String,
+    pub screen_share_locked: bool,
+    pub screen_share_max_concurrent: i32,
+    pub screen_share_max_kilobits_per_second: i32,
+    pub screen_share_egress_megabits_per_second: i32,
+    pub avatar_host_max_megabytes: i32,
+    pub avatar_host_cache_megabytes: i32,
     pub storage_enabled: bool,
     pub storage_backend: String,
     pub storage_max_bytes_per_player: i32,
@@ -341,6 +356,21 @@ impl Default for ServerConfig {
             safe_display_names_forced: false,
             content_removal_locked: false,
             external_links_locked: false,
+            avatar_hosting_locked: false,
+            video_clips_locked: false,
+            image_max_resolution_k: 4,
+            video_clip_max_megabytes: 96,
+            video_clip_max_per_player: 3,
+            video_clip_cache_enabled: true,
+            video_clip_cache_max_megabytes: 1024,
+            video_clip_cache_serve_megabytes_per_second: 64,
+            video_clip_cache_directory: String::new(),
+            screen_share_locked: false,
+            screen_share_max_concurrent: 8,
+            screen_share_max_kilobits_per_second: 12000,
+            screen_share_egress_megabits_per_second: 200,
+            avatar_host_max_megabytes: 256,
+            avatar_host_cache_megabytes: 1024,
             storage_enabled: true,
             storage_backend: "file".to_owned(),
             storage_max_bytes_per_player: 16_384,
@@ -708,6 +738,37 @@ impl ServerConfig {
         override_field!("SafeDisplayNamesForced", safe_display_names_forced, bool);
         override_field!("ContentRemovalLocked", content_removal_locked, bool);
         override_field!("ExternalLinksLocked", external_links_locked, bool);
+        override_field!("AvatarHostingLocked", avatar_hosting_locked, bool);
+        override_field!("VideoClipsLocked", video_clips_locked, bool);
+        override_field!("ImageMaxResolutionK", image_max_resolution_k, u8);
+        override_field!("VideoClipMaxMegabytes", video_clip_max_megabytes, u16);
+        override_field!("VideoClipMaxPerPlayer", video_clip_max_per_player, u8);
+        override_field!("VideoClipCacheEnabled", video_clip_cache_enabled, bool);
+        override_field!(
+            "VideoClipCacheMaxMegabytes",
+            video_clip_cache_max_megabytes,
+            i32
+        );
+        override_field!(
+            "VideoClipCacheServeMegabytesPerSecond",
+            video_clip_cache_serve_megabytes_per_second,
+            i32
+        );
+        override_string!("VideoClipCacheDirectory", video_clip_cache_directory);
+        override_field!("ScreenShareLocked", screen_share_locked, bool);
+        override_field!("ScreenShareMaxConcurrent", screen_share_max_concurrent, i32);
+        override_field!(
+            "ScreenShareMaxKilobitsPerSecond",
+            screen_share_max_kilobits_per_second,
+            i32
+        );
+        override_field!(
+            "ScreenShareEgressMegabitsPerSecond",
+            screen_share_egress_megabits_per_second,
+            i32
+        );
+        override_field!("AvatarHostMaxMegabytes", avatar_host_max_megabytes, i32);
+        override_field!("AvatarHostCacheMegabytes", avatar_host_cache_megabytes, i32);
         override_field!("StorageEnabled", storage_enabled, bool);
         override_string!("StorageBackend", storage_backend);
         override_field!(
@@ -956,6 +1017,24 @@ fn resolve_config_path(path: &Path) -> std::io::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn v57_media_config_roundtrips_pascal_case_fields() {
+        let config = super::ServerConfig {
+            avatar_hosting_locked: true,
+            video_clips_locked: true,
+            image_max_resolution_k: 8,
+            video_clip_max_megabytes: 512,
+            video_clip_max_per_player: 6,
+            screen_share_max_concurrent: 2,
+            ..super::ServerConfig::default()
+        };
+        let xml = quick_xml::se::to_string(&config).unwrap();
+        assert!(xml.contains("<ImageMaxResolutionK>8</ImageMaxResolutionK>"));
+        assert!(xml.contains("<VideoClipMaxMegabytes>512</VideoClipMaxMegabytes>"));
+        assert!(xml.contains("<AvatarHostingLocked>true</AvatarHostingLocked>"));
+        let restored: super::ServerConfig = quick_xml::de::from_str(&xml).unwrap();
+        assert_eq!(restored, config);
+    }
     #[test]
     fn benchmark_fixtures_load_without_rewriting_frozen_config() {
         let fixtures = [

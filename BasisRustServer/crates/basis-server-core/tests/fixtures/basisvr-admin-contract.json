@@ -44,6 +44,7 @@
     "basis.resource.unload.avatar",
     "basis.resource.unload.prop",
     "basis.resource.unload.world",
+    "basis.screenshare",
     "basis.server.stats",
     "basis.storage.use",
     "basis.voice.lockbypass"
@@ -61,6 +62,7 @@
     "basis.resource.unload.avatar",
     "basis.resource.unload.prop",
     "basis.resource.unload.world",
+    "basis.screenshare",
     "basis.storage.use"
   ],
   "moderator_nodes": [
@@ -186,7 +188,17 @@
     "GlobalToggleGifs",
     "RenamePlayer",
     "GetMuteState",
-    "MuteStateResult"
+    "MuteStateResult",
+    "GlobalToggleContentRemoval",
+    "GlobalToggleExternalLinks",
+    "GetProtectionSettings",
+    "GlobalGetProtectionSettings",
+    "SetProtectionSettings",
+    "GlobalToggleAvatarHosting",
+    "GlobalToggleVideoClips",
+    "SetGlobalImageMaxResolution",
+    "SetGlobalVideoClipMaxSize",
+    "SetGlobalVideoClipMaxPerPlayer"
   ],
   "required_permissions": {
     "AddAllowlist": "basis.moderation.whitelist",
@@ -259,6 +271,18 @@
     "TeleportAll": "basis.moderation.teleport",
     "TeleportPlayer": "basis.moderation.teleport",
     "UnBan": "basis.moderation.unban",
-    "UnBanIP": "basis.moderation.unbanip"
-  }
+    "UnBanIP": "basis.moderation.unbanip",
+    "GetProtectionSettings": "basis.configuration",
+    "GlobalGetProtectionSettings": null,
+    "SetProtectionSettings": "basis.configuration",
+    "GlobalToggleAvatarHosting": "basis.moderation.globallock",
+    "GlobalToggleVideoClips": "basis.moderation.globallock",
+    "SetGlobalImageMaxResolution": "basis.moderation.globallock",
+    "SetGlobalVideoClipMaxSize": "basis.moderation.globallock",
+    "SetGlobalVideoClipMaxPerPlayer": "basis.moderation.globallock",
+    "GlobalToggleContentRemoval": "basis.moderation.globallock",
+    "GlobalToggleExternalLinks": "basis.moderation.globallock"
+  },
+  "v57_source_commit": "2e6b44de394d73a17ebba5a58ec4812464e120e8",
+  "v57_scope": "Added ScreenShare permission/default grant and admin modes96\u2013105; other entries retain the original audit scope."
 }

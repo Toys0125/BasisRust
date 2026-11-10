@@ -49,6 +49,17 @@ impl Client {
         version: u16,
         application: Option<(&str, &str)>,
     ) -> Self {
+        Self::connect_pending_with_capabilities(state, uuid, auth, version, application, None).await
+    }
+
+    async fn connect_pending_with_capabilities(
+        state: &ServerState,
+        uuid: &str,
+        auth: &[u8],
+        version: u16,
+        application: Option<(&str, &str)>,
+        capabilities: Option<u8>,
+    ) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket
             .connect(state.transport.local_addr().unwrap())
@@ -82,6 +93,9 @@ impl Client {
         super::tests::ready_message(uuid)
             .serialize(&mut writer)
             .unwrap();
+        if let Some(capabilities) = capabilities {
+            writer.put_u8(capabilities);
+        }
         let payload_hash =
             basis_protocol::login::connection_payload_hash(&writer.as_slice()[payload_start..]);
         socket.send(writer.as_slice()).await.unwrap();
@@ -2720,4 +2734,460 @@ async fn ordered_udp_burst_backpressures_and_retries_in_fifo_order() {
         .unwrap();
     state.shutdown().await.unwrap();
     let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn screen_share_routes_only_watched_keyframes_and_replays_sessions() {
+    use basis_protocol::screen_share as ss;
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let mut sharer = Client::connect(&state, "screen-sharer").await;
+    let sharer_id = peer_by_uuid(&state, "screen-sharer").unwrap();
+    state.permissions.add_user_node(
+        "screen-sharer",
+        basis_server_permissions::nodes::SCREEN_SHARE,
+    );
+    let mut subscribe = NetWriter::new();
+    subscribe.put_u8(channels::REGISTRY_SUB_SUBSCRIBE);
+    BasisMessageSubscribe {
+        ids: vec![ss::CONTROL_ID, ss::MEDIA_ID],
+    }
+    .serialize(&mut subscribe)
+    .unwrap();
+    sharer
+        .send(channels::REGISTRY_CONTROL, subscribe.as_slice(), true)
+        .await;
+    let matches_sub =
+        |p: &[u8], id: u16, sub: u8| p.len() >= 3 && p[..2] == id.to_le_bytes() && p[2] == sub;
+    sharer
+        .receive(|c, p| {
+            c == channels::PLUGIN_RELIABLE && matches_sub(p, ss::CONTROL_ID, ss::POLICY)
+        })
+        .await;
+    let info = ss::StreamInfo {
+        width: 1280,
+        height: 720,
+        fps: 30,
+        has_audio: true,
+        title: "Test screen".into(),
+    };
+    let pose = ss::ScreenPose {
+        position: [0.; 3],
+        rotation: [0., 0., 0., 1.],
+        scale: 1.,
+    };
+    let mut start = NetWriter::new();
+    start.put_u16(ss::CONTROL_ID);
+    start.put_u8(ss::START);
+    info.serialize(&mut start).unwrap();
+    pose.serialize(&mut start).unwrap();
+    sharer
+        .send(channels::PLUGIN_RELIABLE, start.as_slice(), true)
+        .await;
+    let accepted = sharer
+        .receive(|c, p| {
+            c == channels::PLUGIN_RELIABLE && matches_sub(p, ss::CONTROL_ID, ss::ACCEPTED)
+        })
+        .await;
+    assert_eq!(NetReader::new(&accepted[3..]).get_u32().unwrap(), 12000);
+
+    let mut viewer = Client::connect(&state, "screen-viewer").await;
+    viewer
+        .send(channels::REGISTRY_CONTROL, subscribe.as_slice(), true)
+        .await;
+    let announced = viewer
+        .receive(|c, p| {
+            c == channels::PLUGIN_RELIABLE && matches_sub(p, ss::CONTROL_ID, ss::ANNOUNCE)
+        })
+        .await;
+    let mut r = NetReader::new(&announced[3..]);
+    assert_eq!(r.get_u16().unwrap(), sharer_id);
+    assert_eq!(ss::StreamInfo::read(&mut r).unwrap(), info);
+    assert_eq!(ss::ScreenPose::read(&mut r).unwrap(), pose);
+    let mut watch = NetWriter::new();
+    watch.put_u16(ss::CONTROL_ID);
+    watch.put_u8(ss::WATCH);
+    watch.put_u16(sharer_id);
+    watch.put_bool(true);
+    viewer
+        .send(channels::PLUGIN_RELIABLE, watch.as_slice(), true)
+        .await;
+    let count = sharer
+        .receive(|c, p| {
+            c == channels::PLUGIN_RELIABLE && matches_sub(p, ss::CONTROL_ID, ss::VIEWERS)
+        })
+        .await;
+    assert_eq!(NetReader::new(&count[3..]).get_u16().unwrap(), 1);
+    for (sequence, flags) in [(1, 0), (2, ss::FLAG_KEY)] {
+        let mut chunk = NetWriter::new();
+        chunk.put_u16(ss::MEDIA_ID);
+        ss::ChunkHeader {
+            sequence,
+            kind: ss::KIND_VIDEO,
+            flags,
+            index: 0,
+            count: 1,
+            pts_us: 42,
+            total_length: 3,
+        }
+        .serialize(&mut chunk)
+        .unwrap();
+        chunk.put_bytes(&[7, 8, 9]);
+        sharer
+            .send(channels::PLUGIN_RELIABLE, chunk.as_slice(), true)
+            .await;
+    }
+    let media = viewer
+        .receive(|c, p| {
+            c == channels::PLUGIN_RELIABLE && p.len() >= 4 && p[..2] == ss::MEDIA_ID.to_le_bytes()
+        })
+        .await;
+    let mut r = NetReader::new(&media[2..]);
+    assert_eq!(r.get_u16().unwrap(), sharer_id);
+    assert_eq!(ss::ChunkHeader::read(&mut r).unwrap().sequence, 2);
+    assert_eq!(r.remaining_slice(), [7, 8, 9]);
+    let mut stop = NetWriter::new();
+    stop.put_u16(ss::CONTROL_ID);
+    stop.put_u8(ss::STOP);
+    sharer
+        .send(channels::PLUGIN_RELIABLE, stop.as_slice(), true)
+        .await;
+    let ended = viewer
+        .receive(|c, p| c == channels::PLUGIN_RELIABLE && matches_sub(p, ss::CONTROL_ID, ss::ENDED))
+        .await;
+    assert_eq!(NetReader::new(&ended[3..]).get_u16().unwrap(), sharer_id);
+    state.config.write().screen_share_locked = true;
+    sharer
+        .send(channels::PLUGIN_RELIABLE, start.as_slice(), true)
+        .await;
+    let refused = sharer
+        .receive(|c, p| {
+            c == channels::PLUGIN_RELIABLE && matches_sub(p, ss::CONTROL_ID, ss::REFUSED)
+        })
+        .await;
+    assert_eq!(refused[3], ss::REFUSED_LOCKED);
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn v57_avatar_host_relay_validates_owners_and_serves_cached_ranges() {
+    let (state, shutdown, dir) = super::tests::test_server(false).await;
+    let mut owner = Client::connect(&state, "avatar-owner").await;
+    let mut viewer = Client::connect(&state, "avatar-viewer").await;
+    for client in [&mut owner, &mut viewer] {
+        let mut w = NetWriter::new();
+        w.put_u8(channels::REGISTRY_SUB_SUBSCRIBE);
+        basis_protocol::messages::BasisMessageSubscribe { ids: vec![64] }
+            .serialize(&mut w)
+            .unwrap();
+        client
+            .send(channels::REGISTRY_CONTROL, w.as_slice(), true)
+            .await;
+    }
+    let mut offer = NetWriter::new();
+    offer.put_u16(64);
+    offer.put_u8(0);
+    offer.put_bytes(&[7; 16]);
+    offer.put_i64(50000);
+    owner
+        .send(channels::PLUGIN_RELIABLE, offer.as_slice(), true)
+        .await;
+    let result = owner
+        .receive(|c, p| c == channels::PLUGIN_RELIABLE && p.get(2) == Some(&10))
+        .await;
+    assert_eq!(&result[3..19], &[7; 16]);
+    assert_eq!(&result[19..], &[1, 0]);
+    let mut request = NetWriter::new();
+    request.put_u16(64);
+    request.put_u8(2);
+    request.put_u32(42);
+    request.put_bytes(&[7; 16]);
+    request.put_i64(10);
+    request.put_i32(4);
+    let mut invalid = request.as_slice().to_vec();
+    let end = invalid.len();
+    invalid[end - 4..].copy_from_slice(&60000i32.to_le_bytes());
+    viewer.send(channels::PLUGIN_RELIABLE, &invalid, true).await;
+    let rejected = viewer
+        .receive(|c, p| c == channels::PLUGIN_RELIABLE && p.get(2) == Some(&13))
+        .await;
+    assert_eq!(rejected.last(), Some(&5));
+    viewer
+        .send(channels::PLUGIN_RELIABLE, request.as_slice(), true)
+        .await;
+    let fetch = owner
+        .receive(|c, p| c == channels::PLUGIN_RELIABLE && p.get(2) == Some(&11))
+        .await;
+    let fetch_id = u32::from_le_bytes(fetch[3..7].try_into().unwrap());
+    assert_eq!(&fetch[7..23], &[7; 16]);
+    assert_eq!(i64::from_le_bytes(fetch[23..31].try_into().unwrap()), 10);
+    let mut chunk = NetWriter::new();
+    chunk.put_u16(64);
+    chunk.put_u8(3);
+    chunk.put_u32(fetch_id);
+    chunk.put_i32(0);
+    chunk.put_i32(4);
+    chunk.put_bytes(b"BEE!");
+    // A requester cannot impersonate the owner of a pending fetch.
+    let (viewer_id, _) = session_for_uuid(&state, "avatar-viewer");
+    crate::avatar_host::handle(&state, viewer_id, &chunk.as_slice()[2..])
+        .await
+        .unwrap();
+    owner
+        .send(channels::PLUGIN_RELIABLE, chunk.as_slice(), true)
+        .await;
+    let bytes = viewer
+        .receive(|c, p| c == channels::PLUGIN_RELIABLE && p.get(2) == Some(&12))
+        .await;
+    assert_eq!(&bytes[3..7], &42u32.to_le_bytes());
+    assert_eq!(&bytes[7..11], &0i32.to_le_bytes());
+    assert_eq!(&bytes[11..15], &4i32.to_le_bytes());
+    assert_eq!(&bytes[15..], b"BEE!");
+    // Same range must be replayed without another owner fetch.
+    viewer
+        .send(channels::PLUGIN_RELIABLE, request.as_slice(), true)
+        .await;
+    let replay = viewer
+        .receive(|c, p| c == channels::PLUGIN_RELIABLE && p.get(2) == Some(&12))
+        .await;
+    assert_eq!(bytes, replay);
+    // Cached ranges spanning several wire chunks must retain offsets and byte order.
+    let mut large = NetWriter::new();
+    large.put_u16(64);
+    large.put_u8(2);
+    large.put_u32(43);
+    large.put_bytes(&[7; 16]);
+    large.put_i64(20);
+    large.put_i32(32769);
+    viewer
+        .send(channels::PLUGIN_RELIABLE, large.as_slice(), true)
+        .await;
+    let fetch = owner
+        .receive(|c, p| c == channels::PLUGIN_RELIABLE && p.get(2) == Some(&11))
+        .await;
+    let id = u32::from_le_bytes(fetch[3..7].try_into().unwrap());
+    let data: Vec<u8> = (0..32769).map(|i| (i % 251) as u8).collect();
+    for (i, part) in data.chunks(16384).enumerate() {
+        let mut w = NetWriter::new();
+        w.put_u16(64);
+        w.put_u8(3);
+        w.put_u32(id);
+        w.put_i32((i * 16384) as i32);
+        w.put_i32(part.len() as i32);
+        w.put_bytes(part);
+        owner
+            .send(channels::PLUGIN_RELIABLE, w.as_slice(), true)
+            .await;
+    }
+    for cached in [false, true] {
+        if cached {
+            viewer
+                .send(channels::PLUGIN_RELIABLE, large.as_slice(), true)
+                .await;
+        }
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            let bytes = viewer
+                .receive(|c, p| c == channels::PLUGIN_RELIABLE && p.get(2) == Some(&12))
+                .await;
+            assert_eq!(u32::from_le_bytes(bytes[3..7].try_into().unwrap()), 43);
+            assert_eq!(
+                i32::from_le_bytes(bytes[7..11].try_into().unwrap()) as usize,
+                received.len()
+            );
+            received.extend_from_slice(&bytes[15..]);
+        }
+        assert_eq!(received, data);
+    }
+    let mut withdraw = NetWriter::new();
+    withdraw.put_u16(64);
+    withdraw.put_u8(1);
+    withdraw.put_bytes(&[7; 16]);
+    // Apply withdrawal synchronously to avoid cross-peer scheduling races.
+    let (owner_id, _) = session_for_uuid(&state, "avatar-owner");
+    crate::avatar_host::handle(&state, owner_id, &withdraw.as_slice()[2..])
+        .await
+        .unwrap();
+    viewer
+        .send(channels::PLUGIN_RELIABLE, request.as_slice(), true)
+        .await;
+    let failure = viewer
+        .receive(|c, p| c == channels::PLUGIN_RELIABLE && p.get(2) == Some(&13))
+        .await;
+    assert_eq!(&failure[3..], &[42, 0, 0, 0, 4]);
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn v57_protection_settings_initial_sync_requires_capability_opt_in() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    let mut opted = Client::connect_pending_with_capabilities(
+        &state,
+        "v57-opted",
+        &[],
+        SERVER_VERSION,
+        None,
+        Some(2),
+    )
+    .await;
+    let payload = opted
+        .receive(|channel, payload| {
+            channel == channels::ADMIN
+                && admin_mode(payload, AdminRequestMode::GlobalGetProtectionSettings)
+        })
+        .await;
+    let mut reader = NetReader::new(&payload);
+    assert_eq!(reader.get_u8().unwrap(), 99);
+    assert_eq!(reader.get_u16().unwrap(), 8);
+    let mut ordinary = Client::connect(&state, "v57-ordinary").await;
+    assert_eq!(
+        state
+            .authenticated_peers
+            .iter()
+            .find(|peer| peer.metadata.player_uuid == "v57-opted")
+            .unwrap()
+            .capabilities,
+        2
+    );
+    assert_eq!(
+        state
+            .authenticated_peers
+            .iter()
+            .find(|peer| peer.metadata.player_uuid == "v57-ordinary")
+            .unwrap()
+            .capabilities,
+        0
+    );
+    assert!(tokio::time::timeout(
+        Duration::from_millis(100),
+        ordinary.receive(|channel, payload| channel == channels::ADMIN
+            && admin_mode(payload, AdminRequestMode::GlobalGetProtectionSettings))
+    )
+    .await
+    .is_err());
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn v57_capability_survives_signed_identity_admission() {
+    let (state, shutdown, _) = super::tests::test_server(false).await;
+    state.config.write().use_auth_identity = true;
+    let key = SigningKey::from_bytes(&[118; 32]);
+    let did = client_did(&key);
+    let mut client =
+        Client::connect_pending_with_capabilities(&state, &did, &[], SERVER_VERSION, None, Some(2))
+            .await;
+    client.answer_identity(&key).await;
+    client
+        .receive(|channel, payload| {
+            channel == channels::ADMIN
+                && admin_mode(payload, AdminRequestMode::GlobalGetProtectionSettings)
+        })
+        .await;
+    let peer = state
+        .authenticated_peers
+        .iter()
+        .find(|peer| peer.metadata.player_uuid == did)
+        .unwrap();
+    assert!(peer.identity_verified);
+    assert_eq!(peer.capabilities, 2);
+    drop(peer);
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn video_clip_cache_uses_private_server_addressing_and_direct_scene_replies() {
+    let (state, shutdown, dir) = super::tests::test_server(false).await;
+    state
+        .config
+        .write()
+        .video_clip_cache_serve_megabytes_per_second = 0;
+    let mut owner = Client::connect(&state, "clip-owner").await;
+    let mut viewer = Client::connect(&state, "clip-viewer").await;
+    let owner_id = peer_by_uuid(&state, "clip-owner").unwrap();
+    let viewer_id = peer_by_uuid(&state, "clip-viewer").unwrap();
+    let message_index = state
+        .net_ids
+        .add_or_find_for_peer(crate::video_clip::CLIP_MANAGER_IDENTIFIER, owner_id, 100)
+        .unwrap()
+        .0;
+    let id = [7u8; 16];
+    fn envelope(message_index: u16, recipient: u16, payload: Vec<u8>) -> Vec<u8> {
+        let mut w = NetWriter::new();
+        SceneDataMessage {
+            message_index,
+            recipients: vec![recipient],
+            payload,
+        }
+        .serialize(&mut w)
+        .unwrap();
+        w.into_vec()
+    }
+    let matches_clip = |channel: u8, p: &[u8]| {
+        channel == channels::DIRECT_SCENE_SERVER
+            && p.len() > 4
+            && p[2..4] == message_index.to_le_bytes()
+    };
+    let mut offer = vec![1];
+    offer.extend(id);
+    offer.extend(3i32.to_le_bytes());
+    offer.extend([0, 0]);
+    offer.extend([0; 32]);
+    offer.extend(0u16.to_le_bytes());
+    owner
+        .send(
+            channels::DIRECT_SCENE_SERVER,
+            &envelope(message_index, owner_id, offer),
+            true,
+        )
+        .await;
+    let uploading = owner.receive(matches_clip).await;
+    assert_eq!(&uploading[4..5], &[6]);
+    assert_eq!(uploading[21], 1);
+    let mut chunk = vec![2];
+    chunk.extend(id);
+    chunk.extend(0i32.to_le_bytes());
+    chunk.extend([11, 22, 33]);
+    owner
+        .send(
+            channels::DIRECT_SCENE_SERVER,
+            &envelope(message_index, owner_id, chunk),
+            true,
+        )
+        .await;
+    let held = owner.receive(matches_clip).await;
+    assert_eq!(&held[4..5], &[6]);
+    assert_eq!(held[21], 2);
+    let mut catalog = vec![9];
+    catalog.extend([0; 16]);
+    viewer
+        .send(
+            channels::DIRECT_SCENE_SERVER,
+            &envelope(message_index, viewer_id, catalog),
+            true,
+        )
+        .await;
+    let cached = viewer.receive(matches_clip).await;
+    assert_eq!(cached[4], 7);
+    assert_eq!(&cached[..2], &owner_id.to_le_bytes());
+    let mut request = vec![8];
+    request.extend(id);
+    viewer
+        .send(
+            channels::DIRECT_SCENE_SERVER,
+            &envelope(message_index, viewer_id, request),
+            true,
+        )
+        .await;
+    // A generic relay of either private request would appear here before its cached chunk.
+    let data = viewer.receive(matches_clip).await;
+    assert_eq!(data[4], 2);
+    assert_eq!(&data[25..], &[11, 22, 33]);
+    state.shutdown().await.unwrap();
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_dir_all(dir);
 }
