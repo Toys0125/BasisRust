@@ -852,6 +852,7 @@ mod tests {
                 ready,
                 session: None,
                 identity_verified: false,
+                capabilities: 0,
                 scene_pending: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 upload_bucket: Arc::new(Mutex::new(crate::upload_budget::Bucket::default())),
             },
@@ -965,6 +966,103 @@ mod tests {
             let node = contract["required_permissions"][expected_name.as_str().unwrap()].as_str();
             assert_eq!(admin_mode_required_permission(mode), node, "{mode:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn v57_media_admin_dispatch_enforces_permission_clamps_and_persists() {
+        let (state, shutdown, dir) = test_server(true).await;
+        add_peer(&state, 1, "ordinary");
+        add_peer(&state, 2, "moderator");
+        state
+            .permissions
+            .add_user_to_group("moderator", "moderator");
+        for (mode, payload) in [
+            (AdminRequestMode::GlobalToggleAvatarHosting, vec![]),
+            (AdminRequestMode::GlobalToggleVideoClips, vec![]),
+            (AdminRequestMode::SetGlobalImageMaxResolution, vec![16]),
+            (AdminRequestMode::SetGlobalVideoClipMaxSize, vec![0, 2]),
+            (AdminRequestMode::SetGlobalVideoClipMaxPerPlayer, vec![8]),
+        ] {
+            request(&state, 1, mode, |w| w.put_bytes(&payload)).await;
+        }
+        assert!(!state.config.read().avatar_hosting_locked);
+        assert!(!state.config.read().video_clips_locked);
+        assert_eq!(state.config.read().image_max_resolution_k, 4);
+        assert_eq!(state.config.read().video_clip_max_megabytes, 96);
+        assert_eq!(state.config.read().video_clip_max_per_player, 3);
+        request(
+            &state,
+            2,
+            AdminRequestMode::GlobalToggleAvatarHosting,
+            |_| {},
+        )
+        .await;
+        request(&state, 2, AdminRequestMode::GlobalToggleVideoClips, |_| {}).await;
+        request(
+            &state,
+            2,
+            AdminRequestMode::SetGlobalImageMaxResolution,
+            |w| w.put_u8(0),
+        )
+        .await;
+        request(
+            &state,
+            2,
+            AdminRequestMode::SetGlobalVideoClipMaxSize,
+            |w| w.put_u16(u16::MAX),
+        )
+        .await;
+        request(
+            &state,
+            2,
+            AdminRequestMode::SetGlobalVideoClipMaxPerPlayer,
+            |w| w.put_u8(255),
+        )
+        .await;
+        let saved = ServerConfig::load_or_create(&dir.join("config/config.xml")).unwrap();
+        assert!(saved.avatar_hosting_locked);
+        assert!(saved.video_clips_locked);
+        assert_eq!(saved.image_max_resolution_k, 1);
+        assert_eq!(saved.video_clip_max_megabytes, 1024);
+        assert_eq!(saved.video_clip_max_per_player, 16);
+        assert_eq!(
+            crate::encode_lock_state_payload(&state.global_state.read())[23..],
+            [1, 1, 1, 0, 4, 16]
+        );
+        state.shutdown().await.unwrap();
+        let _ = shutdown.send(());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn v57_protection_settings_dispatch_rejects_unauthorized_and_malformed_batches() {
+        let (state, shutdown, dir) = test_server(true).await;
+        add_peer(&state, 1, "ordinary");
+        add_peer(&state, 2, "admin");
+        state.permissions.add_user_to_group("admin", "admin");
+        let change = |w: &mut NetWriter| {
+            w.put_u16(1);
+            w.put_string("ScreenShareMaxConcurrent").unwrap();
+            w.put_f64(17.0);
+        };
+        request(&state, 1, AdminRequestMode::SetProtectionSettings, change).await;
+        assert_eq!(state.config.read().screen_share_max_concurrent, 8);
+        request(&state, 2, AdminRequestMode::SetProtectionSettings, change).await;
+        assert_eq!(state.config.read().screen_share_max_concurrent, 17);
+        let saved = ServerConfig::load_or_create(&dir.join("config/config.xml")).unwrap();
+        assert_eq!(saved.screen_share_max_concurrent, 17);
+        let mut malformed = NetWriter::new();
+        malformed.put_u8(AdminRequestMode::SetProtectionSettings as u8);
+        malformed.put_u16(2);
+        malformed.put_string("ScreenShareMaxConcurrent").unwrap();
+        malformed.put_f64(5.0);
+        assert!(handle_admin_message(&state, 2, malformed.as_slice())
+            .await
+            .is_err());
+        assert_eq!(state.config.read().screen_share_max_concurrent, 17);
+        state.shutdown().await.unwrap();
+        let _ = shutdown.send(());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

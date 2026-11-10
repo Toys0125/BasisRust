@@ -955,9 +955,13 @@ mod tests {
         assert_eq!(manager.snapshot().seeded_defaults["Moderator"].len(), 25);
         let fresh = PermissionManager::default();
         fresh.ensure_defaults();
-        assert_eq!(fresh.snapshot().groups["default"].nodes.len(), 13);
+        assert_eq!(fresh.snapshot().groups["default"].nodes.len(), 14);
         assert_eq!(fresh.snapshot().groups["moderator"].nodes.len(), 25);
         assert!(fresh.is_in_group("unknown", "default"));
+        assert!(fresh.has("unknown", nodes::SCREEN_SHARE));
+        fresh.remove_group_node("default", nodes::SCREEN_SHARE);
+        fresh.ensure_defaults();
+        assert!(!fresh.has("unknown", nodes::SCREEN_SHARE));
     }
 
     #[test]
@@ -1045,7 +1049,7 @@ mod tests {
 
         let reloaded = PermissionManager::new(fixture.path());
         reloaded.load_from_xml().unwrap();
-        assert_eq!(reloaded.snapshot().seeded_defaults["default"].len(), 13);
+        assert_eq!(reloaded.snapshot().seeded_defaults["default"].len(), 14);
         assert!(reloaded.snapshot().seeded_defaults["admin"].contains(nodes::ALL));
     }
 

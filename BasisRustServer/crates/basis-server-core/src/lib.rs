@@ -1,4 +1,5 @@
 mod admin_runtime;
+mod avatar_host;
 mod avatar_sync;
 mod benchmark_validation;
 mod content_share_validation;
@@ -18,9 +19,15 @@ mod image_governor;
 mod image_tests;
 pub mod memory_reclaim;
 mod p2p;
+mod plugin_catalog;
+mod protection_settings;
+mod protection_sync;
+mod queue_admission;
 mod realtime;
 mod scene_relay;
+mod screen_share;
 mod upload_budget;
+mod video_clip;
 
 pub use avatar_sync::BsrProfilerSnapshot;
 #[cfg(any(feature = "benchmark-validation", test))]
@@ -104,6 +111,7 @@ pub struct ConnectedPeer {
     pub session: Option<PeerSession>,
     /// Whether this connection completed the connection-bound DID proof.
     pub identity_verified: bool,
+    pub(crate) capabilities: u8,
     // A fresh counter per authenticated connection. Clones share admission work;
     // old in-flight permits cannot decrement a replacement connection's quota.
     pub(crate) scene_pending: Arc<AtomicU64>,
@@ -113,6 +121,7 @@ pub struct ConnectedPeer {
 struct PendingIdentity {
     session: PeerSession,
     ready: ReadyMessage,
+    capabilities: u8,
     challenge: Vec<u8>,
     /// Connection-bound protocol-56 DID signature payload, not just the nonce.
     transcript: Vec<u8>,
@@ -506,6 +515,10 @@ pub struct ServerState {
     scene_relay: Option<Arc<scene_relay::SceneRelay>>,
     image_governor: Arc<image_governor::ImageBandwidthGovernor<PeerSession>>,
     image_cache: Arc<Mutex<image_cache::ImageCache>>,
+    video_clip_cache: Arc<Mutex<video_clip::VideoClipCache>>,
+    screen_share: Arc<Mutex<screen_share::Ledger>>,
+    avatar_host: Arc<Mutex<avatar_host::Ledger>>,
+    protection_sync: Arc<Mutex<protection_sync::Pending>>,
     jiggle_buckets: Arc<Mutex<HashMap<PeerId, JiggleTokenBucket>>>,
     error_report_hashes: Arc<DashMap<String, HashSet<u64>>>,
     pub avatar_sync: AvatarSyncSystem,
@@ -737,6 +750,10 @@ impl ServerState {
             scene_relay: None,
             image_governor: Arc::new(image_governor::ImageBandwidthGovernor::default()),
             image_cache: Arc::new(Mutex::new(image_cache::ImageCache::default())),
+            video_clip_cache: Arc::new(Mutex::new(video_clip::VideoClipCache::default())),
+            screen_share: Arc::new(Mutex::new(screen_share::Ledger::default())),
+            avatar_host: Arc::new(Mutex::new(avatar_host::Ledger::default())),
+            protection_sync: Arc::new(Mutex::new(protection_sync::Pending::default())),
             jiggle_buckets: Arc::new(Mutex::new(HashMap::new())),
             error_report_hashes: Arc::new(DashMap::new()),
             avatar_sync,
@@ -783,6 +800,9 @@ impl ServerState {
         state.workers.lock().extend([
             spawn_leave_broadcast_loop(state.clone()),
             spawn_image_replay_loop(state.clone()),
+            spawn_video_clip_replay_loop(state.clone()),
+            avatar_host::spawn_pump(state.clone()),
+            protection_sync::spawn_pump(state.clone()),
             spawn_content_expiry_loop(state.clone()),
             admin_runtime::spawn_permission_updates(state.clone()),
             tokio::spawn(event_loop(
@@ -1144,6 +1164,10 @@ impl ServerState {
         // Accepted event handlers and all disconnect cleanup have now finished.
         self.image_governor.reset();
         self.image_cache.lock().reset();
+        self.video_clip_cache.lock().reset();
+        *self.screen_share.lock() = screen_share::Ledger::default();
+        *self.avatar_host.lock() = avatar_host::Ledger::default();
+        protection_sync::reset(self);
         let final_save = self.flush_shutdown_state();
         if let Err(err) = &final_save {
             error!("final shutdown persistence failed: {err:#}");
@@ -1435,6 +1459,110 @@ async fn deliver_image_cache_sends(state: &ServerState, sends: Vec<image_cache::
             send_image_payloads(state, &session, ready);
         }
     }
+}
+
+async fn deliver_video_clip_cache_sends(state: &ServerState, sends: Vec<video_clip::CacheSend>) {
+    let Some(message_index) = state.net_ids.find(video_clip::CLIP_MANAGER_IDENTIFIER) else {
+        return;
+    };
+    for send in sends {
+        let Some(session) = send.recipient_session().cloned() else {
+            continue;
+        };
+        if send.requires_share_permission() && !video_clip_owner_may_share(state, send.owner()) {
+            continue;
+        }
+        let message = ServerSceneDataMessage {
+            player_id: send.owner(),
+            scene_data_message: RemoteSceneDataMessage {
+                message_index,
+                payload: send.payload().to_vec(),
+            },
+        };
+        let mut writer = NetWriter::new();
+        if let Err(err) = message.serialize(&mut writer) {
+            warn!("failed to serialize video clip cache replay: {err}");
+            continue;
+        }
+        let overflow = {
+            let mut cache = state.video_clip_cache.lock();
+            if !cache.valid(&send) {
+                continue;
+            }
+            // Cancellation and the exact recipient remain valid through synchronous admission.
+            match queue_admission::reliable(
+                &state.transport,
+                &session,
+                channels::DIRECT_SCENE_SERVER,
+                writer.as_slice(),
+            ) {
+                queue_admission::Outcome::Queued => {
+                    cache.acknowledge(&send);
+                    false
+                }
+                queue_admission::Outcome::RecipientGone => false,
+                queue_admission::Outcome::Backpressured => {
+                    matches!(
+                        cache.retry(&send),
+                        video_clip::RetryOutcome::CapacityExceeded
+                    )
+                }
+            }
+        };
+        // A bounded control queue must fail explicitly rather than discard authoritative state.
+        if overflow {
+            if let Err(error) = request_disconnect(
+                state,
+                &session,
+                "Video cache control queue capacity reached",
+            )
+            .await
+            {
+                warn!("failed to retire backlogged video cache recipient: {error}");
+            }
+        }
+    }
+}
+
+fn video_clip_owner_may_share(state: &ServerState, owner: PeerId) -> bool {
+    !state.global_state.read().video_clips_locked
+        || peer_has_permission(
+            state,
+            owner,
+            basis_server_permissions::nodes::MODERATION_GLOBAL_LOCK,
+        )
+}
+
+fn spawn_video_clip_replay_loop(state: ServerState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if state.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            let connected = state
+                .authenticated_peers
+                .iter()
+                .map(|p| *p.key())
+                .collect::<Vec<_>>();
+            let sends = state.video_clip_cache.lock().pump(
+                Instant::now(),
+                &state.config.read(),
+                &connected,
+                |owner| video_clip_owner_may_share(&state, owner),
+                |peer| {
+                    state.transport.peer_channel_queued_count(
+                        peer,
+                        channels::DIRECT_SCENE_SERVER,
+                        DeliveryMethod::ReliableOrdered,
+                    )
+                },
+            );
+            deliver_video_clip_cache_sends(&state, sends).await;
+        }
+    })
 }
 
 fn spawn_image_replay_loop(state: ServerState) -> tokio::task::JoinHandle<()> {
@@ -2648,6 +2776,8 @@ async fn handle_connection_request(
         }
     };
 
+    let capabilities = reader.get_u8().unwrap_or(0);
+
     if state.global_state.read().disallow_headless
         && is_headless_platform(&ready.player_meta_data_message.player_platform)
     {
@@ -2782,6 +2912,7 @@ async fn handle_connection_request(
             PendingIdentity {
                 session: session.clone(),
                 ready,
+                capabilities,
                 challenge: challenge.clone(),
                 transcript,
                 expires_at,
@@ -2843,7 +2974,7 @@ async fn handle_connection_request(
             )
             .await?;
     } else {
-        finalize_accept(state, &session, ready, false).await?;
+        finalize_accept(state, &session, ready, false, capabilities).await?;
     }
     Ok(())
 }
@@ -2896,6 +3027,7 @@ async fn finalize_accept(
     session: &PeerSession,
     ready: ReadyMessage,
     identity_verified: bool,
+    capabilities: u8,
 ) -> Result<()> {
     let peer_id = session.peer_id();
     let uuid = ready.player_meta_data_message.player_uuid.clone();
@@ -2922,6 +3054,7 @@ async fn finalize_accept(
         ready: ready.clone(),
         session: Some(session.clone()),
         identity_verified,
+        capabilities,
         scene_pending: Arc::new(AtomicU64::new(0)),
         upload_bucket: Arc::new(Mutex::new(upload_budget::Bucket::default())),
     };
@@ -2948,6 +3081,7 @@ async fn finalize_accept(
         .await;
         return Ok(());
     };
+    state.video_clip_cache.lock().bind_session(session.clone());
     info!("peer connected: {peer_id}");
 
     let server_meta = ServerMetaDataMessage {
@@ -2977,7 +3111,9 @@ async fn finalize_accept(
 
     let mut registry_writer = NetWriter::new();
     registry_writer.put_u8(channels::REGISTRY_SUB_SUPPLY);
-    core_message_supply().serialize(&mut registry_writer)?;
+    let mut supply = core_message_supply();
+    plugin_catalog::add_descriptors(&mut supply);
+    supply.serialize(&mut registry_writer)?;
     state
         .transport
         .send(
@@ -3229,11 +3365,15 @@ async fn handle_disconnect(state: &ServerState, session: &PeerSession, reason: D
     state.pending_identity.remove(&peer);
     state.voice_recipients.remove(&peer);
     state.voice_recipient_sessions.remove(&peer);
+    avatar_host::remove_peer(state, peer).await;
+    protection_sync::remove_peer(state, peer);
+    screen_share::remove_peer(state, peer).await;
     state.message_subscriptions.remove(&peer);
     state.uplink_delta_states.remove(&peer);
     state.scene_egress.remove(&peer);
     state.image_governor.remove_peer(peer, session);
     state.image_cache.lock().remove_player(peer);
+    state.video_clip_cache.lock().remove_player(peer);
     state.jiggle_buckets.lock().remove(&peer);
     if !departed_uuid.is_empty() {
         state.error_report_hashes.remove(&departed_uuid);
@@ -3575,7 +3715,7 @@ async fn handle_message(
                     .await;
                     return Ok(());
                 }
-                finalize_accept(state, session, pending.ready, true).await?;
+                finalize_accept(state, session, pending.ready, true, pending.capabilities).await?;
             }
         }
         channels::PLAYER_AVATAR_HIGH | channels::PLAYER_AVATAR_HIGH_ADDITIONAL => {
@@ -4418,6 +4558,20 @@ async fn handle_message(
                 state
                     .message_subscriptions
                     .insert(peer, subscription.ids.into_iter().collect());
+                screen_share::subscribed_peer(state, peer).await;
+            }
+        }
+        channels::PLUGIN_RELIABLE => {
+            if delivery == DeliveryMethod::ReliableOrdered {
+                let mut reader = NetReader::new(&payload);
+                let id = reader.get_u16()?;
+                if id == basis_protocol::avatar_host::MESSAGE_ID {
+                    avatar_host::handle(state, peer, reader.remaining_slice()).await?;
+                } else if id == basis_protocol::screen_share::CONTROL_ID
+                    || id == basis_protocol::screen_share::MEDIA_ID
+                {
+                    screen_share::handle(state, peer, id, reader.remaining_slice()).await?;
+                }
             }
         }
         channels::SERVER_BOUND => {
@@ -4499,6 +4653,17 @@ async fn relay_scene_generic(
     let scene = SceneDataMessage::deserialize(&mut reader)?;
     let is_image_traffic =
         state.net_ids.find(image_cache::IMAGE_MANAGER_IDENTIFIER) == Some(scene.message_index);
+    let is_video_clip_traffic =
+        state.net_ids.find(video_clip::CLIP_MANAGER_IDENTIFIER) == Some(scene.message_index);
+    // Live uploads must pass moderation before either cache observation or relay.
+    // The sender-supplied bypass flag is descriptive data, never authority.
+    if is_video_clip_traffic
+        && basis_protocol::video_clip::Opcode::from_payload(&scene.payload)
+            .is_some_and(|op| op.is_upload())
+        && !video_clip_owner_may_share(state, peer)
+    {
+        return Ok(());
+    }
     let allow_animation = !is_image_traffic || image_animation_allowed(state, peer);
     if is_image_traffic && matches!(scene.payload.first(), Some(6 | 7)) && !allow_animation {
         return Ok(());
@@ -4545,6 +4710,33 @@ async fn relay_scene_generic(
             &state.config.read(),
         );
         deliver_image_cache_sends(state, effects.sends).await;
+    }
+    if is_video_clip_traffic
+        && (allowed
+            || basis_protocol::video_clip::Opcode::from_payload(&scene.payload)
+                .is_some_and(|op| op.is_cache_control()))
+    {
+        let connected = state
+            .authenticated_peers
+            .iter()
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+        let sends = state.video_clip_cache.lock().observe(
+            peer,
+            &scene.payload,
+            &scene.recipients,
+            &connected,
+            &state.config.read(),
+            |owner| video_clip_owner_may_share(state, owner),
+        );
+        deliver_video_clip_cache_sends(state, sends).await;
+    }
+    // A clip packet addressed only to its sender is a private server-cache message.
+    if is_video_clip_traffic
+        && !scene.recipients.is_empty()
+        && scene.recipients.iter().all(|recipient| *recipient == peer)
+    {
+        return Ok(());
     }
     if !allowed {
         return Ok(());
@@ -5595,6 +5787,53 @@ async fn handle_admin_message(state: &ServerState, peer: PeerId, payload: &[u8])
             )
             .await;
         }
+        AdminRequestMode::GetProtectionSettings => {
+            let payload = protection_settings::encode(&state.config.read())?;
+            send_admin_payload_to_peer(state, peer, payload).await?;
+        }
+        AdminRequestMode::SetProtectionSettings => {
+            let changes = protection_settings::read_changes(&mut reader)?;
+            {
+                let mut config = state.config.write();
+                protection_settings::apply(&mut config, changes);
+            }
+            state.refresh_runtime_config();
+            broadcast_protection_settings(state).await?;
+        }
+        AdminRequestMode::GlobalToggleAvatarHosting => {
+            toggle_simple_lock(
+                state,
+                |s| &mut s.avatar_hosting_locked,
+                |c| &mut c.avatar_hosting_locked,
+            )
+            .await;
+        }
+        AdminRequestMode::GlobalToggleVideoClips => {
+            toggle_simple_lock(
+                state,
+                |s| &mut s.video_clips_locked,
+                |c| &mut c.video_clips_locked,
+            )
+            .await;
+        }
+        AdminRequestMode::SetGlobalImageMaxResolution => {
+            let value = reader.get_u8()?.clamp(1, 16);
+            state.config.write().image_max_resolution_k = value;
+            state.global_state.write().image_max_resolution_k = value;
+            broadcast_lock_state(state).await;
+        }
+        AdminRequestMode::SetGlobalVideoClipMaxSize => {
+            let value = reader.get_u16()?.clamp(16, 1024);
+            state.config.write().video_clip_max_megabytes = value;
+            state.global_state.write().video_clip_max_megabytes = value;
+            broadcast_lock_state(state).await;
+        }
+        AdminRequestMode::SetGlobalVideoClipMaxPerPlayer => {
+            let value = reader.get_u8()?.clamp(1, 16);
+            state.config.write().video_clip_max_per_player = value;
+            state.global_state.write().video_clip_max_per_player = value;
+            broadcast_lock_state(state).await;
+        }
         AdminRequestMode::GlobalGetLockState => {
             send_lock_state_to_peer(state, peer).await?;
         }
@@ -6294,7 +6533,7 @@ async fn send_lock_state_to_peer(state: &ServerState, peer_id: PeerId) -> Result
 async fn send_initial_admin_state_to_peer(state: &ServerState, peer_id: PeerId) {
     let globals = state.global_state.read().clone();
     let config = state.config.read().clone();
-    let payloads = [
+    let mut payloads = vec![
         encode_lock_state_payload(&globals),
         encode_bool_admin_state_payload(
             AdminRequestMode::GlobalGetHeadlessAudioState,
@@ -6336,11 +6575,59 @@ async fn send_initial_admin_state_to_peer(state: &ServerState, peer_id: PeerId) 
         encode_image_bandwidth_payload(&config),
         encode_i32_admin_state_payload(AdminRequestMode::GlobalGetPeerLimit, config.peer_limit),
     ];
-    let messages =
-        payloads.map(|payload| (channels::ADMIN, DeliveryMethod::ReliableOrdered, payload));
+    if protection_editor_eligible(state, peer_id) {
+        match protection_settings::encode(&config) {
+            Ok(payload) => payloads.push(payload),
+            Err(error) => warn!("failed to encode initial protection settings: {error:#}"),
+        }
+    }
+    let messages = payloads
+        .into_iter()
+        .map(|payload| (channels::ADMIN, DeliveryMethod::ReliableOrdered, payload))
+        .collect::<Vec<_>>();
     if let Err(err) = state.transport.send_many(peer_id, &messages).await {
         warn!("failed to send initial admin state to peer {peer_id}: {err:#}");
     }
+}
+
+fn protection_editor_eligible(state: &ServerState, peer: PeerId) -> bool {
+    let opted_in = state
+        .authenticated_peers
+        .get(&peer)
+        .is_some_and(|p| p.capabilities & 2 != 0);
+    opted_in
+        && peer_has_permission(
+            state,
+            peer,
+            basis_server_permissions::nodes::CONFIGURATION_EDITOR,
+        )
+}
+
+async fn broadcast_protection_settings(state: &ServerState) -> Result<()> {
+    let payload = protection_settings::encode(&state.config.read())?;
+    // Freeze connection identities before any asynchronous send can allow ID reuse.
+    let sessions: Vec<_> = state
+        .authenticated_peers
+        .iter()
+        .filter_map(|p| {
+            let peer = *p.key();
+            let opted_in = p.capabilities & 2 != 0;
+            let session = p.session.clone();
+            drop(p);
+            (opted_in
+                && peer_has_permission(
+                    state,
+                    peer,
+                    basis_server_permissions::nodes::CONFIGURATION_EDITOR,
+                ))
+            .then_some(session)
+            .flatten()
+        })
+        .collect();
+    for session in sessions {
+        protection_sync::queue(state, session, payload.clone());
+    }
+    Ok(())
 }
 
 fn encode_lock_state_payload(locks: &GlobalState) -> Vec<u8> {
@@ -6373,6 +6660,11 @@ fn write_lock_state_fields(writer: &mut NetWriter, locks: &GlobalState) {
     writer.put_bool(locks.gifs_locked);
     writer.put_bool(locks.content_removal_locked);
     writer.put_bool(locks.external_links_locked);
+    writer.put_bool(locks.avatar_hosting_locked);
+    writer.put_bool(locks.video_clips_locked);
+    writer.put_u8(locks.image_max_resolution_k);
+    writer.put_u16(locks.video_clip_max_megabytes);
+    writer.put_u8(locks.video_clip_max_per_player);
 }
 
 fn encode_bool_admin_state_payload(mode: AdminRequestMode, value: bool) -> Vec<u8> {
@@ -6762,6 +7054,12 @@ fn admin_mode_persists_config(mode: AdminRequestMode) -> bool {
             | AdminRequestMode::GlobalToggleSafeDisplayNames
             | AdminRequestMode::GlobalToggleContentRemoval
             | AdminRequestMode::GlobalToggleExternalLinks
+            | AdminRequestMode::GlobalToggleAvatarHosting
+            | AdminRequestMode::GlobalToggleVideoClips
+            | AdminRequestMode::SetGlobalImageMaxResolution
+            | AdminRequestMode::SetGlobalVideoClipMaxSize
+            | AdminRequestMode::SetGlobalVideoClipMaxPerPlayer
+            | AdminRequestMode::SetProtectionSettings
             | AdminRequestMode::SetServerName
             | AdminRequestMode::SetServerMotd
             | AdminRequestMode::SetAllowlistMode
@@ -6827,7 +7125,12 @@ fn admin_mode_required_permission(mode: AdminRequestMode) -> Option<&'static str
         | AdminRequestMode::GlobalTogglePropGrabbing
         | AdminRequestMode::GlobalToggleSafeDisplayNames
         | AdminRequestMode::GlobalToggleContentRemoval
-        | AdminRequestMode::GlobalToggleExternalLinks => nodes::MODERATION_GLOBAL_LOCK,
+        | AdminRequestMode::GlobalToggleExternalLinks
+        | AdminRequestMode::GlobalToggleAvatarHosting
+        | AdminRequestMode::GlobalToggleVideoClips
+        | AdminRequestMode::SetGlobalImageMaxResolution
+        | AdminRequestMode::SetGlobalVideoClipMaxSize
+        | AdminRequestMode::SetGlobalVideoClipMaxPerPlayer => nodes::MODERATION_GLOBAL_LOCK,
         AdminRequestMode::SetGlobalHeadlessAudio => nodes::MODERATION_HEADLESS_AUDIO,
         AdminRequestMode::SetUserOpusBitrate
         | AdminRequestMode::SetGlobalOpusFrameDuration
@@ -6838,7 +7141,9 @@ fn admin_mode_required_permission(mode: AdminRequestMode) -> Option<&'static str
         | AdminRequestMode::CreateGroup
         | AdminRequestMode::DeleteGroup
         | AdminRequestMode::SetGroupParent => nodes::PERMISSIONS_EDIT,
-        AdminRequestMode::SetServerName
+        AdminRequestMode::GetProtectionSettings
+        | AdminRequestMode::SetProtectionSettings
+        | AdminRequestMode::SetServerName
         | AdminRequestMode::SetServerMotd
         | AdminRequestMode::SetAllowlistMode
         | AdminRequestMode::SetGlobalPeerLimit
@@ -7648,6 +7953,7 @@ mod tests {
             ready: test_ready_message(),
             session: None,
             identity_verified: false,
+            capabilities: 0,
             scene_pending: Arc::new(AtomicU64::new(0)),
             upload_bucket: Arc::new(Mutex::new(upload_budget::Bucket::default())),
         }

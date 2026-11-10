@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/sqlx-sqlite"]
 members = [
     "crates/basis-protocol",
     "crates/basis-transport",
@@ -66,3 +67,7 @@ uuid = { version = "1", features = ["v4", "fast-rng", "serde"] }
 walkdir = "2"
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "dx12", "metal"] }
 windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
+
+# Backport patched bundled SQLite without changing SQLx APIs (see vendor/sqlx-sqlite/PATCHES.txt).
+[patch.crates-io]
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }

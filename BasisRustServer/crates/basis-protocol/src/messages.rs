@@ -2347,6 +2347,14 @@ pub enum AdminRequestMode {
     MuteStateResult = 95,
     GlobalToggleContentRemoval = 96,
     GlobalToggleExternalLinks = 97,
+    GetProtectionSettings = 98,
+    GlobalGetProtectionSettings = 99,
+    SetProtectionSettings = 100,
+    GlobalToggleAvatarHosting = 101,
+    GlobalToggleVideoClips = 102,
+    SetGlobalImageMaxResolution = 103,
+    SetGlobalVideoClipMaxSize = 104,
+    SetGlobalVideoClipMaxPerPlayer = 105,
     Unknown = 255,
 }
 
@@ -2470,6 +2478,14 @@ impl From<u8> for AdminRequestMode {
             95 => Self::MuteStateResult,
             96 => Self::GlobalToggleContentRemoval,
             97 => Self::GlobalToggleExternalLinks,
+            98 => Self::GetProtectionSettings,
+            99 => Self::GlobalGetProtectionSettings,
+            100 => Self::SetProtectionSettings,
+            101 => Self::GlobalToggleAvatarHosting,
+            102 => Self::GlobalToggleVideoClips,
+            103 => Self::SetGlobalImageMaxResolution,
+            104 => Self::SetGlobalVideoClipMaxSize,
+            105 => Self::SetGlobalVideoClipMaxPerPlayer,
             _ => Self::Unknown,
         }
     }
@@ -3450,7 +3466,7 @@ mod admin_parity_tests {
 
     #[test]
     fn admin_mode_ids_cover_pinned_basisvr_catalog() {
-        for id in 0..=97 {
+        for id in 0..=105 {
             assert_ne!(AdminRequestMode::from(id), AdminRequestMode::Unknown);
             assert_eq!(AdminRequestMode::from(id) as u8, id);
         }
@@ -3463,7 +3479,15 @@ mod admin_parity_tests {
         assert_eq!(AdminRequestMode::MuteStateResult as u8, 95);
         assert_eq!(AdminRequestMode::GlobalToggleContentRemoval as u8, 96);
         assert_eq!(AdminRequestMode::GlobalToggleExternalLinks as u8, 97);
-        assert_eq!(AdminRequestMode::from(98), AdminRequestMode::Unknown);
+        assert_eq!(AdminRequestMode::GetProtectionSettings as u8, 98);
+        assert_eq!(AdminRequestMode::GlobalGetProtectionSettings as u8, 99);
+        assert_eq!(AdminRequestMode::SetProtectionSettings as u8, 100);
+        assert_eq!(AdminRequestMode::GlobalToggleAvatarHosting as u8, 101);
+        assert_eq!(AdminRequestMode::GlobalToggleVideoClips as u8, 102);
+        assert_eq!(AdminRequestMode::SetGlobalImageMaxResolution as u8, 103);
+        assert_eq!(AdminRequestMode::SetGlobalVideoClipMaxSize as u8, 104);
+        assert_eq!(AdminRequestMode::SetGlobalVideoClipMaxPerPlayer as u8, 105);
+        assert_eq!(AdminRequestMode::from(106), AdminRequestMode::Unknown);
         assert_eq!(
             AdminPermissionQueryKind::try_from(0),
             Ok(AdminPermissionQueryKind::Node)

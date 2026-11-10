@@ -8,3 +8,6 @@
 BasisRustServer/docker-entrypoint.sh text eol=lf
 BasisRustServer/Dockerfile        text eol=lf
 .github/workflows/*.yml           text eol=lf
+
+# Unmodified upstream SQLite driver sources; local dependency patch stays reviewable.
+BasisRustServer/vendor/sqlx-sqlite/src/** linguist-vendored=true whitespace=-blank-at-eol
