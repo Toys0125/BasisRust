@@ -460,6 +460,25 @@ fn decode_record(data: Option<Vec<u8>>, owner: &str) -> Result<PlayerRecord> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn sqlite_runtime_includes_wal_page_size_fix() {
+        let (storage, _) = SqlPlayerStorage::connect("", None, "basis_storage")
+            .await
+            .unwrap();
+        let Pool::Sqlite(pool) = &storage.pool else {
+            unreachable!()
+        };
+        let version: String = sqlx::query_scalar("SELECT sqlite_version()")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let components: Vec<u32> = version.split('.').map(|n| n.parse().unwrap()).collect();
+        assert!(
+            components.as_slice() >= [3, 54, 1].as_slice(),
+            "SQLite {version} predates the bundled fix for RUSTSEC-2026-0459"
+        );
+    }
+
     pub(super) async fn sqlite_usage(storage: &SqlPlayerStorage) -> (i64, i64, i64) {
         let Pool::Sqlite(pool) = &storage.pool else {
             unreachable!()
